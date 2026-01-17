@@ -1,0 +1,44 @@
+# @package _global_
+defaults:
+  - override /model: obj_ch8      # 你的模型設定
+  - override /data: face_reconstruction  # 你的資料設定
+  - override /lora: face_lora     # 你的 LoRA 設定
+  - override /task: img2depth     # 你的任務設定
+
+name: face_reconstruction_lora_v1
+
+train:
+  trainer_params:
+    val_check_interval: 1.0  # 設定為 1.0 代表「每個 Epoch 結束時驗證一次」
+                             # 或者你可以設成小一點的整數，例如 100
+# ---------------------------------------------------------
+# 任務覆寫 (Task Overrides)
+# ---------------------------------------------------------
+task:
+  # 1. 條件注入設定
+  context_key: x0_latent    # 將輸入圖片 (x0) 的 Latent 與噪聲串接
+  conditioning_key: x0      # Cross-Attention 的鍵值
+  cond_dropout: 0.0
+
+  # 使用 Dummy Embedder (忽略文字輸入)
+  cond_stage_cfg:
+    target: diff2flow.conditioning.encoders.DummyOpenCLIPTextEmbedder
+    params:
+      nulltext_path: checkpoints/nulltext_openclip_embedding.npy
+
+  # 2. 評估指標設定
+  metric_tracker_cfg:
+    target: diff2flow.metrics.ImageMetricTracker
+
+  # 3. 視覺化設定
+  visualizer:
+    target: diff2flow.visualizer.T2IVisualizer
+    params:
+      show_x1: True
+
+# ---------------------------------------------------------
+# 模型參數微調
+# ---------------------------------------------------------
+model:
+  params:
+    diffusion_schedule: linear

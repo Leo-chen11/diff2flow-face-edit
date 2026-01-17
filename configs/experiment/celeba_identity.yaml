@@ -1,0 +1,39 @@
+# @package _global_
+defaults:
+  - override /model: obj_ch8    # 關鍵：使用 8 通道 (接受圖片條件)
+  - override /data: celeba_data   # 使用你建立的 CelebA 資料設定
+  - override /lora: face_lora
+  - override /task: txt2img       # 借用 txt2img 模板，但下面會修改
+
+name: celeba_identity_v1
+
+train:
+  trainer_params:
+    val_check_interval: 1.0
+
+task:
+  # -----------------------------------------------
+  # [固定身份模式]
+  # context_key: x0_latent
+  # 代表我們把原圖 (x0) 也串接進去給模型看
+  # -----------------------------------------------
+  context_key: x0_latent
+
+  conditioning_key: txt
+  cond_dropout: 0.1
+
+  cond_stage_cfg:
+    target: diff2flow.conditioning.encoders.FrozenOpenCLIPEmbedder
+    params:
+      arch: ViT-H-14
+      version: laion2b_s32b_b79k
+      freeze: True
+      layer: penultimate
+
+  metric_tracker_cfg:
+    target: diff2flow.metrics.ImageMetricTracker
+
+  visualizer:
+    target: diff2flow.visualizer.T2IVisualizer
+    params:
+      show_x1: True # 顯示原圖做對比

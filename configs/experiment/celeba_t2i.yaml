@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+  - override /model: obj_ch4     # <--- 這裡必須是 obj_ch8，不能是 obj_ch4
+  - override /data: celeba_data   # 指向你的 CelebA 資料設定
+  - override /lora: face_lora     # 使用 LoRA
+  - override /task: txt2img       # 使用 txt2img 模板
+
+name: celeba_t2i_v1
+
+train:
+  trainer_params:
+    val_check_interval: 1.0       # 每個 Epoch 驗證一次
+
+# ---------------------------------------------------------
+# 任務設定
+# ---------------------------------------------------------
+task:
+  name: text_to_image_identity
+
+  # 1. 條件設定
+  # context_key: x0_latent
+  # 這行代表我們要「串接」原圖的 Latent。
+  # 這會讓輸入變成 4+4=8 channel。
+  # 所以上面的 model 必須配合使用 obj_ch8。
+  context_key: null
+
+  conditioning_key: txt          # 讀取 batch['txt']
+  cond_dropout: 0.1              # 文字條件 Dropout
+
+  # 2. 文字編碼器
+  cond_stage_cfg:
+    target: diff2flow.conditioning.encoders.FrozenOpenCLIPEmbedder
+    params:
+      arch: ViT-H-14
+      version: laion2b_s32b_b79k
+      freeze: True
+      layer: penultimate
+
+  # 3. 評估與視覺化
+  metric_tracker_cfg:
+    target: diff2flow.metrics.ImageMetricTracker
+
+  visualizer:
+    target: diff2flow.visualizer.T2IVisualizer
+    params:
+      show_x1: True
