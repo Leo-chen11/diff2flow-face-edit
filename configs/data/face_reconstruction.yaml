@@ -1,0 +1,21 @@
+name: face_reconstruction
+target: diff2flow.dataloader.DataModuleFromConfig
+params:
+  batch_size: 4       # 根據顯存大小調整 (3090 可以嘗試 4 到 8)
+  num_workers: 4
+
+  # 訓練集設定
+  train:
+    target: diff2flow.dataloader.FolderDataset # 呼叫剛剛寫的 Class
+    params:
+      root: /home/cchen/桌面/train_data      # 你的訓練資料路徑
+      size: 512                              # 訓練解析度
+      ext: jpg                               # 請確認你的圖片格式 (jpg 或 png)
+
+  # 驗證集設定
+  validation:
+    target: diff2flow.dataloader.FolderDataset
+    params:
+      root: /home/cchen/桌面/test_data       # 你的測試資料路徑
+      size: 512
+      ext: jpg
