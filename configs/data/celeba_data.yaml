@@ -1,1 +1,19 @@
-
+name: CelebA_HQ_Data
+target: diff2flow.dataloader.DataModuleFromConfig
+params:
+  batch_size: 4  # 3090 可設 4~8
+  num_workers: 4
+  train:
+    target: diff2flow.dataloader.CelebAHQDataset
+    params:
+      # 請修改為你的實際路徑
+      img_dir: /home/cchen/桌面/MM-CelebA-HQ-Dataset-main\split_2000_500/train/images
+      attr_path: /home/cchen/桌面/MM-CelebA-HQ-Dataset-main\split_2000_500/train/attributes.txt
+      size: 512
+  validation:
+    # 測試時如果沒有分開的資料夾，可以先指到一樣的，或是切分出另一個資料夾
+    target: diff2flow.dataloader.CelebAHQDataset
+    params:
+      img_dir: /home/cchen/桌面/MM-CelebA-HQ-Dataset-main\split_2000_500/val/images
+      attr_path: /home/cchen/桌面/MM-CelebA-HQ-Dataset-main\split_2000_500/val/attributes.txt
+      size: 512
