@@ -1,0 +1,116 @@
+defaults:
+  - _self_
+  - autoencoder: sd_ae
+  - model: obj_ch8          # [固定] 使用 8 通道模型 (接受原圖輸入)
+  - lora: face_lora         # [固定] 預設開啟 LoRA
+  - data: celeba_data       # [固定] 鎖定 CelebA 資料集
+  - task: txt2img           # 基礎任務模板
+  - experiment: null
+
+  # disable hydra logging
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+# ----------------------------------------
+name: celeba_identity_v2    # [修改] 幫你改個新名字，方便區分
+
+# ----------------------------------------
+# logging
+use_wandb: False
+use_wandb_offline: False
+
+# checkpoint loading
+load_weights: null
+load_lora_weights: null
+resume_checkpoint: null
+
+# ----------------------------------------
+# [核心修改] 任務設定 (Task)
+# 這裡把 celeba_identity.yaml 的精華直接搬過來
+# 這樣你跑 python train.py 預設就是 "人臉編輯模式"
+task:
+  # 關鍵：x0_latent 代表輸入包含 "原圖" + "文字"
+  context_key: x0_latent
+
+  conditioning_key: txt
+  cond_dropout: 0.1
+
+  # 設定文字編碼器 (OpenCLIP)
+  cond_stage_cfg:
+    target: diff2flow.conditioning.encoders.FrozenOpenCLIPEmbedder
+    params:
+      arch: ViT-H-14
+      version: laion2b_s32b_b79k
+      freeze: True
+      layer: penultimate
+
+  # 顯示設定：生成時對比原圖
+  visualizer:
+    target: diff2flow.visualizer.T2IVisualizer
+    params:
+      show_x1: True
+
+# ----------------------------------------
+# training logics
+train:
+  # [確認] LoRA 訓練建議 1e-4，若全量微調改 1e-5
+  lr: 1e-4
+
+  weight_decay: 0.0
+  sampling_steps: 50
+
+  # EMA stuff
+  ema_rate: 0.999
+  ema_update_every: 1
+  ema_update_after_step: 1000
+  use_ema_for_sampling: True
+
+  # Misc
+  n_images_to_vis: 8  # 改少一點，省空間
+  log_grad_norm: False
+
+  # Training metrics
+  checkpoint_callback_params:
+    every_n_train_steps: 5000   # 每 5000 步存一次 Checkpoint
+    save_top_k: -1
+    verbose: True
+    save_last: True
+    auto_insert_metric_name: False
+
+  trainer_params:
+    max_epochs: -1
+    num_sanity_val_steps: 0
+
+    # [確認] 梯度累加：穩定訓練的關鍵
+    accumulate_grad_batches: 4
+
+    log_every_n_steps: 50
+    limit_val_batches: 16
+
+    # [修改] 讓驗證頻率快一點，每 1000 步就看一次結果
+    val_check_interval: 1000
+    precision: 32-true
+
+  lr_scheduler: null
+
+  callbacks:
+    - target: pytorch_lightning.callbacks.LearningRateMonitor
+      params:
+        logging_interval: 'step'
+
+# ----------------------------------------
+# distributed
+num_nodes: 1
+devices: -1
+auto_requeue: False
+tqdm_refresh_rate: 1
+deepspeed_stage: 0
+p2p_disable: False
+slurm_id: null
+
+# ----------------------------------------
+# don't log and save files
+hydra:
+  output_subdir: null
+  run:
+    dir: .
