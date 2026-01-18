@@ -1,1 +1,8 @@
-
+lora_cfg:
+  lora_type: lora
+  lora_rank: 64
+  lora_alpha: 64
+  lora_dropout: 0.1
+  lora_conv: True        # 開啟卷積層微調
+  lora_self_attn: True
+  lora_cross_attn: True
