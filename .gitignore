@@ -1,0 +1,26 @@
+# model weights / datasets
+data/
+pretrained_models/
+output/
+outputs/
+runs/
+checkpoints/
+save_models/
+
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.onnx
+*.tflite
+*.npy
+*.npz
+
+# python cache
+__pycache__/
+*.pyc
+
+# environment
+.venv/
+venv/
+env/

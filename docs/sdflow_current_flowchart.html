@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SDFlow / LAG-DOF Current Training Flow</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, "Noto Sans TC", sans-serif;
+      background: #f6f7f9;
+      color: #1f2933;
+    }
+    header {
+      padding: 20px 28px;
+      background: #111827;
+      color: white;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    main {
+      padding: 24px;
+    }
+    .panel {
+      background: white;
+      border: 1px solid #d9dee7;
+      border-radius: 8px;
+      padding: 20px;
+      overflow: auto;
+    }
+    .note {
+      margin: 0 0 16px;
+      color: #4b5563;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    .mermaid {
+      min-width: 1200px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SDFlow / LAG-DOF-SDFlow Current Training Flow</h1>
+  </header>
+  <main>
+    <p class="note">
+      Current pipeline based on training/train_sdflow.py: LAG-DOF velocity field,
+      optional Direction Bank, glasses bypass, optional AIG, and optional frozen diffusion DDS guidance.
+    </p>
+    <div class="panel">
+      <pre class="mermaid">
+flowchart TD
+    A[Input batch] --> A1[image img]
+    A --> A2[W+ latent<br/>B x 18 x 512]
+    A --> A3[CelebA preds]
+
+    A1 --> B[IdentityAttributeConditioner]
+    A2 --> B
+    B --> B1[id_cond]
+    B --> B2[attr_cond]
+
+    B1 --> C[src_cond = concat id_cond + attr_cond]
+    B2 --> C
+    A2 --> D[CNF Forward]
+    C --> D
+
+    D --> D1[base latent z / approx21]
+    D --> D2[NLL loss]
+
+    B2 --> E[Select target attribute<br/>15 Eyeglasses / 20 Male / 39 Young]
+    E --> F[Build soft target attr_cond]
+    F --> G[new_cond = concat id_cond + new_attr_cond]
+
+    D1 --> H[CNF Reverse]
+    G --> H
+    H --> H1[new_latents_raw]
+
+    H1 --> I[flow_delta = new_latents_raw - latent]
+    A2 --> I
+
+    I --> J{Direction Bank enabled?}
+    J -- No --> K[guided_delta = flow_delta]
+    J -- Yes --> L{Eyeglasses bypass?}
+    L -- Yes --> K
+    L -- No --> M[Attribute Direction Bank]
+    F --> M
+    A2 --> M
+    M --> K2[guided_delta]
+
+    K --> N[safe_delta]
+    K2 --> N
+
+    N --> O{AIG enabled?}
+    O -- No --> P[new_latents = latent + safe_delta]
+    O -- Yes --> O1[Adaptive Identity Gate<br/>suppresses risky delta]
+    O1 --> P
+
+    P --> Q[StyleGAN2 Generator]
+    Q --> R[new_face_tensors]
+
+    R --> S[Attribute Teacher<br/>ResNet34 frozen]
+    A1 --> S0[Teacher on source]
+    S --> T1[loss_target]
+    S0 --> T2[loss_leakage]
+
+    R --> U[ArcFace ID Loss]
+    A1 --> U
+    U --> T3[loss_id]
+
+    P --> V[Layer-wise W+ regularization]
+    A2 --> V
+    V --> T4[loss_reg]
+
+    D2 --> T5[loss_nll]
+    B2 --> T6[kd_loss]
+    D --> T7[LAG-DOF regularization<br/>orth + gate_smooth]
+    M --> T8[direction_orth]
+
+    R --> W{Diffusion guidance enabled?}
+    W -- No --> T9[loss_diffusion_dds = 0]
+    W -- Yes, every N steps --> W1[Frozen Stable Diffusion DDS]
+    A1 --> W1
+    E --> W1
+    F --> W1
+    W1 --> T9[loss_diffusion_dds]
+
+    T1 --> Z[Total loss]
+    T2 --> Z
+    T3 --> Z
+    T4 --> Z
+    T5 --> Z
+    T6 --> Z
+    T7 --> Z
+    T8 --> Z
+    T9 --> Z
+
+    Z --> Z1[backward]
+    Z1 --> Z2[optimizer.step]
+    Z2 --> Z3[Update SDFlow / Conditioner / Direction Bank]
+      </pre>
+    </div>
+  </main>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "default",
+      flowchart: {
+        curve: "basis",
+        nodeSpacing: 40,
+        rankSpacing: 60
+      }
+    });
+  </script>
+</body>
+</html>
