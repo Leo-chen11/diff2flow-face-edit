@@ -479,16 +479,9 @@ def main():
                         action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Bypass Direction Bank for Eyeglasses during evaluation/inference.')
-    parser.add_argument('--age_direction_scale', type=float, default=0.55,
-                        help='Age/Young-only multiplier for Direction Bank guided delta.')
-    parser.add_argument('--age_coarse_layer_scale', type=float, default=0.75,
-                        help='Age/Young-only scale for W+ coarse layers 0:4.')
-    parser.add_argument('--age_middle_layer_scale', type=float, default=1.0,
-                        help='Age/Young-only scale for W+ middle layers 4:9.')
-    parser.add_argument('--age_fine_layer_scale', type=float, default=0.45,
-                        help='Age/Young-only scale for W+ fine layers 9:18.')
-    parser.add_argument('--age_delta_max_norm', type=float, default=10.0,
-                        help='Age/Young-only max norm for final guided W+ delta. Set <=0 to disable.')
+    parser.add_argument('--guided_delta_max_norm', type=float, default=0.0,
+                        help='Shared max norm for the final guided W+ delta, applied uniformly to '
+                             'every attribute (not just age). Set <=0 to disable (no cap).')
 
     parser.add_argument('--attribute_index', nargs='*', default=[15, 20, 39], type=int)
     parser.add_argument('--attribute_names', nargs='*', default=None)
@@ -623,11 +616,9 @@ def main():
             direction_freeze=args.direction_freeze,
             ckpt_step=args.ckpt_step,
             bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-            age_direction_scale=args.age_direction_scale,
-            age_coarse_layer_scale=args.age_coarse_layer_scale,
-            age_middle_layer_scale=args.age_middle_layer_scale,
-            age_fine_layer_scale=args.age_fine_layer_scale,
-            age_delta_max_norm=args.age_delta_max_norm,
+            guided_delta_max_norm=(
+                args.guided_delta_max_norm if args.guided_delta_max_norm > 0 else None
+            ),
         )
 
         image_rows = [] if args.save_images > 0 else None
