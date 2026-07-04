@@ -1,16 +1,21 @@
-"""Extract continuous ordinal age scores from the r34 age head for all FFHQ images.
+"""Extract continuous (pre-threshold) sigmoid scores for the 40 CelebA
+binary attribute heads, generalizing extract_continuous_age.py so that every
+attribute -- not just age -- has a continuous confidence score available for
+percentile-extreme splits when computing direction-bank directions (see
+scripts/precompute_directions_stratified.py).
 
-AttributeClassifier contains a separate ResNet34 `age_heads` subnet with a
-6-logit output. sigmoid(logits).sum(dim=1) gives a continuous ordinal score in
-[0, 6] where higher = older. This avoids the binary CelebA Young label whose
-old/young groups overlap heavily in the 35-45 year range.
+tools/precompute_sdflow_data.py only saves AttributeClassifier's already
+thresholded 0/1 predictions (sigmoid(logits) > 0.5), so there is no continuous
+signal to select confidently-labeled samples from. AttributeClassifier.
+forward_attr returns the raw logits for the 40 binary heads before
+thresholding; sigmoid(logits) gives a continuous [0, 1] score per attribute.
 
 Usage:
-    python scripts/extract_continuous_age.py \
+    python scripts/extract_continuous_attrs.py \
         --model_path data/r34_a40_age_256_classifier.pth \
         --img_dir data/FFHQ \
         --img_list data/ffhq.txt \
-        --output data/ffhq_age_continuous.pth
+        --output data/ffhq_e4e_preds_continuous.pth
 """
 
 import argparse
@@ -51,13 +56,13 @@ class _ImageDataset(Dataset):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract continuous ordinal age scores via the r34 age_heads subnet.'
+        description='Extract continuous (pre-threshold) sigmoid scores for the 40 CelebA attribute heads.'
     )
     parser.add_argument('--model_path', default='./data/r34_a40_age_256_classifier.pth')
     parser.add_argument('--img_dir', default='./data/FFHQ')
     parser.add_argument('--img_list', default='./data/ffhq.txt',
                         help='CSV with a "path" column (output of precompute_sdflow_data.py)')
-    parser.add_argument('--output', default='./data/ffhq_age_continuous.pth')
+    parser.add_argument('--output', default='./data/ffhq_e4e_preds_continuous.pth')
     parser.add_argument('--img_size', type=int, default=256,
                         help='Input resolution (matches the "256" in the model filename)')
     parser.add_argument('--batch_size', type=int, default=128)
@@ -71,10 +76,8 @@ def main():
     print(f'Loading model from {args.model_path} ...')
     classifier = AttributeClassifier()
     classifier.load_state_dict(torch.load(args.model_path, map_location='cpu'))
-    age_net = classifier.age_heads   # ResNet34 with fc = Linear(512, 6)
-    age_net.eval().to(device)
-    del classifier
-    print('Loaded age_heads subnet (6-logit ordinal output, higher = older)')
+    classifier.eval().to(device)
+    print('Loaded AttributeClassifier (forward_attr: 40 binary attribute heads, pre-threshold)')
 
     with open(args.img_list, newline='') as f:
         reader = csv.DictReader(f)
@@ -91,31 +94,20 @@ def main():
     )
 
     all_scores = []
-    for batch in tqdm(loader, desc='age scores'):
-        logits = age_net(batch.to(device))                # (B, 6)
-        scores = torch.sigmoid(logits).sum(dim=1).cpu()  # (B,) in [0, 6]
-        all_scores.append(scores)
+    for batch in tqdm(loader, desc='continuous attr scores'):
+        logits, _ = classifier.forward_attr(batch.to(device))   # (B, 40)
+        all_scores.append(torch.sigmoid(logits).cpu())
 
-    scores = torch.cat(all_scores)   # (N,)
-    print(f'\nScore stats: min={scores.min():.3f}  max={scores.max():.3f}  '
-          f'mean={scores.mean():.3f}  std={scores.std():.3f}')
-    print('Percentile distribution:')
-    for pct in [5, 10, 15, 25, 50, 75, 85, 90, 95]:
-        v = torch.quantile(scores, pct / 100).item()
-        n_young = (scores < v).sum().item() if pct <= 25 else None
-        n_old   = (scores > v).sum().item() if pct >= 75 else None
-        tag = f'  → {n_young} young samples below' if n_young else \
-              f'  → {n_old} old samples above' if n_old else ''
-        print(f'  p{pct:2d}: {v:.3f}{tag}')
+    scores = torch.cat(all_scores)   # (N, 40)
+    print(f'\nShape: {tuple(scores.shape)}')
+    for idx, name in [(15, 'Eyeglasses'), (20, 'Male'), (39, 'Young')]:
+        col = scores[:, idx]
+        print(f'  attr {idx:>2} ({name:<10}): mean={col.mean():.3f} std={col.std():.3f} '
+              f'min={col.min():.3f} max={col.max():.3f}')
 
-    out = {
-        'values': scores,
-        'scale': '0-6_ordinal_higher_is_older',
-        'source_img_list': str(args.img_list),
-        'img_size': args.img_size,
-    }
+    out = {'paths': paths, 'values': scores}
     torch.save(out, args.output)
-    print(f'\nSaved → {args.output}  shape={tuple(scores.shape)}')
+    print(f'\nSaved -> {args.output}  shape={tuple(scores.shape)}')
 
 
 if __name__ == '__main__':
