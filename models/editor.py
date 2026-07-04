@@ -60,34 +60,6 @@ def _load_state_allow_old_pos(model, path):
         print(f'[WARN] Loaded old flow checkpoint without position embedding keys: {path}')
 
 
-def _build_direction_bank_safety_controls(
-    attribute_index,
-    age_direction_scale=0.55,
-    age_coarse_layer_scale=0.75,
-    age_middle_layer_scale=1.0,
-    age_fine_layer_scale=0.45,
-    age_delta_max_norm=10.0,
-    num_layers=18,
-):
-    per_attr_direction_scale = []
-    per_attr_delta_max_norm = []
-    per_attr_layer_scale = []
-    for attr_abs_idx in attribute_index:
-        if int(attr_abs_idx) == 39:
-            per_attr_direction_scale.append(float(age_direction_scale))
-            per_attr_delta_max_norm.append(float(age_delta_max_norm))
-            layer_scale = torch.ones(num_layers, dtype=torch.float)
-            layer_scale[:4] *= float(age_coarse_layer_scale)
-            layer_scale[4:9] *= float(age_middle_layer_scale)
-            layer_scale[9:] *= float(age_fine_layer_scale)
-            per_attr_layer_scale.append(layer_scale.tolist())
-        else:
-            per_attr_direction_scale.append(1.0)
-            per_attr_delta_max_norm.append(0.0)
-            per_attr_layer_scale.append([1.0] * num_layers)
-    return per_attr_direction_scale, per_attr_layer_scale, per_attr_delta_max_norm
-
-
 class SDFlow(object):
     def __init__(self, ckpt_dir, attr_num, attr_list=[15, 20, 39], scale=1.0, device='cuda',
                  id_cond_dim=32, id_cond_scale=0.25, attr_backbone='resnet50',
@@ -97,11 +69,7 @@ class SDFlow(object):
                  lag_gate_init_bias=-1.5, direction_bank_path=None,
                  direction_residual_scale=0.05, direction_freeze=True,
                  ckpt_step=None, bypass_glasses_direction_bank=True,
-                 age_direction_scale=0.55,
-                 age_coarse_layer_scale=0.75,
-                 age_middle_layer_scale=1.0,
-                 age_fine_layer_scale=0.45,
-                 age_delta_max_norm=10.0) -> None:
+                 guided_delta_max_norm=None) -> None:
         self.ckpt_dir = ckpt_dir
         self.device = device
         self.attr_num = attr_num
@@ -122,11 +90,11 @@ class SDFlow(object):
         self.direction_freeze = direction_freeze
         self.ckpt_step = ckpt_step
         self.bypass_glasses_direction_bank = bypass_glasses_direction_bank
-        self.age_direction_scale = age_direction_scale
-        self.age_coarse_layer_scale = age_coarse_layer_scale
-        self.age_middle_layer_scale = age_middle_layer_scale
-        self.age_fine_layer_scale = age_fine_layer_scale
-        self.age_delta_max_norm = age_delta_max_norm
+        # Single global cap shared by every attribute, replacing the old
+        # per-attribute (age-only) direction_scale/layer_scale/delta_max_norm
+        # hack. None disables the cap so the raw, LDA-direction-guided delta
+        # can be measured honestly before deciding whether any cap is needed.
+        self.guided_delta_max_norm = guided_delta_max_norm
 
         self.class_indices = attr_list
 
@@ -179,19 +147,9 @@ class SDFlow(object):
         if direction_bank_path is not None:
             _bank_meta = torch.load(direction_bank_path, map_location="cpu")
             _num_k = int(_bank_meta.get("num_k", 1)) if isinstance(_bank_meta, dict) else 1
-            (
-                _per_attr_direction_scale,
-                _per_attr_layer_scale,
-                _per_attr_delta_max_norm,
-            ) = _build_direction_bank_safety_controls(
-                self.class_indices,
-                age_direction_scale=age_direction_scale,
-                age_coarse_layer_scale=age_coarse_layer_scale,
-                age_middle_layer_scale=age_middle_layer_scale,
-                age_fine_layer_scale=age_fine_layer_scale,
-                age_delta_max_norm=age_delta_max_norm,
-                num_layers=18,
-            )
+            # No per-attribute direction_scale/layer_scale/delta_max_norm here:
+            # every attribute gets the same (default) treatment, and the only
+            # magnitude safety net is the shared guided_delta_max_norm below.
             self.direction_bank = AttributeDirectionBank(
                 num_attrs=len(self.class_indices),
                 num_layers=18,
@@ -201,9 +159,7 @@ class SDFlow(object):
                 attribute_index=self.class_indices,
                 residual_scale=direction_residual_scale,
                 freeze_directions=direction_freeze,
-                per_attr_direction_scale=_per_attr_direction_scale,
-                per_attr_layer_scale=_per_attr_layer_scale,
-                per_attr_delta_max_norm=_per_attr_delta_max_norm,
+                guided_delta_max_norm=self.guided_delta_max_norm,
             ).to(self.device)
             filename = _find_latest_ckpt_optional(ckpt_dir, 'direction_bank', ckpt_step)
             if filename is not None:
