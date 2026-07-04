@@ -680,6 +680,18 @@ if __name__ == '__main__':
             args.glasses_residual_scale if idx == 15 else args.direction_residual_scale
             for idx in args.attribute_index
         ]
+        # Read K from the bank file itself rather than trusting --direction_k:
+        # editor.py and evaluate_sdflow.py both do the same at load time, so
+        # --direction_k silently disagreeing with the bank's real K would build
+        # a checkpoint here (e.g. K truncated 4->1, discarding 3 of 4 stratified
+        # directions per attribute) that those scripts then fail to load with a
+        # direction_units shape mismatch. There is only one correct K per bank
+        # file; don't let two independently-set numbers disagree about it.
+        _bank_meta = torch.load(args.direction_bank_path, map_location='cpu')
+        _bank_num_k = int(_bank_meta.get('num_k', args.direction_k)) if isinstance(_bank_meta, dict) else args.direction_k
+        if _bank_num_k != args.direction_k:
+            print(f'** Direction Bank: --direction_k={args.direction_k} ignored, '
+                  f'using num_k={_bank_num_k} from {args.direction_bank_path}')
         # No per-attribute direction_scale/layer_scale/delta_max_norm: every
         # attribute is treated the same, and the only magnitude safety net is
         # the shared guided_delta_max_norm below.
@@ -687,7 +699,7 @@ if __name__ == '__main__':
             num_attrs=len(args.attribute_index),
             num_layers=18,
             latent_dim=512,
-            num_k=args.direction_k,
+            num_k=_bank_num_k,
             bank_path=args.direction_bank_path,
             attribute_index=args.attribute_index,
             residual_scale=args.direction_residual_scale,
