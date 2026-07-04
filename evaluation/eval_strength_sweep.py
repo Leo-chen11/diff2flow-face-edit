@@ -14,6 +14,16 @@ Outputs:
     output/eval_strength_sweep/metrics_detail.csv
     output/eval_strength_sweep/metrics_summary.csv
     output/eval_strength_sweep/images/*.png
+    output/eval_strength_sweep/plots/curves_<attribute>.png       (per attribute)
+    output/eval_strength_sweep/plots/curves_all_attributes.png    (overview)
+
+The curve plots reproduce the Identity/Attribute Preservation vs Editing
+Accuracy figure from the SDFlow paper, computed from this script's own
+metrics so they reflect the real SDFlow.transform() path (direction bank /
+layer mask / LAG-DOF gate) and the same ArcFace identity model used
+elsewhere in this repo. Use --no-plot to skip, or --run_name to change the
+legend label. To compare several runs (e.g. original vs lag_dof, or against
+external baselines) on the same axes, see plot_strength_curves.py.
 """
 
 import argparse
@@ -32,6 +42,13 @@ import torchvision.transforms as T
 from torch.utils import data
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 
 from common.ops import load_network
 from common.id_loss import IDLoss
@@ -267,6 +284,87 @@ def save_strength_grids(output_dir, attr_name, image_rows, strengths):
         save_image(grid, os.path.join(image_dir, f'{safe_name}_sample{row_idx:03d}_{label}.png'))
 
 
+def plot_editing_curves(summary_rows, output_dir, run_name='Ours', x_metric='target_success'):
+    """Identity/Attribute Preservation vs Editing Accuracy curves (reproduces
+    the Fig. 4 style plot from the SDFlow paper), computed directly from this
+    script's own summary rows.
+
+    Unlike evaluation/eval_curves.py, this plots numbers that come from the
+    real SDFlow.transform() path (direction bank / layer mask / LAG-DOF gate
+    included) and from the same ArcFace identity model used everywhere else
+    in this repo, so it is safe to use for internal ablation comparisons.
+    """
+    if plt is None:
+        print('[plot] matplotlib not installed; skipping curve plots (pip install matplotlib).')
+        return
+
+    plot_dir = os.path.join(output_dir, 'plots')
+    os.makedirs(plot_dir, exist_ok=True)
+
+    by_attr = defaultdict(list)
+    for row in summary_rows:
+        by_attr[row['attribute']].append(row)
+
+    colors = plt.cm.tab10.colors
+    overview_fig, overview_axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    for color_idx, (attr_name, rows) in enumerate(sorted(by_attr.items())):
+        rows = sorted(rows, key=lambda r: r['strength'])
+        # Sort by the achieved editing accuracy (not raw strength) so the line
+        # reads left-to-right the same way the paper figure does, since
+        # strength does not map 1:1 onto the resulting classifier accuracy.
+        rows = sorted(rows, key=lambda r: r[x_metric])
+        edit_acc = [r[x_metric] * 100.0 for r in rows]
+        id_sim = [r['id_sim_real'] for r in rows]
+        attr_pres = [r['preserve_acc'] * 100.0 for r in rows]
+
+        fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+        axes[0].plot(edit_acc, id_sim, marker='o', color='#c0392b', linewidth=2, label=run_name)
+        axes[0].set_xlabel('Editing Accuracy (%)')
+        axes[0].set_ylabel('Cosine Similarity')
+        axes[0].set_title('Identity Preservation')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(edit_acc, attr_pres, marker='o', color='#c0392b', linewidth=2, label=run_name)
+        axes[1].set_xlabel('Editing Accuracy (%)')
+        axes[1].set_ylabel('Accuracy (%)')
+        axes[1].set_title('Attribute Preservation')
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+        fig.suptitle(attr_name)
+        fig.tight_layout()
+        safe_name = attr_name.replace(' ', '_')
+        fig_path = os.path.join(plot_dir, f'curves_{safe_name}.png')
+        fig.savefig(fig_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f'[plot] wrote {fig_path}')
+
+        color = colors[color_idx % len(colors)]
+        overview_axes[0].plot(edit_acc, id_sim, marker='o', color=color, linewidth=2, label=attr_name)
+        overview_axes[1].plot(edit_acc, attr_pres, marker='o', color=color, linewidth=2, label=attr_name)
+
+    overview_axes[0].set_xlabel('Editing Accuracy (%)')
+    overview_axes[0].set_ylabel('Cosine Similarity')
+    overview_axes[0].set_title('Identity Preservation')
+    overview_axes[0].grid(True, alpha=0.3)
+    overview_axes[0].legend()
+
+    overview_axes[1].set_xlabel('Editing Accuracy (%)')
+    overview_axes[1].set_ylabel('Accuracy (%)')
+    overview_axes[1].set_title('Attribute Preservation')
+    overview_axes[1].grid(True, alpha=0.3)
+    overview_axes[1].legend()
+
+    overview_fig.suptitle(f'{run_name}: all attributes')
+    overview_fig.tight_layout()
+    overview_path = os.path.join(plot_dir, 'curves_all_attributes.png')
+    overview_fig.savefig(overview_path, dpi=150, bbox_inches='tight')
+    plt.close(overview_fig)
+    print(f'[plot] wrote {overview_path}')
+
+
 def compute_practical_score(row, args, id_floor=None):
     """Score used for selecting a visually useful edit strength.
 
@@ -409,6 +507,15 @@ def main():
     parser.add_argument('--max_samples', type=int, default=64)
     parser.add_argument('--save_images', type=int, default=8)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Paper-style curve plots (Identity/Attribute Preservation vs Editing Accuracy).
+    parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=True,
+                        help='Write Fig.4-style curve plots to <output_dir>/plots/.')
+    parser.add_argument('--run_name', default='Ours',
+                        help='Legend label for this run in the plotted curves.')
+    parser.add_argument('--plot_x_metric', default='target_success',
+                        choices=['target_success', 'effective_success'],
+                        help='Which success metric to treat as "Editing Accuracy" on the X axis.')
 
     # Scoring options.
     # min_target_gain prevents tiny edits near the classifier boundary from being counted as useful.
@@ -562,6 +669,14 @@ def main():
 
     print(f'Wrote {detail_path}')
     print(f'Wrote {summary_path}')
+
+    if args.plot:
+        plot_editing_curves(
+            summary_rows,
+            args.output_dir,
+            run_name=args.run_name,
+            x_metric=args.plot_x_metric,
+        )
     print('\nSummary:')
     for row in summary_rows:
         print(
