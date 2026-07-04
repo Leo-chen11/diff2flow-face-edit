@@ -34,12 +34,17 @@ def build_edit_prompts(attr_abs_idx, target_values):
                 "a realistic face photo of a person with straight hair"
             )
         elif attr == 39:
+            # Structural/mid-layer aging cues, not skin-texture words (wrinkles,
+            # smooth skin, forehead lines). The DDS gradient below only reaches
+            # W+ layers < args.dds_fine_layer_start (coarse/mid); fine-grained
+            # skin texture lives in the fine layers it never touches, so asking
+            # for it here just wastes signal on something this loss can't move.
             prompts.append(
-                "a realistic face photo of a young person with smooth skin, "
-                "tight jawline, bright eyes, and youthful complexion"
+                "a realistic face photo of a young person with a full, firm "
+                "jawline, high round cheeks, and a smooth brow"
                 if enabled else
-                "a realistic face photo of an elderly person with deep wrinkles, "
-                "sagging skin, prominent forehead lines, thin lips, and gray hair"
+                "a realistic face photo of an elderly person with a sagging "
+                "jawline, sunken cheeks, deep-set eyes, and a receding hairline"
             )
         else:
             prompts.append("a realistic face photo of a person")
