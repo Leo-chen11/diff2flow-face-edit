@@ -97,32 +97,6 @@ def get_eyeglasses_local_idx(attribute_index):
     return attribute_index.index(15) if 15 in attribute_index else None
 
 
-def build_direction_bank_safety_controls(attribute_index, args, num_layers=18):
-    """Build per-attribute Direction Bank controls.
-
-    Age/Young uses conservative layer-aware damping because broad age directions
-    often carry texture, hair, lighting, and identity components. Other
-    attributes keep the original behavior by default.
-    """
-    per_attr_direction_scale = []
-    per_attr_delta_max_norm = []
-    per_attr_layer_scale = []
-    for attr_abs_idx in attribute_index:
-        if int(attr_abs_idx) == 39:
-            per_attr_direction_scale.append(args.age_direction_scale)
-            per_attr_delta_max_norm.append(args.age_delta_max_norm)
-            layer_scale = torch.ones(num_layers, dtype=torch.float)
-            layer_scale[:4] *= args.age_coarse_layer_scale
-            layer_scale[4:9] *= args.age_middle_layer_scale
-            layer_scale[9:] *= args.age_fine_layer_scale
-            per_attr_layer_scale.append(layer_scale.tolist())
-        else:
-            per_attr_direction_scale.append(1.0)
-            per_attr_delta_max_norm.append(0.0)
-            per_attr_layer_scale.append([1.0] * num_layers)
-    return per_attr_direction_scale, per_attr_layer_scale, per_attr_delta_max_norm
-
-
 def resolve_resume_save_dir(resume_dir):
     if resume_dir is None:
         return None
@@ -571,18 +545,6 @@ if __name__ == '__main__':
     parser.add_argument('--residual_max_norm', type=float, default=None,
                         help='Hard clip per-sample residual norm in Direction Bank forward(). '
                              'Prevents residual explosion from large DDS gradients. Suggested: 10.0.')
-    parser.add_argument('--age_direction_scale', type=float, default=0.55,
-                        help='Age/Young-only multiplier for Direction Bank guided delta. '
-                             'Use this to prevent strong age banks from blurring identity.')
-    parser.add_argument('--age_coarse_layer_scale', type=float, default=0.75,
-                        help='Age/Young-only scale for W+ coarse layers 0:4.')
-    parser.add_argument('--age_middle_layer_scale', type=float, default=1.0,
-                        help='Age/Young-only scale for W+ middle layers 4:9.')
-    parser.add_argument('--age_fine_layer_scale', type=float, default=0.45,
-                        help='Age/Young-only scale for W+ fine layers 9:18.')
-    parser.add_argument('--age_delta_max_norm', type=float, default=10.0,
-                        help='Age/Young-only max norm for final guided W+ delta. '
-                             'Set <=0 to disable.')
     parser.add_argument('--dds_fine_layer_start', type=int, default=7,
                         help='W+ layer index from which DDS gradients are blocked (fine layers). '
                              'Set 0 to disable masking.')
@@ -718,11 +680,9 @@ if __name__ == '__main__':
             args.glasses_residual_scale if idx == 15 else args.direction_residual_scale
             for idx in args.attribute_index
         ]
-        (
-            _per_attr_direction_scale,
-            _per_attr_layer_scale,
-            _per_attr_delta_max_norm,
-        ) = build_direction_bank_safety_controls(args.attribute_index, args, num_layers=18)
+        # No per-attribute direction_scale/layer_scale/delta_max_norm: every
+        # attribute is treated the same, and the only magnitude safety net is
+        # the shared guided_delta_max_norm below.
         direction_bank = AttributeDirectionBank(
             num_attrs=len(args.attribute_index),
             num_layers=18,
@@ -734,9 +694,6 @@ if __name__ == '__main__':
             per_attr_residual_scale=_per_attr_rs,
             freeze_directions=args.direction_freeze,
             residual_max_norm=args.residual_max_norm,
-            per_attr_direction_scale=_per_attr_direction_scale,
-            per_attr_layer_scale=_per_attr_layer_scale,
-            per_attr_delta_max_norm=_per_attr_delta_max_norm,
             guided_delta_max_norm=(
                 args.direction_guided_delta_max_norm
                 if args.direction_guided_delta_max_norm > 0 else None
