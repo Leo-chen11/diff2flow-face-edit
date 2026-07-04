@@ -73,6 +73,20 @@ def load_preds(path):
     return t
 
 
+def load_paths(path):
+    """Return the 'paths' list saved alongside a tensor, or None if absent.
+
+    Used to catch the case where --preds_file and --continuous_preds_file
+    were built from different or differently-ordered image lists: matching
+    row counts alone would silently pass while actually pairing each row
+    with the wrong image.
+    """
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "paths" in obj:
+        return list(obj["paths"])
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Direction computation
 # ---------------------------------------------------------------------------
@@ -460,6 +474,9 @@ def main():
 
     K = args.K
     age_k = args.age_k
+    if age_k > K:
+        parser.error(f"--age_k ({age_k}) cannot exceed --K ({K}); age_dirs would end up with more "
+                     "rows than glasses_dirs/gender_dirs and torch.stack(...) would fail.")
 
     print("Loading latents ...")
     latents = load_latents(args.latent_file)
@@ -476,6 +493,15 @@ def main():
         parser.error(
             f"--preds_file has {preds.shape[0]} rows but --continuous_preds_file has "
             f"{continuous.shape[0]} rows; they must come from the same image list/order."
+        )
+    preds_paths = load_paths(args.preds_file)
+    continuous_paths = load_paths(args.continuous_preds_file)
+    if preds_paths is not None and continuous_paths is not None and preds_paths != continuous_paths:
+        parser.error(
+            "--preds_file and --continuous_preds_file have matching row counts but different "
+            "'paths' order/content -- they were built from different or differently-ordered image "
+            "lists. Re-run scripts/extract_continuous_attrs.py with the same --img_list used for "
+            "--preds_file, otherwise every row pairs a prediction with the wrong image."
         )
 
     for attr_name, idx in [("glasses", 15), ("gender", 20), ("young", 39)]:
