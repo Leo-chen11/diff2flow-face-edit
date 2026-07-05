@@ -70,6 +70,65 @@ class LearnableAttributeScales(nn.Module):
             return torch.exp(self.attr_log_scales).clamp(self.min_scale, self.max_scale)
 
 
+class CrossAttributeLossBalancer:
+    """Keeps changed_loss progress comparable across attributes sharing one
+    training loop, instead of letting a fixed --counter_attr_weight apply
+    equally regardless of how hard id_loss/reg_loss naturally fight each
+    attribute's edit (e.g. aging a face moves the ArcFace embedding far more
+    than adding glasses does, for the same semantic progress).
+
+    Tracks an EMA of changed_loss per attribute relative to where that
+    attribute's loss started, and raises the changed_loss weight for
+    whichever attribute is lagging behind the others' relative progress.
+    The same update rule runs identically for every attribute index; nothing
+    here is keyed to a specific attribute, so it applies unchanged if
+    attribute_index gains or loses entries.
+    """
+
+    def __init__(self, num_attrs, ema_decay=0.98, adapt_rate=0.05,
+                 min_weight=0.25, max_weight=4.0, device='cuda'):
+        self.num_attrs = int(num_attrs)
+        self.ema_decay = float(ema_decay)
+        self.adapt_rate = float(adapt_rate)
+        self.min_weight = float(min_weight)
+        self.max_weight = float(max_weight)
+        self.initial_loss = torch.zeros(self.num_attrs, device=device)
+        self.ema_loss = torch.zeros(self.num_attrs, device=device)
+        self.initialized = torch.zeros(self.num_attrs, dtype=torch.bool, device=device)
+        self.weights = torch.ones(self.num_attrs, device=device)
+
+    @torch.no_grad()
+    def update(self, attr_local_idx, changed_loss_per_sample):
+        """attr_local_idx: LongTensor [B]. changed_loss_per_sample: FloatTensor [B]."""
+        for a in range(self.num_attrs):
+            mask = attr_local_idx == a
+            if not mask.any():
+                continue
+            v = changed_loss_per_sample[mask].mean()
+            if not self.initialized[a]:
+                self.initial_loss[a] = v
+                self.ema_loss[a] = v
+                self.initialized[a] = True
+            else:
+                self.ema_loss[a] = self.ema_decay * self.ema_loss[a] + (1.0 - self.ema_decay) * v
+
+        if bool(self.initialized.all()):
+            ratio = self.ema_loss / self.initial_loss.clamp(min=1e-8)
+            mean_ratio = ratio.mean().clamp(min=1e-8)
+            relative_lag = (ratio / mean_ratio).clamp(min=1e-3)
+            self.weights = (self.weights * relative_lag.pow(self.adapt_rate)).clamp(
+                self.min_weight, self.max_weight
+            )
+            # Renormalize to mean 1 so the overall loss scale (and therefore
+            # --counter_attr_weight and every other fixed weight) stays
+            # meaningful without retuning.
+            self.weights = self.weights / self.weights.mean().clamp(min=1e-8)
+
+    def weights_for(self, attr_local_idx):
+        """attr_local_idx: LongTensor [B] -> FloatTensor [B] of per-sample weights."""
+        return self.weights[attr_local_idx]
+
+
 def compute_soft_target(src_vals, attr_idx):
     if attr_idx == 0:  # eyeglasses needs a stronger local-edit signal.
         return torch.where(src_vals > 0.5,
@@ -463,6 +522,18 @@ if __name__ == '__main__':
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
+
+    # ── Cross-attribute loss balancing ──────────────────────────────────────
+    parser.add_argument('--balance_attr_losses', action=argparse.BooleanOptionalAction, default=False,
+                        help='Reweight changed_loss per attribute based on measured relative '
+                             'training progress (see CrossAttributeLossBalancer), instead of a '
+                             'single --counter_attr_weight applied identically to every attribute.')
+    parser.add_argument('--balance_ema_decay', type=float, default=0.98,
+                        help='EMA decay for each attribute changed_loss estimate used by the balancer.')
+    parser.add_argument('--balance_adapt_rate', type=float, default=0.05,
+                        help='How aggressively weights move toward equalizing relative progress each update.')
+    parser.add_argument('--balance_min_weight', type=float, default=0.25)
+    parser.add_argument('--balance_max_weight', type=float, default=4.0)
     parser.add_argument('--orth_loss_weight', type=float, default=0.005)
     parser.add_argument('--gate_smooth_weight', type=float, default=0.003)
     parser.add_argument('--reg_fine_weight', type=float, default=0.5)
@@ -671,6 +742,17 @@ if __name__ == '__main__':
     else:
         layer_mask = None
     attr_scales = LearnableAttributeScales(len(args.attribute_index)).cuda()
+    loss_balancer = None
+    if args.balance_attr_losses:
+        loss_balancer = CrossAttributeLossBalancer(
+            len(args.attribute_index),
+            ema_decay=args.balance_ema_decay,
+            adapt_rate=args.balance_adapt_rate,
+            min_weight=args.balance_min_weight,
+            max_weight=args.balance_max_weight,
+            device='cuda',
+        )
+        print(f'** Cross-attribute loss balancing enabled for attrs {args.attribute_index}')
     trainable_params = list(prior.parameters()) + list(conditioner.parameters())
     if args.velocity_field == 'original':
         trainable_params += list(layer_mask.parameters())
@@ -975,7 +1057,12 @@ if __name__ == '__main__':
             target_probs[batch_indices, mid_idx] = soft_target_for_loss
             edited_probs = gen_probs[batch_indices, mid_idx]
             changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
-            changed_loss = changed_mse_per_sample.mean()
+            if loss_balancer is not None:
+                loss_balancer.update(mid_idx.detach(), changed_mse_per_sample.detach())
+                balance_weights = loss_balancer.weights_for(mid_idx).detach()
+                changed_loss = (balance_weights * changed_mse_per_sample).mean()
+            else:
+                changed_loss = changed_mse_per_sample.mean()
 
             _zero = torch.zeros([], device=latent.device, dtype=latent.dtype)
             adaptive_rs_observed = _zero.detach().clone()
@@ -1225,6 +1312,10 @@ if __name__ == '__main__':
             current_attr_scales = attr_scales.current_scales()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'attr_scale/attr_{_attr_abs_idx}'] = current_attr_scales[_i]
+            if loss_balancer is not None:
+                for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                    _log_dict[f'balance_weight/attr_{_attr_abs_idx}'] = loss_balancer.weights[_i]
+                    _log_dict[f'balance_ema_loss/attr_{_attr_abs_idx}'] = loss_balancer.ema_loss[_i]
             for _k, _v in diffusion_logs.items():
                 _log_dict[_k] = _v
             logger.msg(_log_dict, n_iter)
