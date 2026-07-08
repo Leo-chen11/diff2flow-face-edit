@@ -70,6 +70,39 @@ class LearnableAttributeScales(nn.Module):
             return torch.exp(self.attr_log_scales).clamp(self.min_scale, self.max_scale)
 
 
+def _inverse_softplus(x):
+    x = x.clamp(min=1e-6)
+    return torch.log(torch.expm1(x))
+
+
+class LearnableRegLossWeights(nn.Module):
+    """Per-attribute learnable weights for the global/coarse/fine W+ regularization
+    loss groups, replacing the fixed 2.0/1.0/reg_fine_weight constants that used to be
+    shared identically by every attribute. Softplus reparam (same style as
+    AttributeDirectionBank.residual_scale_raw) keeps weights positive with no upper
+    bound; each attribute finds its own global/coarse/fine balance via gradient
+    descent on the same losses already driving training (id_loss pulls a group's
+    weight up when moving there is hurting identity, counter_attr_loss pulls it down
+    when more freedom in that group is needed to hit the target).
+    """
+
+    def __init__(self, n_edit_attrs, init_global=2.0, init_coarse=1.0, init_fine=0.5):
+        super().__init__()
+        self.n_edit_attrs = int(n_edit_attrs)
+        init = torch.tensor([float(init_global), float(init_coarse), float(init_fine)])
+        init = init.unsqueeze(0).repeat(self.n_edit_attrs, 1)   # (n_edit_attrs, 3)
+        self.log_weights_raw = nn.Parameter(_inverse_softplus(init))
+
+    def weights_for(self, attr_local_idx):
+        """attr_local_idx: LongTensor [B] -> (B, 3) tensor of [global, coarse, fine] weights."""
+        weights = F.softplus(self.log_weights_raw)   # (n_edit_attrs, 3)
+        return weights[attr_local_idx]
+
+    def current_weights(self):
+        with torch.no_grad():
+            return F.softplus(self.log_weights_raw)   # (n_edit_attrs, 3)
+
+
 class CrossAttributeLossBalancer:
     """Keeps changed_loss progress comparable across attributes sharing one
     training loop, instead of letting a fixed --counter_attr_weight apply
@@ -152,10 +185,6 @@ def compute_soft_targets(src_vals, attr_indices):
     return targets
 
 
-def get_eyeglasses_local_idx(attribute_index):
-    return attribute_index.index(15) if 15 in attribute_index else None
-
-
 def resolve_resume_save_dir(resume_dir):
     if resume_dir is None:
         return None
@@ -185,36 +214,6 @@ def cap_delta_norm(delta, max_norm):
     delta_norm = delta.reshape(delta.shape[0], -1).norm(dim=1)
     clip = (float(max_norm) / delta_norm.clamp(min=1e-8)).clamp(max=1.0)
     return delta * clip.view(-1, 1, 1), clip
-
-
-def apply_direction_bank_with_glasses_bypass(
-    direction_bank,
-    flow_delta,
-    attr_delta,
-    attr_idx,
-    latent,
-    new_latents_raw,
-    eyeglasses_local_idx,
-    bypass_glasses=True,
-):
-    if direction_bank is None:
-        return new_latents_raw, False, latent.new_tensor(0.0)
-
-    is_glasses = torch.zeros_like(attr_idx, dtype=torch.bool)
-    if bypass_glasses and eyeglasses_local_idx is not None:
-        is_glasses = attr_idx == int(eyeglasses_local_idx)
-
-    if is_glasses.all():
-        return new_latents_raw, False, is_glasses.float().mean()
-
-    guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=latent)
-    guided_latents = latent + guided_delta
-
-    if is_glasses.any():
-        mask = is_glasses.view(-1, 1, 1)
-        guided_latents = torch.where(mask, new_latents_raw, guided_latents)
-
-    return guided_latents, True, is_glasses.float().mean()
 
 
 def generate_test_image(flow_model:torch.nn.Module,
@@ -262,19 +261,8 @@ def generate_test_image(flow_model:torch.nn.Module,
             attr_idx = torch.full((batchsize,), i, device=origin_latent.device, dtype=torch.long)
             flow_delta = new_latents_raw - source_latent
             attr_delta = new_attr_cond - test_attr_cond
-            eyeglasses_local_idx = None
-            if args is not None and getattr(args, 'bypass_glasses_direction_bank', True):
-                eyeglasses_local_idx = get_eyeglasses_local_idx(list(args.attribute_index))
-            new_latents, _, _ = apply_direction_bank_with_glasses_bypass(
-                direction_bank,
-                flow_delta,
-                attr_delta,
-                attr_idx,
-                source_latent,
-                new_latents_raw,
-                eyeglasses_local_idx,
-                bypass_glasses=args is None or getattr(args, 'bypass_glasses_direction_bank', True),
-            )
+            guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=source_latent)
+            new_latents = source_latent + guided_delta
         else:
             new_latents = new_latents_raw
 
@@ -536,7 +524,13 @@ if __name__ == '__main__':
     parser.add_argument('--balance_max_weight', type=float, default=4.0)
     parser.add_argument('--orth_loss_weight', type=float, default=0.005)
     parser.add_argument('--gate_smooth_weight', type=float, default=0.003)
-    parser.add_argument('--reg_fine_weight', type=float, default=0.5)
+    parser.add_argument('--reg_global_weight_init', type=float, default=2.0,
+                        help='Initial global-layer reg_loss weight, per attribute; then learned '
+                             '(see LearnableRegLossWeights). Has no effect after the first step.')
+    parser.add_argument('--reg_coarse_weight_init', type=float, default=1.0,
+                        help='Initial coarse-layer reg_loss weight, per attribute; then learned.')
+    parser.add_argument('--reg_fine_weight', type=float, default=0.5,
+                        help='Initial fine-layer reg_loss weight, per attribute; then learned.')
     parser.add_argument('--direction_bank_path', default=None, type=str,
                         help='Path to precomputed Attribute Direction Bank (.pth).')
     parser.add_argument('--direction_residual_scale', type=float, default=0.05)
@@ -545,18 +539,11 @@ if __name__ == '__main__':
     parser.add_argument('--direction_orth_weight', type=float, default=0.0)
     parser.add_argument('--direction_k', type=int, default=1,
                         help='Number of mixture directions per attribute in the Direction Bank.')
-    parser.add_argument('--glasses_residual_scale', type=float, default=0.05,
-                        help='Residual scale for eyeglasses attribute (local edit; try 0.5-0.8 to give flow more freedom).')
-    parser.add_argument('--bypass_glasses_direction_bank',
-                        action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help='Bypass Direction Bank for eyeglasses so local accessory edits keep full flow gradients.')
     parser.add_argument('--direction_guided_delta_max_norm', type=float, default=0.0,
                         help='Optional global max norm inside Direction Bank after all controls. '
                              'Use 10-12 for safe stage fine-tuning; 0 disables.')
     parser.add_argument('--final_delta_max_norm', type=float, default=0.0,
-                        help='Optional final max norm after glasses bypass / bank mixing. '
-                             'This also caps raw glasses flow deltas; 0 disables.')
+                        help='Optional final max norm after direction-bank mixing. 0 disables.')
     parser.add_argument('--freeze_direction_bank_nets', action='store_true',
                         help='Freeze all Direction Bank trainable nets during fine-tuning. '
                              'Useful when continuing from a good checkpoint and only training the flow/conditioner.')
@@ -570,26 +557,6 @@ if __name__ == '__main__':
                         help='Load optimizer state. Usually false for controlled stage fine-tuning.')
     parser.add_argument('--resume_direction_bank', action=argparse.BooleanOptionalAction, default=False,
                         help='Load direction_bank checkpoint state. Keep false when changing bank path/safety settings.')
-
-    # ── Adaptive residual scale for saturated attributes ───────────────────
-    parser.add_argument('--adaptive_residual_scale', action='store_true', default=False,
-                        help='Adaptively increase one attribute residual_scale when its target loss EMA is low.')
-    parser.add_argument('--adaptive_rs_attr_idx', type=int, default=2,
-                        help='Local attribute index to adapt, e.g. 2 for Age when attribute_index is 15 20 39.')
-    parser.add_argument('--adaptive_rs_ema_decay', type=float, default=0.95,
-                        help='EMA decay for target loss tracking.')
-    parser.add_argument('--adaptive_rs_init_ema', type=float, default=0.30,
-                        help='Initial target-loss EMA for adaptive residual scale.')
-    parser.add_argument('--adaptive_rs_threshold', type=float, default=0.25,
-                        help='Increase residual_scale when target loss EMA is below this value.')
-    parser.add_argument('--adaptive_rs_step_size', type=float, default=0.02,
-                        help='Residual scale increment each time the adaptive rule fires.')
-    parser.add_argument('--adaptive_rs_interval', type=int, default=1000,
-                        help='Check adaptive residual scale every N local training steps.')
-    parser.add_argument('--adaptive_rs_min', type=float, default=0.05,
-                        help='Lower bound for adaptive residual scale.')
-    parser.add_argument('--adaptive_rs_max', type=float, default=0.25,
-                        help='Upper bound for adaptive residual scale.')
 
     # ── Frozen pretrained diffusion guidance ───────────────────────────────
     parser.add_argument('--use_diffusion_guidance', action='store_true',
@@ -643,7 +610,6 @@ if __name__ == '__main__':
                         help='Per-sample weight multiplier for gender (attr 20) in CLIP loss.')
     args = parser.parse_args()
     torch.manual_seed(0)
-    eyeglasses_local_idx = get_eyeglasses_local_idx(list(args.attribute_index))
 
     os.environ['WANDB_MODE'] = args.wandb_mode
 
@@ -742,6 +708,12 @@ if __name__ == '__main__':
     else:
         layer_mask = None
     attr_scales = LearnableAttributeScales(len(args.attribute_index)).cuda()
+    reg_loss_weights = LearnableRegLossWeights(
+        len(args.attribute_index),
+        init_global=args.reg_global_weight_init,
+        init_coarse=args.reg_coarse_weight_init,
+        init_fine=args.reg_fine_weight,
+    ).cuda()
     loss_balancer = None
     if args.balance_attr_losses:
         loss_balancer = CrossAttributeLossBalancer(
@@ -757,11 +729,6 @@ if __name__ == '__main__':
     if args.velocity_field == 'original':
         trainable_params += list(layer_mask.parameters())
     if args.direction_bank_path:
-        # Build per-attribute residual scale: glasses (local) may use a higher scale
-        _per_attr_rs = [
-            args.glasses_residual_scale if idx == 15 else args.direction_residual_scale
-            for idx in args.attribute_index
-        ]
         # Read K from the bank file itself rather than trusting --direction_k:
         # editor.py and evaluate_sdflow.py both do the same at load time, so
         # --direction_k silently disagreeing with the bank's real K would build
@@ -774,9 +741,11 @@ if __name__ == '__main__':
         if _bank_num_k != args.direction_k:
             print(f'** Direction Bank: --direction_k={args.direction_k} ignored, '
                   f'using num_k={_bank_num_k} from {args.direction_bank_path}')
-        # No per-attribute direction_scale/layer_scale/delta_max_norm: every
-        # attribute is treated the same, and the only magnitude safety net is
-        # the shared guided_delta_max_norm below.
+        # No per-attribute direction_scale/layer_scale/delta_max_norm, and no
+        # per-attribute residual_scale init either: every attribute starts from
+        # the same residual_scale value and learns its own from there via
+        # gradient descent (see AttributeDirectionBank.residual_scale_raw). The
+        # only magnitude safety net set here in advance is guided_delta_max_norm.
         direction_bank = AttributeDirectionBank(
             num_attrs=len(args.attribute_index),
             num_layers=18,
@@ -785,7 +754,6 @@ if __name__ == '__main__':
             bank_path=args.direction_bank_path,
             attribute_index=args.attribute_index,
             residual_scale=args.direction_residual_scale,
-            per_attr_residual_scale=_per_attr_rs,
             freeze_directions=args.direction_freeze,
             residual_max_norm=args.residual_max_norm,
             guided_delta_max_norm=(
@@ -797,15 +765,29 @@ if __name__ == '__main__':
             for p in direction_bank.parameters():
                 p.requires_grad_(False)
             print('** Direction Bank trainable nets frozen for safe fine-tuning')
-        trainable_params += [p for p in direction_bank.parameters() if p.requires_grad]
+        trainable_params += [
+            p for p in direction_bank.parameters()
+            if p.requires_grad and p is not direction_bank.residual_scale_raw
+        ]
         print(f'** Direction Bank enabled: {args.direction_bank_path}')
     else:
         direction_bank = None
     trainable_params += list(attr_scales.parameters())
+    trainable_params += list(reg_loss_weights.parameters())
+
+    # Magnitude-controlling meta-parameters (edit-strength center, direction-bank
+    # residual trust, reg_loss layer-group weights) get a lower learning rate than
+    # the main network so they move more conservatively while the rest of the
+    # model is still shifting.
+    low_lr_params = [attr_scales.attr_log_scales, reg_loss_weights.log_weights_raw]
+    if direction_bank is not None and direction_bank.residual_scale_raw.requires_grad:
+        low_lr_params.append(direction_bank.residual_scale_raw)
+    low_lr_ids = {id(p) for p in low_lr_params}
+
     optimizer = optim.Adam(
         [
-            {'params': [p for p in trainable_params if p is not attr_scales.attr_log_scales], 'lr': args.lr},
-            {'params': [attr_scales.attr_log_scales], 'lr': args.lr * 0.1, 'weight_decay': 0.0},
+            {'params': [p for p in trainable_params if id(p) not in low_lr_ids], 'lr': args.lr},
+            {'params': low_lr_params, 'lr': args.lr * 0.1, 'weight_decay': 0.0},
         ]
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -825,6 +807,10 @@ if __name__ == '__main__':
             load_module_checkpoint(attr_scales, resume_save_dir, 'attr_scales', start_step, strict=False)
         except FileNotFoundError:
             print('[Resume] attr_scales checkpoint not found; using default adaptive scales.')
+        try:
+            load_module_checkpoint(reg_loss_weights, resume_save_dir, 'reg_loss_weights', start_step, strict=False)
+        except FileNotFoundError:
+            print('[Resume] reg_loss_weights checkpoint not found; using default init weights.')
         if direction_bank is not None and args.resume_direction_bank:
             load_module_checkpoint(direction_bank, resume_save_dir, 'direction_bank', start_step, strict=False)
         elif direction_bank is not None:
@@ -838,7 +824,7 @@ if __name__ == '__main__':
         else:
             print('[Resume] optimizer state not loaded; using fresh optimizer for controlled fine-tuning.')
 
-    log_modules = [prior, conditioner, attr_scales, optimizer]
+    log_modules = [prior, conditioner, attr_scales, reg_loss_weights, optimizer]
     if args.velocity_field == 'original':
         log_modules.insert(2, layer_mask)
     if direction_bank is not None:
@@ -904,42 +890,6 @@ if __name__ == '__main__':
         )
         print(f'** fixed preview indices: {fixed_preview_batch[-1]}')
 
-    adaptive_rs_enabled = bool(args.adaptive_residual_scale)
-    if adaptive_rs_enabled:
-        if direction_bank is None:
-            raise ValueError('--adaptive_residual_scale requires --direction_bank_path')
-        if not (0 <= args.adaptive_rs_attr_idx < len(args.attribute_index)):
-            raise ValueError(
-                f'--adaptive_rs_attr_idx must be in [0, {len(args.attribute_index) - 1}], '
-                f'got {args.adaptive_rs_attr_idx}'
-            )
-        if args.adaptive_rs_interval <= 0:
-            raise ValueError('--adaptive_rs_interval must be positive')
-        if not (0.0 <= args.adaptive_rs_ema_decay < 1.0):
-            raise ValueError('--adaptive_rs_ema_decay must be in [0, 1)')
-
-        _ars_target_idx = int(args.adaptive_rs_attr_idx)
-        _ars_target_loss_ema = [
-            float(args.adaptive_rs_init_ema) for _ in range(len(args.attribute_index))
-        ]
-        with torch.no_grad():
-            initial_rs = float(direction_bank.residual_scale[_ars_target_idx].detach().cpu().item())
-            initial_rs = min(max(initial_rs, args.adaptive_rs_min), args.adaptive_rs_max)
-            direction_bank.residual_scale[_ars_target_idx] = initial_rs
-        _ars_current = initial_rs
-        print(
-            f'[AdaptiveRS] enabled for attr local_idx={_ars_target_idx} '
-            f'(attr={args.attribute_index[_ars_target_idx]}), initial rs={_ars_current:.4f}, '
-            f'init_ema={args.adaptive_rs_init_ema}, decay={args.adaptive_rs_ema_decay}, '
-            f'threshold={args.adaptive_rs_threshold}, step_size={args.adaptive_rs_step_size}, '
-            f'interval={args.adaptive_rs_interval}, '
-            f'range=[{args.adaptive_rs_min}, {args.adaptive_rs_max}]'
-        )
-    else:
-        _ars_target_idx = -1
-        _ars_target_loss_ema = [1.0 for _ in range(len(args.attribute_index))]
-        _ars_current = 0.0
-        
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -994,32 +944,14 @@ if __name__ == '__main__':
             lag_dof_losses = collect_lag_dof_losses(prior)
             flow_delta = new_latents_raw - latent
             direction_bank_applied = False
-            glasses_bank_bypass_fraction = latent.new_tensor(0.0)
-            # is_glasses_bypass: [B] bool — samples whose delta comes from raw flow, not direction bank
-            is_glasses_bypass = torch.zeros(latent.shape[0], dtype=torch.bool, device=latent.device)
 
             if args.velocity_field == 'original':
                 lm = layer_mask(mid_idx, src_attr_flow, soft_flow_target).unsqueeze(-1)
                 guided_delta = lm * flow_delta
             elif direction_bank is not None:
                 attr_delta = new_attr_cond - attr_cond.detach()
-                if args.bypass_glasses_direction_bank and eyeglasses_local_idx is not None:
-                    is_glasses_bypass = mid_idx == int(eyeglasses_local_idx)
-                glasses_bank_bypass_fraction = is_glasses_bypass.float().mean()
-
-                if is_glasses_bypass.all():
-                    # All samples are eyeglasses — skip direction bank entirely
-                    guided_delta = flow_delta
-                else:
-                    direction_bank_applied = True
-                    _db_delta = direction_bank(flow_delta, attr_delta, attr_idx=mid_idx, latent=latent)
-                    if is_glasses_bypass.any():
-                        # Mixed batch: glasses samples use raw flow, others use direction bank
-                        guided_delta = torch.where(
-                            is_glasses_bypass.view(-1, 1, 1), flow_delta, _db_delta
-                        )
-                    else:
-                        guided_delta = _db_delta
+                direction_bank_applied = True
+                guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=mid_idx, latent=latent)
             else:
                 guided_delta = flow_delta
 
@@ -1035,7 +967,12 @@ if __name__ == '__main__':
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
-            reg_loss = (2.0 * reg_loss_global + 1.0 * reg_loss_coarse + args.reg_fine_weight * reg_loss_fine).mean()
+            reg_weights = reg_loss_weights.weights_for(mid_idx)   # (B, 3): [global, coarse, fine]
+            reg_loss = (
+                reg_weights[:, 0] * reg_loss_global
+                + reg_weights[:, 1] * reg_loss_coarse
+                + reg_weights[:, 2] * reg_loss_fine
+            ).mean()
 
             # Identity loss: edited face should preserve identity of original
             id_src_feat = F.normalize(id_criterion.extract_features(img), dim=1).detach()
@@ -1065,41 +1002,6 @@ if __name__ == '__main__':
                 changed_loss = changed_mse_per_sample.mean()
 
             _zero = torch.zeros([], device=latent.device, dtype=latent.dtype)
-            adaptive_rs_observed = _zero.detach().clone()
-            adaptive_rs_fired = _zero.detach().clone()
-            if adaptive_rs_enabled and direction_bank is not None:
-                ars_mask = mid_idx == _ars_target_idx
-                if ars_mask.any():
-                    observed = changed_mse_per_sample[ars_mask].detach().mean().item()
-                    _ars_target_loss_ema[_ars_target_idx] = (
-                        args.adaptive_rs_ema_decay * _ars_target_loss_ema[_ars_target_idx]
-                        + (1.0 - args.adaptive_rs_ema_decay) * observed
-                    )
-                    adaptive_rs_observed = latent.new_tensor(observed)
-
-                if (
-                    local_step > 0
-                    and local_step % args.adaptive_rs_interval == 0
-                    and _ars_target_loss_ema[_ars_target_idx] < args.adaptive_rs_threshold
-                ):
-                    old_rs = _ars_current
-                    _ars_current = min(
-                        _ars_current + args.adaptive_rs_step_size,
-                        args.adaptive_rs_max,
-                    )
-                    _ars_current = max(_ars_current, args.adaptive_rs_min)
-                    with torch.no_grad():
-                        direction_bank.residual_scale[_ars_target_idx] = _ars_current
-                    if _ars_current != old_rs:
-                        adaptive_rs_fired = torch.ones([], device=latent.device, dtype=latent.dtype).detach()
-                        print(
-                            f'[AdaptiveRS] step {n_iter}: '
-                            f'attr={args.attribute_index[_ars_target_idx]} '
-                            f'target_ema={_ars_target_loss_ema[_ars_target_idx]:.4f} '
-                            f'< {args.adaptive_rs_threshold}, '
-                            f'residual_scale {old_rs:.4f} -> {_ars_current:.4f}'
-                        )
-
             # Vectorized: build a boolean mask [B, num_attrs] where True = non-target attr.
             # In cycle mode all samples share the same mid_idx, but this handles random mode too.
             attr_range = torch.arange(len(args.attribute_index), device=latent.device)
@@ -1281,12 +1183,6 @@ if __name__ == '__main__':
                 'final_delta_norm': final_delta_norm,
                 'final_delta_clip_factor': final_delta_clip_factor,
                 'final_delta_max_norm': torch.tensor(args.final_delta_max_norm),
-                'adaptive_rs_ema': torch.tensor(_ars_target_loss_ema[_ars_target_idx])
-                if adaptive_rs_enabled else _zero.detach().clone(),
-                'adaptive_rs_current': torch.tensor(_ars_current)
-                if adaptive_rs_enabled else _zero.detach().clone(),
-                'adaptive_rs_observed': adaptive_rs_observed,
-                'adaptive_rs_fired': adaptive_rs_fired,
                 'dir_orth': dir_orth_loss,
                 'dir_bank_flow_delta_norm': dir_logs.get('dir_bank_flow_delta_norm', _zero.detach().clone()),
                 'dir_bank_dir_delta_norm': dir_logs.get('dir_bank_dir_delta_norm', _zero.detach().clone()),
@@ -1298,7 +1194,6 @@ if __name__ == '__main__':
                 'dir_bank_active_delta_max_norm': dir_logs.get('dir_bank_active_delta_max_norm', _zero.detach().clone()),
                 'dir_bank_global_delta_max_norm': dir_logs.get('dir_bank_global_delta_max_norm', _zero.detach().clone()),
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
-                'glasses_bank_bypass_fraction': glasses_bank_bypass_fraction,
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
@@ -1312,6 +1207,15 @@ if __name__ == '__main__':
             current_attr_scales = attr_scales.current_scales()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'attr_scale/attr_{_attr_abs_idx}'] = current_attr_scales[_i]
+            if direction_bank is not None:
+                current_residual_scales = direction_bank.current_residual_scale().detach()
+                for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                    _log_dict[f'residual_scale/attr_{_attr_abs_idx}'] = current_residual_scales[_i]
+            current_reg_weights = reg_loss_weights.current_weights()
+            for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                _log_dict[f'reg_weight_global/attr_{_attr_abs_idx}'] = current_reg_weights[_i, 0]
+                _log_dict[f'reg_weight_coarse/attr_{_attr_abs_idx}'] = current_reg_weights[_i, 1]
+                _log_dict[f'reg_weight_fine/attr_{_attr_abs_idx}'] = current_reg_weights[_i, 2]
             if loss_balancer is not None:
                 for _i, _attr_abs_idx in enumerate(args.attribute_index):
                     _log_dict[f'balance_weight/attr_{_attr_abs_idx}'] = loss_balancer.weights[_i]
