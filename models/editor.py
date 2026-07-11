@@ -68,7 +68,7 @@ class SDFlow(object):
                  velocity_field='original', lag_gate_hidden_dim=64,
                  lag_gate_init_bias=-1.5, direction_bank_path=None,
                  direction_residual_scale=0.05, direction_freeze=True,
-                 ckpt_step=None, bypass_glasses_direction_bank=True,
+                 ckpt_step=None,
                  guided_delta_max_norm=None) -> None:
         self.ckpt_dir = ckpt_dir
         self.device = device
@@ -89,7 +89,6 @@ class SDFlow(object):
         self.direction_residual_scale = direction_residual_scale
         self.direction_freeze = direction_freeze
         self.ckpt_step = ckpt_step
-        self.bypass_glasses_direction_bank = bypass_glasses_direction_bank
         # Single global cap shared by every attribute, replacing the old
         # per-attribute (age-only) direction_scale/layer_scale/delta_max_norm
         # hack. None disables the cap so the raw, LDA-direction-guided delta
@@ -238,8 +237,7 @@ class SDFlow(object):
                 new_attr_cond[:, attr_local_idx],
             ).unsqueeze(-1)
             new_styles = inputs + lm * flow_delta
-        elif (self.direction_bank is not None
-              and not (self.bypass_glasses_direction_bank and self.attr_num == 15)):
+        elif self.direction_bank is not None:
             attr_delta = new_attr_cond - attr_cond
             guided_delta = self.direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=inputs)
             new_styles = inputs + guided_delta
