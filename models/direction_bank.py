@@ -125,8 +125,13 @@ class AttributeDirectionBank(nn.Module):
         else:
             self.gate_net = None
 
-        # per_attr_residual_scale: (num_attrs,) — different scale per attribute.
-        # Falls back to the scalar residual_scale if not provided.
+        # residual_scale: (num_attrs,) — learned, not hand-tuned. per_attr_residual_scale
+        # (or the scalar residual_scale) only sets the *initial* value; gradient descent
+        # on the normal training losses (id/reg/changed/preserve) decides from there how
+        # much each attribute should trust the flow's own local freedom (residual) vs the
+        # dataset-level direction. Softplus reparam keeps it positive with no artificial
+        # upper bound -- guided_delta_max_norm and reg_loss are the safety rails against
+        # runaway growth, not a per-attribute cap decided in advance.
         if per_attr_residual_scale is not None:
             scales = torch.tensor([float(s) for s in per_attr_residual_scale], dtype=torch.float)
             if scales.shape[0] != self.num_attrs:
@@ -135,7 +140,7 @@ class AttributeDirectionBank(nn.Module):
                 )
         else:
             scales = torch.full((self.num_attrs,), float(residual_scale))
-        self.register_buffer("residual_scale", scales)   # (num_attrs,)
+        self.residual_scale_raw = nn.Parameter(_inverse_softplus(scales))   # (num_attrs,)
         self.residual_max_norm = float(residual_max_norm) if residual_max_norm is not None else None
 
         # Optional safety controls applied to the final guided delta. These are
@@ -185,6 +190,10 @@ class AttributeDirectionBank(nn.Module):
         )
         self.last_logs = {}
         self._last_alpha = None   # (B, num_attrs, K) — set each forward, used for selection loss
+
+    def current_residual_scale(self):
+        """(num_attrs,) learned residual_scale values, always positive."""
+        return F.softplus(self.residual_scale_raw)
 
     def _gate_weights(self, latent, B, device, dtype):
         """Return (B, num_attrs, K) softmax mixture weights."""
@@ -238,10 +247,16 @@ class AttributeDirectionBank(nn.Module):
             clip = (self.residual_max_norm / r_norm.clamp(min=1e-8)).clamp(max=1.0)
             residual = residual * clip.view(B, 1, 1)
 
-        # Per-attribute residual scale: use the scale of the active attribute.
-        # In cycle mode all samples edit the same attribute, so attr_idx[0] is sufficient.
-        scales = self.residual_scale.to(device=device, dtype=dtype)   # (num_attrs,)
-        rs = (scales[attr_idx[0].long()] if attr_idx is not None else scales.mean()).clone()
+        # Per-attribute residual scale, learned via gradient descent. Gathered per-sample
+        # (not just attr_idx[0]) so mixed-attribute batches from --attribute_sampling
+        # random are handled correctly, not only the cycle-mode case where every sample
+        # in a batch shares one attribute.
+        scales = self.current_residual_scale().to(device=device, dtype=dtype)   # (num_attrs,)
+        if attr_idx is not None:
+            attr_idx_long = attr_idx.view(-1).long()
+            rs = scales[attr_idx_long].view(B, 1, 1)
+        else:
+            rs = scales.mean()
         guided_delta = dir_delta + rs * residual
 
         guided_delta_pre_clip = guided_delta
@@ -292,7 +307,7 @@ class AttributeDirectionBank(nn.Module):
                 "dir_bank_residual_norm": residual_norm.detach(),
                 "dir_bank_guided_delta_norm_pre_clip": guided_pre_clip_norm.detach(),
                 "dir_bank_guided_delta_norm": guided_norm.detach(),
-                "dir_bank_residual_scale": self.residual_scale.detach(),
+                "dir_bank_residual_scale": scales.detach(),
                 "dir_bank_active_direction_scale": active_direction_scale.detach(),
                 "dir_bank_active_delta_max_norm": active_delta_max_norm.detach(),
                 "dir_bank_global_delta_max_norm": active_global_delta_max_norm.detach(),
