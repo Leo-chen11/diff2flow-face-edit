@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import os,sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -163,27 +164,64 @@ class CrossAttributeLossBalancer:
         return self.weights[attr_local_idx]
 
 
-def compute_soft_target(src_vals, attr_idx):
-    if attr_idx == 0:  # eyeglasses needs a stronger local-edit signal.
-        return torch.where(src_vals > 0.5,
-                           torch.full_like(src_vals, 0.10),
-                           torch.full_like(src_vals, 0.90))
-    elif attr_idx == 1:  # gender should move, but not force a full identity-changing flip.
-        return torch.where(src_vals > 0.5,
-                           torch.full_like(src_vals, 0.20),
-                           torch.full_like(src_vals, 0.80))
-    else:  # age is the most identity-sensitive edit; keep the target conservative.
-        return torch.where(src_vals > 0.5,
-                           torch.full_like(src_vals, 0.20),
-                           torch.full_like(src_vals, 0.80))
+# Soft-target policy keyed by ABSOLUTE CelebA attribute index. The old version
+# keyed on local position (0/1/2 assumed to be glasses/gender/age), so any
+# other --attribute_index ordering or attribute set silently mis-targeted
+# every edit with no error.
+SOFT_TARGET_TABLE = {
+    15: (0.10, 0.90),   # eyeglasses needs a stronger local-edit signal
+    20: (0.20, 0.80),   # gender should move without forcing a full identity flip
+    39: (0.20, 0.80),   # age is the most identity-sensitive edit; conservative
+}
+DEFAULT_SOFT_TARGET = (0.20, 0.80)
 
 
-def compute_soft_targets(src_vals, attr_indices):
+def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
+    """attribute_index: the --attribute_index list mapping local -> absolute idx."""
     targets = torch.empty_like(src_vals)
-    for attr_idx in torch.unique(attr_indices):
-        mask = attr_indices == attr_idx
-        targets[mask] = compute_soft_target(src_vals[mask], int(attr_idx.item()))
+    for local in torch.unique(attr_local_idx):
+        abs_idx = int(attribute_index[int(local.item())])
+        low, high = SOFT_TARGET_TABLE.get(abs_idx, DEFAULT_SOFT_TARGET)
+        mask = attr_local_idx == local
+        targets[mask] = torch.where(src_vals[mask] > 0.5,
+                                    torch.full_like(src_vals[mask], low),
+                                    torch.full_like(src_vals[mask], high))
     return targets
+
+
+def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_size=256):
+    """Shared-parameter, differentiable augmentation applied to BOTH the source
+    and the edited image before the frozen attribute teacher.
+
+    Purpose: break adversarial teacher-fooling. The independent-judge eval shows
+    a ~30pp gap between teacher accuracy and CLIP accuracy (e.g. Eyeglasses 91%
+    vs 58%), i.e. the generator learns high-frequency patterns that move the
+    teacher's logits without a real semantic change. Random crop/flip/resize and
+    shared noise destroy such patterns while leaving true semantics intact.
+    Gradients still flow to the generator (crop/flip/interpolate/add are all
+    differentiable); parameters are shared so src/edit scores stay comparable
+    for preserve_loss.
+    """
+    if not enabled:
+        return (F.interpolate(src_images, (out_size, out_size)),
+                F.interpolate(edit_images, (out_size, out_size)))
+    H, W = src_images.shape[-2:]
+    s = float(torch.empty(1).uniform_(0.85, 1.0))
+    ch, cw = int(H * s), int(W * s)
+    top = int(torch.randint(0, H - ch + 1, (1,)))
+    left = int(torch.randint(0, W - cw + 1, (1,)))
+    src = src_images[:, :, top:top + ch, left:left + cw]
+    edit = edit_images[:, :, top:top + ch, left:left + cw]
+    if float(torch.rand(1)) < 0.5:
+        src = torch.flip(src, [-1])
+        edit = torch.flip(edit, [-1])
+    src = F.interpolate(src, (out_size, out_size), mode='bilinear', align_corners=False)
+    edit = F.interpolate(edit, (out_size, out_size), mode='bilinear', align_corners=False)
+    if noise_std > 0:
+        noise = torch.randn_like(edit) * noise_std
+        src = (src + noise).clamp(-1, 1)
+        edit = (edit + noise).clamp(-1, 1)
+    return src, edit
 
 
 def resolve_resume_save_dir(resume_dir):
@@ -555,6 +593,13 @@ if __name__ == '__main__':
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
+    parser.add_argument('--teacher_aug', action=argparse.BooleanOptionalAction, default=True,
+                        help='Shared-parameter random crop/flip/noise on src+edited images '
+                             'before the frozen attribute teacher, to break adversarial '
+                             'teacher-fooling (independent-judge eval showed ~30pp gap '
+                             'between teacher and CLIP accuracy without it).')
+    parser.add_argument('--teacher_aug_noise', type=float, default=0.02,
+                        help='Std of the shared gaussian noise in --teacher_aug.')
 
     # ── Cross-attribute loss balancing ──────────────────────────────────────
     parser.add_argument('--balance_attr_losses', action=argparse.BooleanOptionalAction, default=False,
@@ -694,10 +739,19 @@ if __name__ == '__main__':
     if args.wandb_entity:
         wandb_kwargs['entity'] = args.wandb_entity
     
-    logger = WANDBLoggerX(save_root=os.path.join('./output',args.model_name,args.run_name),
+    save_root = os.path.join('./output', args.model_name, args.run_name)
+    logger = WANDBLoggerX(save_root=save_root,
                           print_freq=args.print_freq,
                           config=args,
                           **wandb_kwargs)
+    # Persist the full run config next to the checkpoints. evaluate_sdflow.py
+    # auto-loads this file so eval model-structure flags can never silently
+    # drift from what was trained (the strict=False loads would otherwise hide
+    # such a mismatch completely).
+    os.makedirs(save_root, exist_ok=True)
+    with open(os.path.join(save_root, 'config.json'), 'w') as _f:
+        json.dump(vars(args), _f, indent=2, default=str)
+    print(f'** run config saved to {os.path.join(save_root, "config.json")}')
     attribute_index = torch.tensor(args.attribute_index,dtype=int)
     base_condition_dim = args.id_cond_dim + len(args.attribute_index)
     condition_dim = base_condition_dim
@@ -1046,7 +1100,7 @@ if __name__ == '__main__':
                 device=latent.device,
                 dtype=latent.dtype,
             )
-            hard_flow_target = compute_soft_targets(src_attr_flow, mid_idx)
+            hard_flow_target = compute_soft_targets(src_attr_flow, mid_idx, args.attribute_index)
             soft_flow_target = src_attr_flow + train_scale * (hard_flow_target - src_attr_flow)
             new_attr_cond = attr_cond.detach().clone()
             new_attr_cond = new_attr_cond.scatter(1, mid_idx.view(-1, 1), soft_flow_target.view(-1, 1))
@@ -1098,16 +1152,21 @@ if __name__ == '__main__':
             else:
                 id_loss = 1.0 - id_cos_sim.mean()
 
-            # Frozen counterfactual teacher: external supervision on visual attribute change
-            new_face_256 = F.interpolate(new_face_tensors, (256, 256))
-            src_face_256 = F.interpolate(img, (256, 256))
+            # Frozen counterfactual teacher: external supervision on visual attribute change.
+            # Shared-parameter augmentation before the teacher breaks adversarial
+            # teacher-fooling (see teacher_augment docstring).
+            src_face_256, new_face_256 = teacher_augment(
+                img, new_face_tensors,
+                enabled=args.teacher_aug,
+                noise_std=args.teacher_aug_noise,
+            )
             src_logits, _ = attr_teacher(src_face_256)
             gen_logits, _ = attr_teacher(new_face_256)
             src_probs = torch.sigmoid(src_logits)[:, attribute_index].detach()
             gen_probs = torch.sigmoid(gen_logits)[:, attribute_index]
             target_probs = src_probs.clone()
             src_attr = src_probs[batch_indices, mid_idx]
-            hard_teacher_target = compute_soft_targets(src_attr, mid_idx)
+            hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
             soft_target = src_attr + train_scale * (hard_teacher_target - src_attr)
             soft_target_for_loss = soft_target.detach()
             target_probs[batch_indices, mid_idx] = soft_target_for_loss
