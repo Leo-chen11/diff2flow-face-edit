@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os,sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -204,6 +205,42 @@ def load_module_checkpoint(module, save_dir, prefix, step, strict=False):
         print(
             f'[Resume] {prefix} non-strict load: '
             f'missing={result.missing_keys}, unexpected={result.unexpected_keys}'
+        )
+
+
+@torch.no_grad()
+def update_ema(ema_module, module, decay):
+    """In-place EMA update: ema_module <- decay * ema_module + (1 - decay) * module.
+    Buffers (e.g. frozen direction_units) are copied directly, not averaged."""
+    ema_params = dict(ema_module.named_parameters())
+    for name, p in module.named_parameters():
+        ema_params[name].mul_(decay).add_(p.detach(), alpha=1.0 - decay)
+    ema_buffers = dict(ema_module.named_buffers())
+    for name, b in module.named_buffers():
+        ema_buffers[name].copy_(b)
+
+
+def make_ema_copy(module):
+    """Deep-copy a module into a frozen (no-grad, eval-mode) EMA shadow starting
+    identical to the live weights."""
+    ema = copy.deepcopy(module)
+    ema.eval()
+    for p in ema.parameters():
+        p.requires_grad_(False)
+    return ema
+
+
+def save_ema_checkpoints(save_root, step, ema_modules):
+    """Save EMA shadow modules under save_models_ema/ using the same prefix
+    naming convention as logger.checkpoints() uses under save_models/, so
+    eval scripts can load them unmodified by pointing --ckpt_dir at
+    save_models_ema/ instead of save_models/."""
+    ema_dir = os.path.join(save_root, 'save_models_ema')
+    os.makedirs(ema_dir, exist_ok=True)
+    for name, module in ema_modules.items():
+        torch.save(
+            module.state_dict(),
+            os.path.join(ema_dir, '{}-{}'.format(name, str(step).zfill(7))),
         )
 
 
@@ -472,7 +509,7 @@ if __name__ == '__main__':
     
     # parameters for training 
     parser.add_argument("--img_size",type=int,default=512,help="image size for model")
-    parser.add_argument("--batch", type=int, default=4, help="batch size")
+    parser.add_argument("--batch", type=int, default=8, help="batch size")
     parser.add_argument("--num_workers", type=int, default=16, help="number of workers")
     parser.add_argument("--epochs", type=int, default=10, help="number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -608,6 +645,31 @@ if __name__ == '__main__':
                         help='Per-sample weight multiplier for age (attr 39) in CLIP loss.')
     parser.add_argument('--clip_prompt_gender_weight', type=float, default=1.0,
                         help='Per-sample weight multiplier for gender (attr 20) in CLIP loss.')
+
+    # ── EMA (exponential moving average) of trainable weights ──────────────
+    parser.add_argument('--use_ema', action=argparse.BooleanOptionalAction, default=True,
+                        help='Track an EMA shadow copy of prior/conditioner/attr_scales/'
+                             'reg_loss_weights/direction_bank, saved alongside the live '
+                             'checkpoints under save_models_ema/. Point --ckpt_dir at that '
+                             'directory at eval time to use the EMA weights instead of the '
+                             'raw (noisier) live weights; no eval code changes needed since '
+                             'the file naming matches save_models/ exactly.')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='EMA decay per optimizer step. 0.999 ~= averaging over the last '
+                             '~1000 steps. Higher = smoother but slower to reflect recent training.')
+
+    # ── Hinge identity loss ─────────────────────────────────────────────────
+    parser.add_argument('--id_loss_hinge', action=argparse.BooleanOptionalAction, default=False,
+                        help='Replace the continuous id_loss (1 - cosine_sim, always pulling) with '
+                             'a hinge loss that is exactly zero once id cosine similarity is at or '
+                             'above --id_hinge_threshold, and only pulls below that floor. Lets the '
+                             'model spend its full editing budget above the safety line instead of '
+                             'constantly fighting a continuous pull, without weakening the floor '
+                             'itself. This threshold is a fixed safety policy, not a per-attribute '
+                             'learnable target -- a learnable floor could degenerate toward 0 and '
+                             'remove the safety net it exists to provide.')
+    parser.add_argument('--id_hinge_threshold', type=float, default=0.8,
+                        help='Identity cosine-similarity floor for --id_loss_hinge.')
     args = parser.parse_args()
     torch.manual_seed(0)
 
@@ -794,6 +856,27 @@ if __name__ == '__main__':
         optimizer, T_max=args.epochs * len(train_loader) // args.grad_accum_steps, eta_min=1e-6
     )
 
+    ema_pairs = []       # [(live_module, ema_module, save_name), ...]
+    ema_modules_for_save = {}
+    if args.use_ema:
+        prior_ema = make_ema_copy(prior)
+        conditioner_ema = make_ema_copy(conditioner)
+        attr_scales_ema = make_ema_copy(attr_scales)
+        reg_loss_weights_ema = make_ema_copy(reg_loss_weights)
+        ema_pairs = [
+            (prior, prior_ema, 'prior'),
+            (conditioner, conditioner_ema, 'conditioner'),
+            (attr_scales, attr_scales_ema, 'attr_scales'),
+            (reg_loss_weights, reg_loss_weights_ema, 'reg_loss_weights'),
+        ]
+        ema_modules_for_save = {name: ema for _, ema, name in ema_pairs}
+        if direction_bank is not None:
+            direction_bank_ema = make_ema_copy(direction_bank)
+            ema_pairs.append((direction_bank, direction_bank_ema, 'direction_bank'))
+            ema_modules_for_save['direction_bank'] = direction_bank_ema
+        print(f'** EMA enabled (decay={args.ema_decay}); shadow weights saved to '
+              f'save_models_ema/, point --ckpt_dir there at eval time to use them.')
+
     start_step = 0
     if args.resume_dir is not None:
         if args.resume_step is None:
@@ -823,6 +906,19 @@ if __name__ == '__main__':
             print(f'[Resume] loaded optimizer from {opt_path}')
         else:
             print('[Resume] optimizer state not loaded; using fresh optimizer for controlled fine-tuning.')
+
+        if args.use_ema:
+            # EMA shadow copies were made from the pre-resume (freshly constructed)
+            # weights above; now that the live weights have been resumed, either
+            # resume the EMA shadow too (if it was saved) or re-sync it to match
+            # the resumed live weights so it isn't stuck at the old init.
+            ema_resume_dir = os.path.join(os.path.dirname(resume_save_dir), 'save_models_ema')
+            for live_module, ema_module, name in ema_pairs:
+                try:
+                    load_module_checkpoint(ema_module, ema_resume_dir, name, start_step, strict=False)
+                except FileNotFoundError:
+                    ema_module.load_state_dict(live_module.state_dict())
+                    print(f'[Resume] {name}_ema checkpoint not found; re-synced EMA to resumed live weights.')
 
     log_modules = [prior, conditioner, attr_scales, reg_loss_weights, optimizer]
     if args.velocity_field == 'original':
@@ -974,10 +1070,18 @@ if __name__ == '__main__':
                 + reg_weights[:, 2] * reg_loss_fine
             ).mean()
 
-            # Identity loss: edited face should preserve identity of original
+            # Identity loss: edited face should preserve identity of original.
+            # Hinge mode (--id_loss_hinge) is exactly zero once id cosine similarity
+            # is at or above --id_hinge_threshold, so the model can spend its full
+            # editing budget above that floor instead of a continuous pull fighting
+            # counter_attr_loss even when identity is already well preserved.
             id_src_feat = F.normalize(id_criterion.extract_features(img), dim=1).detach()
             id_edit_feat = F.normalize(id_criterion.extract_features(new_face_tensors), dim=1)
-            id_loss = 1.0 - F.cosine_similarity(id_edit_feat, id_src_feat, dim=1).mean()
+            id_cos_sim = F.cosine_similarity(id_edit_feat, id_src_feat, dim=1)
+            if args.id_loss_hinge:
+                id_loss = F.relu(args.id_hinge_threshold - id_cos_sim).mean()
+            else:
+                id_loss = 1.0 - id_cos_sim.mean()
 
             # Frozen counterfactual teacher: external supervision on visual attribute change
             new_face_256 = F.interpolate(new_face_tensors, (256, 256))
@@ -1135,6 +1239,9 @@ if __name__ == '__main__':
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                if args.use_ema:
+                    for live_module, ema_module, _name in ema_pairs:
+                        update_ema(ema_module, live_module, args.ema_decay)
             
             
             if n_iter % args.save_freq==0:
@@ -1163,6 +1270,8 @@ if __name__ == '__main__':
                     )
                     logger.save_image(grid_img,n_iter,'test')
                 logger.checkpoints(n_iter)
+                if args.use_ema:
+                    save_ema_checkpoints(logger.save_root, n_iter, ema_modules_for_save)
                     
             _log_dict = {
                 'loss_total': loss,
