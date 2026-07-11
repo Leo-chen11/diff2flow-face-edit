@@ -205,6 +205,64 @@ def build_fid(args):
 
 
 # ---------------------------------------------------------------------------
+# Run-config auto-load
+# ---------------------------------------------------------------------------
+
+# Model-structure keys that MUST match training; anything here silently loaded
+# wrong under strict=False used to produce plausible-looking garbage metrics.
+RUN_CONFIG_KEYS = [
+    'attribute_index', 'flow_modules', 'num_blocks', 'velocity_field',
+    'lag_gate_hidden_dim', 'lag_gate_init_bias', 'id_cond_dim', 'id_cond_scale',
+    'attr_backbone', 'conditioner_backbone', 'clip_model', 'fused_hidden_dim',
+    'img_size', 'direction_residual_scale', 'direction_bank_path',
+]
+
+
+def apply_run_config(args):
+    """If the run saved a config.json (train_sdflow.py writes one), use it as
+    the source of truth for model-structure flags. CLI flags you pass
+    explicitly still win; --ignore_run_config disables the whole mechanism."""
+    cfg_path = os.path.join(args.checkpoint_dir, 'config.json')
+    if getattr(args, 'ignore_run_config', False):
+        return args
+    if not os.path.exists(cfg_path):
+        print(f'[RunConfig] no config.json in {args.checkpoint_dir} — falling back to CLI '
+              f'flags. Make sure they match training exactly (strict-load checks below '
+              f'will catch structural mismatches, but not value-only ones like '
+              f'lag_gate_init_bias).')
+        return args
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    explicit = set()
+    for tok in sys.argv[1:]:
+        if tok.startswith('--'):
+            explicit.add(tok.split('=')[0].lstrip('-').replace('-', '_'))
+    for key in RUN_CONFIG_KEYS:
+        if key not in cfg or key in explicit:
+            continue
+        old = getattr(args, key, None)
+        new = cfg[key]
+        if old != new:
+            print(f'[RunConfig] {key}: {old} -> {new} (from config.json)')
+            setattr(args, key, new)
+    return args
+
+
+def _check_load(result, name):
+    """strict=False load, but missing keys are a hard error: they mean the eval
+    model structure does not match the checkpoint and every metric would be
+    garbage. Unexpected keys (extra buffers from newer training code) only warn."""
+    if result.missing_keys:
+        raise RuntimeError(
+            f'{name} checkpoint does not match the eval model structure. '
+            f'Missing keys: {result.missing_keys[:8]} ... '
+            f'Fix the model-structure flags (or rely on config.json auto-load).'
+        )
+    if result.unexpected_keys:
+        print(f'[WARN] {name} unexpected keys (ignored): {result.unexpected_keys[:8]}')
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
@@ -251,7 +309,7 @@ def load_models(args):
 
     prior_ckpt = _ckpt_path(args.checkpoint_dir, 'prior', args.step)
     print(f'Loading prior  ← {prior_ckpt}')
-    prior.load_state_dict(load_network(prior_ckpt), strict=False)
+    _check_load(prior.load_state_dict(load_network(prior_ckpt), strict=False), 'prior')
 
     # ── Conditioner ───────────────────────────────────────────────────────
     conditioner = IdentityAttributeConditioner(
@@ -266,7 +324,8 @@ def load_models(args):
 
     cond_ckpt = _ckpt_path(args.checkpoint_dir, 'conditioner', args.step)
     print(f'Loading cond   ← {cond_ckpt}')
-    conditioner.load_state_dict(load_network(cond_ckpt), strict=False)
+    _check_load(conditioner.load_state_dict(load_network(cond_ckpt), strict=False),
+                'conditioner')
 
     # ── Direction Bank (optional, loads trained weights if saved) ─────────
     direction_bank = None
@@ -745,6 +804,11 @@ if __name__ == '__main__':
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
+    parser.add_argument('--ignore_run_config', action='store_true',
+                        help='Do not auto-load model-structure flags from the run\'s '
+                             'config.json (written by train_sdflow.py). By default the '
+                             'saved config wins over CLI defaults; explicit CLI flags '
+                             'always win over both.')
     parser.add_argument('--override_residual_scale', type=float, default=None,
                         help='Force the direction-bank residual_scale to this value for all '
                              'attributes at eval time (e.g. 0.15 or 0.3), overriding the trained '
@@ -763,6 +827,7 @@ if __name__ == '__main__':
                         default=[0.80, 0.85, 0.90, 0.95])
 
     args = parser.parse_args()
+    args = apply_run_config(args)
 
     # Auto-detect latest step if not specified
     if args.step is None:
