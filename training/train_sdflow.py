@@ -472,7 +472,7 @@ if __name__ == '__main__':
     
     # parameters for training 
     parser.add_argument("--img_size",type=int,default=512,help="image size for model")
-    parser.add_argument("--batch", type=int, default=8, help="batch size")
+    parser.add_argument("--batch", type=int, default=4, help="batch size")
     parser.add_argument("--num_workers", type=int, default=16, help="number of workers")
     parser.add_argument("--epochs", type=int, default=10, help="number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4)
