@@ -233,13 +233,22 @@ class AttributeDirectionBank(nn.Module):
         # dir_delta: (B, 18, 512)
         dir_delta = (signed_magnitudes.unsqueeze(-1) * mix_dirs).sum(dim=1)
 
-        # ── Residual orthogonal to all A*K directions ─────────────────────
-        residual = flow_delta
-        for a in range(self.num_attrs):
-            for k in range(self.num_k):
-                d = dirs[a, k]                                         # (18, 512)
-                dot = (residual * d.unsqueeze(0)).sum(dim=-1, keepdim=True)
-                residual = residual - dot * d.unsqueeze(0)
+        # ── Residual orthogonal to the FULL span of all A*K directions ────
+        # Proper orthogonal-complement projection via pseudo-inverse, replacing
+        # the old sequential Gram-Schmidt subtraction: subtracting projections
+        # one direction at a time is only correct when the directions are
+        # mutually orthogonal, which A*K dataset-level directions are not.
+        # The old version left order-dependent direction components inside the
+        # residual, so "residual" silently double-counted the bank directions
+        # (worse for stratified K>1 banks). pinv handles rank deficiency and
+        # zero/duplicate directions safely.
+        M = self.num_attrs * self.num_k
+        # (A, K, 18, 512) -> per-layer direction matrix D: (18, 512, M)
+        D = dirs.reshape(M, self.num_layers, self.latent_dim).permute(1, 2, 0)
+        pinv_D = torch.linalg.pinv(D)                                  # (18, M, 512)
+        coeff = torch.einsum('lms,bls->blm', pinv_D, flow_delta)       # (B, 18, M)
+        proj = torch.einsum('lsm,blm->bls', D, coeff)                  # (B, 18, 512)
+        residual = flow_delta - proj
 
         # Clip per-sample residual norm to prevent explosion from large DDS gradients.
         if self.residual_max_norm is not None:
