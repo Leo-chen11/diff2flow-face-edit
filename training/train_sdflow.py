@@ -88,21 +88,30 @@ class LearnableRegLossWeights(nn.Module):
     when more freedom in that group is needed to hit the target).
     """
 
-    def __init__(self, n_edit_attrs, init_global=2.0, init_coarse=1.0, init_fine=0.5):
+    def __init__(self, n_edit_attrs, init_global=2.0, init_coarse=1.0, init_fine=0.5,
+                 min_weight=0.1):
         super().__init__()
         self.n_edit_attrs = int(n_edit_attrs)
+        # Floor on every learned weight. Every main training loss pushes these
+        # weights DOWN (regularization only ever hurts the other objectives),
+        # and nothing pushes them up, so at full meta lr they degenerate to ~0
+        # (observed: fine/attr_39 collapsed 0.5 -> 5e-6 by 46k steps, freeing
+        # the fine W+ layers and producing texture/color artifacts). The floor
+        # keeps per-attribute REBALANCING learnable while making total collapse
+        # impossible.
+        self.min_weight = float(min_weight)
         init = torch.tensor([float(init_global), float(init_coarse), float(init_fine)])
         init = init.unsqueeze(0).repeat(self.n_edit_attrs, 1)   # (n_edit_attrs, 3)
         self.log_weights_raw = nn.Parameter(_inverse_softplus(init))
 
     def weights_for(self, attr_local_idx):
         """attr_local_idx: LongTensor [B] -> (B, 3) tensor of [global, coarse, fine] weights."""
-        weights = F.softplus(self.log_weights_raw)   # (n_edit_attrs, 3)
+        weights = F.softplus(self.log_weights_raw).clamp(min=self.min_weight)
         return weights[attr_local_idx]
 
     def current_weights(self):
         with torch.no_grad():
-            return F.softplus(self.log_weights_raw)   # (n_edit_attrs, 3)
+            return F.softplus(self.log_weights_raw).clamp(min=self.min_weight)
 
 
 class CrossAttributeLossBalancer:
@@ -174,6 +183,16 @@ SOFT_TARGET_TABLE = {
     39: (0.20, 0.80),   # age is the most identity-sensitive edit; conservative
 }
 DEFAULT_SOFT_TARGET = (0.20, 0.80)
+
+# Local attributes: edits that should only touch a specific facial region.
+# Maps absolute CelebA attribute index -> BiSeNet parsing classes defining the
+# region the edit is ALLOWED to change (see common/face_parser.py label map).
+# Eyeglasses: brows(2,3) + eyes(4,5) + glasses(6). Global attributes such as
+# gender(20)/age(39) are intentionally absent — a whole-face region mask would
+# make the loss a no-op for them.
+LOCAL_REGION_CLASSES = {
+    15: [2, 3, 4, 5, 6],
+}
 
 
 def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
@@ -600,6 +619,16 @@ if __name__ == '__main__':
                              'between teacher and CLIP accuracy without it).')
     parser.add_argument('--teacher_aug_noise', type=float, default=0.02,
                         help='Std of the shared gaussian noise in --teacher_aug.')
+    parser.add_argument('--local_region_loss_weight', type=float, default=0.0,
+                        help='Weight for the face-parser locality loss on LOCAL attributes '
+                             '(currently eyeglasses, see LOCAL_REGION_CLASSES): outside the '
+                             'allowed region, the edited image must match the source '
+                             'reconstruction pixel-wise. Directly attacks the ~55-60%% real '
+                             'eyeglasses accuracy ceiling by forcing the edit budget into '
+                             'the eye region instead of a diffuse whole-face "glasses-ness". '
+                             '0 disables (default). Suggested when enabling: 0.5.')
+    parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
+                        help='BiSeNet weights for --local_region_loss_weight.')
 
     # ── Cross-attribute loss balancing ──────────────────────────────────────
     parser.add_argument('--balance_attr_losses', action=argparse.BooleanOptionalAction, default=False,
@@ -621,6 +650,11 @@ if __name__ == '__main__':
                         help='Initial coarse-layer reg_loss weight, per attribute; then learned.')
     parser.add_argument('--reg_fine_weight', type=float, default=0.5,
                         help='Initial fine-layer reg_loss weight, per attribute; then learned.')
+    parser.add_argument('--reg_weight_min', type=float, default=0.1,
+                        help='Hard floor for every learned reg-loss weight. All main losses '
+                             'push these weights down and nothing pushes them up, so without '
+                             'a floor they collapse to ~0 at full meta lr (v7: fine/attr_39 '
+                             'hit 5e-6, freeing fine layers -> texture/color artifacts).')
     parser.add_argument('--direction_bank_path', default=None, type=str,
                         help='Path to precomputed Attribute Direction Bank (.pth).')
     # Independent-judge eval evidence: with the old 0.05 init the residual (the
@@ -841,6 +875,7 @@ if __name__ == '__main__':
         init_global=args.reg_global_weight_init,
         init_coarse=args.reg_coarse_weight_init,
         init_fine=args.reg_fine_weight,
+        min_weight=args.reg_weight_min,
     ).cuda()
     loss_balancer = None
     if args.balance_attr_losses:
@@ -1018,6 +1053,18 @@ if __name__ == '__main__':
         p.requires_grad_(False)
     print('** Frozen attribute teacher initialization success !')
 
+    face_parser = None
+    if args.local_region_loss_weight > 0:
+        from common.face_parser import FaceParser
+        try:
+            face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
+            print(f'** Face-parser locality loss enabled (weight='
+                  f'{args.local_region_loss_weight}) for local attrs {local_attrs}')
+        except (FileNotFoundError, RuntimeError) as exc:
+            face_parser = None
+            print(f'[WARN] Face parser unavailable ({exc}); locality loss disabled.')
+
     diffusion_guidance = None
     if args.use_diffusion_guidance:
         from models.diffusion_guidance import FrozenDiffusionDDSGuidance
@@ -1129,6 +1176,36 @@ if __name__ == '__main__':
             
             new_face_tensors = G([new_latents],input_is_latent=True,randomize_noise=False)[0].clamp(-1, 1)
             new_face_tensors = F.interpolate(new_face_tensors, (args.img_size, args.img_size))
+
+            # ── Face-parser locality loss (local attributes only) ────────────
+            # Outside the attribute's allowed facial region, the edited image
+            # must match the source reconstruction. Compared against G(latent)
+            # (not the real photo) so the inversion gap is not charged to the
+            # edit. In cycle mode this fires on the local attribute's steps only.
+            local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            if face_parser is not None:
+                _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
+                _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
+                                         device=latent.device)
+                if _is_local.any():
+                    with torch.no_grad():
+                        src_recon = G([latent], input_is_latent=True,
+                                      randomize_noise=False)[0].clamp(-1, 1)
+                        src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
+                    _terms = []
+                    for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
+                        _sel = torch.tensor([a == _abs_idx for a in _mid_abs],
+                                            device=latent.device)
+                        with torch.no_grad():
+                            region = face_parser.get_region_mask(
+                                src_recon[_sel], LOCAL_REGION_CLASSES[_abs_idx])
+                        outside = (1.0 - region)
+                        diff_sq = (new_face_tensors[_sel] - src_recon[_sel]).pow(2)
+                        _terms.append(
+                            (diff_sq * outside).sum()
+                            / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
+                        )
+                    local_region_loss = torch.stack(_terms).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -1300,7 +1377,8 @@ if __name__ == '__main__':
                 args.gate_smooth_weight * lag_gate_smooth +\
                 args.direction_orth_weight * dir_orth_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
-                args.clip_prompt_weight * clip_semantic_loss
+                args.clip_prompt_weight * clip_semantic_loss +\
+                args.local_region_loss_weight * local_region_loss
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -1379,6 +1457,7 @@ if __name__ == '__main__':
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
+                'loss_local_region':  local_region_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
