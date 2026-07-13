@@ -168,6 +168,34 @@ class FaceParser(nn.Module):
         self.register_buffer('std',  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     @torch.no_grad()
+    def get_region_mask(self, x, classes, blur_sigma=5):
+        """
+        Soft mask over an arbitrary set of BiSeNet classes.
+        x: [-1,1] tensor [B,3,H,W]; classes: list of label ids (see map above)
+        returns: [B,1,H,W] in [0,1], 1 = inside the region.
+        blur_sigma dilates the boundary so the loss outside the region does not
+        fight legitimate edits right at the region border.
+        """
+        h, w = x.shape[2:]
+        inp = F.interpolate(x, 512, mode='bilinear', align_corners=False)
+        inp = (inp * 0.5 + 0.5 - self.mean) / self.std
+        seg = self.net(inp).argmax(dim=1)             # [B, 512, 512]
+
+        mask = torch.zeros_like(seg, dtype=torch.float32)
+        for c in classes:
+            mask = mask + (seg == c).float()
+        mask = mask.clamp(0, 1).unsqueeze(1)
+
+        if blur_sigma > 0:
+            ks = blur_sigma * 6 + 1
+            pad = ks // 2
+            weight = self._gaussian_kernel(ks, blur_sigma, x.device)
+            mask = F.conv2d(mask, weight, padding=pad)
+
+        mask = F.interpolate(mask, (h, w), mode='bilinear', align_corners=False)
+        return mask.clamp(0, 1)
+
+    @torch.no_grad()
     def get_mask(self, x, blur_sigma=3):
         """
         x: [-1,1] tensor [B,3,H,W]
