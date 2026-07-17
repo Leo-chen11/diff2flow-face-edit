@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 
 import torch
@@ -60,6 +61,26 @@ def _load_state_allow_old_pos(model, path):
         print(f'[WARN] Loaded old flow checkpoint without position embedding keys: {path}')
 
 
+# Model-structure keys that must match how the checkpoint was trained.
+# Loaded from the run's config.json when available -- the strict=False loads
+# below would otherwise silently accept a structurally wrong model.
+_RUN_CONFIG_KEYS = [
+    'attribute_index', 'flow_modules', 'num_blocks', 'velocity_field',
+    'lag_gate_hidden_dim', 'lag_gate_init_bias', 'id_cond_dim', 'id_cond_scale',
+    'attr_backbone', 'conditioner_backbone', 'clip_model', 'fused_hidden_dim',
+    'direction_residual_scale', 'direction_bank_path',
+]
+
+
+def _find_run_config(ckpt_dir):
+    """config.json lives next to save_models/; accept either dir as ckpt_dir."""
+    for d in (ckpt_dir, os.path.dirname(os.path.normpath(ckpt_dir))):
+        path = os.path.join(d, 'config.json')
+        if os.path.exists(path):
+            return path
+    return None
+
+
 class SDFlow(object):
     def __init__(self, ckpt_dir, attr_num, attr_list=[15, 20, 39], scale=1.0, device='cuda',
                  id_cond_dim=32, id_cond_scale=0.25, attr_backbone='resnet50',
@@ -69,7 +90,64 @@ class SDFlow(object):
                  lag_gate_init_bias=-1.5, direction_bank_path=None,
                  direction_residual_scale=0.05, direction_freeze=True,
                  ckpt_step=None,
-                 guided_delta_max_norm=None) -> None:
+                 guided_delta_max_norm=None,
+                 use_run_config=True) -> None:
+        # When the run saved a config.json (train_sdflow.py writes one), treat
+        # it as the source of truth for model structure: the constructor
+        # defaults here historically disagreed with training defaults
+        # (velocity_field 'original' vs 'lag_dof', gate bias -1.5 vs -0.5),
+        # and a mismatch loads garbage weights without an error. Pass
+        # use_run_config=False for full manual control.
+        if use_run_config:
+            cfg_path = _find_run_config(ckpt_dir)
+            if cfg_path is not None:
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                overrides = {
+                    'attribute_index': lambda v: None if v == attr_list else v,
+                }
+                local_vars = {
+                    'flow_modules': flow_modules, 'num_blocks': num_blocks,
+                    'velocity_field': velocity_field,
+                    'lag_gate_hidden_dim': lag_gate_hidden_dim,
+                    'lag_gate_init_bias': lag_gate_init_bias,
+                    'id_cond_dim': id_cond_dim, 'id_cond_scale': id_cond_scale,
+                    'attr_backbone': attr_backbone,
+                    'conditioner_backbone': conditioner_backbone,
+                    'clip_model': clip_model, 'fused_hidden_dim': fused_hidden_dim,
+                    'direction_residual_scale': direction_residual_scale,
+                    'direction_bank_path': direction_bank_path,
+                }
+                for key in _RUN_CONFIG_KEYS:
+                    if key not in cfg:
+                        continue
+                    if key == 'attribute_index':
+                        if list(cfg[key]) != list(attr_list):
+                            print(f'[RunConfig] attr_list: {attr_list} -> {cfg[key]}')
+                            attr_list = list(cfg[key])
+                        continue
+                    if key in local_vars and local_vars[key] != cfg[key]:
+                        print(f'[RunConfig] {key}: {local_vars[key]} -> {cfg[key]}')
+                flow_modules = cfg.get('flow_modules', flow_modules)
+                num_blocks = cfg.get('num_blocks', num_blocks)
+                velocity_field = cfg.get('velocity_field', velocity_field)
+                lag_gate_hidden_dim = cfg.get('lag_gate_hidden_dim', lag_gate_hidden_dim)
+                lag_gate_init_bias = cfg.get('lag_gate_init_bias', lag_gate_init_bias)
+                id_cond_dim = cfg.get('id_cond_dim', id_cond_dim)
+                id_cond_scale = cfg.get('id_cond_scale', id_cond_scale)
+                attr_backbone = cfg.get('attr_backbone', attr_backbone)
+                conditioner_backbone = cfg.get('conditioner_backbone', conditioner_backbone)
+                clip_model = cfg.get('clip_model', clip_model)
+                fused_hidden_dim = cfg.get('fused_hidden_dim', fused_hidden_dim)
+                direction_residual_scale = cfg.get('direction_residual_scale',
+                                                   direction_residual_scale)
+                if direction_bank_path is None:
+                    direction_bank_path = cfg.get('direction_bank_path', None)
+                print(f'[RunConfig] editor aligned to {cfg_path}')
+            else:
+                print('[WARN] editor: no config.json found near ckpt_dir; using '
+                      'constructor arguments as-is. Make sure they match training '
+                      '(velocity_field / gate bias mismatches load garbage silently).')
         self.ckpt_dir = ckpt_dir
         self.device = device
         self.attr_num = attr_num
