@@ -629,6 +629,14 @@ if __name__ == '__main__':
                              '0 disables (default). Suggested when enabling: 0.5.')
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
                         help='BiSeNet weights for --local_region_loss_weight.')
+    parser.add_argument('--local_region_add_blur', type=float, default=15,
+                        help='Mask dilation (gaussian blur sigma) for ADDITION-direction '
+                             'local edits. The source face has no glasses pixels for '
+                             'BiSeNet to label, so the precise mask cannot contain a '
+                             'future frame; a heavily dilated eye/brow region acts as a '
+                             'geometric prior for the frame footprint while still '
+                             'forbidding hair/mouth/background changes. Removal edits '
+                             'keep the precise mask (sigma 5).')
 
     # ── Cross-attribute loss balancing ──────────────────────────────────────
     parser.add_argument('--balance_attr_losses', action=argparse.BooleanOptionalAction, default=False,
@@ -1182,6 +1190,28 @@ if __name__ == '__main__':
             # must match the source reconstruction. Compared against G(latent)
             # (not the real photo) so the inversion gap is not charged to the
             # edit. In cycle mode this fires on the local attribute's steps only.
+            #
+            # REMOVAL-ONLY: the region mask is computed from the SOURCE
+            # reconstruction. For a face that does not yet have glasses, BiSeNet
+            # only labels the bare eyes/brows (no "glasses" class pixels exist
+            # yet), which is much smaller than the actual frame footprint (it
+            # extends toward the temples/cheeks). Enforcing "no change outside
+            # this tight mask" on an add-glasses edit makes it geometrically
+            # impossible to paint a full frame, and the model just gives up
+            # drawing one (observed: v11 preview grid stopped adding glasses
+            # entirely). For a face that already has glasses, the source mask
+            # correctly covers the full frame, so removal edits are safe.
+            # Restrict the loss to src_attr_flow > 0.5 (removal direction only)
+            # so addition edits fall back to the unconstrained v10 behavior.
+            # Direction-aware masking:
+            #   removal (source HAS the attribute): BiSeNet sees the full frame
+            #     on the source, so a precise mask (default blur) is safe.
+            #   addition (source LACKS it): no glasses pixels exist yet, so the
+            #     precise mask is far smaller than a real frame's footprint and
+            #     would make painting one impossible (v11 stopped adding glasses
+            #     entirely). Instead use a heavily dilated eye/brow mask
+            #     (--local_region_add_blur) as a geometric prior for where a
+            #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
@@ -1192,20 +1222,31 @@ if __name__ == '__main__':
                         src_recon = G([latent], input_is_latent=True,
                                       randomize_noise=False)[0].clamp(-1, 1)
                         src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
+                    _is_removal = src_attr_flow > 0.5
                     _terms = []
                     for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
-                        _sel = torch.tensor([a == _abs_idx for a in _mid_abs],
-                                            device=latent.device)
-                        with torch.no_grad():
-                            region = face_parser.get_region_mask(
-                                src_recon[_sel], LOCAL_REGION_CLASSES[_abs_idx])
-                        outside = (1.0 - region)
-                        diff_sq = (new_face_tensors[_sel] - src_recon[_sel]).pow(2)
-                        _terms.append(
-                            (diff_sq * outside).sum()
-                            / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
-                        )
-                    local_region_loss = torch.stack(_terms).mean()
+                        _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
+                                                 device=latent.device)
+                        for _dir_sel, _sigma in [
+                            (_attr_sel & _is_removal, 5),
+                            (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
+                        ]:
+                            if not _dir_sel.any():
+                                continue
+                            with torch.no_grad():
+                                region = face_parser.get_region_mask(
+                                    src_recon[_dir_sel],
+                                    LOCAL_REGION_CLASSES[_abs_idx],
+                                    blur_sigma=_sigma,
+                                )
+                            outside = (1.0 - region)
+                            diff_sq = (new_face_tensors[_dir_sel] - src_recon[_dir_sel]).pow(2)
+                            _terms.append(
+                                (diff_sq * outside).sum()
+                                / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
+                            )
+                    if _terms:
+                        local_region_loss = torch.stack(_terms).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
