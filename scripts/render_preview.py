@@ -164,6 +164,9 @@ if __name__ == '__main__':
     parser.add_argument('--bypass_glasses_direction_bank',
                         action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--guided_delta_max_norm', type=float, default=0.0)
+    parser.add_argument('--override_residual_scale', type=float, default=None,
+                        help='Force direction-bank residual_scale at render time '
+                             '(same diagnostic knob as evaluate_sdflow.py).')
     parser.add_argument('--ignore_run_config', action='store_true')
 
     args = parser.parse_args()
