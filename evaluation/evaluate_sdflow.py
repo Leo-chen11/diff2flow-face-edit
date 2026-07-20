@@ -124,13 +124,30 @@ class CLIPAttributeJudge(nn.Module):
 
 
 class IndependentIDJudge(nn.Module):
-    """FaceNet (InceptionResnetV1, VGGFace2) identity embedder — a different
-    architecture and training set from the insightface ArcFace used in id_loss."""
+    """FaceNet (InceptionResnetV1) identity embedder.
 
-    def __init__(self, device='cuda'):
+    NOTE ON INDEPENDENCE: common/id_loss.py tries insightface ArcFace first,
+    but common/nn/insightface.py does not exist in this repo, so IDLoss
+    ALWAYS falls back to facenet-pytorch (InceptionResnetV1, vggface2
+    weights) on every machine -- id_arc is never actually ArcFace here.
+    To keep this judge from being a literal duplicate of the training-time
+    identity loss (same architecture AND same weights AND same training
+    set), default to the 'casia-webface' pretrained weights instead of
+    'vggface2': same architecture as the training-time fallback, but a
+    different training dataset, so embeddings are not identical. This is
+    a partial-independence compromise, not true architectural independence
+    (that would need a real ArcFace/insightface install) -- chosen because
+    it keeps the batched-GPU-tensor extract() interface eval relies on,
+    instead of switching to a CPU/PIL-based library like deepface that
+    would require rewriting the calling convention and be much slower
+    over 500 samples x multiple scales x multiple attributes.
+    """
+
+    def __init__(self, device='cuda', pretrained='casia-webface'):
         super().__init__()
         from facenet_pytorch import InceptionResnetV1  # ImportError handled by caller
-        self.net = InceptionResnetV1(pretrained='vggface2').to(device).eval()
+        self.net = InceptionResnetV1(pretrained=pretrained).to(device).eval()
+        self.pretrained = pretrained
         for p in self.net.parameters():
             p.requires_grad_(False)
 
@@ -158,15 +175,26 @@ def build_optional_judges(args, attribute_index, id_criterion):
               'pip install git+https://github.com/openai/CLIP.git')
 
     try:
-        indep_id = IndependentIDJudge(device)
+        indep_id = IndependentIDJudge(device, pretrained=args.id_indep_pretrained)
         # If the training IDLoss itself fell back to facenet (input_size 160),
-        # this judge is NOT independent -- say so loudly instead of silently
-        # reporting a rigged number.
+        # this judge shares the SAME architecture as id_arc -- say so loudly
+        # instead of silently reporting a number that looks independent.
         if getattr(id_criterion, 'input_size', 112) == 160:
-            print('[WARN] Training IDLoss is ALSO facenet (insightface unavailable). '
-                  'id_indep below is NOT independent from the training identity loss.')
+            same_weights = (args.id_indep_pretrained == 'vggface2')
+            if same_weights:
+                print('[WARN] Training IDLoss is ALSO facenet/vggface2 (insightface '
+                      'unavailable) and id_indep uses the SAME weights -- id_indep is '
+                      'a literal duplicate of id_arc, not independent at all.')
+            else:
+                print(f'[WARN] Training IDLoss is ALSO facenet (insightface unavailable). '
+                      f'id_indep uses facenet/{args.id_indep_pretrained} (different training '
+                      f'set) so it is PARTIALLY independent -- same architecture as id_arc, '
+                      f'different weights. Not a substitute for a true architectural '
+                      f'independent judge (e.g. real ArcFace/insightface).')
         else:
-            print('[Judge] Independent ID judge: facenet InceptionResnetV1 (VGGFace2)')
+            print(f'[Judge] Independent ID judge: facenet InceptionResnetV1 '
+                  f'({args.id_indep_pretrained}) -- architecturally independent from '
+                  f'training id_arc (insightface ArcFace).')
     except ImportError:
         print('[WARN] facenet-pytorch not installed -> no independent ID metric. '
               'pip install facenet-pytorch')
@@ -377,6 +405,31 @@ def load_models(args):
             print(f'[Override] direction bank residual_scale forced to '
                   f'{args.override_residual_scale} for ALL attributes '
                   f'(trained value ignored)')
+
+        if getattr(args, 'age_fine_layer_scale', None) is not None and 39 in args.attribute_index:
+            # Diagnostic knob: render_preview.py with --override_residual_scale 0
+            # showed the color-cast artifact on age edits comes 100% from the
+            # precomputed direction_units for attribute 39 (age), independent of
+            # the flow/residual entirely -- residual=0 (pure Direction Bank
+            # output) still reproduces the identical artifact. StyleGAN's fine
+            # W+ layers (index >=4, matching the reg_loss_fine grouping used
+            # elsewhere in this codebase) control color/texture, while
+            # global/coarse layers (<4) control structure (face shape,
+            # wrinkles-as-geometry, hairline). This scales down the age
+            # direction's fine-layer components at inference time -- no
+            # retraining, no bank recomputation -- to test whether the color
+            # confound specifically lives in those layers.
+            _age_local = args.attribute_index.index(39)
+            _start = int(args.age_fine_layer_start)
+            with torch.no_grad():
+                direction_bank.layer_scale[_age_local, _start:] = float(args.age_fine_layer_scale)
+            print(f'[Override] age (attr 39) direction layer scale forced to '
+                  f'{args.age_fine_layer_scale} for layers [{_start}:18] '
+                  f'(layers [0:{_start}] untouched). 500-sample eval showed a '
+                  f'blanket cut at layer 4 kills real aging signal (rm-direction '
+                  f'AccCLIP 76%->17%) along with the color artifact -- they are '
+                  f'not cleanly separable at that boundary; narrow the cut to '
+                  f'the very last layers first.')
 
     # ── StyleGAN2 ─────────────────────────────────────────────────────────
     ckpt = torch.load(args.stygan2_weights, map_location='cpu')
@@ -628,8 +681,14 @@ def evaluate(args):
                         if not is_clear(s):
                             continue
                         any_clear = True
-                        metrics[f'acc_{jname}_{attr_name}'].append(
-                            float(strict_success(s, e, args.success_margin)))
+                        _succ = float(strict_success(s, e, args.success_margin))
+                        metrics[f'acc_{jname}_{attr_name}'].append(_succ)
+                        # Direction split: source lacks the attribute -> this
+                        # edit ADDS it; source has it -> this edit REMOVES it.
+                        # Aggregate accuracy can hide a large asymmetry (e.g.
+                        # glasses removal easy, glasses addition hard).
+                        _dir = 'add' if s < 0.5 else 'rm'
+                        metrics[f'acc_{jname}_{attr_name}_{_dir}'].append(_succ)
                         if jname == 'teacher':
                             metrics[f'acc_lenient_{attr_name}'].append(
                                 float(lenient_success(s, e)))
@@ -697,6 +756,20 @@ def evaluate(args):
 
         print(f'  (* = same model as the training loss; reference only, '
               f'inflated by construction)')
+
+        # ── Add/remove direction breakdown (CLIP judge) ────────────────────
+        # The aggregate accuracy can hide a big asymmetry between adding an
+        # attribute and removing it (especially for object-like attributes
+        # such as eyeglasses).
+        print(f'  Direction split (AccCLIP): add = source lacks attr, rm = source has attr')
+        for attr_name in attr_names:
+            _a = _summ(metrics[f'acc_clip_{attr_name}_add'])
+            _r = _summ(metrics[f'acc_clip_{attr_name}_rm'])
+            _a_txt = f'{_a["mean"]*100:5.1f}% (n={_a["n"]})' if _a else '   --'
+            _r_txt = f'{_r["mean"]*100:5.1f}% (n={_r["n"]})' if _r else '   --'
+            print(f'    {attr_name:<12} add: {_a_txt}   rm: {_r_txt}')
+            scale_summary[attr_name]['acc_clip_add'] = _a
+            scale_summary[attr_name]['acc_clip_rm'] = _r
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
@@ -804,6 +877,14 @@ if __name__ == '__main__':
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
+    parser.add_argument('--id_indep_pretrained', default='casia-webface',
+                        choices=['casia-webface', 'vggface2'],
+                        help='Pretrained weights for the facenet-pytorch id_indep judge. '
+                             'Default casia-webface differs from the vggface2 weights that '
+                             'common/id_loss.py falls back to when insightface is unavailable '
+                             '(the common case in this repo), so id_indep is not a literal '
+                             'duplicate of id_arc. Still the same architecture either way -- '
+                             'see IndependentIDJudge docstring.')
     parser.add_argument('--ignore_run_config', action='store_true',
                         help='Do not auto-load model-structure flags from the run\'s '
                              'config.json (written by train_sdflow.py). By default the '
@@ -813,6 +894,19 @@ if __name__ == '__main__':
                         help='Force the direction-bank residual_scale to this value for all '
                              'attributes at eval time (e.g. 0.15 or 0.3), overriding the trained '
                              'value (which tends to be frozen near its 0.05 init). Diagnostic only.')
+    parser.add_argument('--age_fine_layer_scale', type=float, default=None,
+                        help='Scale the age (attr 39) direction layers [age_fine_layer_start:18] '
+                             'by this factor at eval time (e.g. 0.0 to zero them out). '
+                             'Diagnostic for the confirmed color-cast artifact living in the '
+                             'age direction fine layers -- but a blanket cut at layer 4 also '
+                             'kills real aging signal (500-sample eval: rm-direction AccCLIP '
+                             '76%->17%), so narrow the range with --age_fine_layer_start.')
+    parser.add_argument('--age_fine_layer_start', type=int, default=4,
+                        help='First W+ layer index (0-17) affected by --age_fine_layer_scale. '
+                             'Default 4 matches the reg_loss_fine grouping used elsewhere in '
+                             'this codebase, but that boundary was shown to cut into real '
+                             'aging signal too. Try 10-14 to target only the very last, most '
+                             'texture/color-dominated layers.')
     parser.add_argument('--success_margin', type=float, default=0.0,
                         help='Strict success requires the edited score to cross 0.5 by this '
                              'margin. 0.0 = just cross the decision boundary.')
