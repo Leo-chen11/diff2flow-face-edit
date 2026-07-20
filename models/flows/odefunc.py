@@ -198,6 +198,7 @@ class LAGDOFODEnet(nn.Module):
                 "orth": zero,
                 "orth_layer": zero,
                 "gate_smooth": zero,
+                "gate_sparse": zero,
             }
 
         v_attr = self._last_v_attr
@@ -215,12 +216,24 @@ class LAGDOFODEnet(nn.Module):
             orth_layer = zero
         if self.mode in {'lag', 'lag_dof'}:
             gate_smooth = (gate[:, 1:, :] - gate[:, :-1, :]).abs().mean()
+            # L_sparse: mean |g_a|. gate_smooth alone only pulls adjacent
+            # layers toward each other -- it has no gradient pushing any
+            # layer toward 0, so with only that term the gate has no reason
+            # to ever close a layer. Diagnostic evidence (scripts/inspect_gate.py)
+            # on a trained checkpoint confirmed exactly this: every layer
+            # stayed in 0.79-0.99 regardless of attribute or ODE time,
+            # i.e. the gate degenerated into an always-open, attribute-
+            # agnostic constant instead of the selective layer gate the
+            # design intends. This term gives sparsity an actual gradient.
+            gate_sparse = gate.abs().mean()
         else:
             gate_smooth = zero
+            gate_sparse = zero
         return {
             "orth": orth,
             "orth_layer": orth_layer,
             "gate_smooth": gate_smooth,
+            "gate_sparse": gate_sparse,
         }
 
 
