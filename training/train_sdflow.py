@@ -651,6 +651,16 @@ if __name__ == '__main__':
     parser.add_argument('--balance_max_weight', type=float, default=4.0)
     parser.add_argument('--orth_loss_weight', type=float, default=0.005)
     parser.add_argument('--gate_smooth_weight', type=float, default=0.003)
+    parser.add_argument('--gate_sparse_weight', type=float, default=0.01,
+                        help='L_sparse = mean|g_a|, from the method doc but never wired '
+                             'into the loss until now. gate_smooth only pulls adjacent '
+                             'layers toward each other -- it has no gradient pushing any '
+                             'layer toward 0, so the gate has no incentive to ever close a '
+                             'layer. scripts/inspect_gate.py confirmed this on a trained '
+                             'checkpoint: every layer stayed in 0.79-0.99 regardless of '
+                             'attribute or ODE time (degenerated to an always-open, '
+                             'attribute-agnostic constant). Method doc suggested 0.01, '
+                             'try 0.003 if edits become too weak.')
     parser.add_argument('--reg_global_weight_init', type=float, default=2.0,
                         help='Initial global-layer reg_loss weight, per attribute; then learned '
                              '(see LearnableRegLossWeights). Has no effect after the first step.')
@@ -1337,9 +1347,11 @@ if __name__ == '__main__':
             if lag_dof_losses is None:
                 lag_orth = _zero.clone()
                 lag_gate_smooth = _zero.clone()
+                lag_gate_sparse = _zero.clone()
             else:
                 lag_orth = lag_dof_losses['orth']
                 lag_gate_smooth = lag_dof_losses['gate_smooth']
+                lag_gate_sparse = lag_dof_losses['gate_sparse']
 
             id_warmup_steps = 1500
             id_weight = args.id_loss_weight * min(1.0, n_iter / max(1, id_warmup_steps))
@@ -1416,6 +1428,7 @@ if __name__ == '__main__':
                 args.counter_attr_weight * counter_attr_loss +\
                 args.orth_loss_weight * lag_orth +\
                 args.gate_smooth_weight * lag_gate_smooth +\
+                args.gate_sparse_weight * lag_gate_sparse +\
                 args.direction_orth_weight * dir_orth_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
@@ -1479,6 +1492,7 @@ if __name__ == '__main__':
                 'reg_loss_fine': reg_loss_fine.mean(),
                 'lag_orth': lag_orth,
                 'lag_gate_smooth': lag_gate_smooth,
+                'lag_gate_sparse': lag_gate_sparse,
                 'edit_scale': train_scale.detach().mean(),
                 'attr_scale_grad_norm': attr_scale_grad_norm,
                 'final_delta_norm_pre_clip': final_delta_norm_pre_clip,
