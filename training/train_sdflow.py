@@ -194,6 +194,10 @@ LOCAL_REGION_CLASSES = {
     15: [2, 3, 4, 5, 6],
 }
 
+# BiSeNet 'skin' class, used by --color_shift_loss_weight to measure whether
+# an edit shifted the overall skin tone rather than changing texture/geometry.
+SKIN_CLASS = [1]
+
 
 def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
     """attribute_index: the --attribute_index list mapping local -> absolute idx."""
@@ -637,6 +641,25 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
+    parser.add_argument('--color_shift_loss_weight', type=float, default=0.0,
+                        help='Penalize the mean-RGB shift of the BiSeNet skin region between '
+                             'source and edited face, for --color_shift_attrs samples. '
+                             'A visual audit (scripts/dump_attr_failures.py, attr 39 direction '
+                             'rm) found the model satisfies the aging edit largely via a '
+                             'uniform red/orange skin-tone shift rather than genuine structural '
+                             'aging (wrinkles, gray hair) -- confirmed across every fix tried so '
+                             'far (direction changes, scale changes, directional CLIP loss all '
+                             'left the color-cast unchanged). Unlike those, this acts directly '
+                             'on the generated image pixels: it does not touch the direction '
+                             'vector or edit magnitude, it makes the color-shift shortcut itself '
+                             'costly, so satisfying the attribute loss has to come from '
+                             'elsewhere. Genuine structural aging is a texture/geometry change, '
+                             'not a uniform tone shift, so it is barely affected. 0 disables '
+                             '(default). Suggested when enabling: 0.5-2.0.')
+    parser.add_argument('--color_shift_attrs', nargs='*', type=int, default=[39],
+                        help='Attribute indices the color-shift regularizer applies to. '
+                             'Default is age (39) only, since that is the attribute the visual '
+                             'audit found relying on the color-shift shortcut.')
 
     # ── Cross-attribute loss balancing ──────────────────────────────────────
     parser.add_argument('--balance_attr_losses', action=argparse.BooleanOptionalAction, default=False,
@@ -747,13 +770,33 @@ if __name__ == '__main__':
     parser.add_argument('--clip_prompt_weight', type=float, default=0.03,
                         help='Weight for CLIP prompt loss. Suggested range: 0.02–0.05.')
     parser.add_argument('--clip_prompt_temperature', type=float, default=1.0,
-                        help='Temperature for softplus sharpness in CLIP loss.')
+                        help='Temperature for softplus sharpness in CLIP loss (absolute mode only).')
+    parser.add_argument('--clip_prompt_mode', default='absolute', choices=['absolute', 'directional'],
+                        help="'absolute' (default) pulls the edited image toward the target "
+                             "prompt regardless of the source. A visual audit (attr 39, "
+                             "direction rm) found this lets the model reach a high CLIP "
+                             "'looks old' score via a red/orange color shift instead of real "
+                             "structural aging -- a shortcut, not the intended edit. "
+                             "'directional' (StyleGAN-NADA style) instead rewards moving the "
+                             "image, from ITS OWN source, along the same CLIP-space axis that "
+                             "separates the pos/neg prompts -- closing off shortcuts that shift "
+                             "every image the same way regardless of content. Costs one extra "
+                             "CLIP image encode per step (source image).")
     parser.add_argument('--clip_prompt_interval', type=int, default=1,
                         help='Compute CLIP loss every N steps (1 = every step).')
     parser.add_argument('--clip_prompt_age_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for age (attr 39) in CLIP loss.')
     parser.add_argument('--clip_prompt_gender_weight', type=float, default=1.0,
                         help='Per-sample weight multiplier for gender (attr 20) in CLIP loss.')
+    parser.add_argument('--clip_prompt_glasses_weight', type=float, default=1.0,
+                        help='Per-sample weight multiplier for eyeglasses (attr 15) in CLIP '
+                             'loss. Eyeglasses-add is the biggest independent-judge gap (r34 '
+                             'teacher ~91%% but CLIP judge ~44%%, i.e. teacher-fooling) AND '
+                             'the attribute that historically got the LEAST semantic help '
+                             '(age has a 3x CLIP weight and its own diffusion guidance; '
+                             'glasses had neither). Try 3.0-5.0 to force real, CLIP-visible '
+                             'glasses instead of a decision-boundary trick the frozen r34 '
+                             'classifier alone rewards.')
 
     # ── EMA (exponential moving average) of trainable weights ──────────────
     parser.add_argument('--use_ema', action=argparse.BooleanOptionalAction, default=True,
@@ -1072,16 +1115,20 @@ if __name__ == '__main__':
     print('** Frozen attribute teacher initialization success !')
 
     face_parser = None
-    if args.local_region_loss_weight > 0:
+    if args.local_region_loss_weight > 0 or args.color_shift_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-            local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
-            print(f'** Face-parser locality loss enabled (weight='
-                  f'{args.local_region_loss_weight}) for local attrs {local_attrs}')
+            if args.local_region_loss_weight > 0:
+                local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
+                print(f'** Face-parser locality loss enabled (weight='
+                      f'{args.local_region_loss_weight}) for local attrs {local_attrs}')
+            if args.color_shift_loss_weight > 0:
+                print(f'** Color-shift regularizer enabled (weight='
+                      f'{args.color_shift_loss_weight}) for attrs {args.color_shift_attrs}')
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
-            print(f'[WARN] Face parser unavailable ({exc}); locality loss disabled.')
+            print(f'[WARN] Face parser unavailable ({exc}); locality/color-shift loss disabled.')
 
     diffusion_guidance = None
     if args.use_diffusion_guidance:
@@ -1104,6 +1151,7 @@ if __name__ == '__main__':
         clip_prompt_loss_fn = FrozenCLIPPromptLoss(
             clip_model=args.clip_prompt_model,
             temperature=args.clip_prompt_temperature,
+            mode=args.clip_prompt_mode,
         ).cuda().eval()
         for p in clip_prompt_loss_fn.parameters():
             p.requires_grad_(False)
@@ -1223,40 +1271,71 @@ if __name__ == '__main__':
             #     (--local_region_add_blur) as a geometric prior for where a
             #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            # ── Color-shift regularizer (--color_shift_loss_weight) ──────────
+            # A visual audit (scripts/dump_attr_failures.py, attr 39 direction
+            # rm) found the model satisfies the aging edit largely by shifting
+            # the whole face's skin tone toward red/orange, not by drawing
+            # genuine texture/geometry aging (wrinkles, gray hair) -- and this
+            # was unchanged by every fix tried so far that operates on the
+            # direction vector or edit magnitude (direction swaps, scale
+            # sweeps, residual overrides, directional CLIP loss). This
+            # regularizer instead acts directly on the generated pixels: it
+            # penalizes the change in mean skin-region RGB between source and
+            # edited face, making the color-shift shortcut itself costly so
+            # the attribute loss has to be satisfied some other way. Genuine
+            # aging is a texture/geometry change, not a uniform tone shift,
+            # so it should be largely unaffected by this penalty.
+            color_shift_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
                 _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
                                          device=latent.device)
-                if _is_local.any():
+                _is_color = torch.tensor([a in args.color_shift_attrs for a in _mid_abs],
+                                         device=latent.device)
+                if _is_local.any() or _is_color.any():
                     with torch.no_grad():
                         src_recon = G([latent], input_is_latent=True,
                                       randomize_noise=False)[0].clamp(-1, 1)
                         src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
-                    _is_removal = src_attr_flow > 0.5
-                    _terms = []
-                    for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
-                        _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
-                                                 device=latent.device)
-                        for _dir_sel, _sigma in [
-                            (_attr_sel & _is_removal, 5),
-                            (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
-                        ]:
-                            if not _dir_sel.any():
-                                continue
-                            with torch.no_grad():
-                                region = face_parser.get_region_mask(
-                                    src_recon[_dir_sel],
-                                    LOCAL_REGION_CLASSES[_abs_idx],
-                                    blur_sigma=_sigma,
+
+                    if _is_local.any():
+                        _is_removal = src_attr_flow > 0.5
+                        _terms = []
+                        for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
+                            _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
+                                                     device=latent.device)
+                            for _dir_sel, _sigma in [
+                                (_attr_sel & _is_removal, 5),
+                                (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
+                            ]:
+                                if not _dir_sel.any():
+                                    continue
+                                with torch.no_grad():
+                                    region = face_parser.get_region_mask(
+                                        src_recon[_dir_sel],
+                                        LOCAL_REGION_CLASSES[_abs_idx],
+                                        blur_sigma=_sigma,
+                                    )
+                                outside = (1.0 - region)
+                                diff_sq = (new_face_tensors[_dir_sel] - src_recon[_dir_sel]).pow(2)
+                                _terms.append(
+                                    (diff_sq * outside).sum()
+                                    / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
                                 )
-                            outside = (1.0 - region)
-                            diff_sq = (new_face_tensors[_dir_sel] - src_recon[_dir_sel]).pow(2)
-                            _terms.append(
-                                (diff_sq * outside).sum()
-                                / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
-                            )
-                    if _terms:
-                        local_region_loss = torch.stack(_terms).mean()
+                        if _terms:
+                            local_region_loss = torch.stack(_terms).mean()
+
+                    if _is_color.any():
+                        with torch.no_grad():
+                            skin_mask = face_parser.get_region_mask(
+                                src_recon[_is_color], SKIN_CLASS, blur_sigma=5,
+                            )   # (N, 1, H, W)
+                        _src_c = src_recon[_is_color]
+                        _edit_c = new_face_tensors[_is_color]
+                        _pixel_count = skin_mask.sum(dim=(2, 3)).clamp(min=1e-6)   # (N, 1)
+                        mean_src = (_src_c * skin_mask).sum(dim=(2, 3)) / _pixel_count    # (N, 3)
+                        mean_edit = (_edit_c * skin_mask).sum(dim=(2, 3)) / _pixel_count  # (N, 3)
+                        color_shift_loss = (mean_edit - mean_src).pow(2).sum(dim=1).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -1336,13 +1415,16 @@ if __name__ == '__main__':
                     attr_abs_idx=_clip_abs_idx,
                     target_values=soft_target_for_loss,
                     reduction='none',
+                    src_images=img if args.clip_prompt_mode == 'directional' else None,
                 )   # clip_loss_each: (B,)
                 clip_sample_weight = torch.ones_like(clip_loss_each)
                 clip_sample_weight[_clip_abs_idx == 39] = args.clip_prompt_age_weight
                 clip_sample_weight[_clip_abs_idx == 20] = args.clip_prompt_gender_weight
+                clip_sample_weight[_clip_abs_idx == 15] = args.clip_prompt_glasses_weight
                 clip_semantic_loss = (clip_sample_weight * clip_loss_each).mean()
                 clip_logs['clip_prompt_age_fraction'] = (_clip_abs_idx == 39).float().mean().detach()
                 clip_logs['clip_prompt_gender_fraction'] = (_clip_abs_idx == 20).float().mean().detach()
+                clip_logs['clip_prompt_glasses_fraction'] = (_clip_abs_idx == 15).float().mean().detach()
 
             if lag_dof_losses is None:
                 lag_orth = _zero.clone()
@@ -1432,7 +1514,8 @@ if __name__ == '__main__':
                 args.direction_orth_weight * dir_orth_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
-                args.local_region_loss_weight * local_region_loss
+                args.local_region_loss_weight * local_region_loss +\
+                args.color_shift_loss_weight * color_shift_loss
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -1513,13 +1596,16 @@ if __name__ == '__main__':
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
+                'loss_color_shift':   color_shift_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
+                'clip_directional_cos': clip_logs.get('clip_directional_cos', latent.new_tensor(0.0)),
                 'clip_direction_mean': clip_logs.get('clip_direction_mean', latent.new_tensor(0.0)),
                 'clip_prompt_weight':  torch.tensor(args.clip_prompt_weight),
                 'clip_prompt_age_fraction':    clip_logs.get('clip_prompt_age_fraction',    latent.new_tensor(0.0)),
                 'clip_prompt_gender_fraction': clip_logs.get('clip_prompt_gender_fraction', latent.new_tensor(0.0)),
+                'clip_prompt_glasses_fraction': clip_logs.get('clip_prompt_glasses_fraction', latent.new_tensor(0.0)),
             }
             current_attr_scales = attr_scales.current_scales()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
