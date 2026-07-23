@@ -36,15 +36,37 @@ _warned_unsupported: set = set()
 
 
 class FrozenCLIPPromptLoss(nn.Module):
-    """Frozen CLIP semantic direction loss for attribute editing.
+    """Frozen CLIP semantic loss for attribute editing, with two modes.
 
-    For each edited image and its target attribute, computes:
-        score = cos(clip_img, clip_pos) - cos(clip_img, clip_neg)
+    'absolute' (original): pulls the EDITED image's CLIP embedding toward the
+    positive/negative text prompt, independent of the source image:
+        score = cos(clip_img_edit, clip_pos) - cos(clip_img_edit, clip_neg)
         loss  = softplus(-direction * score / temperature)
+    This only constrains WHERE the edited image ends up in CLIP space. It has
+    no opinion on the PATH taken to get there, so the model is free to reach
+    a high "looks old" score via any correlated shortcut CLIP responds to --
+    e.g. a warm/red color shift -- instead of genuine structural aging. A
+    visual audit (scripts/dump_attr_failures.py, attr 39 direction rm) found
+    exactly this: successful "aging" edits were almost always accompanied by
+    a red/orange color-cast, while edits without the color shift mostly
+    stayed visually young despite the loss pushing on them.
 
-    where direction = +1 if target_value >= 0.5 else -1.
-    All CLIP parameters are frozen; gradients only flow through the image encoder
-    path back to the edited image tensor.
+    'directional' (StyleGAN-NADA style): constrains the DIRECTION of change
+    instead of the destination:
+        img_delta  = clip_img_edit - clip_img_src         (normalized)
+        text_delta = clip_pos - clip_neg                   (normalized)
+        loss = 1 - cos(img_delta, direction * text_delta)
+    This only rewards moving the image along the SAME axis in CLIP space that
+    separates the pos/neg prompts, from THIS image's own starting point. A
+    shortcut like a uniform color shift moves every image by roughly the same
+    delta regardless of its content, which is much less likely to align with
+    the pos/neg text axis than a real structural change specific to that
+    face -- so directional mode is intended to close off the shortcut rather
+    than just reward reaching the destination however possible.
+
+    Cost: directional mode needs a source-image CLIP encode in addition to
+    the edited-image encode (one extra forward through the CLIP image
+    encoder per step).
     """
 
     def __init__(
@@ -52,8 +74,12 @@ class FrozenCLIPPromptLoss(nn.Module):
         clip_model: str = "ViT-B/32",
         image_size: int = 224,
         temperature: float = 1.0,
+        mode: str = "absolute",
     ):
         super().__init__()
+        if mode not in ("absolute", "directional"):
+            raise ValueError(f"Unknown FrozenCLIPPromptLoss mode: {mode}")
+        self.mode = mode
         try:
             import clip as openai_clip
         except ImportError as exc:
@@ -148,41 +174,59 @@ class FrozenCLIPPromptLoss(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
+    def _encode_images(self, images: torch.Tensor) -> torch.Tensor:
+        x = self._preprocess_images(images)
+        feats = self.clip.encode_image(x.to(dtype=self.clip_mean.dtype))
+        return F.normalize(feats.float(), dim=-1)   # (B, D)
+
+    def _text_deltas(self, attr_abs_idx: torch.Tensor, device):
+        """Per-sample (pos, neg) text features gathered by attribute id."""
+        attr_list = attr_abs_idx.detach().cpu().tolist()
+        pos_feats = torch.stack(
+            [self._get_text_feat(int(a), "pos") for a in attr_list], dim=0
+        ).to(device)
+        neg_feats = torch.stack(
+            [self._get_text_feat(int(a), "neg") for a in attr_list], dim=0
+        ).to(device)
+        return pos_feats, neg_feats
+
     def forward(
         self,
         images: torch.Tensor,
         attr_abs_idx: torch.Tensor,
         target_values: torch.Tensor,
         reduction: str = "none",
+        src_images: torch.Tensor = None,
     ):
         """
         Args:
-            images:        (B, 3, H, W)  range [-1, 1]
+            images:        (B, 3, H, W)  range [-1, 1]  -- the EDITED image
             attr_abs_idx:  (B,)  absolute CelebA attribute index
             target_values: (B,)  target attribute probability (detached)
             reduction:     'none' → return (B,) loss tensor
                            'mean' → return scalar
+            src_images:    (B, 3, H, W)  range [-1, 1]  -- the SOURCE image.
+                           REQUIRED when mode == 'directional'; ignored in
+                           'absolute' mode.
 
         Returns:
             loss:  scalar or (B,) tensor depending on reduction
             logs:  dict of scalar metrics
         """
+        if self.mode == "directional":
+            if src_images is None:
+                raise ValueError(
+                    "FrozenCLIPPromptLoss(mode='directional') requires src_images."
+                )
+            return self._forward_directional(images, src_images, attr_abs_idx,
+                                              target_values, reduction)
+        return self._forward_absolute(images, attr_abs_idx, target_values, reduction)
+
+    def _forward_absolute(self, images, attr_abs_idx, target_values, reduction):
         B = images.shape[0]
-        device = images.device
 
-        # ── Image features ────────────────────────────────────────────
-        x = self._preprocess_images(images)
-        img_feats = self.clip.encode_image(x.to(dtype=self.clip_mean.dtype))
-        img_feats = F.normalize(img_feats.float(), dim=-1)   # (B, D)
-
-        # ── Gather text features per sample ───────────────────────────
-        attr_list = attr_abs_idx.detach().cpu().tolist()
-        pos_feats = torch.stack(
-            [self._get_text_feat(int(a), "pos") for a in attr_list], dim=0
-        )   # (B, D)
-        neg_feats = torch.stack(
-            [self._get_text_feat(int(a), "neg") for a in attr_list], dim=0
-        )   # (B, D)
+        img_feats = self._encode_images(images)
+        pos_feats, neg_feats = self._text_deltas(attr_abs_idx, images.device)
 
         # ── Scores ────────────────────────────────────────────────────
         score_pos = (img_feats * pos_feats).sum(dim=-1)   # (B,)
@@ -196,11 +240,7 @@ class FrozenCLIPPromptLoss(nn.Module):
             -images.new_ones(B),
         )
         loss_each = F.softplus(-direction * score / self.temperature)   # (B,)
-
-        if reduction == "mean":
-            loss = loss_each.mean()
-        else:
-            loss = loss_each
+        loss = loss_each.mean() if reduction == "mean" else loss_each
 
         logs = {
             "clip_target_loss":    loss_each.mean().detach(),
@@ -208,5 +248,35 @@ class FrozenCLIPPromptLoss(nn.Module):
             "clip_score_pos_mean": score_pos.mean().detach(),
             "clip_score_neg_mean": score_neg.mean().detach(),
             "clip_direction_mean": direction.mean().detach(),
+        }
+        return loss, logs
+
+    def _forward_directional(self, images, src_images, attr_abs_idx, target_values, reduction):
+        B = images.shape[0]
+
+        # ── Image-space delta: where did the edit actually move the image ──
+        feat_edit = self._encode_images(images)
+        feat_src = self._encode_images(src_images)
+        img_delta = F.normalize(feat_edit - feat_src, dim=-1, eps=1e-6)   # (B, D)
+
+        # ── Text-space delta: where SHOULD it move, for this attribute ─────
+        pos_feats, neg_feats = self._text_deltas(attr_abs_idx, images.device)
+        text_delta = F.normalize(pos_feats - neg_feats, dim=-1, eps=1e-6)  # (B, D)
+
+        direction = torch.where(
+            target_values.float() >= 0.5,
+            images.new_ones(B),
+            -images.new_ones(B),
+        )
+        target_delta = direction.unsqueeze(-1) * text_delta   # (B, D)
+
+        cos_sim = (img_delta * target_delta).sum(dim=-1)      # (B,) in [-1, 1]
+        loss_each = 1.0 - cos_sim                              # (B,) in [0, 2]
+        loss = loss_each.mean() if reduction == "mean" else loss_each
+
+        logs = {
+            "clip_target_loss":     loss_each.mean().detach(),
+            "clip_directional_cos": cos_sim.mean().detach(),
+            "clip_direction_mean":  direction.mean().detach(),
         }
         return loss, logs
