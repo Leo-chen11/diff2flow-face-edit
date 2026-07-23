@@ -123,6 +123,56 @@ class CLIPAttributeJudge(nn.Module):
         return torch.softmax(logits, dim=-1)[:, :, 0]
 
 
+class GlassesParserJudge(nn.Module):
+    """Purpose-built eyeglasses detector using the BiSeNet face parser's
+    dedicated glasses class (label 6), to REPLACE CLIP zero-shot scoring for
+    eyeglasses.
+
+    WHY: a visual audit (scripts/dump_glasses_failures.py) showed the CLIP
+    zero-shot judge scores genuine THIN / rimless eyeglasses around 0.4 --
+    just under a 0.5 threshold -- so ~44% of glasses-add edits that VISIBLY
+    had glasses were counted as failures. CLIP zero-shot is weak on thin,
+    high-frequency structures like eyeglass frames. BiSeNet has a dedicated
+    'eyeglasses' segmentation class and detects the frames at the pixel level,
+    which matches the eye far better than a text-prompt similarity. The
+    presence score is a smooth function of the glasses-pixel AREA fraction,
+    crossing 0.5 at --glasses_area_thresh, so it plugs into the same
+    strict_success / add-rm-split machinery as every other judge.
+
+    INDEPENDENCE: BiSeNet segmentation is a different model and task from both
+    the r34 attribute teacher and the facenet/ArcFace id judge, so it is an
+    independent glasses judge -- UNLESS the run trained with
+    --local_region_loss_weight > 0 (which uses this same parser). v16 trained
+    with it at 0, so it is independent there; note the caveat for runs that
+    used the locality loss.
+
+    CALIBRATION: after changing --glasses_area_thresh, re-run the dumper to
+    confirm the new successes really have glasses and the new failures really
+    do not. This is calibration grounded in the image audit, not number
+    inflation.
+    """
+    GLASSES_CLASS = 6
+
+    def __init__(self, weights_path, device='cuda', area_thresh=0.0010, sharpness=0.5):
+        super().__init__()
+        from common.face_parser import FaceParser
+        self.parser = FaceParser(weights_path=weights_path).to(device).eval()
+        for p in self.parser.parameters():
+            p.requires_grad_(False)
+        self.area_thresh = float(area_thresh)
+        self.sharpness = float(sharpness)
+
+    @torch.no_grad()
+    def glasses_prob(self, images):
+        """images: [-1,1] (B,3,H,W) -> (B,) probability eyeglasses are present."""
+        inp = F.interpolate(images, 512, mode='bilinear', align_corners=False)
+        inp = (inp * 0.5 + 0.5 - self.parser.mean) / self.parser.std
+        seg = self.parser.net(inp).argmax(dim=1)                     # (B,512,512)
+        frac = (seg == self.GLASSES_CLASS).float().mean(dim=(1, 2))  # (B,) area fraction
+        denom = self.sharpness * self.area_thresh + 1e-8
+        return torch.sigmoid((frac - self.area_thresh) / denom)      # 0.5 at frac==thresh
+
+
 class IndependentIDJudge(nn.Module):
     """FaceNet (InceptionResnetV1) identity embedder.
 
@@ -165,7 +215,8 @@ class IndependentIDJudge(nn.Module):
 def build_optional_judges(args, attribute_index, id_criterion):
     """Instantiate independent judges; degrade gracefully with clear warnings."""
     device = 'cuda'
-    clip_judge, indep_id, lpips_fn, indep_teacher = None, None, None, None
+    clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser = \
+        None, None, None, None, None
 
     try:
         clip_judge = CLIPAttributeJudge(attribute_index, args.clip_judge_model, device)
@@ -216,7 +267,23 @@ def build_optional_judges(args, attribute_index, id_criterion):
             p.requires_grad_(False)
         print(f'[Judge] Independent classifier: {args.independent_attr_weights}')
 
-    return clip_judge, indep_id, lpips_fn, indep_teacher
+    if getattr(args, 'glasses_judge', 'clip') == 'parser' \
+            and 15 in [int(i) for i in attribute_index]:
+        try:
+            glasses_parser = GlassesParserJudge(
+                args.face_parser_weights, device,
+                area_thresh=args.glasses_area_thresh,
+                sharpness=args.glasses_area_sharpness,
+            )
+            print(f'[Judge] Eyeglasses scored by BiSeNet parser (class 6, '
+                  f'area_thresh={args.glasses_area_thresh}) -- REPLACES CLIP for '
+                  f'glasses only. CLIP zero-shot under-detects thin frames; the '
+                  f'AccCLIP glasses cell is now parser-scored (label it as such).')
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --glasses_judge parser requested but face parser '
+                  f'unavailable ({exc}); falling back to CLIP for glasses.')
+
+    return clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser
 
 
 def build_fid(args):
@@ -383,12 +450,37 @@ def load_models(args):
             ),
         ).to(device).eval()
         if os.path.exists(db_ckpt_path):
+            # The frozen direction_units are a registered buffer, so they live
+            # in this checkpoint too. Snapshot the geometry that was just built
+            # from --direction_bank_path BEFORE the checkpoint load, so we can
+            # optionally restore it afterwards -- otherwise load_state_dict
+            # silently overwrites a spliced/new bank's directions with the ones
+            # frozen at training time, and pointing --direction_bank_path at a
+            # new file would have no effect at all.
+            _bank_dirs = None
+            if args.force_bank_directions:
+                _bank_dirs = direction_bank.direction_units.detach().clone()
             result = direction_bank.load_state_dict(load_network(db_ckpt_path), strict=False)
             if result.missing_keys:
                 print(f'[WARN] Direction bank missing keys: {result.missing_keys[:8]}')
             if result.unexpected_keys:
                 print(f'[WARN] Direction bank unexpected keys: {result.unexpected_keys[:8]}')
             print(f'Loading bank   ← {db_ckpt_path}')
+            if _bank_dirs is not None:
+                if _bank_dirs.shape != direction_bank.direction_units.shape:
+                    raise ValueError(
+                        f'--force_bank_directions: bank file directions '
+                        f'{tuple(_bank_dirs.shape)} do not match the model '
+                        f'{tuple(direction_bank.direction_units.shape)}.'
+                    )
+                with torch.no_grad():
+                    direction_bank.direction_units.copy_(_bank_dirs)
+                print(f'[ForceBank] re-injected direction_units from '
+                      f'{bank_path}, overriding the frozen directions saved in '
+                      f'the checkpoint. (Only the direction GEOMETRY is swapped; '
+                      f'the trained magnitude_net/gate_net/residual_scale are '
+                      f'kept, so use a bank spliced with --keep_original_norms to '
+                      f'stay calibrated.)')
         else:
             print(f'Direction bank init (no trained weights at {db_ckpt_path})')
 
@@ -547,8 +639,9 @@ def evaluate(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank = load_models(args)
 
-    clip_judge, indep_id, lpips_fn, indep_teacher = \
+    clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser = \
         build_optional_judges(args, args.attribute_index, id_criterion)
+    _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
 
     if args.bypass_glasses_direction_bank:
         print('[WARN] --bypass_glasses_direction_bank is ON: Eyeglasses is evaluated '
@@ -623,6 +716,8 @@ def evaluate(args):
             src_id_arc = F.normalize(id_criterion.extract_features(src_face_256), dim=1)
             src_probs_teacher = torch.sigmoid(attr_teacher(src_face_256)[0])[:, attribute_index]
             src_probs_clip = clip_judge.scores(src_face_256) if clip_judge is not None else None
+            if glasses_parser is not None and src_probs_clip is not None and _glasses_local is not None:
+                src_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(src_face_256)
             src_probs_indep = torch.sigmoid(indep_teacher(src_face_256)[0])[:, attribute_index] \
                 if indep_teacher is not None else None
             src_id_indep = indep_id.extract(src_face_256) if indep_id is not None else None
@@ -656,6 +751,8 @@ def evaluate(args):
                 edit_id_arc = F.normalize(id_criterion.extract_features(edited_256), dim=1)
                 edit_probs_teacher = torch.sigmoid(attr_teacher(edited_256)[0])[:, attribute_index]
                 edit_probs_clip = clip_judge.scores(edited_256) if clip_judge is not None else None
+                if glasses_parser is not None and edit_probs_clip is not None and _glasses_local is not None:
+                    edit_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(edited_256)
                 edit_probs_indep = torch.sigmoid(indep_teacher(edited_256)[0])[:, attribute_index] \
                     if indep_teacher is not None else None
                 edit_id_indep = indep_id.extract(edited_256) if indep_id is not None else None
@@ -837,6 +934,14 @@ if __name__ == '__main__':
     parser.add_argument('--stygan2_weights', default='./data/stylegan2-ffhq-config-f.pt')
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth')
     parser.add_argument('--direction_bank_path', default=None)
+    parser.add_argument('--force_bank_directions', action='store_true',
+                        help='Re-inject the direction geometry from --direction_bank_path '
+                             'AFTER the checkpoint load, overriding the frozen direction_units '
+                             'saved in the checkpoint. Without this, swapping --direction_bank_path '
+                             'to a new/spliced bank has NO effect at eval time, because '
+                             'direction_units is a registered buffer restored from the checkpoint. '
+                             'Use with a bank spliced via --keep_original_norms so the trained '
+                             'magnitude_net stays calibrated. Diagnostic only.')
 
     # Model config (must match training)
     parser.add_argument('--img_size',         type=int,   default=512)
@@ -877,6 +982,24 @@ if __name__ == '__main__':
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
+    parser.add_argument('--glasses_judge', default='clip', choices=['clip', 'parser'],
+                        help="How to score EYEGLASSES (attr 15). 'clip' = CLIP zero-shot "
+                             "(under-detects thin frames; a visual audit showed ~44%% of "
+                             "glasses-add edits that visibly had glasses were scored as "
+                             "failures). 'parser' = BiSeNet face-parser glasses class (label "
+                             "6), a purpose-built pixel-level detector that matches the eye "
+                             "far better -- REPLACES CLIP for the glasses cell only; gender/age "
+                             "still use CLIP. Recommended: parser. Re-run the dumper to "
+                             "visually confirm calibration after switching.")
+    parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
+                        help='BiSeNet weights for --glasses_judge parser.')
+    parser.add_argument('--glasses_area_thresh', type=float, default=0.0010,
+                        help='Glasses-pixel area fraction at which the parser judge outputs '
+                             '0.5 (present/absent boundary). Lower = more sensitive to thin '
+                             'frames. Calibrate against the dumper.')
+    parser.add_argument('--glasses_area_sharpness', type=float, default=0.5,
+                        help='Relative width of the parser presence sigmoid; smaller = sharper '
+                             '(more binary) present/absent decision.')
     parser.add_argument('--id_indep_pretrained', default='casia-webface',
                         choices=['casia-webface', 'vggface2'],
                         help='Pretrained weights for the facenet-pytorch id_indep judge. '
