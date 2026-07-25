@@ -797,6 +797,17 @@ if __name__ == '__main__':
                              'glasses had neither). Try 3.0-5.0 to force real, CLIP-visible '
                              'glasses instead of a decision-boundary trick the frozen r34 '
                              'classifier alone rewards.')
+    parser.add_argument('--balance_clip_prompt_loss', action=argparse.BooleanOptionalAction, default=False,
+                        help='Replace the fixed --clip_prompt_{age,gender,glasses}_weight constants '
+                             'with a CrossAttributeLossBalancer tracking CLIP loss progress per '
+                             'attribute, instead of hand-tuning weights after each eval. IMPORTANT: '
+                             'this tracks the CLIP loss itself, not changed_loss/--balance_attr_losses '
+                             '(that one watches the r34 teacher, which already reads eyeglasses as '
+                             "~91% -- it would never flag eyeglasses as lagging, since teacher-fooling "
+                             "is exactly a gap between teacher and CLIP judgment). A separate balancer "
+                             'keyed to CLIP loss is required to auto-detect that gap and correct it. '
+                             'Uses the same --balance_ema_decay/--balance_adapt_rate/--balance_min_weight/'
+                             '--balance_max_weight hyperparameters as --balance_attr_losses.')
 
     # ── EMA (exponential moving average) of trainable weights ──────────────
     parser.add_argument('--use_ema', action=argparse.BooleanOptionalAction, default=True,
@@ -949,6 +960,19 @@ if __name__ == '__main__':
             device='cuda',
         )
         print(f'** Cross-attribute loss balancing enabled for attrs {args.attribute_index}')
+
+    clip_loss_balancer = None
+    if args.balance_clip_prompt_loss:
+        clip_loss_balancer = CrossAttributeLossBalancer(
+            len(args.attribute_index),
+            ema_decay=args.balance_ema_decay,
+            adapt_rate=args.balance_adapt_rate,
+            min_weight=args.balance_min_weight,
+            max_weight=args.balance_max_weight,
+            device='cuda',
+        )
+        print(f'** CLIP-prompt-loss auto-balancing enabled for attrs {args.attribute_index} '
+              f'(overrides --clip_prompt_{{age,gender,glasses}}_weight)')
     trainable_params = list(prior.parameters()) + list(conditioner.parameters())
     if args.velocity_field == 'original':
         trainable_params += list(layer_mask.parameters())
@@ -1417,10 +1441,18 @@ if __name__ == '__main__':
                     reduction='none',
                     src_images=img if args.clip_prompt_mode == 'directional' else None,
                 )   # clip_loss_each: (B,)
-                clip_sample_weight = torch.ones_like(clip_loss_each)
-                clip_sample_weight[_clip_abs_idx == 39] = args.clip_prompt_age_weight
-                clip_sample_weight[_clip_abs_idx == 20] = args.clip_prompt_gender_weight
-                clip_sample_weight[_clip_abs_idx == 15] = args.clip_prompt_glasses_weight
+                if clip_loss_balancer is not None:
+                    # Auto-balanced: tracks THIS loss's own per-attribute progress
+                    # (not changed_loss/r34, which would miss teacher-fooling gaps
+                    # like eyeglasses reading ~91% to the teacher but far lower to
+                    # CLIP -- see --balance_clip_prompt_loss help).
+                    clip_loss_balancer.update(mid_idx.detach(), clip_loss_each.detach())
+                    clip_sample_weight = clip_loss_balancer.weights_for(mid_idx).detach()
+                else:
+                    clip_sample_weight = torch.ones_like(clip_loss_each)
+                    clip_sample_weight[_clip_abs_idx == 39] = args.clip_prompt_age_weight
+                    clip_sample_weight[_clip_abs_idx == 20] = args.clip_prompt_gender_weight
+                    clip_sample_weight[_clip_abs_idx == 15] = args.clip_prompt_glasses_weight
                 clip_semantic_loss = (clip_sample_weight * clip_loss_each).mean()
                 clip_logs['clip_prompt_age_fraction'] = (_clip_abs_idx == 39).float().mean().detach()
                 clip_logs['clip_prompt_gender_fraction'] = (_clip_abs_idx == 20).float().mean().detach()
@@ -1623,6 +1655,10 @@ if __name__ == '__main__':
                 for _i, _attr_abs_idx in enumerate(args.attribute_index):
                     _log_dict[f'balance_weight/attr_{_attr_abs_idx}'] = loss_balancer.weights[_i]
                     _log_dict[f'balance_ema_loss/attr_{_attr_abs_idx}'] = loss_balancer.ema_loss[_i]
+            if clip_loss_balancer is not None:
+                for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                    _log_dict[f'clip_balance_weight/attr_{_attr_abs_idx}'] = clip_loss_balancer.weights[_i]
+                    _log_dict[f'clip_balance_ema_loss/attr_{_attr_abs_idx}'] = clip_loss_balancer.ema_loss[_i]
             for _k, _v in diffusion_logs.items():
                 _log_dict[_k] = _v
             logger.msg(_log_dict, n_iter)
