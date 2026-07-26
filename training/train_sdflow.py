@@ -760,7 +760,24 @@ if __name__ == '__main__':
     parser.add_argument('--age_diffusion_timestep_max', type=int, default=900,
                         help='Max timestep for age-specific DDS pass.')
     parser.add_argument('--age_diffusion_interval', type=int, default=16,
-                        help='Run age DDS guidance every N steps (independent of --diffusion_guidance_interval).')
+                        help='Run age DDS guidance every N steps (independent of --diffusion_guidance_interval). '
+                             'NOTE: default 16 is LESS frequent than non-age (8), i.e. the hardest '
+                             'attribute currently gets the least diffusion supervision. Lower it '
+                             '(e.g. 4-8) to give aging more of the diffusion teacher.')
+    parser.add_argument('--age_diffusion_weight', type=float, default=-1.0,
+                        help='Separate loss weight for the AGE DDS pass. <0 (default) falls back to '
+                             'the shared --diffusion_guidance_weight (0.01), i.e. age currently gets '
+                             'the same tiny weight as glasses/gender. Set higher (e.g. 0.05-0.2) to '
+                             'give the diffusion teacher real pull on aging without touching the '
+                             'other attributes.')
+    parser.add_argument('--age_dds_fine_layer_start', type=int, default=-1,
+                        help='Fine-layer cutoff for the AGE DDS pass specifically. <0 (default) reuses '
+                             '--dds_fine_layer_start (7), which blocks DDS gradients from the fine W+ '
+                             'layers (7-17) -- exactly the layers that carry wrinkles / skin texture / '
+                             'gray hair, so the diffusion teacher currently CANNOT teach real aging '
+                             'texture and the model falls back on the coarse/global color-shift '
+                             'shortcut. Set to 18 to let age DDS reach all layers (teach true aging '
+                             'texture), or a higher value like 12-14 for a middle ground.')
 
     # ── Frozen CLIP semantic target loss ───────────────────────────────
     parser.add_argument('--use_clip_prompt_loss', action='store_true',
@@ -1476,7 +1493,8 @@ if __name__ == '__main__':
                 dir_orth_loss = _zero.clone()
                 dir_logs = {}
 
-            diffusion_loss = _zero.clone()
+            diffusion_loss = _zero.clone()       # non-age DDS (glasses/gender)
+            age_diffusion_loss = _zero.clone()   # age DDS, separately weighted
             diffusion_logs = {}
             if diffusion_guidance is not None and args.diffusion_guidance_weight > 0:
                 mid_abs_idx = torch.tensor(
@@ -1497,42 +1515,52 @@ if __name__ == '__main__':
                     and n_iter % args.age_diffusion_interval == 0
                 )
 
-                # Fine-layer masking: DDS gradients only flow through coarse/mid W+ layers.
-                # A separate G forward with detached fine layers avoids contaminating
-                # id/reg gradients that legitimately need fine layer information.
-                if (non_age_fires or age_fires) and args.dds_fine_layer_start > 0:
-                    _nl_dds = torch.cat([
-                        new_latents[:, :args.dds_fine_layer_start, :],
-                        new_latents[:, args.dds_fine_layer_start:, :].detach(),
-                    ], dim=1)
-                    _ft_dds = G([_nl_dds], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-                    new_face_for_dds = F.interpolate(_ft_dds, (args.img_size, args.img_size))
-                else:
-                    new_face_for_dds = new_face_tensors
+                # Fine-layer masking: DDS gradients only flow through W+ layers below
+                # the cutoff; layers at/above it are detached. A separate G forward
+                # avoids contaminating id/reg gradients that need fine layer info.
+                # Age can use a DIFFERENT cutoff (--age_dds_fine_layer_start) so the
+                # diffusion teacher can reach the fine layers that carry wrinkle/skin
+                # texture, which the default cutoff (7) blocks -- see arg help.
+                def _dds_face(fine_start):
+                    if fine_start > 0 and fine_start < new_latents.size(1):
+                        _nl = torch.cat([
+                            new_latents[:, :fine_start, :],
+                            new_latents[:, fine_start:, :].detach(),
+                        ], dim=1)
+                        _ft = G([_nl], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                        return F.interpolate(_ft, (args.img_size, args.img_size))
+                    return new_face_tensors
 
-                # Non-age samples (glasses, gender): standard interval and timestep range
+                # Non-age samples (glasses, gender): standard cutoff and timestep range
                 non_age_mask = ~is_age
                 if non_age_fires:
+                    _face_non_age = _dds_face(args.dds_fine_layer_start)
                     _loss, _logs = diffusion_guidance(
                         src_images=img[non_age_mask],
-                        edit_images=new_face_for_dds[non_age_mask],
+                        edit_images=_face_non_age[non_age_mask],
                         attr_abs_idx=mid_abs_idx[non_age_mask],
                         target_values=soft_target[non_age_mask].detach(),
                     )
                     diffusion_loss = diffusion_loss + _loss
                     diffusion_logs.update(_logs)
 
-                # Age samples: coarse timestep range [400, 900], longer interval
+                # Age samples: coarse timestep range, own interval, own fine-layer
+                # cutoff (may reach fine layers), accumulated into age_diffusion_loss
+                # so it can carry its own --age_diffusion_weight.
                 if age_fires:
+                    _age_fine_start = (args.age_dds_fine_layer_start
+                                       if args.age_dds_fine_layer_start >= 0
+                                       else args.dds_fine_layer_start)
+                    _face_age = _dds_face(_age_fine_start)
                     _loss, _logs = diffusion_guidance(
                         src_images=img[is_age],
-                        edit_images=new_face_for_dds[is_age],
+                        edit_images=_face_age[is_age],
                         attr_abs_idx=mid_abs_idx[is_age],
                         target_values=soft_target[is_age].detach(),
                         timestep_min=args.age_diffusion_timestep_min,
                         timestep_max=args.age_diffusion_timestep_max,
                     )
-                    diffusion_loss = diffusion_loss + _loss
+                    age_diffusion_loss = age_diffusion_loss + _loss
                     diffusion_logs.update({f'age_{k}': v for k, v in _logs.items()})
 
             loss = args.kd_loss_weight * kd_loss +\
@@ -1545,6 +1573,8 @@ if __name__ == '__main__':
                 args.gate_sparse_weight * lag_gate_sparse +\
                 args.direction_orth_weight * dir_orth_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
+                (args.age_diffusion_weight if args.age_diffusion_weight >= 0
+                 else args.diffusion_guidance_weight) * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
                 args.color_shift_loss_weight * color_shift_loss
@@ -1626,6 +1656,7 @@ if __name__ == '__main__':
                 'dir_bank_global_delta_max_norm': dir_logs.get('dir_bank_global_delta_max_norm', _zero.detach().clone()),
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
                 'loss_diffusion_dds': diffusion_loss,
+                'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
                 'loss_color_shift':   color_shift_loss,
