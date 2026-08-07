@@ -9,6 +9,10 @@ _ATTR_PROMPTS = {
         "a face wearing eyeglasses",
         "a face without eyeglasses",
     ),
+    24: (
+        "a clean-shaven face with no beard",
+        "a face with a full beard",
+    ),
     20: (
         "a face of a male person",
         "a face of a female person",
