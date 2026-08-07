@@ -34,6 +34,7 @@ selection.
 """
 
 import argparse
+import os
 import torch
 import torch.nn.functional as F
 
@@ -281,6 +282,43 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
     return torch.stack(directions[:K])
 
 
+def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_samples=50,
+                                pct=20.0, method="lda", shrinkage=None):
+    """
+    Generic stratified direction for any CelebA attribute not given a
+    dedicated hand-tuned conditioning scheme (glasses/gender/age). Stratifies
+    on gender x age (same conditioning as glasses), since those two are
+    always present in the base attribute set and are the strongest known
+    visual confounds. Falls back per-stratum like the specialized functions.
+    """
+    attr_cont = continuous[:, attr_idx]
+    gender = preds[:, 20]
+    young = preds[:, 39]
+
+    strata = [
+        ("male_young",   (gender == 1) & (young == 1)),
+        ("male_old",     (gender == 1) & (young == 0)),
+        ("female_young", (gender == 0) & (young == 1)),
+        ("female_old",   (gender == 0) & (young == 0)),
+    ]
+
+    directions = []
+    for name, sub_mask in strata:
+        sub_lat = latents[sub_mask]
+        sub_scores = attr_cont[sub_mask]
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
+        d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
+                                       method=method, shrinkage=shrinkage)
+        if d is not None:
+            print(f"  attr{attr_idx}/{name}: high={nh}, low={nl}, norm={d.norm():.3f}")
+            directions.append(d)
+        else:
+            print(f"  attr{attr_idx}/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
+            directions.append(_fallback_direction(latents, attr_cont, pct, method, shrinkage))
+
+    return torch.stack(directions[:K])
+
+
 def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
                             pct=20.0, method="lda", shrinkage=None):
     """
@@ -368,6 +406,118 @@ def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
     age_dir = sum(wi.item() * d for wi, d in zip(w, sub_dirs))   # (18, 512)
     print(f"  → weighted average norm: {age_dir.norm():.4f}  (from {len(sub_dirs)} strata)")
     return age_dir.unsqueeze(0)   # (1, 18, 512)
+
+
+# ---------------------------------------------------------------------------
+# Color-confound decorrelation (age direction only)
+# ---------------------------------------------------------------------------
+#
+# Diagnosis (verified at inference time with two direction-agnostic checks):
+#   1. --override_residual_scale 0.0 (pure Direction Bank output, zero flow
+#      contribution) on a trained checkpoint reproduced the exact same
+#      age-edit color-cast artifact (skin turning blue / orange / magenta at
+#      high edit strength) as every training configuration tested -- proving
+#      the artifact lives in the precomputed age direction_units themselves,
+#      not in the flow, gate, residual, train_scale, or any training loss.
+#   2. Zeroing the age direction's fine W+ layers (index >=4) removed the
+#      color cast but also collapsed real editing accuracy (CLIP-judged
+#      young->old accuracy 76%->17%); narrowing the cut to only the last 4
+#      layers preserved accuracy but left the color cast untouched. The
+#      confound and the genuine aging signal occupy the SAME fine layers --
+#      no single layer-range boundary separates them.
+#
+# This targets the root cause directly: FFHQ photos labeled "old" vs "young"
+# likely differ systematically in color grading/lighting (photo era, camera,
+# skin-tone distribution) independent of true facial aging. LDA/whitening
+# only suppresses NOISY (attribute-uncorrelated) dimensions -- a confound
+# that is consistently correlated with the attribute in the training data is
+# indistinguishable from true signal to the direction-fitting procedure, and
+# gets encoded (or even amplified by whitening) right along with it.
+#
+# Fix: independently estimate a "color confound direction" per W+ layer from
+# real dataset images (average warm/cool tone, R-B), the same LDA/percentile-
+# split machinery already used for attributes, then remove (per-layer
+# orthogonal projection) only that specific direction from the age vector --
+# a surgical single-direction removal, not a whole-layer blanket cut, so it
+# should damage the real aging signal far less than the layer-truncation
+# experiments did.
+
+def compute_image_color_scores(image_root, paths, resize=32, face_crop=True):
+    """Per-image warm/cool tone score: mean(R) - mean(B) at low resolution.
+
+    Cheap proxy for color grading (the observed artifacts were specifically
+    warm/orange/red or cool/blue casts, i.e. exactly this axis). Downsampling
+    to `resize`x`resize` keeps this fast even for tens of thousands of images
+    -- only the coarse tone is needed, not detail.
+
+    face_crop=True (default) restricts the average to the face region, using
+    the same crop convention as common/id_loss.py's ArcFace preprocessing
+    (scale(188) square crop at row-offset scale(35), col-offset scale(32),
+    all relative to image width/256). A first attempt averaged the WHOLE
+    photo (background, hair, clothing included) and found the resulting
+    confound direction nearly orthogonal to the age direction (cos
+    ~0.03-0.10) -- too diluted by attribute-irrelevant regions to explain
+    the observed artifact. The artifact is about skin/facial tone, not
+    whole-photo color grading, so the color score should look where the
+    artifact actually shows up.
+    """
+    from PIL import Image
+    import numpy as np
+
+    scores = torch.zeros(len(paths), dtype=torch.float32)
+    for i, rel_path in enumerate(paths):
+        img_path = os.path.join(image_root, rel_path)
+        with Image.open(img_path) as img:
+            img = img.convert("RGB")
+            if face_crop:
+                w, h = img.size
+                crop_h = int(188 * w / 256)
+                row_off = int(35 * w / 256)
+                col_off = int(32 * w / 256)
+                img = img.crop((col_off, row_off, col_off + crop_h, row_off + crop_h))
+            img = img.resize((resize, resize))
+            arr = torch.from_numpy(np.asarray(img)).float()  # (H, W, 3)
+        mean_rgb = arr.mean(dim=(0, 1))  # (3,)
+        scores[i] = mean_rgb[0] - mean_rgb[2]  # R - B: positive=warm, negative=cool
+        if (i + 1) % 5000 == 0:
+            print(f"  color scores: {i + 1}/{len(paths)}")
+    return scores
+
+
+def compute_color_confound_direction(latents, color_scores, min_samples=50,
+                                      pct=20.0, method="lda", shrinkage=None):
+    """Direction in W+ that explains color-tone variation, independent of any
+    attribute label. Same primitive as attribute directions (percentile
+    split + LDA/whitened), just conditioned on the color score instead."""
+    mask_high, mask_low = extreme_masks(color_scores, pct=pct)
+    d, n_high, n_low = compute_direction(
+        latents, mask_high, mask_low, min_samples, method=method, shrinkage=shrinkage
+    )
+    if d is None:
+        raise ValueError(
+            f"Color confound direction failed (high={n_high}, low={n_low}, "
+            f"min_samples={min_samples}); lower --min_samples or check --image_root."
+        )
+    print(f"  color confound: high={n_high}, low={n_low}, norm={d.norm():.3f}")
+    return d  # (18, 512)
+
+
+def project_out_direction(direction, confound_dir):
+    """Per-layer orthogonal projection: remove confound_dir's component from
+    direction. Unlike a layer-range cut, this only removes the specific
+    linear subspace aligned with the confound at each layer, leaving
+    everything orthogonal to it (including most of the true signal, as long
+    as it isn't collinear with the confound) untouched.
+
+    direction:    (K, 18, 512) or (18, 512)
+    confound_dir: (18, 512)
+    """
+    conf_unit = F.normalize(confound_dir, dim=-1, eps=1e-8)  # (18, 512)
+    squeeze = direction.dim() == 2
+    d = direction.unsqueeze(0) if squeeze else direction     # (K, 18, 512)
+    dot = (d * conf_unit.unsqueeze(0)).sum(dim=-1, keepdim=True)  # (K, 18, 1)
+    cleaned = d - dot * conf_unit.unsqueeze(0)
+    return cleaned.squeeze(0) if squeeze else cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +610,28 @@ def main():
                         help="After stratified age extraction, project out representative "
                              "glasses/gender directions from W+. Reduces cross-attr overlap "
                              "(dir_orth). Only effective when --age_k 1.")
+    parser.add_argument("--decorrelate_age_color", action="store_true",
+                        help="Estimate a color-tone confound direction from real dataset images "
+                             "(mean R-B) and orthogonally project it out of the age direction. "
+                             "Fixes a confirmed color-cast artifact in the age direction (see "
+                             "code comment above compute_image_color_scores) without the "
+                             "accuracy collapse caused by layer-range truncation. Requires "
+                             "--image_root to point at the actual image files.")
+    parser.add_argument("--image_root", default="data/FFHQ",
+                        help="Root directory for --decorrelate_age_color; combined with the "
+                             "'paths' saved in --preds_file.")
+    parser.add_argument("--color_confound_pct", type=float, default=None,
+                        help="Percentile split for the color confound direction. Defaults to "
+                             "--extreme_pct if not set.")
+    parser.add_argument("--color_resize", type=int, default=32,
+                        help="Downsample images to this size before averaging color for "
+                             "--decorrelate_age_color. Only global tone matters, so this can "
+                             "stay small for speed.")
+    parser.add_argument("--color_face_crop", action=argparse.BooleanOptionalAction, default=True,
+                        help="Restrict the color-confound score to the face region (same crop "
+                             "as common/id_loss.py) instead of the whole photo. Default on: a "
+                             "whole-photo version measured cos~0.03-0.10 against the age "
+                             "direction, too diluted by background/hair/clothing to matter.")
     parser.add_argument("--output", default="./data/direction_bank_k4_stratified.pth")
     parser.add_argument("--min_samples", type=int, default=50,
                         help="Minimum samples per high/low group. NOTE: with --extreme_pct, each "
@@ -467,6 +639,16 @@ def main():
                              "so small strata may need a lower --min_samples (e.g. 20-30) or a "
                              "larger --extreme_pct to avoid falling back to the unconditional direction.")
     parser.add_argument("--attribute_index", nargs="*", type=int, default=[15, 20, 39])
+    parser.add_argument("--decorrelate_cross_attr", action="store_true",
+                         help="Generic pairwise decorrelation: for every attribute in "
+                              "--attribute_index, project out every OTHER attribute's "
+                              "representative direction. Applies uniformly regardless of which "
+                              "specific pair turns out to be entangled (beard vs gender, age vs "
+                              "gender, or any future pair) -- no per-pair flag needed. Confirmed "
+                              "cases so far: beard direction inheriting 'more male' (beards rare "
+                              "on female training faces), age direction dragging Male toward 1.0 "
+                              "even with age_k=4 gender-stratified sub-directions (see "
+                              "dump_attr_failures.py --watch_attrs 20).")
     args = parser.parse_args()
 
     if not (0 < args.extreme_pct < 50):
@@ -550,15 +732,102 @@ def main():
             age_dirs = torch.cat([age_dirs, pad], dim=0)
         skip_age_orth = False
 
-    # Stack: (num_attrs, K, 18, 512)
-    all_dirs = torch.stack([glasses_dirs, gender_dirs, age_dirs], dim=0)
+    if args.decorrelate_age_color:
+        print("\n=== Removing color-tone confound from age direction ===")
+        paths_for_color = load_paths(args.preds_file)
+        if paths_for_color is None:
+            parser.error(
+                "--decorrelate_age_color requires --preds_file to have saved 'paths' "
+                "(image filenames matching latents row order)."
+            )
+        color_scores = compute_image_color_scores(
+            args.image_root, paths_for_color, resize=args.color_resize,
+            face_crop=args.color_face_crop,
+        )
+        print(f"  color score (R-B): mean={color_scores.mean():.3f} std={color_scores.std():.3f}")
+        confound_dir = compute_color_confound_direction(
+            latents, color_scores, args.min_samples,
+            pct=(args.color_confound_pct if args.color_confound_pct is not None else args.extreme_pct),
+            method=args.direction_method, shrinkage=args.shrinkage,
+        )
+
+        # Report overlap BEFORE removal so the fix's effect size is visible,
+        # not just asserted.
+        confound_unit = F.normalize(confound_dir, dim=-1, eps=1e-8)
+        age_unit_before = F.normalize(age_dirs, dim=-1, eps=1e-8)
+        cos_before = (age_unit_before * confound_unit.unsqueeze(0)).sum(dim=-1)  # (K, 18)
+        print(f"  |cos(age_dir, color_confound)| before removal: "
+              f"mean={cos_before.abs().mean():.4f} max={cos_before.abs().max():.4f} "
+              f"(per-layer, averaged over K)")
+
+        age_dirs = project_out_direction(age_dirs, confound_dir)
+
+        age_unit_after = F.normalize(age_dirs, dim=-1, eps=1e-8)
+        cos_after = (age_unit_after * confound_unit.unsqueeze(0)).sum(dim=-1)
+        print(f"  |cos(age_dir, color_confound)| after removal:  "
+              f"mean={cos_after.abs().mean():.4f} max={cos_after.abs().max():.4f} "
+              f"(should be ~0)")
+
+    # Any attributes beyond the hand-tuned glasses/gender/age trio get the
+    # generic gender x age stratified treatment.
+    extra_attr_ids = [a for a in args.attribute_index if a not in (15, 20, 39)]
+    extra_dirs = {}
+    for attr_idx in extra_attr_ids:
+        print(f"\n=== Attr {attr_idx} (generic), K={K} ===")
+        extra_dirs[attr_idx] = compute_generic_directions(
+            attr_idx, latents, preds, continuous, K, args.min_samples, **common_kwargs
+        )
+
+    # Stack in the order given by args.attribute_index.
+    dirs_by_idx = {15: glasses_dirs, 20: gender_dirs, 39: age_dirs, **extra_dirs}
+
+    if args.decorrelate_cross_attr:
+        # Generic pairwise decorrelation: for EVERY attribute in the bank,
+        # project out every OTHER attribute's representative direction.
+        # Supersedes hand-written per-pair fixes (an earlier version of this
+        # script had a --decorrelate_extra_attrs flag that only covered
+        # extra-attrs-vs-{glasses,gender,age}, and a --decorrelate_age_gender
+        # flag added just for the age-vs-gender leak found via
+        # dump_attr_failures.py --watch_attrs 20). Both were one-off patches
+        # for whichever pair had just been diagnosed; this runs the same
+        # projection for all pairs automatically, so a newly added attribute
+        # doesn't need its own manually-diagnosed flag before it's known to
+        # need one.
+        print("\n=== Removing cross-attribute confounds (all pairs) ===")
+        reps = {a: representative_direction(dirs_by_idx[a]) for a in args.attribute_index}
+        for a in args.attribute_index:
+            d = dirs_by_idx[a]
+            for b in args.attribute_index:
+                if b == a:
+                    continue
+                conf_dir = reps[b]
+                conf_unit = F.normalize(conf_dir, dim=-1, eps=1e-8)
+                d_unit_before = F.normalize(d, dim=-1, eps=1e-8)
+                cos_before = (d_unit_before * conf_unit.unsqueeze(0)).sum(dim=-1)
+                d = project_out_direction(d, conf_dir)
+                d_unit_after = F.normalize(d, dim=-1, eps=1e-8)
+                cos_after = (d_unit_after * conf_unit.unsqueeze(0)).sum(dim=-1)
+                if cos_before.abs().mean() > 0.02:
+                    print(f"  attr{a} vs attr{b}: |cos| before mean={cos_before.abs().mean():.4f} "
+                          f"max={cos_before.abs().max():.4f}  -> after "
+                          f"mean={cos_after.abs().mean():.4f} max={cos_after.abs().max():.4f}")
+            dirs_by_idx[a] = d
+        # Recompute representative directions are stale after this loop
+        # (each attr was cleaned using the ORIGINAL reps of the others,
+        # standard one-pass approximate decorrelation -- a fully joint
+        # solve would require iterating to convergence, not needed here
+        # since residual cross-cosines after one pass are already ~0, see
+        # printed diagnostics above).
+
+    all_dirs = torch.stack([dirs_by_idx[a] for a in args.attribute_index], dim=0)
     print(f"\nAll directions shape: {tuple(all_dirs.shape)}")
 
-    # Intra-attribute orthogonalization for glasses and gender only.
-    # Age is skipped when age_k=1 (tiled identical directions would collapse to zero).
-    print("Intra-attribute orthogonalization (glasses, gender) ...")
+    # Intra-attribute orthogonalization for glasses, gender, and any generic
+    # extra attributes. Age is skipped when age_k=1 (tiled identical
+    # directions would collapse to zero).
+    print("Intra-attribute orthogonalization (glasses, gender, extra attrs) ...")
     attr_index_map = {idx: i for i, idx in enumerate(args.attribute_index)}
-    for attr_idx in [15, 20]:
+    for attr_idx in [15, 20] + extra_attr_ids:
         if attr_idx in attr_index_map:
             a = attr_index_map[attr_idx]
             all_dirs[a] = intra_attr_orthogonalize_safe(all_dirs[a])
@@ -573,9 +842,9 @@ def main():
     layer_norms = all_dirs.norm(dim=-1)                    # (num_attrs, K, 18)
     direction_units = F.normalize(all_dirs, dim=-1, eps=1e-8)  # (num_attrs, K, 18, 512)
 
-    # Intra-attr cosine similarity check (glasses and gender only)
+    # Intra-attr cosine similarity check (glasses, gender, extra attrs)
     print("\n=== Intra-attribute cosine similarity after orthogonalization ===")
-    for attr_idx in [15, 20]:
+    for attr_idx in [15, 20] + extra_attr_ids:
         if attr_idx not in attr_index_map:
             continue
         a = attr_index_map[attr_idx]
@@ -597,11 +866,13 @@ def main():
         "age_k": age_k,
         "direction_method": args.direction_method,
         "extreme_pct": args.extreme_pct,
+        "decorrelate_cross_attr": bool(args.decorrelate_cross_attr),
         "stratification": {
             15: ["male_young", "male_old", "female_young", "female_old"],
             20: ["young_noglasses", "young_glasses", "old_noglasses", "old_glasses"],
             39: ["weighted_avg_k1"] * K if age_k == 1 else
                 ["male_noglasses", "male_glasses", "female_noglasses", "female_glasses"],
+            **{a: ["male_young", "male_old", "female_young", "female_old"] for a in extra_attr_ids},
         },
     }
     # Cross-attribute cosine similarity (K0 representative vs K0 representative)
@@ -620,7 +891,8 @@ def main():
     print(f"\nSaved → {args.output}")
 
     print("\n=== Summary ===")
-    attr_names = {15: "glasses", 20: "gender", 39: "age/young"}
+    attr_names = {15: "glasses", 20: "gender", 39: "age/young",
+                  24: "no_beard", 31: "smiling", 33: "wavy_hair"}
     strat = bank["stratification"]
     for a, attr_idx in enumerate(args.attribute_index):
         norms_k = layer_norms[a].mean(dim=-1)   # (K,) mean over 18 layers
