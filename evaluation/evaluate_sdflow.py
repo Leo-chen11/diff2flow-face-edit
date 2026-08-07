@@ -63,12 +63,46 @@ from models.conditioner import IdentityAttributeConditioner
 from models.stylegan2.model import Generator
 
 
-ATTR_NAMES = {15: 'Eyeglasses', 20: 'Male', 39: 'Young'}
+ATTR_NAMES = {15: 'Eyeglasses', 20: 'Male', 24: 'No_Beard', 31: 'Smiling',
+              33: 'Wavy_Hair', 39: 'Young'}
+
+# Official CelebA list_attr_celeba.txt column order (0-indexed). Index 15 =
+# Eyeglasses, 20 = Male, 24 = No_Beard, 31 = Smiling, 33 = Wavy_Hair, 39 =
+# Young -- matches this project's attribute indices directly.
+CELEBA_ALL_ATTRS = [
+    '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes', 'Bald',
+    'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
+    'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby', 'Double_Chin',
+    'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones',
+    'Male', 'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard',
+    'Oval_Face', 'Pale_Skin', 'Pointy_Nose', 'Receding_Hairline', 'Rosy_Cheeks',
+    'Sideburns', 'Smiling', 'Straight_Hair', 'Wavy_Hair', 'Wearing_Earrings',
+    'Wearing_Hat', 'Wearing_Lipstick', 'Wearing_Necklace', 'Wearing_Necktie', 'Young',
+]
 
 
 # ---------------------------------------------------------------------------
 # Independent judges (never used as training losses)
 # ---------------------------------------------------------------------------
+
+def parse_clip_calibration(spec):
+    """Parse '--clip_calibration 24:0.42:0.15,33:0.60:0.20' into
+    {24: (0.42, 0.15), 33: (0.60, 0.20)}. Returns {} for None/empty."""
+    if not spec:
+        return {}
+    out = {}
+    for chunk in spec.split(','):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(':')
+        if len(parts) != 3:
+            raise ValueError(
+                f"--clip_calibration entry {chunk!r} must be 'attr_idx:thresh:sharpness'")
+        idx, thresh, sharp = parts
+        out[int(idx)] = (float(thresh), float(sharp))
+    return out
+
 
 class CLIPAttributeJudge(nn.Module):
     """Zero-shot CLIP attribute scorer, independent from the training teacher.
@@ -84,13 +118,30 @@ class CLIPAttributeJudge(nn.Module):
              "a headshot of a person who is not wearing glasses"),
         20: ("a headshot of a man",
              "a headshot of a woman"),
+        24: ("a headshot of a clean-shaven person with no beard",
+             "a headshot of a person with a full beard"),
+        31: ("a headshot of a smiling person",
+             "a headshot of a person with a neutral expression"),
+        33: ("a headshot of a person with wavy hair",
+             "a headshot of a person with straight hair"),
         39: ("a headshot of a young adult",
              "a headshot of an elderly senior person"),
     }
     DEFAULT_PROMPTS = ("a headshot of a person",
                        "a headshot of a person")
 
-    def __init__(self, attribute_index, model_name='ViT-L/14', device='cuda'):
+    def __init__(self, attribute_index, model_name='ViT-L/14', device='cuda', calibration=None):
+        """
+        calibration: optional {attr_idx: (thresh, sharpness)}. The raw
+            softmax(pos vs neg) score is remapped through
+            sigmoid((raw - thresh) / sharpness) so the *recalibrated* score's
+            0.5 boundary lines up with the attribute's real visual decision
+            boundary, instead of assuming CLIP's raw pos/neg tie point (0.5
+            on the un-remapped score) is already correct. Mirrors how
+            GlassesParserJudge calibrates its own area_thresh/sharpness.
+            Attributes not in the dict pass through unchanged
+            (thresh=0.5, sharpness->0 i.e. identity).
+        """
         super().__init__()
         import clip  # raises ImportError -> caller decides how to degrade
         self.model, _ = clip.load(model_name, device=device, jit=False)
@@ -98,6 +149,8 @@ class CLIPAttributeJudge(nn.Module):
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.attribute_index = [int(i) for i in attribute_index]
+        self.calibration = {int(k): (float(v[0]), float(v[1]))
+                             for k, v in (calibration or {}).items()}
 
         with torch.no_grad():
             text_feats = []
@@ -120,7 +173,88 @@ class CLIPAttributeJudge(nn.Module):
         img_feat = F.normalize(self.model.encode_image(x).float(), dim=-1)  # (B, D)
         # (B, A, 2) similarity to pos/neg prompt of each attribute
         logits = 100.0 * torch.einsum('bd,akd->bak', img_feat, self.text_feats)
-        return torch.softmax(logits, dim=-1)[:, :, 0]
+        raw = torch.softmax(logits, dim=-1)[:, :, 0]   # (B, A)
+        if not self.calibration:
+            return raw
+        out = raw.clone()
+        for a, idx in enumerate(self.attribute_index):
+            if idx not in self.calibration:
+                continue
+            thresh, sharpness = self.calibration[idx]
+            out[:, a] = torch.sigmoid((raw[:, a] - thresh) / max(sharpness, 1e-4))
+        return out
+
+
+class CelebAAttrClassifierJudge(nn.Module):
+    """Independent supervised CelebA-40-attribute classifier (ResNet18 +
+    MLP head, trained with BCE loss directly on CelebA labels), used as a
+    generic replacement for CLIPAttributeJudge that doesn't need a
+    per-attribute prompt or a hand-tuned decision threshold.
+
+    Unlike CLIP zero-shot (a raw pos/neg similarity with no guarantee that
+    0.5 means anything), this network's sigmoid output is directly trained
+    to cross 0.5 at "attribute present" by construction, so it generalizes
+    to new attributes without the prompt-wording / threshold-calibration
+    fights CLIP required for glasses (thin frames) and beard (only
+    recognized "full beard", missing stubble/partial growth).
+
+    Architecture and CelebA-order output match
+    https://github.com/Hawaii0821/FaceAttr-Analysis (ResNet18 backbone,
+    512->512->128->40 MLP head, sigmoid). Weights are a different
+    architecture/training run than this project's r34 training teacher, so
+    it stays a genuinely independent judge.
+    """
+
+    def __init__(self, weights_path, device='cuda'):
+        super().__init__()
+        from torchvision import models as tv_models
+
+        backbone = tv_models.resnet18(weights=None)
+        self.feature_extractor = nn.Sequential(*list(backbone.children())[:-1])
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 512), nn.ReLU(True), nn.Dropout(p=0.5),
+            nn.Linear(512, 128), nn.ReLU(True), nn.Dropout(p=0.5),
+            nn.Linear(128, len(CELEBA_ALL_ATTRS)),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+        # Re-key the upstream checkpoint's featureExtractor.model.* /
+        # featureClassfier.fc.* names onto this module's names.
+        raw = torch.load(weights_path, map_location='cpu')
+        state = raw.get('state_dict', raw) if isinstance(raw, dict) else raw
+        state = {k[len('module.'):] if k.startswith('module.') else k: v
+                 for k, v in state.items()}
+        remapped = {}
+        for k, v in state.items():
+            if k.startswith('featureExtractor.model.'):
+                remapped['feature_extractor.' + k[len('featureExtractor.model.'):]] = v
+            elif k.startswith('featureClassfier.fc.'):
+                remapped['classifier.' + k[len('featureClassfier.fc.'):]] = v
+        missing, unexpected = self.load_state_dict(remapped, strict=False)
+        print(f'[Judge] CelebAAttrClassifierJudge loaded {weights_path}: '
+              f'{len(missing)} missing, {len(unexpected)} unexpected keys'
+              + ('' if not missing else f' (missing e.g. {missing[:3]})'))
+
+        self.to(device).eval()
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        self.register_buffer(
+            'mean', torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1))
+        self.register_buffer(
+            'std', torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1))
+
+    @torch.no_grad()
+    def scores(self, images):
+        """images: [-1, 1] tensor (B, 3, H, W) -> (B, 40) prob attribute
+        present, in official CelebA column order (index directly with the
+        project's own attribute indices, e.g. [:, 15] for Eyeglasses)."""
+        x = (images + 1.0) * 0.5
+        x = F.interpolate(x, (224, 224), mode='bilinear', align_corners=False)
+        x = (x - self.mean) / self.std
+        feat = self.feature_extractor(x)
+        feat = feat.view(feat.size(0), -1)
+        return self.sigmoid(self.classifier(feat))
 
 
 class GlassesParserJudge(nn.Module):
@@ -215,12 +349,16 @@ class IndependentIDJudge(nn.Module):
 def build_optional_judges(args, attribute_index, id_criterion):
     """Instantiate independent judges; degrade gracefully with clear warnings."""
     device = 'cuda'
-    clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser = \
-        None, None, None, None, None
+    clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
+        None, None, None, None, None, None
 
     try:
-        clip_judge = CLIPAttributeJudge(attribute_index, args.clip_judge_model, device)
+        clip_calibration = parse_clip_calibration(getattr(args, 'clip_calibration', None))
+        clip_judge = CLIPAttributeJudge(attribute_index, args.clip_judge_model, device,
+                                         calibration=clip_calibration)
         print(f'[Judge] CLIP attribute judge: {args.clip_judge_model}')
+        if clip_calibration:
+            print(f'[Judge] CLIP score recalibration active: {clip_calibration}')
     except ImportError:
         print('[WARN] OpenAI CLIP not installed -> no independent attribute judge. '
               'pip install git+https://github.com/openai/CLIP.git')
@@ -283,7 +421,17 @@ def build_optional_judges(args, attribute_index, id_criterion):
             print(f'[WARN] --glasses_judge parser requested but face parser '
                   f'unavailable ({exc}); falling back to CLIP for glasses.')
 
-    return clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser
+    if getattr(args, 'celeba_attr_judge_weights', None):
+        try:
+            celeb_judge = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, device)
+            print('[Judge] CelebAAttrClassifierJudge active -- independent supervised '
+                  '40-attribute classifier, generalizes to any attribute without '
+                  'per-attribute prompt/threshold tuning.')
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --celeba_attr_judge_weights given but failed to load ({exc}); '
+                  f'continuing without it.')
+
+    return clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge
 
 
 def build_fid(args):
@@ -310,6 +458,9 @@ RUN_CONFIG_KEYS = [
     'lag_gate_hidden_dim', 'lag_gate_init_bias', 'id_cond_dim', 'id_cond_scale',
     'attr_backbone', 'conditioner_backbone', 'clip_model', 'fused_hidden_dim',
     'img_size', 'direction_residual_scale', 'direction_bank_path',
+    'use_attr_lora', 'attr_lora_rank',
+    'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
+    'controlnet_hidden_dim', 'controlnet_max_norm',
 ]
 
 
@@ -448,6 +599,8 @@ def load_models(args):
             guided_delta_max_norm=(
                 args.guided_delta_max_norm if args.guided_delta_max_norm > 0 else None
             ),
+            use_attr_lora=getattr(args, 'use_attr_lora', False),
+            attr_lora_rank=getattr(args, 'attr_lora_rank', 4),
         ).to(device).eval()
         if os.path.exists(db_ckpt_path):
             # The frozen direction_units are a registered buffer, so they live
@@ -523,6 +676,29 @@ def load_models(args):
                   f'not cleanly separable at that boundary; narrow the cut to '
                   f'the very last layers first.')
 
+    # ── ControlNet-style attribute control encoder (optional) ─────────────
+    control_encoder = None
+    if getattr(args, 'use_controlnet_injection', False):
+        from models.control_encoder import AttributeControlEncoder
+        control_encoder = AttributeControlEncoder(
+            num_attrs=num_attrs,
+            out_channels=args.controlnet_channels,
+            out_res=args.controlnet_embed_res,
+            hidden_dim=args.controlnet_hidden_dim,
+        ).to(device).eval()
+        ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
+        if os.path.exists(ce_ckpt_path):
+            result = control_encoder.load_state_dict(load_network(ce_ckpt_path), strict=False)
+            if result.missing_keys:
+                print(f'[WARN] control_encoder missing keys: {result.missing_keys[:8]}')
+            if result.unexpected_keys:
+                print(f'[WARN] control_encoder unexpected keys: {result.unexpected_keys[:8]}')
+            print(f'Loading ctrl   ← {ce_ckpt_path}')
+        else:
+            print(f'Control encoder init (no trained weights at {ce_ckpt_path})')
+        for p in control_encoder.parameters():
+            p.requires_grad_(False)
+
     # ── StyleGAN2 ─────────────────────────────────────────────────────────
     ckpt = torch.load(args.stygan2_weights, map_location='cpu')
     G = Generator(size=1024, style_dim=512, n_mlp=8)
@@ -544,7 +720,7 @@ def load_models(args):
         p.requires_grad_(False)
 
     return prior, conditioner, G, id_criterion, attr_teacher, \
-           attribute_index, direction_bank
+           attribute_index, direction_bank, control_encoder
 
 
 # ---------------------------------------------------------------------------
@@ -552,10 +728,75 @@ def load_models(args):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
+    """Blend `edited` face pixels into `orig`'s background/hair, using the
+    BiSeNet face mask. orig, edited: (B,3,H,W) tensors in [-1,1].
+
+    method='alpha': mask-weighted linear blend (edited*mask + orig*(1-mask)),
+    feathered by `blur_sigma`. Simple, but a seam is visible wherever the
+    edited face's overall brightness/color-temperature differs from the
+    surrounding background at the boundary -- widening the feather only
+    smooths the SHAPE of the seam, it does not fix a color/brightness
+    mismatch across it.
+
+    method='poisson': gradient-domain blending (OpenCV seamlessClone). Instead
+    of blending pixel VALUES, it solves for a blend whose gradients match the
+    inserted content and whose boundary matches the background -- eliminates
+    the color-mismatch seam that a feathered alpha blend cannot fix. Runs
+    per-sample on CPU (cv2), so it's slower than the alpha path; fine for
+    eval/deployment post-processing, not for anything in the training loop.
+    """
+    if method == 'alpha':
+        mask = face_parser.get_mask(orig, blur_sigma=int(blur_sigma))
+        return edited * mask + orig * (1.0 - mask)
+
+    if method != 'poisson':
+        raise ValueError(f'Unknown composite method: {method}')
+
+    import cv2
+    import numpy as np
+    mask = face_parser.get_mask(orig, blur_sigma=0)   # hard silhouette; Poisson handles the boundary
+    out = []
+    for b in range(orig.size(0)):
+        o = ((orig[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
+        e = ((edited[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
+        m = (mask[b, 0].cpu().numpy() > 0.5).astype(np.uint8) * 255
+        h, w = m.shape
+        if m.sum() < 255 * 50:   # degenerate mask (parser found ~no face) -> keep original
+            out.append(orig[b])
+            continue
+        try:
+            blended = cv2.seamlessClone(
+                np.ascontiguousarray(e), np.ascontiguousarray(o), m,
+                (w // 2, h // 2), cv2.NORMAL_CLONE,
+            )
+            t = torch.from_numpy(blended).to(orig.device).float().permute(2, 0, 1) / 255.0 * 2 - 1
+        except cv2.error:
+            t = orig[b]   # mask touched the image border or similar -> fall back safely
+        out.append(t)
+    return torch.stack(out, dim=0).to(dtype=orig.dtype)
+
+
 def edit_single_attribute(prior, conditioner, G, id_criterion,
                           img, latent, attr_cond, id_cond,
                           attr_local_idx, edit_scale, direction_bank=None,
-                          attr_global_idx=None, bypass_glasses_direction_bank=False):
+                          attr_global_idx=None, bypass_glasses_direction_bank=False,
+                          face_parser=None, composite_method='alpha', composite_blur_sigma=15,
+                          control_encoder=None, controlnet_max_norm=0.0):
+    """
+    face_parser: if given, composite the edited face back onto the SOURCE
+    RECONSTRUCTION's background/hair (see composite_faces() above). A
+    long-running complaint in this project was that gender/age edits move
+    the background and hair far more than intended (the W+ edit is global,
+    not local to the face). Restricting the visible change to the BiSeNet
+    face region is a training-free way to cut that leakage for EVERY
+    attribute at once, instead of another attribute-specific loss tweak.
+    Composites against G(latent) (the source RECONSTRUCTION), not the raw
+    source photo, so the blend doesn't inherit the encoder's inversion gap
+    as a seam. A first attempt at plain alpha blending showed a visible
+    seam (boundary color/brightness mismatch); composite_method='poisson'
+    fixes that via gradient-domain blending instead of a wider feather.
+    """
     B = img.size(0)
     device = img.device
     zero_pad = torch.zeros(B, 18, 1, device=device)
@@ -574,6 +815,7 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         bypass_glasses_direction_bank
         and attr_global_idx == 15
     )
+    control_skips = None
     if direction_bank is not None and not bypass_bank:
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
@@ -581,10 +823,92 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent)
         new_latents = latent + guided_delta
+        if control_encoder is not None:
+            control_skips = control_encoder(attr_delta, batch_attr_idx)
+            if controlnet_max_norm > 0:
+                skip_norm = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
+                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
+                control_skips = control_skips * clip.view(-1, 1, 1, 1)
     else:
         new_latents = new_latents_raw
 
-    edited_face = G([new_latents], input_is_latent=True,
+    edited_face = G([new_latents], skips=control_skips, input_is_latent=True,
+                    randomize_noise=False)[0].clamp(-1, 1)
+
+    if face_parser is not None:
+        with torch.no_grad():
+            src_recon = G([latent], input_is_latent=True,
+                          randomize_noise=False)[0].clamp(-1, 1)
+            edited_face = composite_faces(face_parser, src_recon, edited_face,
+                                          method=composite_method,
+                                          blur_sigma=composite_blur_sigma)
+
+    return edited_face
+
+
+def edit_multi_attribute(prior, conditioner, G, id_criterion,
+                         img, latent, attr_cond, id_cond,
+                         attr_local_idxs, edit_scales, direction_bank,
+                         attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0):
+    """Edit several attributes on the same face at once.
+
+    Composes N independently-computed single-attribute guided deltas by
+    summation, rather than editing all attr_cond entries in one flow pass
+    and calling direction_bank with attr_idx=None. The latter would skip
+    direction_bank's per-attribute direction_scale/layer_scale/delta_max_norm
+    calibration (those only apply when attr_idx is a single per-sample
+    index -- see AttributeDirectionBank.forward), giving untested,
+    uncalibrated results. Summing calibrated single-attribute deltas instead
+    reuses the exact same code path as edit_single_attribute for each
+    attribute, at the cost of one flow reverse-pass per attribute instead
+    of one shared pass.
+
+    This does NOT fix the deeper issue that attribute directions aren't
+    perfectly orthogonal -- summed edits can still interfere/leak into each
+    other. It only avoids ALSO throwing away calibration on top of that.
+
+    attr_local_idxs: list of local indices (into args.attribute_index) to edit.
+    edit_scales: float, or list of floats matching attr_local_idxs.
+    attr_global_idxs: optional list of absolute CelebA indices, same order
+        as attr_local_idxs (only needed if you rely on bypass_glasses_direction_bank
+        elsewhere; not handled here, direction_bank is always used per attribute).
+    """
+    if isinstance(edit_scales, (int, float)):
+        edit_scales = [edit_scales] * len(attr_local_idxs)
+    assert len(edit_scales) == len(attr_local_idxs)
+
+    B = img.size(0)
+    device = img.device
+    zero_pad = torch.zeros(B, 18, 1, device=device)
+
+    src_cond = torch.cat([id_cond, attr_cond], dim=1)
+    mid_latent, _ = prior(latent, src_cond, zero_pad)
+
+    combined_delta = torch.zeros_like(latent)
+    combined_skips = None
+    for local_idx, scale in zip(attr_local_idxs, edit_scales):
+        new_attr_cond = attr_cond.clone()
+        src = attr_cond[:, local_idx]
+        new_attr_cond[:, local_idx] = src * (1.0 - scale) + (1.0 - src) * scale
+        new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
+
+        new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
+        flow_delta = new_latents_raw - latent
+        attr_delta = new_attr_cond - attr_cond
+        batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
+        guided_delta = direction_bank(flow_delta, attr_delta,
+                                      attr_idx=batch_attr_idx, latent=latent)
+        combined_delta = combined_delta + guided_delta
+        if control_encoder is not None:
+            skip = control_encoder(attr_delta, batch_attr_idx)
+            if controlnet_max_norm > 0:
+                skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
+                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
+                skip = skip * clip.view(-1, 1, 1, 1)
+            combined_skips = skip if combined_skips is None else combined_skips + skip
+
+    new_latents = latent + combined_delta
+    edited_face = G([new_latents], skips=combined_skips, input_is_latent=True,
                     randomize_noise=False)[0].clamp(-1, 1)
     return edited_face
 
@@ -637,11 +961,24 @@ def _fmt(summary, pct=False):
 @torch.no_grad()
 def evaluate(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
-        attribute_index, direction_bank = load_models(args)
+        attribute_index, direction_bank, control_encoder = load_models(args)
 
-    clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser = \
+    clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
     _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
+
+    composite_face_parser = None
+    if args.composite_face_region:
+        from common.face_parser import FaceParser
+        try:
+            composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            print('[Composite] Compositing edited face back onto source-reconstruction '
+                  'background/hair (common/face_parser.py FaceParser.composite) for ALL '
+                  'attributes -- reduces background/hair leakage from global W+ edits, '
+                  'training-free.')
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --composite_face_region requested but face parser unavailable '
+                  f'({exc}); compositing disabled.')
 
     if args.bypass_glasses_direction_bank:
         print('[WARN] --bypass_glasses_direction_bank is ON: Eyeglasses is evaluated '
@@ -720,6 +1057,8 @@ def evaluate(args):
                 src_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(src_face_256)
             src_probs_indep = torch.sigmoid(indep_teacher(src_face_256)[0])[:, attribute_index] \
                 if indep_teacher is not None else None
+            src_probs_celeb = celeb_judge.scores(src_face_256)[:, attribute_index] \
+                if celeb_judge is not None else None
             src_id_indep = indep_id.extract(src_face_256) if indep_id is not None else None
 
             # Inversion gap (once, on the first scale pass only)
@@ -745,6 +1084,11 @@ def evaluate(args):
                     local_idx, edit_scale, direction_bank,
                     attr_global_idx=args.attribute_index[local_idx],
                     bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
+                    face_parser=composite_face_parser,
+                    composite_method=args.composite_method,
+                    composite_blur_sigma=args.composite_blur_sigma,
+                    control_encoder=control_encoder,
+                    controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
                 )
                 edited_256 = F.interpolate(edited_face, (256, 256))
 
@@ -755,6 +1099,8 @@ def evaluate(args):
                     edit_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(edited_256)
                 edit_probs_indep = torch.sigmoid(indep_teacher(edited_256)[0])[:, attribute_index] \
                     if indep_teacher is not None else None
+                edit_probs_celeb = celeb_judge.scores(edited_256)[:, attribute_index] \
+                    if celeb_judge is not None else None
                 edit_id_indep = indep_id.extract(edited_256) if indep_id is not None else None
                 lpips_d = lpips_fn(src_face_256, edited_256).flatten() \
                     if lpips_fn is not None else None
@@ -770,6 +1116,8 @@ def evaluate(args):
                         judge_sets.append(('clip', src_probs_clip, edit_probs_clip))
                     if src_probs_indep is not None:
                         judge_sets.append(('indep', src_probs_indep, edit_probs_indep))
+                    if src_probs_celeb is not None:
+                        judge_sets.append(('celeb', src_probs_celeb, edit_probs_celeb))
 
                     any_clear = False
                     for jname, sp, ep in judge_sets:
@@ -819,7 +1167,7 @@ def evaluate(args):
         print(f'\n  {sample_count} samples evaluated  '
               f'(strict success = cross 0.5±{args.success_margin})')
         header = (f'  {"Attribute":<12} {"ID_arc*":>8} {"ID_ind↑":>8} '
-                  f'{"AccT*":>8} {"AccCLIP↑":>9} {"AccInd↑":>8} '
+                  f'{"AccT*":>8} {"AccCLIP↑":>9} {"AccInd↑":>8} {"AccCeleb↑":>9} '
                   f'{"LPIPS↓":>8} {"LeakCLIP↓":>10}')
         print(header)
         print(f'  {"-" * (len(header) - 2)}')
@@ -834,6 +1182,7 @@ def evaluate(args):
                 (f'acc_lenient_{attr_name}', True),
                 (f'acc_clip_{attr_name}', True),
                 (f'acc_indep_{attr_name}', True),
+                (f'acc_celeb_{attr_name}', True),
                 (f'delta_teacher_{attr_name}', False),
                 (f'delta_clip_{attr_name}', False),
                 (f'lpips_{attr_name}', False),
@@ -848,6 +1197,7 @@ def evaluate(args):
                   f'{_fmt(row["acc_teacher"], pct=True)} '
                   f'{_fmt(row["acc_clip"], pct=True)}  '
                   f'{_fmt(row["acc_indep"], pct=True)} '
+                  f'{_fmt(row["acc_celeb"], pct=True)} '
                   f'{_fmt(row["lpips"])} '
                   f'{_fmt(row["leak_clip"])}')
 
@@ -868,11 +1218,23 @@ def evaluate(args):
             scale_summary[attr_name]['acc_clip_add'] = _a
             scale_summary[attr_name]['acc_clip_rm'] = _r
 
+        if celeb_judge is not None:
+            print(f'  Direction split (AccCeleb): add = source lacks attr, rm = source has attr')
+            for attr_name in attr_names:
+                _a = _summ(metrics[f'acc_celeb_{attr_name}_add'])
+                _r = _summ(metrics[f'acc_celeb_{attr_name}_rm'])
+                _a_txt = f'{_a["mean"]*100:5.1f}% (n={_a["n"]})' if _a else '   --'
+                _r_txt = f'{_r["mean"]*100:5.1f}% (n={_r["n"]})' if _r else '   --'
+                print(f'    {attr_name:<12} add: {_a_txt}   rm: {_r_txt}')
+                scale_summary[attr_name]['acc_celeb_add'] = _a
+                scale_summary[attr_name]['acc_celeb_rm'] = _r
+
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
         for prefix, label in [('id_indep_', 'id_indep'),
                               ('acc_clip_', 'acc_clip'),
                               ('acc_indep_', 'acc_indep'),
+                              ('acc_celeb_', 'acc_celeb'),
                               ('lpips_', 'lpips'),
                               ('id_arc_', 'id_arc'),
                               ('acc_teacher_', 'acc_teacher')]:
@@ -880,10 +1242,14 @@ def evaluate(args):
             ovr[label] = _summ(vals)
         scale_summary['overall'] = ovr
         id_show = ovr['id_indep'] if ovr['id_indep'] else ovr['id_arc']
-        acc_show = ovr['acc_clip'] if ovr['acc_clip'] else ovr['acc_teacher']
+        # Prefer the supervised CelebA classifier over CLIP for the headline
+        # number when available -- it doesn't need per-attribute prompt/
+        # threshold tuning, so it's less likely to be silently miscalibrated.
+        acc_show = ovr['acc_celeb'] if ovr['acc_celeb'] else \
+            (ovr['acc_clip'] if ovr['acc_clip'] else ovr['acc_teacher'])
         print(f'  {"-" * 55}')
         print(f'  {"Overall":<12} ID(ind or arc): {_fmt(id_show)}  '
-              f'Acc(CLIP or teacher): {_fmt(acc_show, pct=True)}')
+              f'Acc(Celeb/CLIP/teacher): {_fmt(acc_show, pct=True)}')
 
         if fid is not None:
             fid_val = float(fid.compute().item())
@@ -971,17 +1337,51 @@ if __name__ == '__main__':
     parser.add_argument('--guided_delta_max_norm', type=float, default=0.0,
                         help='Shared max norm for the final guided W+ delta, applied uniformly to '
                              'every attribute. Set <=0 to disable (no cap).')
+    parser.add_argument('--use_attr_lora', action='store_true',
+                        help='Must match training: whether the checkpoint has a per-attribute '
+                             'LoRA adapter (see train_sdflow.py --use_attr_lora). Auto-restored '
+                             'from config.json if present.')
+    parser.add_argument('--attr_lora_rank', type=int, default=4,
+                        help='Must match training --attr_lora_rank if --use_attr_lora is set.')
+    parser.add_argument('--use_controlnet_injection', action='store_true',
+                        help='Load the ControlNet-style AttributeControlEncoder and inject its '
+                             'predicted skips into StyleGAN2 at embed_res (see '
+                             'models/control_encoder.py, train_sdflow.py --use_controlnet_injection). '
+                             'Auto-restored from config.json if the checkpoint was trained with it.')
+    parser.add_argument('--controlnet_embed_res', type=int, default=64,
+                        help='Must match training --controlnet_embed_res if enabled.')
+    parser.add_argument('--controlnet_channels', type=int, default=512,
+                        help='Must match training --controlnet_channels if enabled.')
+    parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
+                        help='Must match training --controlnet_hidden_dim if enabled.')
+    parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
+                        help='Must match training --controlnet_max_norm if it was set (0 = no cap '
+                             'was applied at training time either). Auto-restored from config.json.')
 
     # Independent judges
     parser.add_argument('--clip_judge_model', default='ViT-L/14',
                         help='CLIP model for the zero-shot attribute judge. Keep it different '
                              'from --clip_prompt_model used in training (default ViT-B/32) so '
                              'the judge is not the teacher.')
+    parser.add_argument('--clip_calibration', default=None,
+                        help="Recalibrate the CLIP judge's raw pos/neg softmax score per "
+                             "attribute so 0.5 lines up with the real visual boundary instead "
+                             "of CLIP's raw tie point, analogous to --glasses_area_thresh for "
+                             "the parser judge. Format: 'attr_idx:thresh:sharpness,...', e.g. "
+                             "'24:0.42:0.15,33:0.60:0.20'. Fit thresh/sharpness with "
+                             "scripts/calibrate_clip_thresh.py on a manually-labeled set.")
     parser.add_argument('--independent_attr_weights', default=None,
                         help='Optional second attribute-classifier checkpoint NOT used during '
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
+    parser.add_argument('--celeba_attr_judge_weights', default=None,
+                        help='Path to a CelebAAttrClassifierJudge checkpoint (ResNet18, '
+                             'https://github.com/Hawaii0821/FaceAttr-Analysis format). '
+                             'A supervised 40-attribute classifier that generalizes to any '
+                             'CelebA attribute without per-attribute CLIP prompt/threshold '
+                             'tuning. Adds an "AccCeleb" column and becomes the preferred '
+                             'headline accuracy number when set.')
     parser.add_argument('--glasses_judge', default='clip', choices=['clip', 'parser'],
                         help="How to score EYEGLASSES (attr 15). 'clip' = CLIP zero-shot "
                              "(under-detects thin frames; a visual audit showed ~44%% of "
@@ -992,7 +1392,28 @@ if __name__ == '__main__':
                              "still use CLIP. Recommended: parser. Re-run the dumper to "
                              "visually confirm calibration after switching.")
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
-                        help='BiSeNet weights for --glasses_judge parser.')
+                        help='BiSeNet weights for --glasses_judge parser and '
+                             '--composite_face_region.')
+    parser.add_argument('--composite_face_region', action='store_true',
+                        help='Training-free post-process: composite the edited face back onto '
+                             'the source-RECONSTRUCTION background/hair using the BiSeNet face '
+                             'mask (common/face_parser.py FaceParser.composite), for every '
+                             'attribute. Targets the long-standing complaint that gender/age '
+                             'edits move far more of the image than intended (global W+ edits '
+                             'leak into background/hair). Zero training risk -- pure inference-'
+                             'time compositing -- so try this before any further training-loss '
+                             'changes for identity/leakage.')
+    parser.add_argument('--composite_method', default='alpha', choices=['alpha', 'poisson'],
+                        help="'alpha' (default) feather-blends by mask weight -- fast, but a "
+                             "visible seam shows wherever the edited face's brightness/color "
+                             "differs from the background at the boundary (a wider "
+                             "--composite_blur_sigma only smooths the seam's SHAPE, not the "
+                             "color mismatch that causes it). 'poisson' uses gradient-domain "
+                             "blending (cv2.seamlessClone) instead, which matches boundary "
+                             "illumination directly and removes that seam; slower (runs "
+                             "per-sample on CPU) but recommended if 'alpha' shows a visible ring.")
+    parser.add_argument('--composite_blur_sigma', type=float, default=15,
+                        help='Feather width for --composite_method alpha. Ignored for poisson.')
     parser.add_argument('--glasses_area_thresh', type=float, default=0.0010,
                         help='Glasses-pixel area fraction at which the parser judge outputs '
                              '0.5 (present/absent boundary). Lower = more sensitive to thin '
