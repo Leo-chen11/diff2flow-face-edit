@@ -70,7 +70,7 @@ def pick_balanced_faces(dataset, attribute_index, num_faces):
 @torch.no_grad()
 def main(args):
     prior, conditioner, G, id_criterion, attr_teacher, attribute_index, \
-        direction_bank = load_models(args)
+        direction_bank, control_encoder = load_models(args)
 
     img_transform = T.Compose([
         T.ToTensor(),
@@ -105,6 +105,8 @@ def main(args):
                 local_idx, args.scale, direction_bank,
                 attr_global_idx=args.attribute_index[local_idx],
                 bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
+                control_encoder=control_encoder,
+                controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
             )
             cells.append(F.interpolate(edited, (args.cell_size, args.cell_size)))
 
