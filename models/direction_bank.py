@@ -35,6 +35,8 @@ class AttributeDirectionBank(nn.Module):
         per_attr_layer_scale=None,
         per_attr_delta_max_norm=None,
         guided_delta_max_norm=None,
+        use_attr_lora=False,
+        attr_lora_rank=4,
     ):
         super().__init__()
         self.num_attrs = int(num_attrs)
@@ -110,6 +112,21 @@ class AttributeDirectionBank(nn.Module):
             prior_norms = layer_norms.mean(dim=1).clamp(min=1e-4)   # (num_attrs, 18)
             self.magnitude_net[-1].bias.copy_(_inverse_softplus(prior_norms.reshape(-1)))
             self.magnitude_net[-1].weight.mul_(0.01)
+
+        # Optional per-attribute LoRA-style adapter on top of magnitude_net's
+        # shared hidden representation. magnitude_net is ONE MLP shared across
+        # all attributes; this gives each attribute its own small low-rank
+        # correction (A: hidden->rank, B: rank->num_layers) instead of only a
+        # shared path, without training a separate full network per attribute.
+        # B is zero-initialized, so this is a strict no-op until trained --
+        # safe to turn on for a bank that already has a trained magnitude_net.
+        self.use_attr_lora = bool(use_attr_lora)
+        if self.use_attr_lora:
+            rank = int(attr_lora_rank)
+            hidden_dim = self.magnitude_net[0].out_features   # 64
+            self.attr_lora_A = nn.Parameter(torch.randn(self.num_attrs, rank, hidden_dim) * 0.01)
+            self.attr_lora_B = nn.Parameter(torch.zeros(self.num_attrs, self.num_layers, rank))
+            print(f"[DirectionBank] per-attribute LoRA adapter enabled (rank={rank})")
 
         # gate_net: learns per-sample mixture weights over K directions (only when K>1)
         if self.num_k > 1:
@@ -213,8 +230,22 @@ class AttributeDirectionBank(nn.Module):
         attr_delta = attr_delta.to(device=device, dtype=dtype)
 
         # ── Magnitudes ────────────────────────────────────────────────────
-        magnitudes = self.magnitude_net(attr_delta.abs())
-        magnitudes = F.softplus(magnitudes).view(B, self.num_attrs, self.num_layers)
+        mag_hidden = torch.tanh(self.magnitude_net[0](attr_delta.abs()))   # (B, 64)
+        mag_logits = self.magnitude_net[2](mag_hidden)                     # (B, A*L)
+        mag_logits = mag_logits.view(B, self.num_attrs, self.num_layers)
+
+        if self.use_attr_lora and attr_idx is not None:
+            attr_idx_long = attr_idx.view(-1).long()
+            A_sel = self.attr_lora_A[attr_idx_long].to(device=device, dtype=dtype)   # (B, rank, 64)
+            B_sel = self.attr_lora_B[attr_idx_long].to(device=device, dtype=dtype)   # (B, L, rank)
+            lora_h = torch.einsum('brh,bh->br', A_sel, mag_hidden)                    # (B, rank)
+            lora_delta = torch.einsum('blr,br->bl', B_sel, lora_h)                    # (B, L)
+            mag_logits = mag_logits.scatter_add(
+                1, attr_idx_long.view(-1, 1, 1).expand(-1, 1, self.num_layers),
+                lora_delta.unsqueeze(1),
+            )
+
+        magnitudes = F.softplus(mag_logits)
 
         if attr_idx is not None:
             mask = torch.zeros(B, self.num_attrs, device=device, dtype=dtype)
