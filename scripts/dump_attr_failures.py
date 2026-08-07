@@ -41,8 +41,9 @@ from torch.utils import data
 from PIL import Image, ImageDraw
 
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, CLIPAttributeJudge, GlassesParserJudge, _latest_step,
-    apply_run_config, edit_single_attribute, is_clear, load_models,
+    ATTR_NAMES, CLIPAttributeJudge, CelebAAttrClassifierJudge, GlassesParserJudge,
+    _latest_step, apply_run_config, edit_single_attribute, is_clear, load_models,
+    parse_clip_calibration,
 )
 from common.face_parser import FaceParser
 from models.dataset import SDFlowDataset
@@ -53,15 +54,27 @@ def to_pil(img_tensor):
     return Image.fromarray(x.permute(1, 2, 0).numpy())
 
 
-def make_pair(src, edited, src_score, edit_score, attr_name, success, size=256):
+def make_pair(src, edited, src_score, edit_score, attr_name, success, size=256, watch=None):
+    """watch: optional list of (name, watch_src_score, watch_edit_score) for
+    bystander attributes that weren't edited -- flags leakage (any large
+    |edit-src| regardless of direction, since there's no "correct" direction
+    for something you didn't intend to change)."""
+    watch = watch or []
+    header_h = 24 + 14 * len(watch)
     a = to_pil(F.interpolate(src.unsqueeze(0), (size, size))[0])
     b = to_pil(F.interpolate(edited.unsqueeze(0), (size, size))[0])
-    canvas = Image.new('RGB', (size * 2, size + 24), (20, 20, 20))
-    canvas.paste(a, (0, 24)); canvas.paste(b, (size, 24))
+    canvas = Image.new('RGB', (size * 2, size + header_h), (20, 20, 20))
+    canvas.paste(a, (0, header_h)); canvas.paste(b, (size, header_h))
     d = ImageDraw.Draw(canvas)
     d.text((4, 6), f'src {attr_name}={src_score:.2f}', fill=(180, 180, 180))
     color = (80, 220, 80) if success else (240, 90, 90)
     d.text((size + 4, 6), f'edited {attr_name}={edit_score:.2f}', fill=color)
+    for i, (wname, ws, we) in enumerate(watch):
+        y = 20 + (i + 1) * 14
+        leaked = abs(we - ws) > 0.15
+        wcolor = (240, 180, 60) if leaked else (150, 150, 150)
+        d.text((4, y), f'[watch]{wname} src={ws:.2f}', fill=(150, 150, 150))
+        d.text((size + 4, y), f'[watch]{wname} edit={we:.2f}', fill=wcolor)
     return canvas
 
 
@@ -82,7 +95,7 @@ def save_montage(pairs, path, cols=4):
 def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     prior, conditioner, G, id_criterion, attr_teacher, \
-        attribute_index, direction_bank = load_models(args)
+        attribute_index, direction_bank, control_encoder = load_models(args)
 
     if args.attr not in args.attribute_index:
         raise SystemExit(f'attribute_index {args.attribute_index} has no attr {args.attr}.')
@@ -97,12 +110,26 @@ def main(args):
         print(f'[Judge] {attr_name} = BiSeNet parser (class 6)')
         score_fn = lambda imgs: pj.glasses_prob(imgs)
     else:
-        cj = CLIPAttributeJudge(args.attribute_index, args.clip_judge_model, 'cuda')
+        cj = CLIPAttributeJudge(args.attribute_index, args.clip_judge_model, 'cuda',
+                                 calibration=parse_clip_calibration(args.clip_calibration))
         print(f'[Judge] {attr_name} = CLIP {args.clip_judge_model} (prompt ensemble)')
         score_fn = lambda imgs: cj.scores(imgs)[:, local_idx]
 
     print(f'auditing {attr_name}  direction={args.direction}  '
           f'({"source lacks -> add it" if args.direction == "add" else "source has -> remove it"})')
+
+    watch_attrs = list(args.watch_attrs or [])
+    watch_score_fn = None
+    if watch_attrs:
+        if args.celeba_attr_judge_weights:
+            wj = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, 'cuda')
+            print(f'[Watch] scoring {watch_attrs} with CelebAAttrClassifierJudge')
+            watch_score_fn = lambda imgs: wj.scores(imgs)[:, watch_attrs]
+        else:
+            wj = CLIPAttributeJudge(watch_attrs, args.clip_judge_model, 'cuda')
+            print(f'[Watch] scoring {watch_attrs} with CLIP (no --celeba_attr_judge_weights given)')
+            watch_score_fn = lambda imgs: wj.scores(imgs)
+    watch_names = [ATTR_NAMES.get(a, f'attr{a}') for a in watch_attrs]
 
     composite_face_parser = None
     if args.composite_face_region:
@@ -124,6 +151,7 @@ def main(args):
 
     fails, succs = [], []
     n_dir, n_fail = 0, 0
+    watch_leak_abs = {name: [] for name in watch_names}
     for img, latent, _pred in loader:
         img = img.cuda(); latent = latent.cuda()
         _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
@@ -139,12 +167,20 @@ def main(args):
             face_parser=composite_face_parser,
             composite_method=args.composite_method,
             composite_blur_sigma=args.composite_blur_sigma,
+            control_encoder=control_encoder,
+            controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
         )
         edited_256 = F.interpolate(edited, (256, 256))
         edit_scores = score_fn(edited_256)
 
+        if watch_score_fn is not None:
+            watch_src = watch_score_fn(src_face_256)
+            watch_edit = watch_score_fn(edited_256)
+
         for b in range(img.size(0)):
             s = src_scores[b].item(); e = edit_scores[b].item()
+            watch = [(watch_names[i], watch_src[b, i].item(), watch_edit[b, i].item())
+                     for i in range(len(watch_attrs))] if watch_score_fn is not None else None
             if not is_clear(s):
                 continue
             # Direction gate on the SOURCE, and success test on the EDIT.
@@ -157,17 +193,30 @@ def main(args):
                     continue                 # source doesn't have it; not a rm case
                 success = e < 0.5            # removed -> crossed down
             n_dir += 1
+            if watch is not None:
+                for wname, ws, we in watch:
+                    watch_leak_abs[wname].append(abs(we - ws))
             if not success:
                 n_fail += 1
                 if len(fails) < args.num_fail:
-                    fails.append(make_pair(src_face[b], edited[b], s, e, attr_name, False))
+                    fails.append(make_pair(src_face[b], edited[b], s, e, attr_name, False, watch=watch))
             elif len(succs) < args.num_success:
-                succs.append(make_pair(src_face[b], edited[b], s, e, attr_name, True))
+                succs.append(make_pair(src_face[b], edited[b], s, e, attr_name, True, watch=watch))
         if len(fails) >= args.num_fail and len(succs) >= args.num_success:
             break
 
     print(f'\n{attr_name} {args.direction}: samples seen={n_dir}, judge-failed={n_fail} '
           f'({n_fail / max(1, n_dir):.1%})')
+
+    for wname, vals in watch_leak_abs.items():
+        if not vals:
+            continue
+        vals_t = torch.tensor(vals)
+        leak_rate = (vals_t > 0.15).float().mean().item()
+        print(f'[watch]{wname} leakage over {len(vals)} samples: '
+              f'mean|Δ|={vals_t.mean():.3f}  median|Δ|={vals_t.median():.3f}  '
+              f'fraction with |Δ|>0.15 = {leak_rate:.1%}')
+
     tag = f'{attr_name}_{args.direction}'
     save_montage(fails, os.path.join(args.out_dir, f'{tag}_FAILURES.png'))
     save_montage(succs, os.path.join(args.out_dir, f'{tag}_successes.png'))
@@ -216,6 +265,14 @@ if __name__ == '__main__':
                    choices=['resnet', 'clip', 'resnet_clip'])
     p.add_argument('--clip_model', default='ViT-B/32')
     p.add_argument('--clip_judge_model', default='ViT-L/14')
+    p.add_argument('--clip_calibration', default=None,
+                    help="Same format as evaluate_sdflow.py: 'attr_idx:thresh:sharpness,...'")
+    p.add_argument('--watch_attrs', nargs='*', type=int, default=None,
+                    help='Extra attributes to SCORE but not edit, to check for leakage into '
+                         'attributes not being edited here (e.g. --attr 39 --watch_attrs 20 '
+                         'checks whether editing Young alone shifts Male).')
+    p.add_argument('--celeba_attr_judge_weights', default=None,
+                    help='Used for --watch_attrs scoring if given (preferred over CLIP).')
     p.add_argument('--fused_hidden_dim', type=int, default=256)
     p.add_argument('--lag_gate_hidden_dim', type=int,   default=64)
     p.add_argument('--lag_gate_init_bias',  type=float, default=-0.5)
