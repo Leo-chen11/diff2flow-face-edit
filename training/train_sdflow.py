@@ -703,6 +703,21 @@ if __name__ == '__main__':
     # run, so Eyeglasses/Young hit a dataset-mean-direction ceiling (~60% real
     # accuracy). Start higher so the flow's personalization is actually in play.
     parser.add_argument('--direction_residual_scale', type=float, default=0.15)
+    parser.add_argument('--age_residual_scale', type=float, default=-1.0,
+                        help='Separate INITIAL residual_scale for age (attr 39) at TRAINING time. '
+                             '<0 (default) falls back to the shared --direction_residual_scale, i.e. '
+                             'age starts with the same residual budget as every other attribute even '
+                             "though the age direction is the one confirmed (via visual audit) to carry "
+                             'a baked-in color-cast shortcut. AttributeDirectionBank already supports '
+                             'per-attribute residual_scale init (per_attr_residual_scale) -- evaluation/'
+                             'evaluate_sdflow.py already uses it for --glasses_residual_scale, but '
+                             'training never wired it up for any attribute until now. Raising this '
+                             '(e.g. 0.15-0.30) gives the flow residual a bigger starting share of the '
+                             "final age edit, so whatever real aging texture --age_diffusion_weight/"
+                             '--age_dds_fine_layer_start teach the flow actually has weight in the '
+                             'output, instead of the frozen (~95% of the edit) direction dominating '
+                             'regardless of what the residual learns. residual_scale is still learned '
+                             'via gradient descent from this starting point, not fixed.')
     parser.add_argument('--direction_freeze', '--direction-freeze',
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--direction_orth_weight', type=float, default=0.0)
@@ -713,6 +728,48 @@ if __name__ == '__main__':
                              'Use 10-12 for safe stage fine-tuning; 0 disables.')
     parser.add_argument('--final_delta_max_norm', type=float, default=0.0,
                         help='Optional final max norm after direction-bank mixing. 0 disables.')
+    parser.add_argument('--use_attr_lora', action='store_true',
+                        help='Give each attribute its own small low-rank (LoRA-style) additive '
+                             'correction on top of magnitude_net\'s shared hidden representation, '
+                             'instead of every attribute sharing the exact same MLP path with only '
+                             'a scalar residual_scale/direction_scale to differ by. '
+                             'Zero-initialized (B matrix), so this is a strict no-op at step 0 -- '
+                             'safe to enable on a bank that already has a trained magnitude_net.')
+    parser.add_argument('--attr_lora_rank', type=int, default=4,
+                        help='Rank of the per-attribute LoRA adapter (--use_attr_lora). Higher = '
+                             'more per-attribute expressiveness, more parameters to learn.')
+    parser.add_argument('--use_controlnet_injection', action='store_true',
+                        help='ControlNet-style additive injection into an INTERMEDIATE StyleGAN2 '
+                             'feature map (models/stylegan2/model.py Generator\'s dormant `skips` '
+                             'hook at embed_res resolution), instead of only at the W+ input like '
+                             'every other mechanism (Direction Bank, flow residual, LoRA). Each '
+                             'attribute gets its own small decoder head (models/control_encoder.py'
+                             '), zero-initialized so this is a no-op at step 0. Requires '
+                             '--direction_bank_path. See models/control_encoder.py module '
+                             'docstring for the motivation.')
+    parser.add_argument('--controlnet_embed_res', type=int, default=64,
+                        help='Must match Generator.forward()\'s embed_res (default 64) -- the '
+                             'feature-map resolution the injection targets.')
+    parser.add_argument('--controlnet_channels', type=int, default=512,
+                        help='Must match StyleGAN2\'s channel count at --controlnet_embed_res '
+                             '(512 for the default channel_multiplier=2 at 64x64).')
+    parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
+                        help='Hidden width of the shared trunk in AttributeControlEncoder.')
+    parser.add_argument('--controlnet_reg_weight', type=float, default=0.001,
+                        help='L2 penalty weight on the per-sample norm of control_skips (the '
+                             'AttributeControlEncoder output actually added into the StyleGAN2 '
+                             'feature map). Unlike the W+ guided_delta, control_skips has NO loss '
+                             'term constraining its magnitude directly -- it is only shaped '
+                             'indirectly through downstream classifier/CLIP losses, which reward '
+                             'moving attribute scores but never penalize HOW that movement looks. '
+                             'Over long fine-tunes this let the injected signal grow large enough '
+                             'to visibly corrupt images (LPIPS blew up, AccCeleb collapsed, while '
+                             'ID stayed misleadingly high) with no warning in any other loss curve. '
+                             'Set 0 to disable (not recommended once this is enabled).')
+    parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
+                        help='Hard per-sample cap on control_skips norm (like guided_delta_max_norm '
+                             'for the W+ path). 0 disables the cap; only the L2 penalty above still '
+                             'applies. Use this if the L2 penalty alone does not keep training stable.')
     parser.add_argument('--freeze_direction_bank_nets', action='store_true',
                         help='Freeze all Direction Bank trainable nets during fine-tuning. '
                              'Useful when continuing from a good checkpoint and only training the flow/conditioner.')
@@ -1011,6 +1068,11 @@ if __name__ == '__main__':
         # the same residual_scale value and learns its own from there via
         # gradient descent (see AttributeDirectionBank.residual_scale_raw). The
         # only magnitude safety net set here in advance is guided_delta_max_norm.
+        _per_attr_residual_scale = [
+            args.age_residual_scale if (idx == 39 and args.age_residual_scale >= 0)
+            else args.direction_residual_scale
+            for idx in args.attribute_index
+        ]
         direction_bank = AttributeDirectionBank(
             num_attrs=len(args.attribute_index),
             num_layers=18,
@@ -1019,12 +1081,15 @@ if __name__ == '__main__':
             bank_path=args.direction_bank_path,
             attribute_index=args.attribute_index,
             residual_scale=args.direction_residual_scale,
+            per_attr_residual_scale=_per_attr_residual_scale,
             freeze_directions=args.direction_freeze,
             residual_max_norm=args.residual_max_norm,
             guided_delta_max_norm=(
                 args.direction_guided_delta_max_norm
                 if args.direction_guided_delta_max_norm > 0 else None
             ),
+            use_attr_lora=args.use_attr_lora,
+            attr_lora_rank=args.attr_lora_rank,
         ).cuda()
         if args.freeze_direction_bank_nets:
             for p in direction_bank.parameters():
@@ -1039,6 +1104,24 @@ if __name__ == '__main__':
         direction_bank = None
     trainable_params += list(attr_scales.parameters())
     trainable_params += list(reg_loss_weights.parameters())
+
+    control_encoder = None
+    if args.use_controlnet_injection:
+        if direction_bank is None:
+            raise ValueError('--use_controlnet_injection requires --direction_bank_path '
+                              '(and --velocity_field != original) -- attr_delta, needed to '
+                              'condition the control encoder, is only computed on that branch.')
+        from models.control_encoder import AttributeControlEncoder
+        control_encoder = AttributeControlEncoder(
+            num_attrs=len(args.attribute_index),
+            out_channels=args.controlnet_channels,
+            out_res=args.controlnet_embed_res,
+            hidden_dim=args.controlnet_hidden_dim,
+        ).cuda()
+        trainable_params += list(control_encoder.parameters())
+        print(f'** ControlNet-style feature injection enabled: embed_res='
+              f'{args.controlnet_embed_res}, channels={args.controlnet_channels} '
+              f'(zero-initialized per-attribute heads, no-op at step 0)')
 
     # Magnitude-controlling meta-parameters (edit-strength center, direction-bank
     # residual trust, reg_loss layer-group weights). The old hardcoded 0.1x lr,
@@ -1080,6 +1163,10 @@ if __name__ == '__main__':
             direction_bank_ema = make_ema_copy(direction_bank)
             ema_pairs.append((direction_bank, direction_bank_ema, 'direction_bank'))
             ema_modules_for_save['direction_bank'] = direction_bank_ema
+        if control_encoder is not None:
+            control_encoder_ema = make_ema_copy(control_encoder)
+            ema_pairs.append((control_encoder, control_encoder_ema, 'control_encoder'))
+            ema_modules_for_save['control_encoder'] = control_encoder_ema
         print(f'** EMA enabled (decay={args.ema_decay}); shadow weights saved to '
               f'save_models_ema/, point --ckpt_dir there at eval time to use them.')
 
@@ -1104,6 +1191,11 @@ if __name__ == '__main__':
             load_module_checkpoint(direction_bank, resume_save_dir, 'direction_bank', start_step, strict=False)
         elif direction_bank is not None:
             print('[Resume] direction_bank checkpoint not loaded; using current bank path and safety controls.')
+        if control_encoder is not None:
+            try:
+                load_module_checkpoint(control_encoder, resume_save_dir, 'control_encoder', start_step, strict=False)
+            except FileNotFoundError:
+                print('[Resume] control_encoder checkpoint not found; starting from zero-init (no-op).')
         if args.resume_optimizer:
             opt_path = os.path.join(resume_save_dir, 'optimizer-{}'.format(str(start_step).zfill(7)))
             if not os.path.exists(opt_path):
@@ -1131,6 +1223,8 @@ if __name__ == '__main__':
         log_modules.insert(2, layer_mask)
     if direction_bank is not None:
         log_modules.insert(-1, direction_bank)
+    if control_encoder is not None:
+        log_modules.insert(-1, control_encoder)
     logger.modules = log_modules
     
     # Initialization for stylegan2 model
@@ -1280,8 +1374,37 @@ if __name__ == '__main__':
             final_delta_clip_factor = final_delta_clip.mean().detach()
             safe_delta = guided_delta
             new_latents = latent + safe_delta
-            
-            new_face_tensors = G([new_latents],input_is_latent=True,randomize_noise=False)[0].clamp(-1, 1)
+
+            control_skips = None
+            control_skip_norm = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            loss_control_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            if control_encoder is not None:
+                # ControlNet-style injection: an additive correction at an
+                # INTERMEDIATE StyleGAN2 feature map (embed_res, default
+                # 64x64), not at the W+ input like every other mechanism in
+                # this project. attr_delta is only defined on the
+                # direction_bank branch above; control_encoder requires
+                # direction_bank to be enabled (checked at arg-parse time).
+                control_skips = control_encoder(attr_delta, mid_idx)
+
+                # control_skips has no OTHER loss term constraining its
+                # magnitude -- it's only shaped indirectly through downstream
+                # classifier/CLIP losses, which reward moving attribute
+                # scores but never penalize how that movement looks. Long
+                # fine-tunes let this grow unbounded (LPIPS spiked, AccCeleb
+                # collapsed, while ID stayed misleadingly high because the
+                # corruption didn't destroy ArcFace's coarse face embedding).
+                # An explicit L2 penalty plus optional hard cap closes that
+                # gap, mirroring guided_delta_max_norm on the W+ path.
+                skip_norm_per_sample = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
+                loss_control_reg = skip_norm_per_sample.pow(2).mean()
+                if args.controlnet_max_norm > 0:
+                    clip = (args.controlnet_max_norm / skip_norm_per_sample.clamp(min=1e-8)).clamp(max=1.0)
+                    control_skips = control_skips * clip.view(-1, 1, 1, 1)
+                control_skip_norm = skip_norm_per_sample.mean().detach()
+
+            new_face_tensors = G([new_latents], skips=control_skips,
+                                 input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             new_face_tensors = F.interpolate(new_face_tensors, (args.img_size, args.img_size))
 
             # ── Face-parser locality loss (local attributes only) ────────────
@@ -1527,7 +1650,8 @@ if __name__ == '__main__':
                             new_latents[:, :fine_start, :],
                             new_latents[:, fine_start:, :].detach(),
                         ], dim=1)
-                        _ft = G([_nl], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                        _ft = G([_nl], skips=control_skips, input_is_latent=True,
+                               randomize_noise=False)[0].clamp(-1, 1)
                         return F.interpolate(_ft, (args.img_size, args.img_size))
                     return new_face_tensors
 
@@ -1577,7 +1701,8 @@ if __name__ == '__main__':
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
-                args.color_shift_loss_weight * color_shift_loss
+                args.color_shift_loss_weight * color_shift_loss +\
+                args.controlnet_reg_weight * loss_control_reg
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -1644,6 +1769,8 @@ if __name__ == '__main__':
                 'final_delta_norm': final_delta_norm,
                 'final_delta_clip_factor': final_delta_clip_factor,
                 'final_delta_max_norm': torch.tensor(args.final_delta_max_norm),
+                'control_skip_norm': control_skip_norm,
+                'loss_control_reg': loss_control_reg.detach(),
                 'dir_orth': dir_orth_loss,
                 'dir_bank_flow_delta_norm': dir_logs.get('dir_bank_flow_delta_norm', _zero.detach().clone()),
                 'dir_bank_dir_delta_norm': dir_logs.get('dir_bank_dir_delta_norm', _zero.detach().clone()),
