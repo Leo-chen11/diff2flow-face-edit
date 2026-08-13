@@ -166,6 +166,9 @@ if __name__ == '__main__':
     parser.add_argument('--bypass_glasses_direction_bank',
                         action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--guided_delta_max_norm', type=float, default=0.0)
+    parser.add_argument('--disable_controlnet', action='store_true',
+                        help='ABLATION: skip control_encoder even if the run was trained with '
+                             'it, to render the same faces through the W+ path alone.')
     parser.add_argument('--override_residual_scale', type=float, default=None,
                         help='Force direction-bank residual_scale at render time '
                              '(same diagnostic knob as evaluate_sdflow.py).')
