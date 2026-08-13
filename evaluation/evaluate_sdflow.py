@@ -458,9 +458,9 @@ RUN_CONFIG_KEYS = [
     'lag_gate_hidden_dim', 'lag_gate_init_bias', 'id_cond_dim', 'id_cond_scale',
     'attr_backbone', 'conditioner_backbone', 'clip_model', 'fused_hidden_dim',
     'img_size', 'direction_residual_scale', 'direction_bank_path',
-    'use_attr_lora', 'attr_lora_rank',
+    'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
-    'controlnet_hidden_dim', 'controlnet_max_norm',
+    'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
 ]
 
 
@@ -601,6 +601,7 @@ def load_models(args):
             ),
             use_attr_lora=getattr(args, 'use_attr_lora', False),
             attr_lora_rank=getattr(args, 'attr_lora_rank', 4),
+            signed_magnitude_input=getattr(args, 'signed_magnitude_input', False),
         ).to(device).eval()
         if os.path.exists(db_ckpt_path):
             # The frozen direction_units are a registered buffer, so they live
@@ -678,13 +679,18 @@ def load_models(args):
 
     # ── ControlNet-style attribute control encoder (optional) ─────────────
     control_encoder = None
-    if getattr(args, 'use_controlnet_injection', False):
+    if getattr(args, 'disable_controlnet', False):
+        print('[Ablation] --disable_controlnet: control_encoder NOT loaded; the edit runs '
+              'through the W+ path (flow + Direction Bank) only, even though this run was '
+              'trained with the injection active.')
+    elif getattr(args, 'use_controlnet_injection', False):
         from models.control_encoder import AttributeControlEncoder
         control_encoder = AttributeControlEncoder(
             num_attrs=num_attrs,
             out_channels=args.controlnet_channels,
             out_res=args.controlnet_embed_res,
             hidden_dim=args.controlnet_hidden_dim,
+            init_gain=getattr(args, 'controlnet_init_gain', 1.0),
         ).to(device).eval()
         ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
         if os.path.exists(ce_ckpt_path):
@@ -1343,6 +1349,9 @@ if __name__ == '__main__':
                              'from config.json if present.')
     parser.add_argument('--attr_lora_rank', type=int, default=4,
                         help='Must match training --attr_lora_rank if --use_attr_lora is set.')
+    parser.add_argument('--signed_magnitude_input', action='store_true',
+                        help='Must match training --signed_magnitude_input. Auto-restored from '
+                             'config.json.')
     parser.add_argument('--use_controlnet_injection', action='store_true',
                         help='Load the ControlNet-style AttributeControlEncoder and inject its '
                              'predicted skips into StyleGAN2 at embed_res (see '
@@ -1354,6 +1363,16 @@ if __name__ == '__main__':
                         help='Must match training --controlnet_channels if enabled.')
     parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
                         help='Must match training --controlnet_hidden_dim if enabled.')
+    parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
+                        help='Must match training --controlnet_init_gain. Only sets the log_gain '
+                             'init; the trained value comes from the checkpoint. Auto-restored '
+                             'from config.json.')
+    parser.add_argument('--disable_controlnet', action='store_true',
+                        help='ABLATION: skip loading control_encoder even for a run trained with '
+                             '--use_controlnet_injection, so the edit goes through the W+ path '
+                             'alone. Run against the same checkpoint as a normal eval to isolate '
+                             'what the feature-map injection contributes. Deliberately NOT in '
+                             'RUN_CONFIG_KEYS -- an eval-time override, never restored from config.')
     parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
                         help='Must match training --controlnet_max_norm if it was set (0 = no cap '
                              'was applied at training time either). Auto-restored from config.json.')
