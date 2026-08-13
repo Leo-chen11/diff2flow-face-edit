@@ -1,7 +1,7 @@
 import argparse
 import copy
 import json
-import os,sys
+import os,shutil,sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'models', 'stylegan2'))
@@ -305,6 +305,40 @@ def save_ema_checkpoints(save_root, step, ema_modules):
         )
 
 
+def save_best_checkpoints(save_root, step, logger, ema_modules, metric, metric_name):
+    """Mirror the run layout under <save_root>/best/ so eval tooling works unchanged.
+
+    Writes save_models/, save_models_ema/ and a copy of config.json, which is
+    what apply_run_config() and _latest_step() expect -- so evaluating the best
+    checkpoint is just --checkpoint_dir <run>/best with no other flags. Previous
+    contents are cleared first, so exactly one step remains and auto-detection
+    picks it.
+    """
+    best_root = os.path.join(save_root, 'best')
+    models_dir = os.path.join(best_root, 'save_models')
+    ema_dir = os.path.join(best_root, 'save_models_ema')
+    for d in (models_dir, ema_dir):
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+        os.makedirs(d, exist_ok=True)
+
+    for name, module in zip(logger.module_names, logger.modules):
+        torch.save(module.state_dict(),
+                   os.path.join(models_dir, '{}-{}'.format(name, str(step).zfill(7))))
+    for name, module in (ema_modules or {}).items():
+        torch.save(module.state_dict(),
+                   os.path.join(ema_dir, '{}-{}'.format(name, str(step).zfill(7))))
+
+    cfg_src = os.path.join(save_root, 'config.json')
+    if os.path.exists(cfg_src):
+        shutil.copy2(cfg_src, os.path.join(best_root, 'config.json'))
+
+    with open(os.path.join(best_root, 'best_info.json'), 'w') as f:
+        json.dump({'step': int(step), 'metric_name': metric_name,
+                   'metric': float(metric)}, f, indent=2)
+    print(f'** new best {metric_name}={metric:.4f} at step {step} -> {best_root}')
+
+
 def cap_delta_norm(delta, max_norm):
     if max_norm is None or max_norm <= 0:
         clip = torch.ones(delta.shape[0], device=delta.device, dtype=delta.dtype)
@@ -565,7 +599,7 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_entity', default=None, type=str, help='wandb user or team name')
     parser.add_argument('--wandb_mode', default='online', choices=['online', 'offline', 'disabled'], help='wandb logging mode')
     parser.add_argument('--print_freq', type=int, default=10,help='print frequency')
-    parser.add_argument('--save_freq', type=int, default=1000,help='save frequency')
+    parser.add_argument('--save_freq', type=int, default=5000,help='save frequency')
     
     
     # parameters for training 
@@ -738,6 +772,18 @@ if __name__ == '__main__':
     parser.add_argument('--attr_lora_rank', type=int, default=4,
                         help='Rank of the per-attribute LoRA adapter (--use_attr_lora). Higher = '
                              'more per-attribute expressiveness, more parameters to learn.')
+    parser.add_argument('--signed_magnitude_input', action='store_true',
+                        help="Feed magnitude_net the SIGNED attr_delta instead of its absolute "
+                             "value, so an attribute can travel a different distance when added "
+                             "than when removed. Under .abs() the two are forced equal, but a "
+                             "scale sweep shows the weak side of each attribute keeps improving "
+                             "with more displacement while the strong side has saturated -- and "
+                             "which side is weak differs per attribute (Male on rm, Young on add). "
+                             "Raising edit_scale globally therefore overpays, buying nothing on "
+                             "the saturated directions while costing identity everywhere. This "
+                             "moves the compensation inside the model so edit_scale stays at 1.0. "
+                             "Parameter shapes are unchanged, so an existing checkpoint can be "
+                             "fine-tuned with --resume_dir rather than retrained from scratch.")
     parser.add_argument('--use_controlnet_injection', action='store_true',
                         help='ControlNet-style additive injection into an INTERMEDIATE StyleGAN2 '
                              'feature map (models/stylegan2/model.py Generator\'s dormant `skips` '
@@ -770,6 +816,78 @@ if __name__ == '__main__':
                         help='Hard per-sample cap on control_skips norm (like guided_delta_max_norm '
                              'for the W+ path). 0 disables the cap; only the L2 penalty above still '
                              'applies. Use this if the L2 penalty alone does not keep training stable.')
+    parser.add_argument('--controlnet_warmup_steps', type=int, default=0,
+                        help='Hold the injection off for this many steps so the W+ path (flow + '
+                             'Direction Bank) learns to edit on its own first. Training both from '
+                             'scratch lets the control branch win the work outright: it reaches '
+                             'the losses more easily and the W+ path then stops developing -- a '
+                             'measured run had W+ delta norm peak early and DECLINE to ~8 while '
+                             'the same recipe without injection climbed to ~15, and disabling the '
+                             'branch at eval dropped accuracy from 71.8% to 28.1%. That hurts '
+                             'exactly the attributes the branch cannot handle: the injection sits '
+                             'at embed_res, downstream of the coarse layers where face geometry is '
+                             'decided, so it is strong on spatially-local attributes and cannot do '
+                             'the jaw/skull/hairline changes age and gender need.')
+    parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
+                        help='Starting norm of the injected control_skips signal (the encoder '
+                             'output is L2-normalized, then scaled by a learnable per-attribute '
+                             'gain initialized here). This IS control_skip_norm at step 0, so set '
+                             'it against the measured magnitude of the feature map it is added to '
+                             '-- run scripts/measure_feature_norm.py rather than guessing.')
+    parser.add_argument('--controlnet_lr_mult', type=float, default=1.0,
+                        help='LR multiplier for control_encoder only (own Adam param group).')
+    parser.add_argument('--target_loss', default='mse', choices=['mse', 'hinge'],
+                        help="Shape of the target-attribute loss. 'mse' squares the distance to "
+                             "soft_target, which keeps pulling on samples that already crossed the "
+                             "decision boundary and leaves the ones far past it holding a surplus "
+                             "the optimiser can spend elsewhere. 'hinge' penalises only the "
+                             "shortfall relative to crossing 0.5 by --target_hinge_margin, matching "
+                             "what AccCeleb actually measures, and gives zero gradient once a "
+                             "sample is safely across.")
+    parser.add_argument('--target_hinge_margin_frac', type=float, default=0.6,
+                        help="Per-attribute --target_loss hinge margin, expressed as a FRACTION "
+                             "of that attribute's own |SOFT_TARGET_TABLE target - 0.5| gap, not an "
+                             "absolute probability offset. An absolute margin is structurally wrong "
+                             "here: SOFT_TARGET_TABLE deliberately gives Eyeglasses a wide target "
+                             "gap (0.10/0.90, gap 0.40) and Male/Young a conservative one "
+                             "(0.20/0.80, gap 0.30, chosen to avoid forcing a full identity flip). "
+                             "A margin of 0.35 sat comfortably inside Eyeglasses' 0.40 gap (no "
+                             "effect -- soft_target always won the "
+                             "max(soft_target,boundary)/min(...) comparison) but exceeded Male/"
+                             "Young's 0.30 gap, pushing their boundary PAST their own intended "
+                             "target and making loss behaviour there hypersensitive to exactly "
+                             "where scores land relative to a boundary that no longer means what "
+                             "it was supposed to. Male rm got weaker (LPIPS 0.1694 -> 0.1359, "
+                             "AccCeleb 54.8% -> 44.4%) under that setup, not stronger. Scaling by "
+                             "each attribute's own gap keeps the buffer proportionate: 0.6 asks "
+                             "for 60% of the way from 0.5 to the intended target, for every "
+                             "attribute, regardless of how aggressive that target already is.")
+    parser.add_argument('--celeba_attr_judge_weights', default=None,
+                        help='Optional independent CelebA attribute classifier (the same weights '
+                             'evaluate_sdflow.py scores AccCeleb with). Used for LOGGING ONLY -- it '
+                             'never enters the loss, so AccCeleb stays an independent measure. The '
+                             'training teacher saturates well before that judge does (AccT* reads '
+                             '100% on Eyeglasses where AccCeleb reads 88%), so without this the '
+                             'real metric is invisible until a run finishes. Logged as '
+                             'judge_celeb_acc/attr_N and judge_celeb_acc_mean.')
+    parser.add_argument('--save_best', action=argparse.BooleanOptionalAction, default=True,
+                        help='Also keep the best-scoring checkpoint under <run>/best/, judged by a '
+                             'smoothed judge_celeb_acc_mean. Requires --celeba_attr_judge_weights, '
+                             'since that monitor is the only signal here that tracks the reported '
+                             'metric rather than the training teacher (which saturates well before '
+                             'it -- AccT* reads 100% on Eyeglasses where AccCeleb reads 88%). The '
+                             'best directory mirrors the run layout, so evaluating it is just '
+                             '--checkpoint_dir <run>/best.')
+    parser.add_argument('--best_metric_ema', type=float, default=0.98,
+                        help='Smoothing for the best-checkpoint metric. The raw monitor scores one '
+                             'batch of --batch samples, of which typically only one or two are '
+                             'editing any given attribute, so it lands on 0/0.5/1 and is far too '
+                             'noisy to select on directly.')
+    parser.add_argument('--best_min_step', type=int, default=10000,
+                        help='Ignore best-checkpoint candidates before this step, while the metric '
+                             'is still climbing out of its initial transient.')
+    parser.add_argument('--celeba_judge_interval', type=int, default=50,
+                        help='Steps between --celeba_attr_judge_weights monitor evaluations.')
     parser.add_argument('--freeze_direction_bank_nets', action='store_true',
                         help='Freeze all Direction Bank trainable nets during fine-tuning. '
                              'Useful when continuing from a good checkpoint and only training the flow/conditioner.')
@@ -1090,6 +1208,7 @@ if __name__ == '__main__':
             ),
             use_attr_lora=args.use_attr_lora,
             attr_lora_rank=args.attr_lora_rank,
+            signed_magnitude_input=args.signed_magnitude_input,
         ).cuda()
         if args.freeze_direction_bank_nets:
             for p in direction_bank.parameters():
@@ -1117,11 +1236,15 @@ if __name__ == '__main__':
             out_channels=args.controlnet_channels,
             out_res=args.controlnet_embed_res,
             hidden_dim=args.controlnet_hidden_dim,
+            init_gain=args.controlnet_init_gain,
         ).cuda()
         trainable_params += list(control_encoder.parameters())
+        _warm = args.controlnet_warmup_steps
         print(f'** ControlNet-style feature injection enabled: embed_res='
-              f'{args.controlnet_embed_res}, channels={args.controlnet_channels} '
-              f'(zero-initialized per-attribute heads, no-op at step 0)')
+              f'{args.controlnet_embed_res}, channels={args.controlnet_channels}, '
+              f'init_gain={args.controlnet_init_gain} (= control_skip_norm once active)'
+              + (f'; held off until step {_warm} so the W+ path matures first'
+                 if _warm > 0 else '; active from step 0'))
 
     # Magnitude-controlling meta-parameters (edit-strength center, direction-bank
     # residual trust, reg_loss layer-group weights). The old hardcoded 0.1x lr,
@@ -1135,12 +1258,24 @@ if __name__ == '__main__':
         low_lr_params.append(direction_bank.residual_scale_raw)
     low_lr_ids = {id(p) for p in low_lr_params}
 
-    optimizer = optim.Adam(
-        [
-            {'params': [p for p in trainable_params if id(p) not in low_lr_ids], 'lr': args.lr},
-            {'params': low_lr_params, 'lr': args.lr * args.meta_lr_mult, 'weight_decay': 0.0},
-        ]
-    )
+    # control_encoder gets its own group so --controlnet_lr_mult can move the
+    # branch independently of the W+ path it runs alongside.
+    control_params = list(control_encoder.parameters()) if control_encoder is not None else []
+    control_ids = {id(p) for p in control_params}
+
+    param_groups = [
+        {'params': [p for p in trainable_params
+                    if id(p) not in low_lr_ids and id(p) not in control_ids],
+         'lr': args.lr},
+        {'params': low_lr_params, 'lr': args.lr * args.meta_lr_mult, 'weight_decay': 0.0},
+    ]
+    if control_params:
+        param_groups.append({'params': control_params,
+                             'lr': args.lr * args.controlnet_lr_mult})
+        print(f'** control_encoder lr = {args.lr * args.controlnet_lr_mult:g} '
+              f'({args.controlnet_lr_mult}x base lr)')
+
+    optimizer = optim.Adam(param_groups)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs * len(train_loader) // args.grad_accum_steps, eta_min=1e-6
     )
@@ -1225,6 +1360,15 @@ if __name__ == '__main__':
         log_modules.insert(-1, direction_bank)
     if control_encoder is not None:
         log_modules.insert(-1, control_encoder)
+
+    # Best-checkpoint tracking. The metric is the AccCeleb monitor, smoothed --
+    # the raw value scores one small batch and lands on 0/0.5/1, so selecting on
+    # it unsmoothed would just pick a lucky batch.
+    best_metric_ema = None
+    best_metric_seen = float('-inf')
+    if args.save_best and not args.celeba_attr_judge_weights:
+        print('** --save_best ignored: it selects on judge_celeb_acc_mean, which needs '
+              '--celeba_attr_judge_weights')
     logger.modules = log_modules
     
     # Initialization for stylegan2 model
@@ -1248,6 +1392,22 @@ if __name__ == '__main__':
     for p in attr_teacher.parameters():
         p.requires_grad_(False)
     print('** Frozen attribute teacher initialization success !')
+
+    # Independent AccCeleb monitor. Deliberately outside the loss: this is the
+    # same classifier evaluate_sdflow.py reports AccCeleb with, so feeding it
+    # gradients would turn the headline metric into self-grading. It exists
+    # only so the real number is visible during a run instead of after it --
+    # the training teacher saturates far earlier (AccT* 100% on Eyeglasses
+    # against AccCeleb 88%), which is why loss curves kept looking healthy
+    # while the independent judge disagreed.
+    celeb_monitor = None
+    if args.celeba_attr_judge_weights:
+        from evaluation.evaluate_sdflow import CelebAAttrClassifierJudge
+        celeb_monitor = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, 'cuda')
+        for p_ in celeb_monitor.parameters():
+            p_.requires_grad_(False)
+        print(f'** AccCeleb monitor enabled (logging only, every '
+              f'{args.celeba_judge_interval} steps): {args.celeba_attr_judge_weights}')
 
     face_parser = None
     if args.local_region_loss_weight > 0 or args.color_shift_loss_weight > 0:
@@ -1378,7 +1538,9 @@ if __name__ == '__main__':
             control_skips = None
             control_skip_norm = torch.zeros([], device=latent.device, dtype=latent.dtype)
             loss_control_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
-            if control_encoder is not None:
+            controlnet_active = (control_encoder is not None
+                                 and n_iter >= args.controlnet_warmup_steps)
+            if controlnet_active:
                 # ControlNet-style injection: an additive correction at an
                 # INTERMEDIATE StyleGAN2 feature map (embed_res, default
                 # 64x64), not at the W+ input like every other mechanism in
@@ -1542,7 +1704,45 @@ if __name__ == '__main__':
             soft_target_for_loss = soft_target.detach()
             target_probs[batch_indices, mid_idx] = soft_target_for_loss
             edited_probs = gen_probs[batch_indices, mid_idx]
-            changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
+            if args.target_loss == 'hinge':
+                # AccCeleb only asks whether the edited score CROSSED 0.5; it is
+                # blind to how far past the boundary a sample lands. A squared
+                # error to soft_target is not: a sample sitting at 0.02 when the
+                # target is 0 contributes almost nothing, so from the loss's view
+                # it holds a large surplus that can be spent elsewhere -- moving
+                # it to 0.45 costs only ~0.2 while freeing capacity for a sample
+                # stuck at 0.85 whose squared error is 0.72. Accuracy sees that
+                # trade very differently: 0.02 and 0.45 are both successes, but
+                # 0.55 is a total loss, and the squared error barely changes
+                # across that cliff (0.20 -> 0.30). Enabling --signed_magnitude_input
+                # gave the model the freedom to make exactly that trade, and it
+                # did: Eyeglasses rm fell 98.4% -> 90.6% funding a Male rm gain.
+                #
+                # The hinge penalises only the shortfall relative to crossing the
+                # boundary by --target_hinge_margin_frac (scaled per attribute --
+                # see below), and only ever asks for the
+                # easier of (soft_target, boundary) so a partial train_scale is
+                # never turned into a demand for a full flip. Past the boundary
+                # the gradient is zero, so there is no surplus left to harvest.
+                _sign = torch.sign(hard_teacher_target.detach() - src_attr)
+                # Margin as a fraction of THIS attribute's own target gap, not
+                # a shared absolute offset -- see --target_hinge_margin_frac.
+                _gap = torch.empty_like(src_attr)
+                for _local in torch.unique(mid_idx):
+                    _abs = int(args.attribute_index[int(_local.item())])
+                    _low, _high = SOFT_TARGET_TABLE.get(_abs, DEFAULT_SOFT_TARGET)
+                    _gap[mid_idx == _local] = (_high - _low) / 2.0
+                _boundary = 0.5 + _sign * args.target_hinge_margin_frac * _gap
+                _eff_target = torch.where(
+                    _sign > 0,
+                    torch.minimum(soft_target_for_loss, _boundary),
+                    torch.maximum(soft_target_for_loss, _boundary),
+                )
+                changed_mse_per_sample = torch.relu(
+                    _sign * (_eff_target - edited_probs)
+                ).pow(2)
+            else:
+                changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
             if loss_balancer is not None:
                 loss_balancer.update(mid_idx.detach(), changed_mse_per_sample.detach())
                 balance_weights = loss_balancer.weights_for(mid_idx).detach()
@@ -1748,7 +1948,40 @@ if __name__ == '__main__':
                 logger.checkpoints(n_iter)
                 if args.use_ema:
                     save_ema_checkpoints(logger.save_root, n_iter, ema_modules_for_save)
+
+                if (args.save_best and best_metric_ema is not None
+                        and n_iter >= args.best_min_step
+                        and best_metric_ema > best_metric_seen):
+                    best_metric_seen = best_metric_ema
+                    save_best_checkpoints(
+                        logger.save_root, n_iter, logger,
+                        ema_modules_for_save if args.use_ema else None,
+                        best_metric_ema, 'judge_celeb_acc_ema')
                     
+            # AccCeleb monitor: same success rule as evaluate_sdflow.strict_success
+            # (did the edited score cross 0.5), scored by the independent judge.
+            # No gradient -- purely a readout.
+            celeb_acc_log = {}
+            if celeb_monitor is not None and n_iter % args.celeba_judge_interval == 0:
+                with torch.no_grad():
+                    _src_c = celeb_monitor.scores(
+                        F.interpolate(src_face_256, (256, 256)))[:, attribute_index]
+                    _edit_c = celeb_monitor.scores(
+                        F.interpolate(new_face_256, (256, 256)))[:, attribute_index]
+                    _s = _src_c[batch_indices, mid_idx]
+                    _e = _edit_c[batch_indices, mid_idx]
+                    _ok = torch.where(_s > 0.5, _e < 0.5, _e > 0.5).float()
+                    for _local in torch.unique(mid_idx):
+                        _m = mid_idx == _local
+                        _abs = int(args.attribute_index[int(_local.item())])
+                        celeb_acc_log[f'judge_celeb_acc/attr_{_abs}'] = _ok[_m].mean()
+                    celeb_acc_log['judge_celeb_acc_mean'] = _ok.mean()
+                    _m = float(_ok.mean())
+                    best_metric_ema = _m if best_metric_ema is None else (
+                        args.best_metric_ema * best_metric_ema
+                        + (1.0 - args.best_metric_ema) * _m)
+                    celeb_acc_log['judge_celeb_acc_ema'] = torch.tensor(best_metric_ema)
+
             _log_dict = {
                 'loss_total': loss,
                 'loss_nll': log_p2,
@@ -1818,6 +2051,8 @@ if __name__ == '__main__':
                     _log_dict[f'clip_balance_weight/attr_{_attr_abs_idx}'] = clip_loss_balancer.weights[_i]
                     _log_dict[f'clip_balance_ema_loss/attr_{_attr_abs_idx}'] = clip_loss_balancer.ema_loss[_i]
             for _k, _v in diffusion_logs.items():
+                _log_dict[_k] = _v
+            for _k, _v in celeb_acc_log.items():
                 _log_dict[_k] = _v
             logger.msg(_log_dict, n_iter)
             
