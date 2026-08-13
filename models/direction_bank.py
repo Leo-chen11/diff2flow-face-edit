@@ -37,6 +37,7 @@ class AttributeDirectionBank(nn.Module):
         guided_delta_max_norm=None,
         use_attr_lora=False,
         attr_lora_rank=4,
+        signed_magnitude_input=False,
     ):
         super().__init__()
         self.num_attrs = int(num_attrs)
@@ -120,6 +121,27 @@ class AttributeDirectionBank(nn.Module):
         # shared path, without training a separate full network per attribute.
         # B is zero-initialized, so this is a strict no-op until trained --
         # safe to turn on for a bank that already has a trained magnitude_net.
+        # Feeding magnitude_net the SIGNED attr_delta lets an attribute use a
+        # different step size for adding vs removing it. With .abs() the two
+        # are forced to the same magnitude, and only the final sign differs --
+        # so "make masculine" and "make feminine" must travel exactly as far.
+        # A scale sweep on a trained model shows that assumption is wrong: the
+        # strong directions saturate while the weak ones keep improving with
+        # more displacement (AccCeleb at edit_scale 1.0 / 1.2 / 1.4):
+        #
+        #   Eyeglasses add  91.5  91.5  92.4    saturated
+        #   Eyeglasses rm   98.4  98.4  98.4    saturated
+        #   Male       add  86.8  91.4  93.4    flattening
+        #   Male       rm   40.0  50.4  57.8    still climbing
+        #   Young      add  58.5  63.4  68.3    still climbing
+        #   Young      rm   90.9  94.9  98.3    near ceiling
+        #
+        # Which side is weak differs per attribute (Male on rm, Young on add),
+        # so a global edit_scale increase overpays: it buys nothing on the
+        # saturated directions while spending identity on every sample. Making
+        # the magnitude signed moves that compensation inside the model, so
+        # edit_scale can stay at 1.0.
+        self.signed_magnitude_input = bool(signed_magnitude_input)
         self.use_attr_lora = bool(use_attr_lora)
         if self.use_attr_lora:
             rank = int(attr_lora_rank)
@@ -230,7 +252,11 @@ class AttributeDirectionBank(nn.Module):
         attr_delta = attr_delta.to(device=device, dtype=dtype)
 
         # ── Magnitudes ────────────────────────────────────────────────────
-        mag_hidden = torch.tanh(self.magnitude_net[0](attr_delta.abs()))   # (B, 64)
+        # Signed input -> add and rm can learn different magnitudes; .abs()
+        # forces them equal. The sign of the edit still comes from attr_delta
+        # below either way, so this only affects how far each side travels.
+        mag_input = attr_delta if self.signed_magnitude_input else attr_delta.abs()
+        mag_hidden = torch.tanh(self.magnitude_net[0](mag_input))          # (B, 64)
         mag_logits = self.magnitude_net[2](mag_hidden)                     # (B, A*L)
         mag_logits = mag_logits.view(B, self.num_attrs, self.num_layers)
 
