@@ -40,10 +40,32 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class AttributeControlEncoder(nn.Module):
-    def __init__(self, num_attrs, out_channels=512, out_res=64, seed_res=4, hidden_dim=256):
+    """Magnitude is decoupled from direction on purpose.
+
+    The head network only decides the SHAPE of the injected signal; its
+    output is L2-normalized per sample and then scaled by a single
+    learnable gain per attribute. Letting the conv stack set the magnitude
+    directly turned out to be unusable in both directions: at the shared
+    base LR the zero-initialized stack never grew past ~0.5 against a
+    512x64x64 feature map whose own norm measures ~2931 (a 0.017%
+    perturbation -- --disable_controlnet reproduced identical accuracy, ID,
+    LPIPS and leakage, so the module was inert), and at 20x LR with no
+    penalty it diverged to ~6e7 within 70 steps. Four stacked 512-channel
+    ConvTranspose2d layers compound weight growth multiplicatively, so the
+    output norm responds to LR far too sharply to tune by trial.
+
+    With this split, control_skip_norm in the training log IS the gain:
+    directly observable, settable via --controlnet_init_gain, and bounded
+    by --controlnet_max_norm. The gain stays learnable so the model can
+    still choose how much to lean on this branch.
+    """
+
+    def __init__(self, num_attrs, out_channels=512, out_res=64, seed_res=4, hidden_dim=256,
+                 init_gain=1.0):
         super().__init__()
         self.num_attrs = int(num_attrs)
         self.out_channels = int(out_channels)
@@ -72,6 +94,13 @@ class AttributeControlEncoder(nn.Module):
             self._build_head(self.out_channels, num_upsamples) for _ in range(self.num_attrs)
         ])
 
+        # One learnable magnitude per attribute, through softplus so it stays
+        # positive. Stored inverted from init_gain so that at step 0 the
+        # injected signal has exactly norm == init_gain.
+        init_gain = max(float(init_gain), 1e-4)
+        raw = math.log(math.expm1(init_gain))
+        self.log_gain = nn.Parameter(torch.full((self.num_attrs,), raw))
+
     def _build_head(self, channels, num_upsamples):
         layers = []
         for _ in range(num_upsamples):
@@ -79,10 +108,10 @@ class AttributeControlEncoder(nn.Module):
                 nn.ConvTranspose2d(channels, channels, kernel_size=4, stride=2, padding=1),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
-        final = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        nn.init.zeros_(final.weight)
-        nn.init.zeros_(final.bias)
-        layers.append(final)
+        # NOT zero-initialized: the output is L2-normalized in forward(), so a
+        # zero head would divide by zero. Magnitude safety comes from log_gain
+        # (and --controlnet_max_norm) instead.
+        layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1))
         return nn.Sequential(*layers)
 
     def forward(self, attr_delta, attr_idx):
@@ -104,4 +133,8 @@ class AttributeControlEncoder(nn.Module):
             mask = attr_idx == a
             if mask.any():
                 out[mask] = self.attr_heads[a](seed[mask])
-        return out
+
+        # Direction from the head, magnitude from the per-attribute gain.
+        out = F.normalize(out.reshape(B, -1), dim=1).view_as(out)
+        gain = F.softplus(self.log_gain)[attr_idx].to(device=device, dtype=dtype)
+        return out * gain.view(-1, 1, 1, 1)
