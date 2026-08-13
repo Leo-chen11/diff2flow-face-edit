@@ -285,6 +285,9 @@ if __name__ == '__main__':
     p.add_argument('--age_fine_layer_scale', type=float, default=None)
     p.add_argument('--age_fine_layer_start', type=int, default=4)
     p.add_argument('--force_bank_directions', action='store_true')
+    p.add_argument('--disable_controlnet', action='store_true',
+                   help='ABLATION: skip control_encoder even if the run was trained with it, '
+                        'so leakage is measured through the W+ path alone.')
     p.add_argument('--batch', type=int, default=4)
     p.add_argument('--ignore_run_config', action='store_true')
 
