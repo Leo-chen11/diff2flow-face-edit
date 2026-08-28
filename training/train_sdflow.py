@@ -173,6 +173,113 @@ class CrossAttributeLossBalancer:
         return self.weights[attr_local_idx]
 
 
+class JudgePeakDeclineBalancer:
+    """Weights CLIP-prompt loss by how far each attribute's independent-judge
+    accuracy has fallen from its own best-seen (EMA-smoothed) value, instead
+    of CrossAttributeLossBalancer's relative-progress-since-init signal.
+
+    Built to fix a specific failure: a run's judge_celeb_acc rose to a
+    plateau by ~10k steps, then Male declined steadily for the rest of
+    training (0.68 -> 0.58 by 60k) while Eyeglasses kept climbing the whole
+    time (0.3 -> 0.9). CrossAttributeLossBalancer never caught this, because
+    it tracks the CLIP LOSS's own relative progress since its initial value
+    -- Male's CLIP loss had dropped early and stayed low, so the balancer
+    read it as "ahead" and kept its weight near the floor right through the
+    accuracy decline the loss was blind to.
+
+    The judge itself never receives gradient (scored under torch.no_grad() in
+    the training loop's monitor block), so raising an attribute's weight here
+    gives the model no way to earn it by fooling the judge -- only by
+    genuinely recovering accuracy does its own EMA rise back toward its peak
+    and its weight relax. The judge only routes more gradient through the
+    REAL supervised loss (loss_clip_prompt); it never becomes the target.
+
+    per_direction (default on) tracks add and rm as SEPARATE slots. Keying on
+    the attribute alone measures the mean over both edit directions, and that
+    mean can be restored by improving whichever direction is cheaper rather
+    than the one that actually declined. That is exactly what the first run of
+    this balancer did: Male's weight climbed from 20k on, its judge accuracy
+    peaked HIGHER than the unbalanced baseline (0.75-0.8 vs 0.65-0.7) -- and
+    the eval showed the gain had been bought entirely on the easy side, Male
+    add 83.6% -> 92.8% while Male rm collapsed 68.1% -> 34.1%, a 58.7pp split.
+    The judge was never fooled; the SUMMARY STATISTIC was satisfiable one-sided.
+    Splitting the slots closes that route: a saturated add direction sits at
+    its own peak and earns no uplift, so only the direction genuinely falling
+    away from its own best is funded.
+    """
+
+    def __init__(self, num_attrs, ema_decay=0.98, gain=4.0,
+                 min_weight=0.25, max_weight=4.0, warmup_updates=5,
+                 per_direction=True, device='cuda'):
+        self.num_attrs = int(num_attrs)
+        self.per_direction = bool(per_direction)
+        self.num_slots = self.num_attrs * 2 if self.per_direction else self.num_attrs
+        self.ema_decay = float(ema_decay)
+        self.gain = float(gain)
+        self.min_weight = float(min_weight)
+        self.max_weight = float(max_weight)
+        self.warmup_updates = int(warmup_updates)
+        self.ema_acc = torch.zeros(self.num_slots, device=device)
+        self.peak_acc = torch.zeros(self.num_slots, device=device)
+        self.n_updates = torch.zeros(self.num_slots, dtype=torch.long, device=device)
+        self.weights = torch.ones(self.num_slots, device=device)
+
+    def slot_index(self, attr_local_idx, is_rm=None):
+        """Map (attribute, edit direction) -> slot. Layout is attr-major:
+        slot 2a is attribute a's add direction, 2a+1 its rm direction."""
+        if not self.per_direction:
+            return attr_local_idx
+        if is_rm is None:
+            raise ValueError('per_direction balancer needs is_rm per sample')
+        return attr_local_idx * 2 + is_rm.long()
+
+    def slot_name(self, slot, attribute_index):
+        """Human-readable key for logging, e.g. 'attr_20_rm'."""
+        if not self.per_direction:
+            return f'attr_{attribute_index[slot]}'
+        return f'attr_{attribute_index[slot // 2]}_{"rm" if slot % 2 else "add"}'
+
+    @torch.no_grad()
+    def update(self, attr_local_idx, correct_per_sample, is_rm=None):
+        """attr_local_idx: LongTensor [B] of attributes present at this judge
+        tick. correct_per_sample: FloatTensor [B] in {0,1}, whether the judge
+        called that sample's edit a success (same rule as
+        evaluate_sdflow.strict_success). is_rm: BoolTensor [B], True where the
+        source already HAS the attribute so the edit removes it -- the same
+        add/rm convention evaluate_sdflow reports its direction split under."""
+        slots = self.slot_index(attr_local_idx, is_rm)
+        for a in torch.unique(slots).tolist():
+            mask = slots == a
+            v = correct_per_sample[mask].mean()
+            if self.n_updates[a] == 0:
+                self.ema_acc[a] = v
+            else:
+                self.ema_acc[a] = self.ema_decay * self.ema_acc[a] + (1.0 - self.ema_decay) * v
+            self.n_updates[a] += 1
+            # Only start tracking a peak once the EMA has had a few ticks to
+            # settle -- the first handful are the climb off zero, not a peak
+            # to decline from.
+            if self.n_updates[a] > self.warmup_updates:
+                self.peak_acc[a] = torch.maximum(self.peak_acc[a], self.ema_acc[a])
+
+        settled = self.n_updates > self.warmup_updates
+        if settled.any():
+            decline = (self.peak_acc - self.ema_acc).clamp(min=0.0)
+            target = 1.0 + self.gain * decline
+            target = torch.where(settled, target, torch.ones_like(target))
+            self.weights = target.clamp(self.min_weight, self.max_weight)
+            # Renormalize to mean 1 over the settled slots only, so a slot
+            # still in warmup doesn't get silently down-weighted by the
+            # renormalization before it has a real peak to compare to. With
+            # per_direction on, this is what funds a declining rm direction
+            # out of a saturated add direction rather than out of thin air.
+            denom = self.weights[settled].mean().clamp(min=1e-8) if settled.any() else 1.0
+            self.weights = self.weights / denom
+
+    def weights_for(self, attr_local_idx, is_rm=None):
+        return self.weights[self.slot_index(attr_local_idx, is_rm)]
+
+
 # Soft-target policy keyed by ABSOLUTE CelebA attribute index. The old version
 # keyed on local position (0/1/2 assumed to be glasses/gender/age), so any
 # other --attribute_index ordering or attribute set silently mis-targeted
@@ -666,7 +773,24 @@ if __name__ == '__main__':
                              'the eye region instead of a diffuse whole-face "glasses-ness". '
                              '0 disables (default). Suggested when enabling: 0.5.')
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
-                        help='BiSeNet weights for --local_region_loss_weight.')
+                        help='BiSeNet weights for --local_region_loss_weight and '
+                             '--dds_face_mask.')
+    parser.add_argument('--dds_face_mask', action='store_true',
+                        help='Restrict the DDS diffusion-guidance gradient (models/'
+                             'diffusion_guidance.py) to the region the edit is allowed to touch, '
+                             'instead of the whole latent. Unmasked, DDS asks the frozen '
+                             'diffusion model to denoise the ENTIRE image toward edit_prompt, so '
+                             'background/hair/clothing all get nonzero gradient even though the '
+                             'prompt has no real opinion about them -- wasted signal that '
+                             'directly funds LeakCLIP and ID drift. Eyeglasses uses '
+                             'LOCAL_REGION_CLASSES (brows/eyes/glasses only); Male/Young use '
+                             'FaceParser.FACE_CLASSES, which already INCLUDES hair -- age\'s '
+                             '"receding hairline" prompt cue is not cut by this. Loads a '
+                             'FaceParser the same way --local_region_loss_weight does (shared '
+                             'instance if both are set). 0 risk to identity/leakage, upside '
+                             'only if DDS was actually spending gradient off-face; off by '
+                             'default because it changes DDS numerics for existing --resume_dir '
+                             'runs.')
     parser.add_argument('--local_region_add_blur', type=float, default=15,
                         help='Mask dilation (gaussian blur sigma) for ADDITION-direction '
                              'local edits. The source face has no glasses pixels for '
@@ -836,6 +960,20 @@ if __name__ == '__main__':
                              '-- run scripts/measure_feature_norm.py rather than guessing.')
     parser.add_argument('--controlnet_lr_mult', type=float, default=1.0,
                         help='LR multiplier for control_encoder only (own Adam param group).')
+    parser.add_argument('--controlnet_per_direction',
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="Give add and rm their own decoder head and their own learnable gain "
+                             "per attribute, instead of sharing one of each per attribute. Sharing "
+                             "forces the SAME weights to learn two very different tasks -- e.g. "
+                             "eyeglasses add must synthesize frame structure from nothing while rm "
+                             "only erases an existing one. A 128x128 run (--controlnet_embed_res "
+                             "128) showed the predicted failure: judge_celeb_acc/attr_15_add "
+                             "climbed slowly from ~0 while judge_celeb_acc/attr_15_rm drifted down "
+                             "over the same steps -- the harder add task pulling shared capacity "
+                             "away from rm, the same entanglement --per_direction already fixed for "
+                             "AttributeDirectionBank and never fixed here. Off by default: changes "
+                             "control_encoder's parameter shapes, so a checkpoint saved with the "
+                             "old (shared) layout cannot --resume_dir into a run with this flag set.")
     parser.add_argument('--target_loss', default='mse', choices=['mse', 'hinge'],
                         help="Shape of the target-attribute loss. 'mse' squares the distance to "
                              "soft_target, which keeps pulling on samples that already crossed the "
@@ -1000,6 +1138,37 @@ if __name__ == '__main__':
                              'keyed to CLIP loss is required to auto-detect that gap and correct it. '
                              'Uses the same --balance_ema_decay/--balance_adapt_rate/--balance_min_weight/'
                              '--balance_max_weight hyperparameters as --balance_attr_losses.')
+    parser.add_argument('--clip_balance_signal', default='loss', choices=['loss', 'judge'],
+                        help="What --balance_clip_prompt_loss tracks to set weights. 'loss' uses "
+                             "CrossAttributeLossBalancer on the CLIP loss's own relative progress "
+                             "(original behaviour). 'judge' uses JudgePeakDeclineBalancer instead: it "
+                             "reads --celeba_attr_judge_weights accuracy and raises an attribute's "
+                             "weight the further its OWN smoothed accuracy has fallen from its own "
+                             "best-seen value. This exists because CLIP-loss progress and judge "
+                             "accuracy can disagree for a long stretch of training -- a run's Male "
+                             "judge accuracy peaked by ~10k steps then eroded to 60k while its CLIP "
+                             "loss stayed low the whole time (having dropped early), so the "
+                             "loss-based balancer read Male as ahead and kept deprioritizing it right "
+                             "through the decline. Requires --celeba_attr_judge_weights.")
+    parser.add_argument('--judge_balance_gain', type=float, default=4.0,
+                        help='--clip_balance_signal judge: weight = 1 + gain * (own peak accuracy - '
+                             'current smoothed accuracy), before clamping to [--balance_min_weight, '
+                             '--balance_max_weight] and renormalizing to mean 1.')
+    parser.add_argument('--judge_balance_warmup_updates', type=int, default=5,
+                        help='--clip_balance_signal judge: judge ticks (each --celeba_judge_interval '
+                             "steps) an attribute needs before its EMA starts counting toward its own "
+                             "peak. Skips the initial climb off zero so it is never mistaken for a "
+                             "decline.")
+    parser.add_argument('--judge_balance_per_direction',
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help='--clip_balance_signal judge: track add and rm as separate slots, each '
+                             'with its own peak and weight. On by default because keying on the '
+                             'attribute alone weights a mean over both directions, and that mean is '
+                             'satisfiable one-sided: the first run of this balancer lifted Male add '
+                             '83.6%% -> 92.8%% while Male rm fell 68.1%% -> 34.1%%, so the attribute '
+                             'average looked healthy (it peaked HIGHER than the unbalanced baseline) '
+                             'while the edit everyone actually cares about got worse. Pass '
+                             '--no-judge_balance_per_direction to reproduce that per-attribute run.')
 
     # ── EMA (exponential moving average) of trainable weights ──────────────
     parser.add_argument('--use_ema', action=argparse.BooleanOptionalAction, default=True,
@@ -1154,17 +1323,25 @@ if __name__ == '__main__':
         print(f'** Cross-attribute loss balancing enabled for attrs {args.attribute_index}')
 
     clip_loss_balancer = None
+    judge_balancer = None   # built after celeb_monitor exists, see below
     if args.balance_clip_prompt_loss:
-        clip_loss_balancer = CrossAttributeLossBalancer(
-            len(args.attribute_index),
-            ema_decay=args.balance_ema_decay,
-            adapt_rate=args.balance_adapt_rate,
-            min_weight=args.balance_min_weight,
-            max_weight=args.balance_max_weight,
-            device='cuda',
-        )
-        print(f'** CLIP-prompt-loss auto-balancing enabled for attrs {args.attribute_index} '
-              f'(overrides --clip_prompt_{{age,gender,glasses}}_weight)')
+        if args.clip_balance_signal == 'judge':
+            if not args.celeba_attr_judge_weights:
+                raise ValueError('--clip_balance_signal judge requires --celeba_attr_judge_weights.')
+            print(f'** CLIP-prompt-loss auto-balancing enabled for attrs {args.attribute_index} '
+                  f'(overrides --clip_prompt_{{age,gender,glasses}}_weight), signal=judge '
+                  f'(JudgePeakDeclineBalancer built once the judge is loaded below)')
+        else:
+            clip_loss_balancer = CrossAttributeLossBalancer(
+                len(args.attribute_index),
+                ema_decay=args.balance_ema_decay,
+                adapt_rate=args.balance_adapt_rate,
+                min_weight=args.balance_min_weight,
+                max_weight=args.balance_max_weight,
+                device='cuda',
+            )
+            print(f'** CLIP-prompt-loss auto-balancing enabled for attrs {args.attribute_index} '
+                  f'(overrides --clip_prompt_{{age,gender,glasses}}_weight), signal=loss')
     trainable_params = list(prior.parameters()) + list(conditioner.parameters())
     if args.velocity_field == 'original':
         trainable_params += list(layer_mask.parameters())
@@ -1237,6 +1414,7 @@ if __name__ == '__main__':
             out_res=args.controlnet_embed_res,
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=args.controlnet_init_gain,
+            per_direction=args.controlnet_per_direction,
         ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
@@ -1409,8 +1587,24 @@ if __name__ == '__main__':
         print(f'** AccCeleb monitor enabled (logging only, every '
               f'{args.celeba_judge_interval} steps): {args.celeba_attr_judge_weights}')
 
+    if args.balance_clip_prompt_loss and args.clip_balance_signal == 'judge':
+        judge_balancer = JudgePeakDeclineBalancer(
+            len(args.attribute_index),
+            ema_decay=args.balance_ema_decay,
+            gain=args.judge_balance_gain,
+            min_weight=args.balance_min_weight,
+            max_weight=args.balance_max_weight,
+            warmup_updates=args.judge_balance_warmup_updates,
+            per_direction=args.judge_balance_per_direction,
+            device='cuda',
+        )
+        print(f'** JudgePeakDeclineBalancer built (gain={args.judge_balance_gain}, '
+              f'warmup={args.judge_balance_warmup_updates} judge ticks, '
+              f'{"per add/rm direction" if args.judge_balance_per_direction else "per attribute"}, '
+              f'{judge_balancer.num_slots} slots)')
+
     face_parser = None
-    if args.local_region_loss_weight > 0 or args.color_shift_loss_weight > 0:
+    if args.local_region_loss_weight > 0 or args.color_shift_loss_weight > 0 or args.dds_face_mask:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -1421,9 +1615,13 @@ if __name__ == '__main__':
             if args.color_shift_loss_weight > 0:
                 print(f'** Color-shift regularizer enabled (weight='
                       f'{args.color_shift_loss_weight}) for attrs {args.color_shift_attrs}')
+            if args.dds_face_mask:
+                print('** DDS face mask enabled: diffusion-guidance gradient restricted to '
+                      'the region each attribute is allowed to touch.')
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
-            print(f'[WARN] Face parser unavailable ({exc}); locality/color-shift loss disabled.')
+            print(f'[WARN] Face parser unavailable ({exc}); locality/color-shift/DDS-mask '
+                  f'disabled.')
 
     diffusion_guidance = None
     if args.use_diffusion_guidance:
@@ -1547,7 +1745,8 @@ if __name__ == '__main__':
                 # this project. attr_delta is only defined on the
                 # direction_bank branch above; control_encoder requires
                 # direction_bank to be enabled (checked at arg-parse time).
-                control_skips = control_encoder(attr_delta, mid_idx)
+                control_skips = control_encoder(attr_delta, mid_idx,
+                                                is_rm=(src_attr_flow > 0.5))
 
                 # control_skips has no OTHER loss term constraining its
                 # magnitude -- it's only shaped indirectly through downstream
@@ -1566,6 +1765,7 @@ if __name__ == '__main__':
                 control_skip_norm = skip_norm_per_sample.mean().detach()
 
             new_face_tensors = G([new_latents], skips=control_skips,
+                                 embed_res=args.controlnet_embed_res,
                                  input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             new_face_tensors = F.interpolate(new_face_tensors, (args.img_size, args.img_size))
 
@@ -1699,6 +1899,12 @@ if __name__ == '__main__':
             gen_probs = torch.sigmoid(gen_logits)[:, attribute_index]
             target_probs = src_probs.clone()
             src_attr = src_probs[batch_indices, mid_idx]
+            # Which way is this edit going? Same convention evaluate_sdflow
+            # reports its direction split under: rm = the source already has
+            # the attribute. Computed once here so the judge balancer buckets a
+            # sample the same way when it reads a weight out (clip-prompt loss,
+            # below) and when it writes an accuracy back in (monitor block).
+            edit_is_rm = (src_attr > 0.5).detach()
             hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
             soft_target = src_attr + train_scale * (hard_teacher_target - src_attr)
             soft_target_for_loss = soft_target.detach()
@@ -1788,6 +1994,16 @@ if __name__ == '__main__':
                     # CLIP -- see --balance_clip_prompt_loss help).
                     clip_loss_balancer.update(mid_idx.detach(), clip_loss_each.detach())
                     clip_sample_weight = clip_loss_balancer.weights_for(mid_idx).detach()
+                elif judge_balancer is not None:
+                    # --clip_balance_signal judge: weights come from
+                    # JudgePeakDeclineBalancer, updated in the AccCeleb monitor
+                    # block below (every --celeba_judge_interval steps) from the
+                    # judge's actual pass/fail calls, not this loss. Reading
+                    # .weights_for() here just applies whatever the balancer's
+                    # state currently is -- it lags by at most one judge tick,
+                    # same as every other EMA-based balancer in this file.
+                    clip_sample_weight = judge_balancer.weights_for(
+                        mid_idx, edit_is_rm).detach()
                 else:
                     clip_sample_weight = torch.ones_like(clip_loss_each)
                     clip_sample_weight[_clip_abs_idx == 39] = args.clip_prompt_age_weight
@@ -1850,10 +2066,30 @@ if __name__ == '__main__':
                             new_latents[:, :fine_start, :],
                             new_latents[:, fine_start:, :].detach(),
                         ], dim=1)
-                        _ft = G([_nl], skips=control_skips, input_is_latent=True,
+                        _ft = G([_nl], skips=control_skips, embed_res=args.controlnet_embed_res,
+                               input_is_latent=True,
                                randomize_noise=False)[0].clamp(-1, 1)
                         return F.interpolate(_ft, (args.img_size, args.img_size))
                     return new_face_tensors
+
+                # --dds_face_mask: restrict the DDS gradient to the region each
+                # attribute is allowed to touch, per-sample (a batch can mix
+                # glasses and gender). Eyeglasses gets the narrow
+                # LOCAL_REGION_CLASSES mask; everything else gets FaceParser's
+                # default FACE_CLASSES mask, which already includes hair.
+                def _dds_mask(images, abs_idx_1d):
+                    if face_parser is None or not args.dds_face_mask:
+                        return None
+                    mask = torch.zeros(images.shape[0], 1, images.shape[2], images.shape[3],
+                                       device=images.device, dtype=images.dtype)
+                    for _a in set(abs_idx_1d.detach().cpu().tolist()):
+                        _sel = abs_idx_1d == _a
+                        if _a in LOCAL_REGION_CLASSES:
+                            mask[_sel] = face_parser.get_region_mask(
+                                images[_sel], LOCAL_REGION_CLASSES[_a])
+                        else:
+                            mask[_sel] = face_parser.get_mask(images[_sel])
+                    return mask
 
                 # Non-age samples (glasses, gender): standard cutoff and timestep range
                 non_age_mask = ~is_age
@@ -1864,6 +2100,7 @@ if __name__ == '__main__':
                         edit_images=_face_non_age[non_age_mask],
                         attr_abs_idx=mid_abs_idx[non_age_mask],
                         target_values=soft_target[non_age_mask].detach(),
+                        face_mask=_dds_mask(_face_non_age[non_age_mask], mid_abs_idx[non_age_mask]),
                     )
                     diffusion_loss = diffusion_loss + _loss
                     diffusion_logs.update(_logs)
@@ -1883,6 +2120,7 @@ if __name__ == '__main__':
                         target_values=soft_target[is_age].detach(),
                         timestep_min=args.age_diffusion_timestep_min,
                         timestep_max=args.age_diffusion_timestep_max,
+                        face_mask=_dds_mask(_face_age[is_age], mid_abs_idx[is_age]),
                     )
                     age_diffusion_loss = age_diffusion_loss + _loss
                     diffusion_logs.update({f'age_{k}': v for k, v in _logs.items()})
@@ -1971,10 +2209,28 @@ if __name__ == '__main__':
                     _s = _src_c[batch_indices, mid_idx]
                     _e = _edit_c[batch_indices, mid_idx]
                     _ok = torch.where(_s > 0.5, _e < 0.5, _e > 0.5).float()
+                    if judge_balancer is not None:
+                        judge_balancer.update(mid_idx.detach(), _ok.detach(), edit_is_rm)
+                        for _slot in range(judge_balancer.num_slots):
+                            _key = judge_balancer.slot_name(_slot, args.attribute_index)
+                            celeb_acc_log[f'judge_balance_weight/{_key}'] = \
+                                judge_balancer.weights[_slot]
+                            celeb_acc_log[f'judge_balance_peak/{_key}'] = \
+                                judge_balancer.peak_acc[_slot]
                     for _local in torch.unique(mid_idx):
                         _m = mid_idx == _local
                         _abs = int(args.attribute_index[int(_local.item())])
                         celeb_acc_log[f'judge_celeb_acc/attr_{_abs}'] = _ok[_m].mean()
+                        # Also split by direction. The per-attribute mean hid a
+                        # 58.7pp add/rm gap for a whole run; logging both halves
+                        # makes that visible in wandb as it happens instead of
+                        # only in the eval afterwards.
+                        for _rm in (False, True):
+                            _md = _m & (edit_is_rm == _rm)
+                            if _md.any():
+                                celeb_acc_log[
+                                    f'judge_celeb_acc/attr_{_abs}_{"rm" if _rm else "add"}'
+                                ] = _ok[_md].mean()
                     celeb_acc_log['judge_celeb_acc_mean'] = _ok.mean()
                     _m = float(_ok.mean())
                     best_metric_ema = _m if best_metric_ema is None else (
