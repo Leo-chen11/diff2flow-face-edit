@@ -764,18 +764,20 @@ if __name__ == '__main__':
                              'between teacher and CLIP accuracy without it).')
     parser.add_argument('--teacher_aug_noise', type=float, default=0.02,
                         help='Std of the shared gaussian noise in --teacher_aug.')
-    parser.add_argument('--local_region_loss_weight', type=float, default=0.0,
+    parser.add_argument('--local_region_loss_weight', type=float, default=0.5,
                         help='Weight for the face-parser locality loss on LOCAL attributes '
                              '(currently eyeglasses, see LOCAL_REGION_CLASSES): outside the '
                              'allowed region, the edited image must match the source '
                              'reconstruction pixel-wise. Directly attacks the ~55-60%% real '
                              'eyeglasses accuracy ceiling by forcing the edit budget into '
                              'the eye region instead of a diffuse whole-face "glasses-ness". '
-                             '0 disables (default). Suggested when enabling: 0.5.')
+                             'DEFAULT changed from 0.0 (off) to 0.5 (the previously-suggested '
+                             'value) -- eyeglasses structure was found incomplete/imperfect '
+                             'without it. Pass 0 to fully disable.')
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
                         help='BiSeNet weights for --local_region_loss_weight and '
                              '--dds_face_mask.')
-    parser.add_argument('--dds_face_mask', action='store_true',
+    parser.add_argument('--dds_face_mask', action=argparse.BooleanOptionalAction, default=True,
                         help='Restrict the DDS diffusion-guidance gradient (models/'
                              'diffusion_guidance.py) to the region the edit is allowed to touch, '
                              'instead of the whole latent. Unmasked, DDS asks the frozen '
@@ -788,9 +790,10 @@ if __name__ == '__main__':
                              '"receding hairline" prompt cue is not cut by this. Loads a '
                              'FaceParser the same way --local_region_loss_weight does (shared '
                              'instance if both are set). 0 risk to identity/leakage, upside '
-                             'only if DDS was actually spending gradient off-face; off by '
-                             'default because it changes DDS numerics for existing --resume_dir '
-                             'runs.')
+                             'only if DDS was actually spending gradient off-face. DEFAULT '
+                             'changed from off to on -- pass --no-dds_face_mask to resume an '
+                             'existing --resume_dir run unmasked (matching the DDS numerics it '
+                             'was trained with) instead of introducing the mask mid-run.')
     parser.add_argument('--local_region_add_blur', type=float, default=15,
                         help='Mask dilation (gaussian blur sigma) for ADDITION-direction '
                              'local edits. The source face has no glasses pixels for '
@@ -925,7 +928,7 @@ if __name__ == '__main__':
                              '(512 for the default channel_multiplier=2 at 64x64).')
     parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
                         help='Hidden width of the shared trunk in AttributeControlEncoder.')
-    parser.add_argument('--controlnet_reg_weight', type=float, default=0.001,
+    parser.add_argument('--controlnet_reg_weight', type=float, default=0.01,
                         help='L2 penalty weight on the per-sample norm of control_skips (the '
                              'AttributeControlEncoder output actually added into the StyleGAN2 '
                              'feature map). Unlike the W+ guided_delta, control_skips has NO loss '
@@ -935,7 +938,12 @@ if __name__ == '__main__':
                              'Over long fine-tunes this let the injected signal grow large enough '
                              'to visibly corrupt images (LPIPS blew up, AccCeleb collapsed, while '
                              'ID stayed misleadingly high) with no warning in any other loss curve. '
-                             'Set 0 to disable (not recommended once this is enabled).')
+                             'DEFAULT raised from 0.001 to 0.01: eval found ControlNet injection '
+                             'earns its keep on eyeglasses but gives gender/age no measured '
+                             'accuracy benefit while adding a sparkle artifact -- the stronger '
+                             'penalty lets training itself shrink the injection toward zero for '
+                             'attributes that do not need it, rather than a hard eval-time '
+                             '--controlnet_disable_attrs override. Set 0 to disable.')
     parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
                         help='Hard per-sample cap on control_skips norm (like guided_delta_max_norm '
                              'for the W+ path). 0 disables the cap; only the L2 penalty above still '
@@ -1041,8 +1049,17 @@ if __name__ == '__main__':
                         help='Load direction_bank checkpoint state. Keep false when changing bank path/safety settings.')
 
     # ── Frozen pretrained diffusion guidance ───────────────────────────────
-    parser.add_argument('--use_diffusion_guidance', action='store_true',
-                        help='Use a frozen Stable Diffusion model as auxiliary DDS semantic guidance.')
+    parser.add_argument('--use_diffusion_guidance', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use a frozen Stable Diffusion model as auxiliary DDS semantic '
+                             'guidance. DEFAULT changed from off to on -- this is what lets '
+                             '--age_dds_fine_layer_start/--age_diffusion_weight/'
+                             '--age_diffusion_interval (below) do anything; without it those are '
+                             'silently no-ops. COST: downloads/loads --diffusion_model_id (a few '
+                             'GB from HuggingFace on first run) and adds a forward/backward pass '
+                             'through it every --diffusion_guidance_interval steps -- meaningfully '
+                             'more VRAM and time per step. Pass --no-use_diffusion_guidance to '
+                             'restore the old default if you don\'t have network access to '
+                             'HuggingFace or want the old resource footprint.')
     parser.add_argument('--diffusion_model_id', default='SG161222/Realistic_Vision_V5.1_noVAE', type=str,
                         help='HuggingFace model id or local path for the frozen diffusion model.')
     parser.add_argument('--diffusion_vae_model_id', default='stabilityai/sd-vae-ft-mse', type=str,
@@ -1062,9 +1079,15 @@ if __name__ == '__main__':
 
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='Gradient accumulation steps. Effective batch = batch * grad_accum_steps.')
-    parser.add_argument('--residual_max_norm', type=float, default=None,
+    parser.add_argument('--residual_max_norm', type=float, default=10.0,
                         help='Hard clip per-sample residual norm in Direction Bank forward(). '
-                             'Prevents residual explosion from large DDS gradients. Suggested: 10.0.')
+                             'Prevents residual explosion from large DDS gradients. DEFAULT '
+                             'changed from None (off) to 10.0 (the previously-suggested value). '
+                             'There is no CLI value that means "off" any more (the consuming code '
+                             'in AttributeDirectionBank checks `is not None`, and a negative norm '
+                             'would flip the residual\'s sign rather than disable clipping) -- pass '
+                             'a very large value (e.g. 1e6) to make the clip effectively a no-op, '
+                             'or edit this default back to None to fully restore the old behavior.')
     parser.add_argument('--dds_fine_layer_start', type=int, default=7,
                         help='W+ layer index from which DDS gradients are blocked (fine layers). '
                              'Set 0 to disable masking.')
@@ -1072,61 +1095,69 @@ if __name__ == '__main__':
                         help='Min timestep for age-specific DDS pass (coarse structure).')
     parser.add_argument('--age_diffusion_timestep_max', type=int, default=900,
                         help='Max timestep for age-specific DDS pass.')
-    parser.add_argument('--age_diffusion_interval', type=int, default=16,
+    parser.add_argument('--age_diffusion_interval', type=int, default=8,
                         help='Run age DDS guidance every N steps (independent of --diffusion_guidance_interval). '
-                             'NOTE: default 16 is LESS frequent than non-age (8), i.e. the hardest '
-                             'attribute currently gets the least diffusion supervision. Lower it '
-                             '(e.g. 4-8) to give aging more of the diffusion teacher.')
-    parser.add_argument('--age_diffusion_weight', type=float, default=-1.0,
-                        help='Separate loss weight for the AGE DDS pass. <0 (default) falls back to '
-                             'the shared --diffusion_guidance_weight (0.01), i.e. age currently gets '
-                             'the same tiny weight as glasses/gender. Set higher (e.g. 0.05-0.2) to '
-                             'give the diffusion teacher real pull on aging without touching the '
-                             'other attributes.')
-    parser.add_argument('--age_dds_fine_layer_start', type=int, default=-1,
-                        help='Fine-layer cutoff for the AGE DDS pass specifically. <0 (default) reuses '
-                             '--dds_fine_layer_start (7), which blocks DDS gradients from the fine W+ '
-                             'layers (7-17) -- exactly the layers that carry wrinkles / skin texture / '
-                             'gray hair, so the diffusion teacher currently CANNOT teach real aging '
-                             'texture and the model falls back on the coarse/global color-shift '
-                             'shortcut. Set to 18 to let age DDS reach all layers (teach true aging '
-                             'texture), or a higher value like 12-14 for a middle ground.')
+                             'DEFAULT lowered from 16 to 8 (matching non-age) -- 16 was LESS '
+                             'frequent than non-age despite age being the hardest attribute, i.e. '
+                             'the hardest attribute was getting the least diffusion supervision.')
+    parser.add_argument('--age_diffusion_weight', type=float, default=0.1,
+                        help='Separate loss weight for the AGE DDS pass. DEFAULT changed from -1 '
+                             '(fall back to the shared --diffusion_guidance_weight, 0.01, same tiny '
+                             'weight as glasses/gender) to 0.1 -- gives the diffusion teacher real '
+                             'pull on aging without touching the other attributes. Pass a negative '
+                             'value to restore the old fall-back-to-shared-weight behavior.')
+    parser.add_argument('--age_dds_fine_layer_start', type=int, default=12,
+                        help='Fine-layer cutoff for the AGE DDS pass specifically. DEFAULT changed '
+                             'from -1 (fall back to the shared --dds_fine_layer_start, 7, which '
+                             'blocks DDS gradients from the fine W+ layers 7-17 -- exactly the '
+                             'layers that carry wrinkles/skin texture/gray hair, so the diffusion '
+                             'teacher could not teach real aging texture and the model fell back on '
+                             'the coarse/global color-shift shortcut) to 12: the documented '
+                             'middle-ground value, letting the teacher reach most texture layers. '
+                             'Set to 18 for fully unblocked (higher risk), or a negative value to '
+                             'restore the old fall-back-to-7 behavior.')
 
     # ── Frozen CLIP semantic target loss ───────────────────────────────
-    parser.add_argument('--use_clip_prompt_loss', action='store_true',
-                        help='Enable frozen CLIP prompt loss for semantic direction supervision.')
+    parser.add_argument('--use_clip_prompt_loss', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable frozen CLIP prompt loss for semantic direction supervision. '
+                             'DEFAULT changed from off to on -- required for --clip_prompt_mode/'
+                             '--clip_prompt_glasses_weight/--clip_prompt_age_weight (below) to have '
+                             'any effect; without it those are silently no-ops. Pass '
+                             '--no-use_clip_prompt_loss to restore the old default.')
     parser.add_argument('--clip_prompt_model', type=str, default='ViT-B/32',
                         help='OpenAI CLIP model name.')
     parser.add_argument('--clip_prompt_weight', type=float, default=0.03,
                         help='Weight for CLIP prompt loss. Suggested range: 0.02–0.05.')
     parser.add_argument('--clip_prompt_temperature', type=float, default=1.0,
                         help='Temperature for softplus sharpness in CLIP loss (absolute mode only).')
-    parser.add_argument('--clip_prompt_mode', default='absolute', choices=['absolute', 'directional'],
-                        help="'absolute' (default) pulls the edited image toward the target "
-                             "prompt regardless of the source. A visual audit (attr 39, "
-                             "direction rm) found this lets the model reach a high CLIP "
-                             "'looks old' score via a red/orange color shift instead of real "
-                             "structural aging -- a shortcut, not the intended edit. "
-                             "'directional' (StyleGAN-NADA style) instead rewards moving the "
-                             "image, from ITS OWN source, along the same CLIP-space axis that "
-                             "separates the pos/neg prompts -- closing off shortcuts that shift "
-                             "every image the same way regardless of content. Costs one extra "
-                             "CLIP image encode per step (source image).")
+    parser.add_argument('--clip_prompt_mode', default='directional', choices=['absolute', 'directional'],
+                        help="'absolute' pulls the edited image toward the target prompt "
+                             "regardless of the source. A visual audit (attr 39, direction rm) "
+                             "found this lets the model reach a high CLIP 'looks old' score via a "
+                             "red/orange color shift instead of real structural aging -- a "
+                             "shortcut, not the intended edit, and the actual source of the "
+                             "age color-cast artifact. 'directional' (StyleGAN-NADA style, now "
+                             "DEFAULT, was 'absolute') instead rewards moving the image, from ITS "
+                             "OWN source, along the same CLIP-space axis that separates the pos/"
+                             "neg prompts -- closing off shortcuts that shift every image the same "
+                             "way regardless of content. Costs one extra CLIP image encode per "
+                             "step (source image). Pass 'absolute' to restore the old default.")
     parser.add_argument('--clip_prompt_interval', type=int, default=1,
                         help='Compute CLIP loss every N steps (1 = every step).')
     parser.add_argument('--clip_prompt_age_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for age (attr 39) in CLIP loss.')
     parser.add_argument('--clip_prompt_gender_weight', type=float, default=1.0,
                         help='Per-sample weight multiplier for gender (attr 20) in CLIP loss.')
-    parser.add_argument('--clip_prompt_glasses_weight', type=float, default=1.0,
+    parser.add_argument('--clip_prompt_glasses_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for eyeglasses (attr 15) in CLIP '
                              'loss. Eyeglasses-add is the biggest independent-judge gap (r34 '
                              'teacher ~91%% but CLIP judge ~44%%, i.e. teacher-fooling) AND '
-                             'the attribute that historically got the LEAST semantic help '
+                             'was historically the attribute that got the LEAST semantic help '
                              '(age has a 3x CLIP weight and its own diffusion guidance; '
-                             'glasses had neither). Try 3.0-5.0 to force real, CLIP-visible '
-                             'glasses instead of a decision-boundary trick the frozen r34 '
-                             'classifier alone rewards.')
+                             'glasses had neither). DEFAULT raised from 1.0 to 3.0 to force '
+                             'real, CLIP-visible glasses instead of a decision-boundary trick '
+                             'the frozen r34 classifier alone rewards. Try up to 5.0 if '
+                             'eyeglasses structure is still incomplete.')
     parser.add_argument('--balance_clip_prompt_loss', action=argparse.BooleanOptionalAction, default=False,
                         help='Replace the fixed --clip_prompt_{age,gender,glasses}_weight constants '
                              'with a CrossAttributeLossBalancer tracking CLIP loss progress per '
@@ -1625,22 +1656,38 @@ if __name__ == '__main__':
 
     diffusion_guidance = None
     if args.use_diffusion_guidance:
-        from models.diffusion_guidance import FrozenDiffusionDDSGuidance
-        diffusion_guidance = FrozenDiffusionDDSGuidance(
-            model_id=args.diffusion_model_id,
-            vae_model_id=args.diffusion_vae_model_id or None,
-            image_size=args.diffusion_image_size,
-            timestep_min=args.diffusion_timestep_min,
-            timestep_max=args.diffusion_timestep_max,
-            guidance_scale=args.diffusion_guidance_scale,
-            fp16=args.diffusion_fp16,
-        ).cuda()
-        print(f'** Frozen diffusion DDS guidance enabled: {args.diffusion_model_id}  '
-              f'weight={args.diffusion_guidance_weight}  interval={args.diffusion_guidance_interval}')
+        try:
+            from models.diffusion_guidance import FrozenDiffusionDDSGuidance
+            diffusion_guidance = FrozenDiffusionDDSGuidance(
+                model_id=args.diffusion_model_id,
+                vae_model_id=args.diffusion_vae_model_id or None,
+                image_size=args.diffusion_image_size,
+                timestep_min=args.diffusion_timestep_min,
+                timestep_max=args.diffusion_timestep_max,
+                guidance_scale=args.diffusion_guidance_scale,
+                fp16=args.diffusion_fp16,
+            ).cuda()
+            print(f'** Frozen diffusion DDS guidance enabled: {args.diffusion_model_id}  '
+                  f'weight={args.diffusion_guidance_weight}  interval={args.diffusion_guidance_interval}')
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                f'--use_diffusion_guidance is on by default but failed to load '
+                f'{args.diffusion_model_id} ({exc}). This needs the `diffusers` package plus '
+                f'either network access to HuggingFace or a local cache of the model. Pass '
+                f'--no-use_diffusion_guidance to train without it (age gets less diffusion '
+                f'supervision but everything else is unaffected).'
+            ) from exc
 
     clip_prompt_loss_fn = None
     if args.use_clip_prompt_loss:
-        from models.clip_prompt_loss import FrozenCLIPPromptLoss
+        try:
+            from models.clip_prompt_loss import FrozenCLIPPromptLoss
+        except ImportError as exc:
+            raise RuntimeError(
+                f'--use_clip_prompt_loss is on by default but failed to import ({exc}). Install '
+                f'OpenAI CLIP (pip install git+https://github.com/openai/CLIP.git) or pass '
+                f'--no-use_clip_prompt_loss to train without it.'
+            ) from exc
         clip_prompt_loss_fn = FrozenCLIPPromptLoss(
             clip_model=args.clip_prompt_model,
             temperature=args.clip_prompt_temperature,
