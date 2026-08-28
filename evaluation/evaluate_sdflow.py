@@ -831,9 +831,28 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
     the color-mismatch seam that a feathered alpha blend cannot fix. Runs
     per-sample on CPU (cv2), so it's slower than the alpha path; fine for
     eval/deployment post-processing, not for anything in the training loop.
+
+    MASK SOURCE: the face region is taken as the UNION (elementwise max) of
+    the source's and the edited image's BiSeNet face masks, not just the
+    source's. Using only `orig` (as an earlier version of this function did)
+    silently truncates any structure the edit ADDS that extends past the
+    pre-edit face silhouette -- e.g. eyeglasses temple arms reaching past the
+    ears, which a glasses-free source has no reason for BiSeNet to have
+    labeled "face". Those newly-added pixels would then fall outside the
+    orig-only mask and get overwritten by the ORIGINAL (glasses-less)
+    background at composite time, i.e. compositing would cut the very
+    structure it's supposed to only be protecting the background around --
+    directly lowering eyeglasses-add accuracy, not just leaving it flat.
+    Taking the union costs a small amount of background/hair protection
+    right at that boundary; it does not reintroduce the leakage problem
+    compositing exists to fix, since both masks still exclude everything far
+    from the face on both sides.
     """
     if method == 'alpha':
-        mask = face_parser.get_mask(orig, blur_sigma=int(blur_sigma))
+        mask = torch.maximum(
+            face_parser.get_mask(orig, blur_sigma=int(blur_sigma)),
+            face_parser.get_mask(edited, blur_sigma=int(blur_sigma)),
+        )
         return edited * mask + orig * (1.0 - mask)
 
     if method != 'poisson':
@@ -841,7 +860,11 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
 
     import cv2
     import numpy as np
-    mask = face_parser.get_mask(orig, blur_sigma=0)   # hard silhouette; Poisson handles the boundary
+    # hard silhouette (union of both masks -- see docstring); Poisson handles the boundary
+    mask = torch.maximum(
+        face_parser.get_mask(orig, blur_sigma=0),
+        face_parser.get_mask(edited, blur_sigma=0),
+    )
     out = []
     for b in range(orig.size(0)):
         o = ((orig[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
