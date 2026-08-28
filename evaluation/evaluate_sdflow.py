@@ -461,6 +461,7 @@ RUN_CONFIG_KEYS = [
     'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
+    'controlnet_per_direction',
 ]
 
 
@@ -691,6 +692,7 @@ def load_models(args):
             out_res=args.controlnet_embed_res,
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=getattr(args, 'controlnet_init_gain', 1.0),
+            per_direction=getattr(args, 'controlnet_per_direction', False),
         ).to(device).eval()
         ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
         if os.path.exists(ce_ckpt_path):
@@ -788,7 +790,8 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                           attr_local_idx, edit_scale, direction_bank=None,
                           attr_global_idx=None, bypass_glasses_direction_bank=False,
                           face_parser=None, composite_method='alpha', composite_blur_sigma=15,
-                          control_encoder=None, controlnet_max_norm=0.0):
+                          control_encoder=None, controlnet_max_norm=0.0,
+                          controlnet_disable_attrs=None, controlnet_embed_res=64):
     """
     face_parser: if given, composite the edited face back onto the SOURCE
     RECONSTRUCTION's background/hair (see composite_faces() above). A
@@ -829,8 +832,19 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent)
         new_latents = latent + guided_delta
-        if control_encoder is not None:
-            control_skips = control_encoder(attr_delta, batch_attr_idx)
+        # controlnet_disable_attrs: some attributes (e.g. eyeglasses) need the
+        # ControlNet feature-map injection to synthesize structure the W+
+        # direction bank alone can't (AccCeleb add 93%->12% when disabled
+        # globally); others (gender/age) got no measurable accuracy benefit
+        # from it (~70.7% either way) while it introduced a hairline/collar
+        # sparkle artifact -- render_preview visual audit confirmed the
+        # artifact tracks with control_encoder being active, not with
+        # --scale. Rather than an all-or-nothing --disable_controlnet, this
+        # keeps it ONLY for the attributes it actually earns its keep on.
+        if control_encoder is not None and (
+                controlnet_disable_attrs is None
+                or attr_global_idx not in controlnet_disable_attrs):
+            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
             if controlnet_max_norm > 0:
                 skip_norm = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -838,8 +852,8 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     else:
         new_latents = new_latents_raw
 
-    edited_face = G([new_latents], skips=control_skips, input_is_latent=True,
-                    randomize_noise=False)[0].clamp(-1, 1)
+    edited_face = G([new_latents], skips=control_skips, embed_res=controlnet_embed_res,
+                    input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
 
     if face_parser is not None:
         with torch.no_grad():
@@ -852,10 +866,207 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     return edited_face
 
 
+def edit_sequential_attribute(prior, conditioner, G, id_criterion,
+                              img, latent, attr_cond, id_cond,
+                              attr_local_idxs, edit_scales, direction_bank,
+                              control_encoder=None, controlnet_max_norm=0.0,
+                              controlnet_embed_res=64):
+    """Edit several attributes on the same face ONE AFTER ANOTHER, instead of
+    edit_multi_attribute's parallel sum of independently-computed deltas.
+
+    Each step re-derives the flow's guided delta from wherever the PREVIOUS
+    step's edit landed (current_latent), instead of every attribute computing
+    its delta from the original source latent and adding the results
+    together blind to each other. direction_bank also receives the evolving
+    current_latent (not the original) as its LAG-DOF context, so the gate/
+    magnitude it picks for step 2 already accounts for what step 1 changed --
+    parallel summation cannot do this even in principle, since both deltas
+    are computed from the same starting point simultaneously.
+
+    Order matters here (A-then-B is not guaranteed to equal B-then-A) --
+    that asymmetry is an accepted trade for less cross-attribute leakage, not
+    an oversight; diagnose_multi_attribute_interference.py's --sequential
+    flag measures whether the trade is actually worth it on this checkpoint.
+
+    attr_local_idxs / edit_scales: same as edit_multi_attribute.
+    """
+    if isinstance(edit_scales, (int, float)):
+        edit_scales = [edit_scales] * len(attr_local_idxs)
+    assert len(edit_scales) == len(attr_local_idxs)
+
+    B = img.size(0)
+    device = img.device
+    zero_pad = torch.zeros(B, 18, 1, device=device)
+
+    current_latent = latent
+    current_attr_cond = attr_cond.clone()
+    combined_skips = None
+    for local_idx, scale in zip(attr_local_idxs, edit_scales):
+        src_cond = torch.cat([id_cond, current_attr_cond], dim=1)
+        mid_latent, _ = prior(current_latent, src_cond, zero_pad)
+
+        new_attr_cond = current_attr_cond.clone()
+        src = current_attr_cond[:, local_idx]
+        new_attr_cond[:, local_idx] = src * (1.0 - scale) + (1.0 - src) * scale
+        new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
+
+        new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
+        flow_delta = new_latents_raw - current_latent
+        attr_delta = new_attr_cond - current_attr_cond
+        batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
+        guided_delta = direction_bank(flow_delta, attr_delta,
+                                      attr_idx=batch_attr_idx, latent=current_latent)
+
+        if control_encoder is not None:
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
+            if controlnet_max_norm > 0:
+                skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
+                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
+                skip = skip * clip.view(-1, 1, 1, 1)
+            combined_skips = skip if combined_skips is None else combined_skips + skip
+
+        current_latent = current_latent + guided_delta
+        current_attr_cond = new_attr_cond
+
+    edited_face = G([current_latent], skips=combined_skips, embed_res=controlnet_embed_res,
+                    input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+    return edited_face
+
+
+# Mirrors training/train_sdflow.py's LOCAL_REGION_CLASSES -- kept as a small
+# local copy instead of importing the training script (heavier module-level
+# deps like wandb) just for one dict. Keep the two in sync if this changes.
+LOCAL_REGION_CLASSES = {
+    15: [2, 3, 4, 5, 6],   # eyeglasses: brows(2,3) + eyes(4,5) + glasses(6)
+}
+
+
+@torch.no_grad()
+def edit_composite_local_global(prior, conditioner, G, id_criterion,
+                                img, latent, attr_cond, id_cond,
+                                local_idx, local_global_idx, local_scale,
+                                global_idxs, global_scales,
+                                direction_bank, face_parser,
+                                add_blur_sigma=15, rm_blur_sigma=5, composite_method='alpha',
+                                control_encoder=None, controlnet_max_norm=0.0,
+                                controlnet_embed_res=64):
+    """Edit one LOCAL attribute (must be a key of LOCAL_REGION_CLASSES, e.g.
+    eyeglasses) together with one or more GLOBAL attributes (gender/age),
+    WITHOUT letting either edit's flow computation see the other at all.
+
+    diagnose_multi_attribute_interference.py found real cross-attribute
+    leakage from both edit_multi_attribute (parallel sum) and
+    edit_sequential_attribute (chained) -- e.g. +0.09 leakage onto the third
+    attribute for Eyeglasses+Male, barely moved by changing composition
+    order. The leakage comes from the flow's nonlinear reverse pass and the
+    generator entangling the two conditions once they are combined in W+ --
+    chaining or summing still puts both edits through the SAME latent/pixels.
+
+    This sidesteps that entirely for any pair involving a LOCAL attribute:
+    compute the global edit and the local edit as two completely independent,
+    single-attribute results (same code path as edit_single_attribute, zero
+    cross-contamination by construction), then composite them in PIXEL SPACE
+    using the BiSeNet region mask that already exists for
+    --local_region_loss_weight -- local attribute's pixels come from its own
+    edit, everywhere else comes from the global edit. Cannot leak into each
+    other because neither ever saw the other's target condition.
+
+    Does not apply to two GLOBAL attributes together (e.g. Male+Young) --
+    there is no spatial region to cut along, both edits are supposed to touch
+    the whole face. That pair still needs edit_multi_attribute/
+    edit_sequential_attribute, or training-time exposure to composed edits.
+
+    add_blur_sigma/rm_blur_sigma: same asymmetry as train_sdflow.py's
+    --local_region_add_blur -- an ADD edit (source lacks the local attribute)
+    has no real pixels for BiSeNet to find yet, so the mask is taken from the
+    EDITED image with a wide dilation as a geometric prior; an RM edit (source
+    already has it) has real source pixels, so a tighter mask on the SOURCE
+    image is precise and safe.
+    """
+    B = img.size(0)
+    is_removal = attr_cond[:, local_idx] > 0.5
+
+    global_face = (
+        edit_single_attribute(
+            prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
+            global_idxs[0], global_scales[0], direction_bank,
+            control_encoder=control_encoder, controlnet_max_norm=controlnet_max_norm,
+            controlnet_embed_res=controlnet_embed_res,
+        ) if len(global_idxs) == 1 else
+        edit_multi_attribute(
+            prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
+            global_idxs, global_scales, direction_bank,
+            control_encoder=control_encoder, controlnet_max_norm=controlnet_max_norm,
+            controlnet_embed_res=controlnet_embed_res,
+        )
+    )
+    local_face = edit_single_attribute(
+        prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
+        local_idx, local_scale, direction_bank,
+        control_encoder=control_encoder, controlnet_max_norm=controlnet_max_norm,
+        controlnet_embed_res=controlnet_embed_res,
+    )
+
+    classes = LOCAL_REGION_CLASSES[local_global_idx]
+    out_hw = (local_face.shape[2], local_face.shape[3])
+    mask = torch.zeros(B, 1, out_hw[0], out_hw[1],
+                       device=local_face.device, dtype=local_face.dtype)
+    if is_removal.any():
+        # img may be a different resolution than local_face/global_face (e.g. G's
+        # native 1024 output vs a smaller dataset img_size) -- get_region_mask
+        # returns a mask sized to whatever it was given, so resize explicitly
+        # rather than assuming the two already match.
+        m = face_parser.get_region_mask(img[is_removal], classes, blur_sigma=rm_blur_sigma)
+        mask[is_removal] = F.interpolate(m, size=out_hw, mode='bilinear', align_corners=False)
+    if (~is_removal).any():
+        m = face_parser.get_region_mask(local_face[~is_removal], classes, blur_sigma=add_blur_sigma)
+        mask[~is_removal] = F.interpolate(m, size=out_hw, mode='bilinear', align_corners=False)
+
+    if composite_method == 'alpha':
+        return local_face * mask + global_face * (1.0 - mask)
+
+    if composite_method != 'poisson':
+        raise ValueError(f'Unknown composite_method: {composite_method}')
+
+    # Gradient-domain blend (cv2.seamlessClone): local_face's region is
+    # inserted into global_face solving for matching gradients at the
+    # boundary, instead of a feathered pixel-value blend. Local_face and
+    # global_face come from two INDEPENDENTLY generated edits (different
+    # global attribute state each), so their overall skin tone/lighting can
+    # differ more than composite_faces()'s use case (editing vs. the SAME
+    # source photo's background) -- alpha blending was found to leave a seam
+    # visible enough to distort both attributes' own classifier scores.
+    import cv2
+    import numpy as np
+    hard_mask = (mask > 0.5).float()
+    out = []
+    for b in range(B):
+        base = ((global_face[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
+        insert = ((local_face[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
+        m = hard_mask[b, 0].cpu().numpy().astype(np.uint8) * 255
+        h, w = m.shape
+        if m.sum() < 255 * 20:   # degenerate mask -> keep the global edit as-is
+            out.append(global_face[b])
+            continue
+        ys, xs = np.nonzero(m)
+        center = (int(xs.mean()), int(ys.mean()))
+        try:
+            blended = cv2.seamlessClone(
+                np.ascontiguousarray(insert), np.ascontiguousarray(base), m,
+                center, cv2.NORMAL_CLONE,
+            )
+            t = torch.from_numpy(blended).to(local_face.device).float().permute(2, 0, 1) / 255.0 * 2 - 1
+        except cv2.error:
+            t = global_face[b]   # mask touched the image border or similar -> fall back safely
+        out.append(t)
+    return torch.stack(out, dim=0).to(dtype=local_face.dtype)
+
+
 def edit_multi_attribute(prior, conditioner, G, id_criterion,
                          img, latent, attr_cond, id_cond,
                          attr_local_idxs, edit_scales, direction_bank,
-                         attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0):
+                         attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0,
+                         controlnet_embed_res=64):
     """Edit several attributes on the same face at once.
 
     Composes N independently-computed single-attribute guided deltas by
@@ -906,7 +1117,7 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
                                       attr_idx=batch_attr_idx, latent=latent)
         combined_delta = combined_delta + guided_delta
         if control_encoder is not None:
-            skip = control_encoder(attr_delta, batch_attr_idx)
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
             if controlnet_max_norm > 0:
                 skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -914,8 +1125,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
             combined_skips = skip if combined_skips is None else combined_skips + skip
 
     new_latents = latent + combined_delta
-    edited_face = G([new_latents], skips=combined_skips, input_is_latent=True,
-                    randomize_noise=False)[0].clamp(-1, 1)
+    edited_face = G([new_latents], skips=combined_skips, embed_res=controlnet_embed_res,
+                    input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
     return edited_face
 
 
@@ -1095,6 +1306,8 @@ def evaluate(args):
                     composite_blur_sigma=args.composite_blur_sigma,
                     control_encoder=control_encoder,
                     controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+                    controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
+                    controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
                 )
                 edited_256 = F.interpolate(edited_face, (256, 256))
 
@@ -1363,6 +1576,9 @@ if __name__ == '__main__':
                         help='Must match training --controlnet_channels if enabled.')
     parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
                         help='Must match training --controlnet_hidden_dim if enabled.')
+    parser.add_argument('--controlnet_per_direction', action='store_true',
+                        help='Must match training --controlnet_per_direction if enabled. '
+                             'Auto-restored from config.json.')
     parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
                         help='Must match training --controlnet_init_gain. Only sets the log_gain '
                              'init; the trained value comes from the checkpoint. Auto-restored '
@@ -1373,6 +1589,18 @@ if __name__ == '__main__':
                              'alone. Run against the same checkpoint as a normal eval to isolate '
                              'what the feature-map injection contributes. Deliberately NOT in '
                              'RUN_CONFIG_KEYS -- an eval-time override, never restored from config.')
+    parser.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                        help='ABLATION: keep control_encoder loaded and active, but skip its '
+                             'injection for these ABSOLUTE attribute indices only (e.g. 20 39 for '
+                             'gender/age), letting others (e.g. eyeglasses) keep it. Found via '
+                             '--disable_controlnet + visual audit: eyeglasses ADD accuracy '
+                             'collapses without ControlNet (93%%->12%%, it synthesizes frame '
+                             'structure the W+ direction bank cannot), but gender/age saw no '
+                             'measurable accuracy benefit from it (~70.7%% either way) while it '
+                             'introduced a hairline/collar sparkle artifact that --scale sweeps '
+                             "(1.0/0.8/0.6) did not change. Use this instead of the all-or-nothing "
+                             '--disable_controlnet once you know which attributes actually need '
+                             'it. Deliberately NOT in RUN_CONFIG_KEYS -- an eval-time override.')
     parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
                         help='Must match training --controlnet_max_norm if it was set (0 = no cap '
                              'was applied at training time either). Auto-restored from config.json.')
