@@ -45,6 +45,7 @@ from torch.utils import data
 
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CLIPAttributeJudge, apply_run_config, edit_single_attribute,
+    resolve_controlnet_disable_attrs,
     load_models,
 )
 from models.dataset import SDFlowDataset
@@ -98,6 +99,7 @@ def do_dump(args):
                 local_idx, scale, direction_bank, attr_global_idx=args.attr,
                 control_encoder=control_encoder,
                 controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+                controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
             )
             edited_256 = F.interpolate(edited, (256, 256))
             edit_scores = cj.scores(edited_256)[:, local_idx]
@@ -225,8 +227,11 @@ if __name__ == '__main__':
     d.add_argument('--guided_delta_max_norm', type=float, default=0.0)
     d.add_argument('--override_residual_scale', type=float, default=None)
     d.add_argument('--age_fine_layer_scale', type=float, default=None)
-    d.add_argument('--age_fine_layer_start', type=int, default=4)
+    d.add_argument('--age_fine_layer_start', type=int, default=10)
     d.add_argument('--force_bank_directions', action='store_true')
+    d.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                    help='Same knob/default as evaluate_sdflow.py: omitted -> auto-resolved '
+                         'to gender/age (20, 39) via resolve_controlnet_disable_attrs().')
     d.add_argument('--ignore_run_config', action='store_true')
 
     f = sub.add_parser('fit')
@@ -237,6 +242,7 @@ if __name__ == '__main__':
     args = p.parse_args()
     if args.mode == 'dump':
         args = apply_run_config(args)
+        args = resolve_controlnet_disable_attrs(args)
         do_dump(args)
     else:
         do_fit(args)

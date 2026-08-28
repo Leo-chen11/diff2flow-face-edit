@@ -36,6 +36,7 @@ from evaluation.evaluate_sdflow import (
     apply_run_config,
     edit_single_attribute,
     load_models,
+    resolve_controlnet_disable_attrs,
 )
 from models.dataset import SDFlowDataset
 
@@ -72,6 +73,19 @@ def main(args):
     prior, conditioner, G, id_criterion, attr_teacher, attribute_index, \
         direction_bank, control_encoder = load_models(args)
 
+    composite_face_parser = None
+    if args.composite_face_region:
+        from common.face_parser import FaceParser
+        try:
+            composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            print('[Composite] Compositing edited face back onto source-reconstruction '
+                  'background/hair -- same mitigation as evaluate_sdflow.py '
+                  '--composite_face_region, applied here too since this script (not the eval '
+                  'loop) is what produced the artifact-heavy preview grids.')
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --composite_face_region requested but face parser unavailable '
+                  f'({exc}); compositing disabled.')
+
     img_transform = T.Compose([
         T.ToTensor(),
         T.Resize((args.img_size, args.img_size)),
@@ -105,8 +119,13 @@ def main(args):
                 local_idx, args.scale, direction_bank,
                 attr_global_idx=args.attribute_index[local_idx],
                 bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
+                face_parser=composite_face_parser,
+                composite_method=args.composite_method,
+                composite_blur_sigma=args.composite_blur_sigma,
                 control_encoder=control_encoder,
                 controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+                controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
+                controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
             )
             cells.append(F.interpolate(edited, (args.cell_size, args.cell_size)))
 
@@ -169,19 +188,41 @@ if __name__ == '__main__':
     parser.add_argument('--disable_controlnet', action='store_true',
                         help='ABLATION: skip control_encoder even if the run was trained with '
                              'it, to render the same faces through the W+ path alone.')
+    parser.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                        help='Same knob as evaluate_sdflow.py: skip ControlNet injection for '
+                             'these absolute attribute indices only. DEFAULT (omitted): '
+                             'auto-resolved to gender/age (20, 39) by resolve_controlnet_disable_'
+                             'attrs() -- see evaluate_sdflow.py for why.')
     parser.add_argument('--override_residual_scale', type=float, default=None,
                         help='Force direction-bank residual_scale at render time '
                              '(same diagnostic knob as evaluate_sdflow.py).')
     parser.add_argument('--age_fine_layer_scale', type=float, default=None,
-                        help='Scale the age direction fine-layer components at render time '
-                             '(same diagnostic knob as evaluate_sdflow.py).')
-    parser.add_argument('--age_fine_layer_start', type=int, default=4,
-                        help='First layer affected by --age_fine_layer_scale (same knob as '
-                             'evaluate_sdflow.py).')
+                        help='Scale the age direction fine-layer components at render time. '
+                             'DEFAULT (omitted): load_models() applies a graduated 1.0->0.6 '
+                             'damping ramp over [--age_fine_layer_start:18] automatically -- '
+                             'same default mitigation as evaluate_sdflow.py.')
+    parser.add_argument('--age_fine_layer_start', type=int, default=10,
+                        help='First layer affected by the age fine-layer color-cast mitigation '
+                             '(same knob/default as evaluate_sdflow.py).')
+    parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
+                        help='BiSeNet weights for --composite_face_region and the parser '
+                             'eyeglasses judge.')
+    parser.add_argument('--composite_face_region',
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help='Composite the edited face back onto the source-reconstruction '
+                             'background/hair (same mitigation/default as evaluate_sdflow.py). '
+                             'Pass --no-composite_face_region to render the raw, uncomposited '
+                             'edit instead.')
+    parser.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'],
+                        help='Blend method for --composite_face_region (same as '
+                             'evaluate_sdflow.py; poisson removes the alpha-blend seam).')
+    parser.add_argument('--composite_blur_sigma', type=float, default=15,
+                        help='Feather width for --composite_method alpha. Ignored for poisson.')
     parser.add_argument('--ignore_run_config', action='store_true')
 
     args = parser.parse_args()
     args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
         if args.step is None:

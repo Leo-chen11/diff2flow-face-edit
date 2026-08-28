@@ -43,7 +43,7 @@ from PIL import Image, ImageDraw
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CLIPAttributeJudge, CelebAAttrClassifierJudge, GlassesParserJudge,
     _latest_step, apply_run_config, edit_single_attribute, is_clear, load_models,
-    parse_clip_calibration,
+    parse_clip_calibration, resolve_controlnet_disable_attrs,
 )
 from common.face_parser import FaceParser
 from models.dataset import SDFlowDataset
@@ -106,7 +106,8 @@ def main(args):
     if args.attr == 15 and args.glasses_judge == 'parser':
         pj = GlassesParserJudge(args.face_parser_weights, 'cuda',
                                 area_thresh=args.glasses_area_thresh,
-                                sharpness=args.glasses_area_sharpness)
+                                sharpness=args.glasses_area_sharpness,
+                                min_component_frac=getattr(args, 'glasses_min_component_frac', 0.00015))
         print(f'[Judge] {attr_name} = BiSeNet parser (class 6)')
         score_fn = lambda imgs: pj.glasses_prob(imgs)
     else:
@@ -133,9 +134,13 @@ def main(args):
 
     composite_face_parser = None
     if args.composite_face_region:
-        composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-        print(f'[Composite] method={args.composite_method} '
-              f'blur_sigma={args.composite_blur_sigma}')
+        try:
+            composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            print(f'[Composite] method={args.composite_method} '
+                  f'blur_sigma={args.composite_blur_sigma}')
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --composite_face_region requested but face parser unavailable '
+                  f'({exc}); compositing disabled.')
 
     img_transform = T.Compose([
         T.ToTensor(), T.Resize((args.img_size, args.img_size)),
@@ -169,6 +174,7 @@ def main(args):
             composite_blur_sigma=args.composite_blur_sigma,
             control_encoder=control_encoder,
             controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+            controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
         )
         edited_256 = F.interpolate(edited, (256, 256))
         edit_scores = score_fn(edited_256)
@@ -241,9 +247,13 @@ if __name__ == '__main__':
     p.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth')
     p.add_argument('--glasses_area_thresh', type=float, default=0.0010)
     p.add_argument('--glasses_area_sharpness', type=float, default=0.5)
-    p.add_argument('--composite_face_region', action='store_true')
-    p.add_argument('--composite_method', default='alpha', choices=['alpha', 'poisson'])
+    p.add_argument('--glasses_min_component_frac', type=float, default=0.00015)
+    p.add_argument('--composite_face_region', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'])
     p.add_argument('--composite_blur_sigma', type=float, default=15)
+    p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                    help='Same knob/default as evaluate_sdflow.py: omitted -> auto-resolved '
+                         'to gender/age (20, 39) via resolve_controlnet_disable_attrs().')
 
     p.add_argument('--index_file',   default='./data/ffhq.txt')
     p.add_argument('--image_root',   default='data/FFHQ')
@@ -283,7 +293,7 @@ if __name__ == '__main__':
     p.add_argument('--guided_delta_max_norm', type=float, default=0.0)
     p.add_argument('--override_residual_scale', type=float, default=None)
     p.add_argument('--age_fine_layer_scale', type=float, default=None)
-    p.add_argument('--age_fine_layer_start', type=int, default=4)
+    p.add_argument('--age_fine_layer_start', type=int, default=10)
     p.add_argument('--force_bank_directions', action='store_true')
     p.add_argument('--disable_controlnet', action='store_true',
                    help='ABLATION: skip control_encoder even if the run was trained with it, '
@@ -293,6 +303,7 @@ if __name__ == '__main__':
 
     args = p.parse_args()
     args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
         if args.step is None:
