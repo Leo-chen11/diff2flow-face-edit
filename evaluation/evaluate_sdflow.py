@@ -491,7 +491,7 @@ RUN_CONFIG_KEYS = [
     'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
-    'controlnet_per_direction',
+    'controlnet_per_direction', 'controlnet_latent_cond',
 ]
 
 
@@ -771,6 +771,7 @@ def load_models(args):
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=getattr(args, 'controlnet_init_gain', 1.0),
             per_direction=getattr(args, 'controlnet_per_direction', False),
+            latent_cond=getattr(args, 'controlnet_latent_cond', False),
         ).to(device).eval()
         ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
         if os.path.exists(ce_ckpt_path):
@@ -945,7 +946,8 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         if control_encoder is not None and (
                 controlnet_disable_attrs is None
                 or attr_global_idx not in controlnet_disable_attrs):
-            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
+            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+                                            latent=latent)
             if controlnet_max_norm > 0:
                 skip_norm = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -1023,7 +1025,11 @@ def edit_sequential_attribute(prior, conditioner, G, id_criterion,
         use_controlnet_here = (control_encoder is not None and not (
             controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
         if use_controlnet_here:
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
+            # Sequential edits condition on the EVOLVING latent, matching how
+            # direction_bank above receives current_latent -- so a latent_cond
+            # control encoder sees the state this step actually starts from.
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+                                   latent=current_latent)
             if controlnet_max_norm > 0:
                 skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -1228,7 +1234,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         use_controlnet_here = (control_encoder is not None and not (
             controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
         if use_controlnet_here:
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+                                   latent=latent)
             if controlnet_max_norm > 0:
                 skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -1690,6 +1697,11 @@ if __name__ == '__main__':
     parser.add_argument('--controlnet_per_direction', action='store_true',
                         help='Must match training --controlnet_per_direction if enabled. '
                              'Auto-restored from config.json.')
+    parser.add_argument('--controlnet_latent_cond', action='store_true',
+                        help='Must match training --controlnet_latent_cond. Changes the control '
+                             'encoder\'s parameter shapes, so a mismatch is a hard checkpoint '
+                             'load error rather than silently wrong numbers. Auto-restored from '
+                             'config.json.')
     parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
                         help='Must match training --controlnet_init_gain. Only sets the log_gain '
                              'init; the trained value comes from the checkpoint. Auto-restored '

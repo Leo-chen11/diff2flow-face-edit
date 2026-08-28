@@ -802,7 +802,24 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
-    parser.add_argument('--color_shift_loss_weight', type=float, default=0.0,
+    parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
+                        help='Compare the edited image against the source RECONSTRUCTION '
+                             'G(latent) instead of the real photo in id_loss, the directional '
+                             'CLIP loss, and the DDS diffusion guidance. The real photo differs '
+                             'from any generated image by (inversion gap) + (edit); referencing '
+                             'it charges the fixed e4e/StyleGAN reconstruction error to the edit, '
+                             'which the flow cannot remove without spending W+ budget on '
+                             'reconstruction instead of the attribute. Concretely: id_loss then '
+                             'optimizes a different quantity than evaluate_sdflow.py reports '
+                             '(it measures edited-vs-reconstruction), the directional CLIP delta '
+                             'carries a constant inversion offset that pulls it off the pos/neg '
+                             'text axis, and the DDS source-branch subtraction no longer cancels '
+                             'cleanly. The locality and color-shift losses already compare '
+                             'against G(latent) for exactly this reason -- this makes the other '
+                             'three consistent with them. Costs one extra frozen G forward per '
+                             'step (no_grad) when no face-parser loss already needed it. Pass '
+                             '--no-losses_vs_recon to restore the old real-photo references.')
+    parser.add_argument('--color_shift_loss_weight', type=float, default=1.0,
                         help='Penalize the mean-RGB shift of the BiSeNet skin region between '
                              'source and edited face, for --color_shift_attrs samples. '
                              'A visual audit (scripts/dump_attr_failures.py, attr 39 direction '
@@ -815,8 +832,12 @@ if __name__ == '__main__':
                              'vector or edit magnitude, it makes the color-shift shortcut itself '
                              'costly, so satisfying the attribute loss has to come from '
                              'elsewhere. Genuine structural aging is a texture/geometry change, '
-                             'not a uniform tone shift, so it is barely affected. 0 disables '
-                             '(default). Suggested when enabling: 0.5-2.0.')
+                             'not a uniform tone shift, so it is barely affected. DEFAULT raised '
+                             'from 0.0 (off) to 1.0, the middle of the previously-suggested '
+                             '0.5-2.0 range: this is the only mechanism in this file that acts '
+                             'directly on the color-cast shortcut, and the reported symptom '
+                             '("aging looks like a color wash, not real aging") is exactly what '
+                             'it targets. Requires a loadable --face_parser_weights. 0 disables.')
     parser.add_argument('--color_shift_attrs', nargs='*', type=int, default=[39],
                         help='Attribute indices the color-shift regularizer applies to. '
                              'Default is age (39) only, since that is the attribute the visual '
@@ -968,6 +989,20 @@ if __name__ == '__main__':
                              '-- run scripts/measure_feature_norm.py rather than guessing.')
     parser.add_argument('--controlnet_lr_mult', type=float, default=1.0,
                         help='LR multiplier for control_encoder only (own Adam param group).')
+    parser.add_argument('--controlnet_latent_cond', action='store_true',
+                        help='Condition the injected feature map on the SOURCE LATENT, not just '
+                             'on attr_delta. WITHOUT this, AttributeControlEncoder.forward() sees '
+                             'only a (B, num_attrs) vector that is effectively identical for every '
+                             'sample editing the same attribute in the same direction -- so it '
+                             'adds ONE fixed, face-agnostic 512x64x64 pattern to a generator '
+                             'feature map that differs for every identity, pose and framing. For '
+                             'eyeglasses that means the perturbation lands at fixed spatial '
+                             'coordinates instead of on THIS face\'s eyes: enough glasses-like '
+                             'texture for a detector to fire, never a correctly placed frame. The '
+                             'real ControlNet is conditioned on a spatial input for exactly this '
+                             'reason. RECOMMENDED for new runs. Off by default because it changes '
+                             'the module\'s parameter shapes -- a checkpoint trained without it '
+                             'cannot be loaded into a model built with it, or vice versa.')
     parser.add_argument('--controlnet_per_direction',
                         action=argparse.BooleanOptionalAction, default=False,
                         help="Give add and rm their own decoder head and their own learnable gain "
@@ -1144,6 +1179,20 @@ if __name__ == '__main__':
                              "step (source image). Pass 'absolute' to restore the old default.")
     parser.add_argument('--clip_prompt_interval', type=int, default=1,
                         help='Compute CLIP loss every N steps (1 = every step).')
+    parser.add_argument('--clip_prompt_num_augs', type=int, default=4,
+                        help='Number of random crop/flip views the CLIP prompt loss averages '
+                             'its score over, per image. 1 = the old single fixed full-frame '
+                             'view, which the generator can attack with spatially-fixed '
+                             'high-frequency patterns that raise the CLIP score with no semantic '
+                             'change -- the CLIP-side twin of the r34 teacher-fooling --teacher_aug '
+                             'already defends against. Averaging over views forces a pattern to '
+                             'survive translation/scale/flip to keep scoring. Costs this many CLIP '
+                             'image encodes per step (doubled in directional mode); lower it to 2 '
+                             'if step time matters, 1 to restore the old behavior.')
+    parser.add_argument('--clip_prompt_aug_min_scale', type=float, default=0.75,
+                        help='Smallest random crop side, as a fraction of the image, for '
+                             '--clip_prompt_num_augs. Too small and the crop can miss the '
+                             'attribute entirely (e.g. crop out the eyes on a glasses edit).')
     parser.add_argument('--clip_prompt_age_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for age (attr 39) in CLIP loss.')
     parser.add_argument('--clip_prompt_gender_weight', type=float, default=1.0,
@@ -1446,6 +1495,7 @@ if __name__ == '__main__':
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=args.controlnet_init_gain,
             per_direction=args.controlnet_per_direction,
+            latent_cond=args.controlnet_latent_cond,
         ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
@@ -1692,6 +1742,8 @@ if __name__ == '__main__':
             clip_model=args.clip_prompt_model,
             temperature=args.clip_prompt_temperature,
             mode=args.clip_prompt_mode,
+            num_augs=args.clip_prompt_num_augs,
+            aug_min_scale=args.clip_prompt_aug_min_scale,
         ).cuda().eval()
         for p in clip_prompt_loss_fn.parameters():
             p.requires_grad_(False)
@@ -1793,7 +1845,8 @@ if __name__ == '__main__':
                 # direction_bank branch above; control_encoder requires
                 # direction_bank to be enabled (checked at arg-parse time).
                 control_skips = control_encoder(attr_delta, mid_idx,
-                                                is_rm=(src_attr_flow > 0.5))
+                                                is_rm=(src_attr_flow > 0.5),
+                                                latent=latent)
 
                 # control_skips has no OTHER loss term constraining its
                 # magnitude -- it's only shaped indirectly through downstream
@@ -1859,6 +1912,32 @@ if __name__ == '__main__':
             # aging is a texture/geometry change, not a uniform tone shift,
             # so it should be largely unaffected by this penalty.
             color_shift_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+
+            # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
+            # Hoisted out of the face-parser branch below so the identity /
+            # CLIP / DDS losses can use it as their reference too (see
+            # --losses_vs_recon). Computed at most once per step and reused.
+            #
+            # WHY THIS MATTERS: `img` is the REAL photo; `new_face_tensors` is
+            # G(latent + delta). The difference between them is (inversion gap)
+            # + (edit). Any loss that compares the edited image against `img`
+            # therefore charges the e4e/StyleGAN inversion error to the edit --
+            # error the flow did not cause and cannot usefully remove, since
+            # fixing it would mean spending W+ budget on reconstruction rather
+            # than on the attribute. The locality/color-shift losses below
+            # already deliberately compare against src_recon for exactly this
+            # reason; --losses_vs_recon extends the same principle to the other
+            # three losses that were still referencing `img`.
+            src_recon = None
+            if (args.losses_vs_recon
+                    or face_parser is not None):
+                with torch.no_grad():
+                    src_recon = G([latent], input_is_latent=True,
+                                  randomize_noise=False)[0].clamp(-1, 1)
+                    src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
+            # Reference image for id_loss / directional CLIP / DDS.
+            loss_ref_img = src_recon if (args.losses_vs_recon and src_recon is not None) else img
+
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
                 _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
@@ -1866,11 +1945,6 @@ if __name__ == '__main__':
                 _is_color = torch.tensor([a in args.color_shift_attrs for a in _mid_abs],
                                          device=latent.device)
                 if _is_local.any() or _is_color.any():
-                    with torch.no_grad():
-                        src_recon = G([latent], input_is_latent=True,
-                                      randomize_noise=False)[0].clamp(-1, 1)
-                        src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
-
                     if _is_local.any():
                         _is_removal = src_attr_flow > 0.5
                         _terms = []
@@ -1924,7 +1998,12 @@ if __name__ == '__main__':
             # is at or above --id_hinge_threshold, so the model can spend its full
             # editing budget above that floor instead of a continuous pull fighting
             # counter_attr_loss even when identity is already well preserved.
-            id_src_feat = F.normalize(id_criterion.extract_features(img), dim=1).detach()
+            # Reference is the source RECONSTRUCTION by default (--losses_vs_recon),
+            # not the real photo: otherwise the fixed inversion gap sits inside
+            # id_loss as a constant penalty the edit cannot remove, and training
+            # optimizes a different quantity than evaluate_sdflow.py reports
+            # (which measures edited-vs-reconstruction identity).
+            id_src_feat = F.normalize(id_criterion.extract_features(loss_ref_img), dim=1).detach()
             id_edit_feat = F.normalize(id_criterion.extract_features(new_face_tensors), dim=1)
             id_cos_sim = F.cosine_similarity(id_edit_feat, id_src_feat, dim=1)
             if args.id_loss_hinge:
@@ -2032,7 +2111,17 @@ if __name__ == '__main__':
                     attr_abs_idx=_clip_abs_idx,
                     target_values=soft_target_for_loss,
                     reduction='none',
-                    src_images=img if args.clip_prompt_mode == 'directional' else None,
+                    # Directional CLIP measures cos(clip(edit) - clip(src), text_delta).
+                    # The source MUST be the reconstruction, not the real photo:
+                    # with the real photo, every img_delta carries the same
+                    # inversion-gap offset in CLIP space on top of the actual
+                    # edit direction, which drags the cosine toward that offset
+                    # and away from the pos/neg text axis the loss is supposed
+                    # to align to. That is very likely why this file's own notes
+                    # record "directional CLIP loss left the color-cast
+                    # unchanged" -- the directional signal was diluted, so it
+                    # never got a fair test.
+                    src_images=loss_ref_img if args.clip_prompt_mode == 'directional' else None,
                 )   # clip_loss_each: (B,)
                 if clip_loss_balancer is not None:
                     # Auto-balanced: tracks THIS loss's own per-attribute progress
@@ -2142,8 +2231,14 @@ if __name__ == '__main__':
                 non_age_mask = ~is_age
                 if non_age_fires:
                     _face_non_age = _dds_face(args.dds_fine_layer_start)
+                    # DDS subtracts the source branch's noise residual as a bias
+                    # correction; that cancellation is only valid when src and
+                    # edit differ ONLY by the edit. Passing the real photo makes
+                    # the residual difference also contain the inversion gap,
+                    # leaving an uncancelled "fix the reconstruction" component
+                    # in the gradient. See --losses_vs_recon.
                     _loss, _logs = diffusion_guidance(
-                        src_images=img[non_age_mask],
+                        src_images=loss_ref_img[non_age_mask],
                         edit_images=_face_non_age[non_age_mask],
                         attr_abs_idx=mid_abs_idx[non_age_mask],
                         target_values=soft_target[non_age_mask].detach(),
@@ -2161,7 +2256,7 @@ if __name__ == '__main__':
                                        else args.dds_fine_layer_start)
                     _face_age = _dds_face(_age_fine_start)
                     _loss, _logs = diffusion_guidance(
-                        src_images=img[is_age],
+                        src_images=loss_ref_img[is_age],
                         edit_images=_face_age[is_age],
                         attr_abs_idx=mid_abs_idx[is_age],
                         target_values=soft_target[is_age].detach(),
