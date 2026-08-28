@@ -159,7 +159,7 @@ class FrozenDiffusionDDSGuidance(nn.Module):
         return latents * self.latent_scale
 
     def forward(self, src_images, edit_images, attr_abs_idx, target_values, source_prompt=None,
-                timestep_min=None, timestep_max=None):
+                timestep_min=None, timestep_max=None, face_mask=None):
         device = edit_images.device
         B = edit_images.shape[0]
         source_prompt = source_prompt or "a realistic face photo of a person"
@@ -192,9 +192,30 @@ class FrozenDiffusionDDSGuidance(nn.Module):
             eps_edit = self._predict_noise(noisy_edit, timesteps, edit_text)
 
         grad = (eps_edit - eps_src).detach()
-        loss = (grad * edit_latents).mean()
+        if face_mask is not None:
+            # Unmasked, the DDS gradient covers the WHOLE latent -- background,
+            # hair, clothing included -- because the diffusion model is asked
+            # to denoise the entire image toward edit_prompt, not just the
+            # face. That spends gradient budget on regions the prompt has no
+            # real opinion about (or, worse, ones a specific edit shouldn't
+            # touch, e.g. eyeglasses editing hair) and directly funds
+            # background/hair leakage (LeakCLIP) plus identity drift (ID),
+            # without buying any real attribute signal. face_mask restricts
+            # the gradient to only the region the caller decided this
+            # attribute's edit is allowed to touch (see LOCAL_REGION_CLASSES /
+            # FaceParser.FACE_CLASSES in train_sdflow.py -- the latter already
+            # includes hair, so this does NOT cut hair-adjacent cues like
+            # age's "receding hairline" prompt text).
+            m = F.interpolate(face_mask.to(grad.dtype), size=grad.shape[-2:],
+                              mode='bilinear', align_corners=False).clamp(0, 1)
+            denom = (m.sum() * grad.shape[1]).clamp(min=1e-6)
+            loss = (grad * edit_latents * m).sum() / denom
+        else:
+            loss = (grad * edit_latents).mean()
         logs = {
             "diffusion_dds_grad_norm": grad.float().flatten(1).norm(dim=1).mean().detach(),
             "diffusion_timestep": timesteps.float().mean().detach(),
         }
+        if face_mask is not None:
+            logs["diffusion_dds_mask_coverage"] = face_mask.float().mean().detach()
         return loss, logs
