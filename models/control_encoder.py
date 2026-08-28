@@ -62,44 +62,70 @@ class AttributeControlEncoder(nn.Module):
     directly observable, settable via --controlnet_init_gain, and bounded
     by --controlnet_max_norm. The gain stays learnable so the model can
     still choose how much to lean on this branch.
+
+    per_direction (default off, opt-in via --controlnet_per_direction) gives
+    add and rm their own decoder head and their own gain per attribute,
+    instead of one shared head/gain per attribute handling both directions.
+    Sharing forces the SAME weights to learn two very different tasks at
+    once -- e.g. eyeglasses add must synthesize frame structure from nothing
+    (source has no glasses pixels at all) while rm only has to erase an
+    existing one, an easier task. A 128x128 run (v41) showed exactly the
+    predicted failure mode: judge_celeb_acc/attr_15_add climbed slowly from
+    ~0 while judge_celeb_acc/attr_15_rm drifted down over the same steps --
+    the harder add task pulling shared capacity away from rm, the same
+    entanglement --per_direction already fixed for AttributeDirectionBank
+    (direction_bank.py) and never fixed here. Splitting removes the shared
+    capacity these two are competing for.
     """
 
     def __init__(self, num_attrs, out_channels=512, out_res=64, seed_res=4, hidden_dim=256,
-                 init_gain=1.0):
+                 init_gain=1.0, per_direction=False):
         super().__init__()
         self.num_attrs = int(num_attrs)
         self.out_channels = int(out_channels)
         self.out_res = int(out_res)
         self.seed_res = int(seed_res)
+        self.per_direction = bool(per_direction)
+        self.num_slots = self.num_attrs * 2 if self.per_direction else self.num_attrs
         assert self.out_res % self.seed_res == 0 and \
             (self.out_res // self.seed_res) & (self.out_res // self.seed_res - 1) == 0, \
             "out_res / seed_res must be a power of 2"
         num_upsamples = int(math.log2(self.out_res // self.seed_res))
 
         # Shared trunk: attribute delta -> a small spatial "seed" feature map.
-        # Shared across attributes (like magnitude_net), since this only sets
-        # up a generic starting point; per-attribute specialization happens
-        # entirely in each attribute's own decoder head below.
+        # Shared across attributes AND directions (like magnitude_net), since
+        # this only sets up a generic starting point; per-slot specialization
+        # happens entirely in each slot's own decoder head below.
         self.fc = nn.Sequential(
             nn.Linear(self.num_attrs, hidden_dim),
             nn.ReLU(inplace=True),
         )
         self.seed_proj = nn.Linear(hidden_dim, self.out_channels * self.seed_res * self.seed_res)
 
-        # Per-attribute decoder head: upsamples the shared seed to the target
-        # resolution. Separate weights per attribute (not LoRA-shared) since
+        # Per-slot decoder head: upsamples the shared seed to the target
+        # resolution. Separate weights per slot (not LoRA-shared) since
         # this module is new and unvalidated -- keep it simple, one variable
         # at a time, matching this project's own experimental discipline.
+        # Slot layout is attr-major when per_direction: slot 2a is attribute
+        # a's add direction, 2a+1 its rm direction (same convention as
+        # direction_bank.py / JudgePeakDeclineBalancer / LearnableAttributeScales).
         self.attr_heads = nn.ModuleList([
-            self._build_head(self.out_channels, num_upsamples) for _ in range(self.num_attrs)
+            self._build_head(self.out_channels, num_upsamples) for _ in range(self.num_slots)
         ])
 
-        # One learnable magnitude per attribute, through softplus so it stays
+        # One learnable magnitude per slot, through softplus so it stays
         # positive. Stored inverted from init_gain so that at step 0 the
         # injected signal has exactly norm == init_gain.
         init_gain = max(float(init_gain), 1e-4)
         raw = math.log(math.expm1(init_gain))
-        self.log_gain = nn.Parameter(torch.full((self.num_attrs,), raw))
+        self.log_gain = nn.Parameter(torch.full((self.num_slots,), raw))
+
+    def slot_index(self, attr_idx, is_rm=None):
+        if not self.per_direction:
+            return attr_idx
+        if is_rm is None:
+            raise ValueError('per_direction AttributeControlEncoder needs is_rm per sample')
+        return attr_idx * 2 + is_rm.long()
 
     def _build_head(self, channels, num_upsamples):
         layers = []
@@ -114,10 +140,15 @@ class AttributeControlEncoder(nn.Module):
         layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1))
         return nn.Sequential(*layers)
 
-    def forward(self, attr_delta, attr_idx):
+    def forward(self, attr_delta, attr_idx, is_rm=None):
         """
         attr_delta: (B, num_attrs) -- same tensor passed to AttributeDirectionBank.
         attr_idx:   (B,) long -- which attribute is being edited, per sample.
+        is_rm:      (B,) bool -- True where the source already HAS the
+                    attribute (this edit removes it). Required when
+                    per_direction=True, same convention as
+                    AttributeDirectionBank/JudgePeakDeclineBalancer/
+                    LearnableAttributeScales; ignored otherwise.
         Returns: (B, out_channels, out_res, out_res), to pass as
                  StyleGAN2 Generator's `skips=` argument.
         """
@@ -129,12 +160,13 @@ class AttributeControlEncoder(nn.Module):
         out = torch.zeros(B, self.out_channels, self.out_res, self.out_res,
                            device=device, dtype=dtype)
         attr_idx = attr_idx.view(-1).long()
-        for a in range(self.num_attrs):
-            mask = attr_idx == a
+        slot_idx = self.slot_index(attr_idx, is_rm)
+        for s in range(self.num_slots):
+            mask = slot_idx == s
             if mask.any():
-                out[mask] = self.attr_heads[a](seed[mask])
+                out[mask] = self.attr_heads[s](seed[mask])
 
-        # Direction from the head, magnitude from the per-attribute gain.
+        # Direction from the head, magnitude from the per-slot gain.
         out = F.normalize(out.reshape(B, -1), dim=1).view_as(out)
-        gain = F.softplus(self.log_gain)[attr_idx].to(device=device, dtype=dtype)
+        gain = F.softplus(self.log_gain)[slot_idx].to(device=device, dtype=dtype)
         return out * gain.view(-1, 1, 1, 1)
