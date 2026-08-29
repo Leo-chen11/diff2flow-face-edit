@@ -939,14 +939,26 @@ def main():
     parser.add_argument("--group_trim_frac", type=float, default=0.1,
                         help="Trim fraction for --group_center trimmed_mean (per side, per "
                              "coordinate). 0.1 = drop the most extreme 10%% on each end.")
-    parser.add_argument("--require_cross_judge_agree", action="store_true",
-                        help="Require an independent judge to agree before a sample counts as "
-                             "confidently high/low on the TARGET attribute (see extreme_masks). "
-                             "Needs --continuous_preds_file to have been built with "
-                             "extract_continuous_attr.py --cross_judge clip (its 'values_cross_clip' "
-                             "/ 'cross_attribute_index' keys); attributes not covered by that file's "
-                             "--cross_judge_attrs fall back to the old r34-only behavior with a "
-                             "warning. Off by default -- r34-only, old behavior.")
+    parser.add_argument("--require_cross_judge_agree", nargs="*", type=int, default=None,
+                        help="Attribute indices to require an independent judge's agreement for, "
+                             "before a sample counts as confidently high/low (see extreme_masks). "
+                             "PER-ATTRIBUTE, not a blanket on/off switch: the attributes this "
+                             "project has documented the LARGEST r34-vs-independent-judge gap on "
+                             "(eyeglasses specifically, ~91%% r34 vs ~44%% CLIP) are exactly the "
+                             "ones where requiring agreement throws away the most samples -- every "
+                             "stratum can starve below --min_samples and fall back to the same weak "
+                             "unconditional direction for all K slots, which is WORSE than plain "
+                             "r34-only filtering, not better (confirmed empirically: applying this "
+                             "blanket-on to eyeglasses collapsed its validate_direction_bank.py "
+                             "AccCLIP to a flat ~1%% at every alpha, while gender/age -- which don't "
+                             "have that large a judge gap -- improved). Pass the attributes where "
+                             "the two judges are known to mostly agree (e.g. 20 39 for gender/age); "
+                             "leave attributes with a large documented judge gap (e.g. 15 for "
+                             "eyeglasses) OUT of this list. Needs --continuous_preds_file built with "
+                             "extract_continuous_attr.py --cross_judge clip; attributes not covered "
+                             "by that file's --cross_judge_attrs fall back to r34-only with a "
+                             "warning regardless of this flag. Omit entirely for the old default "
+                             "(r34-only for everything).")
     parser.add_argument("--substyle_k", type=int, default=1,
                         help="Split each stratum's 'high' (attribute-present) group into this "
                              "many k-means sub-clusters BEFORE computing a direction, instead of "
@@ -1027,7 +1039,8 @@ def main():
               f"continuous mean={cont.mean():.3f} std={cont.std():.3f}")
 
     cross_by_attr = {}
-    if args.require_cross_judge_agree:
+    if args.require_cross_judge_agree is not None:
+        want_attrs = [int(a) for a in args.require_cross_judge_agree]
         _cross_raw = torch.load(args.continuous_preds_file, map_location="cpu")
         if not (isinstance(_cross_raw, dict) and "values_cross_clip" in _cross_raw):
             parser.error(
@@ -1036,11 +1049,21 @@ def main():
             )
         _cross_vals = _cross_raw["values_cross_clip"].float()
         _cross_attrs = [int(a) for a in _cross_raw["cross_attribute_index"]]
-        cross_by_attr = {a: _cross_vals[:, i] for i, a in enumerate(_cross_attrs)}
-        missing = [a for a in args.attribute_index if a not in cross_by_attr]
+        available = {a: _cross_vals[:, i] for i, a in enumerate(_cross_attrs)}
+        # Only apply agreement-filtering to attributes explicitly requested --
+        # NOT every attribute the continuous file happens to have cross scores
+        # for. Blanket-applying this to an attribute with a large documented
+        # r34-vs-CLIP gap (eyeglasses) starves its sample pool per-stratum and
+        # produces a WORSE direction than plain r34-only filtering -- see the
+        # help text above for the empirical confirmation.
+        cross_by_attr = {a: available[a] for a in want_attrs if a in available}
+        missing = [a for a in want_attrs if a not in available]
+        skipped = [a for a in args.attribute_index if a not in want_attrs]
         print(f"[CrossJudge] agreement required for attrs {sorted(cross_by_attr)}"
-              + (f"; falling back to r34-only for {missing} (not in --cross_judge_attrs "
-                 f"when the continuous file was built)" if missing else ""))
+              + (f"; requested but unavailable (not in --cross_judge_attrs when the continuous "
+                 f"file was built, falling back to r34-only) {missing}" if missing else "")
+              + (f"; r34-only by choice (not in --require_cross_judge_agree) {skipped}"
+                 if skipped else ""))
 
     print(f"\nmethod={args.direction_method}, extreme_pct={args.extreme_pct}, "
           f"K glasses/gender={K}, K age={age_k}, residual_age={args.residual_age}, "
