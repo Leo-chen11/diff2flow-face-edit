@@ -885,6 +885,29 @@ if __name__ == '__main__':
     # run, so Eyeglasses/Young hit a dataset-mean-direction ceiling (~60% real
     # accuracy). Start higher so the flow's personalization is actually in play.
     parser.add_argument('--direction_residual_scale', type=float, default=0.15)
+    parser.add_argument('--glasses_residual_scale', type=float, default=0.35,
+                        help='Separate INITIAL residual_scale for eyeglasses (attr 15) at TRAINING '
+                             'time, same mechanism as --age_residual_scale. scripts/'
+                             'validate_direction_bank.py measures the eyeglasses direction ALONE '
+                             '(no residual, no ControlNet, no local_region_loss) reaching only '
+                             '~12%% AccCLIP even at 1.5x its natural magnitude -- markedly weaker '
+                             'than gender or age\'s response curve at the same alphas. This is '
+                             'architectural, not a calibration bug: eyeglasses is a discrete, '
+                             'multi-modal, spatially-precise structure (thin/thick frames, '
+                             'rimless, sunglasses, all at slightly different positions), and a '
+                             'single per-stratum mean-difference direction averages those styles '
+                             'together, which for a high-frequency local structure washes out '
+                             'detail rather than reinforcing it (unlike age/gender, which are '
+                             'smoother, closer to single-axis semantic shifts that a linear '
+                             'direction represents well). DEFAULT 0.35 (more than double the '
+                             'shared 0.15) hands the trainable flow residual more of the budget '
+                             'for glasses specifically, instead of leaning on a frozen direction '
+                             'that is confirmed too weak to carry the edit alone -- the flow, '
+                             'local_region_loss, ControlNet (if enabled) and '
+                             '--clip_prompt_glasses_weight do the real work; the direction only '
+                             'needs to point roughly the right way. Still just an INIT value, '
+                             'learned further via gradient descent from there. <0 falls back to '
+                             '--direction_residual_scale (old behavior).')
     parser.add_argument('--age_residual_scale', type=float, default=-1.0,
                         help='Separate INITIAL residual_scale for age (attr 39) at TRAINING time. '
                              '<0 (default) falls back to the shared --direction_residual_scale, i.e. '
@@ -1438,13 +1461,16 @@ if __name__ == '__main__':
         if _bank_num_k != args.direction_k:
             print(f'** Direction Bank: --direction_k={args.direction_k} ignored, '
                   f'using num_k={_bank_num_k} from {args.direction_bank_path}')
-        # No per-attribute direction_scale/layer_scale/delta_max_norm, and no
-        # per-attribute residual_scale init either: every attribute starts from
-        # the same residual_scale value and learns its own from there via
-        # gradient descent (see AttributeDirectionBank.residual_scale_raw). The
-        # only magnitude safety net set here in advance is guided_delta_max_norm.
+        # No per-attribute direction_scale/layer_scale/delta_max_norm. Age and
+        # glasses DO get their own residual_scale INIT (--age_residual_scale,
+        # --glasses_residual_scale) -- every other attribute still starts from
+        # the same shared --direction_residual_scale. All of them keep
+        # learning their own value from that starting point via gradient
+        # descent (see AttributeDirectionBank.residual_scale_raw); the only
+        # magnitude safety net fixed in advance is guided_delta_max_norm.
         _per_attr_residual_scale = [
             args.age_residual_scale if (idx == 39 and args.age_residual_scale >= 0)
+            else args.glasses_residual_scale if (idx == 15 and args.glasses_residual_scale >= 0)
             else args.direction_residual_scale
             for idx in args.attribute_index
         ]
