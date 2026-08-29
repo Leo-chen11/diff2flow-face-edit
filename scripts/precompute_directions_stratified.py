@@ -512,6 +512,12 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
                                      group_center, group_trim_frac, cross_scores)
             directions.extend(_pad_directions([fb], substyle_k))
 
+    # Pad up to K if this attribute produced fewer directions than the bank's
+    # fixed K (e.g. --substyle_k_attrs excluded it, so it only clustered
+    # substyle_k=1 per stratum while other attributes were multiplied up) --
+    # every attribute in the bank must share exactly the same K.
+    if len(directions) < K:
+        directions = _pad_directions(directions, K)
     return torch.stack(directions[:K])   # (K, 18, 512)
 
 
@@ -557,6 +563,8 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
                                      group_center, group_trim_frac, cross_scores)
             directions.extend(_pad_directions([fb], substyle_k))
 
+    if len(directions) < K:
+        directions = _pad_directions(directions, K)
     return torch.stack(directions[:K])
 
 
@@ -602,6 +610,8 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
                                      group_center, group_trim_frac, cross_scores)
             directions.extend(_pad_directions([fb], substyle_k))
 
+    if len(directions) < K:
+        directions = _pad_directions(directions, K)
     return torch.stack(directions[:K])
 
 
@@ -647,6 +657,8 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
                                      group_center, group_trim_frac, cross_scores)
             directions.extend(_pad_directions([fb], substyle_k))
 
+    if len(directions) < K:
+        directions = _pad_directions(directions, K)
     return torch.stack(directions[:K])
 
 
@@ -986,11 +998,25 @@ def main():
                              "many k-means sub-clusters BEFORE computing a direction, instead of "
                              "one direction averaging every visual style together (thin/thick/"
                              "rimless glasses, closed/open-mouth smiling, etc.) -- see module "
-                             "docstring. Applies uniformly to every attribute in --attribute_index "
-                             "(not just eyeglasses), except age when --age_k 1 (the debiased "
-                             "collapse-to-one path is intentionally incompatible -- use --age_k 4 "
-                             "if you want this applied to age too). 1 (default) = old behavior. "
-                             "--K and --age_k (when not 1) are auto-multiplied by this -- see below.")
+                             "docstring. Applies to every attribute in --substyle_k_attrs (default: "
+                             "every attribute in --attribute_index), except age when --age_k 1 (the "
+                             "debiased collapse-to-one path is intentionally incompatible -- use "
+                             "--age_k 4 if you want this applied to age too). 1 (default) = old "
+                             "behavior. --K and --age_k (when not 1) are auto-multiplied by this.")
+    parser.add_argument("--substyle_k_attrs", nargs="*", type=int, default=None,
+                        help="Restrict --substyle_k to these attribute indices; attributes left out "
+                             "keep substyle_k=1 (plain per-stratum direction). Default (omitted): "
+                             "every attribute in --attribute_index, i.e. no restriction. WHY THIS "
+                             "MATTERS: substyle_k splits an ALREADY-stratified, ALREADY-extreme_pct-"
+                             "filtered group into even smaller k-means sub-clusters -- fine for a "
+                             "common attribute with plenty of samples on both sides (gender, age), "
+                             "but for a RARE attribute (eyeglasses is a small minority of FFHQ) it "
+                             "can push per-cluster sample counts low enough that the LDA covariance "
+                             "solve becomes poorly conditioned even with the isfinite() safety net "
+                             "in compute_direction (that net stops NaN from reaching the bank, it "
+                             "doesn't make a barely-adequate sample size well-conditioned). Pass e.g. "
+                             "--substyle_k 2 --substyle_k_attrs 20 39 to apply sub-clustering only "
+                             "where the sample count comfortably supports it.")
     parser.add_argument("--attribute_index", nargs="*", type=int, default=[15, 20, 39])
     parser.add_argument("--decorrelate_cross_attr", action="store_true",
                          help="Generic pairwise decorrelation: for every attribute in "
@@ -1087,22 +1113,42 @@ def main():
               + (f"; r34-only by choice (not in --require_cross_judge_agree) {skipped}"
                  if skipped else ""))
 
+    # --substyle_k_attrs restricts ACTUAL k-means sub-clustering (the
+    # substyle_k kwarg passed into each compute_*_directions call) to a
+    # subset of attributes; K/age_k above (the TARGET row count every
+    # attribute's direction tensor must have so torch.stack(...) across
+    # attributes works) stay uniform regardless -- an excluded attribute
+    # just produces its plain num_strata directions and gets padded up to
+    # that target count by the guard now at the end of every stratify
+    # function. Default (--substyle_k_attrs omitted): apply to every
+    # attribute in --attribute_index, i.e. old uniform behavior.
+    def _substyle_k_for(attr):
+        if args.substyle_k <= 1:
+            return args.substyle_k
+        if args.substyle_k_attrs is None or attr in args.substyle_k_attrs:
+            return args.substyle_k
+        return 1
+
     print(f"\nmethod={args.direction_method}, extreme_pct={args.extreme_pct}, "
           f"K glasses/gender={K}, K age={age_k}, residual_age={args.residual_age}, "
           f"strata_margin={args.strata_margin}, group_center={args.group_center}"
-          + (f" (trim_frac={args.group_trim_frac})" if args.group_center == "trimmed_mean" else ""))
+          + (f" (trim_frac={args.group_trim_frac})" if args.group_center == "trimmed_mean" else "")
+          + (f", substyle_k={args.substyle_k} restricted to attrs {args.substyle_k_attrs}"
+             if args.substyle_k > 1 else ""))
 
     common_kwargs = dict(pct=args.extreme_pct, method=args.direction_method, shrinkage=args.shrinkage,
                          strata_margin=args.strata_margin, group_center=args.group_center,
-                         group_trim_frac=args.group_trim_frac, substyle_k=args.substyle_k)
+                         group_trim_frac=args.group_trim_frac)
 
-    print(f"\n=== Eyeglasses (attr 15), K={K} ===")
+    print(f"\n=== Eyeglasses (attr 15), K={K}, substyle_k={_substyle_k_for(15)} ===")
     glasses_dirs = compute_glasses_directions(latents, preds, continuous, K, args.min_samples,
-                                              cross_scores=cross_by_attr.get(15), **common_kwargs)
+                                              cross_scores=cross_by_attr.get(15),
+                                              substyle_k=_substyle_k_for(15), **common_kwargs)
 
-    print(f"\n=== Gender / Male (attr 20), K={K} ===")
+    print(f"\n=== Gender / Male (attr 20), K={K}, substyle_k={_substyle_k_for(20)} ===")
     gender_dirs = compute_gender_directions(latents, preds, continuous, K, args.min_samples,
-                                            cross_scores=cross_by_attr.get(20), **common_kwargs)
+                                            cross_scores=cross_by_attr.get(20),
+                                            substyle_k=_substyle_k_for(20), **common_kwargs)
 
     # ── Age direction ──────────────────────────────────────────────────────────
     # When --residual_age: build a W+ where the representative glasses and gender
@@ -1121,15 +1167,19 @@ def main():
         )
         print(f"  projected out glasses and gender from {latents.shape[0]} latents")
 
-    print(f"\n=== Age / Young (attr 39), K={age_k} ===")
+    print(f"\n=== Age / Young (attr 39), K={age_k}, substyle_k={_substyle_k_for(39)} ===")
     if age_k == 1:
+        # compute_age_k1_stratified ignores substyle_k>1 by design (see its
+        # own note), so this is passed for consistency/logging only.
         age_dir_k1 = compute_age_k1_stratified(latents_for_age, preds, continuous, args.min_samples,
-                                               cross_scores=cross_by_attr.get(39), **common_kwargs)
+                                               cross_scores=cross_by_attr.get(39),
+                                               substyle_k=_substyle_k_for(39), **common_kwargs)
         age_dirs = age_dir_k1.expand(K, -1, -1).clone()   # (K, L, D) — tiled
         skip_age_orth = True
     else:
         age_dirs = compute_age_directions(latents_for_age, preds, continuous, age_k, args.min_samples,
-                                          cross_scores=cross_by_attr.get(39), **common_kwargs)
+                                          cross_scores=cross_by_attr.get(39),
+                                          substyle_k=_substyle_k_for(39), **common_kwargs)
         if age_k < K:
             pad = age_dirs[-1:].expand(K - age_k, -1, -1).clone()
             age_dirs = torch.cat([age_dirs, pad], dim=0)
@@ -1177,10 +1227,11 @@ def main():
     extra_attr_ids = [a for a in args.attribute_index if a not in (15, 20, 39)]
     extra_dirs = {}
     for attr_idx in extra_attr_ids:
-        print(f"\n=== Attr {attr_idx} (generic), K={K} ===")
+        print(f"\n=== Attr {attr_idx} (generic), K={K}, substyle_k={_substyle_k_for(attr_idx)} ===")
         extra_dirs[attr_idx] = compute_generic_directions(
             attr_idx, latents, preds, continuous, K, args.min_samples,
-            cross_scores=cross_by_attr.get(attr_idx), **common_kwargs
+            cross_scores=cross_by_attr.get(attr_idx),
+            substyle_k=_substyle_k_for(attr_idx), **common_kwargs
         )
 
     # Stack in the order given by args.attribute_index.
