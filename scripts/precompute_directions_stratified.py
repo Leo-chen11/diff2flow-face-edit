@@ -304,7 +304,18 @@ def compute_direction(latents, mask_high, mask_low, min_samples=50,
             low[:, layer, :] - low[:, layer, :].mean(dim=0, keepdim=True),
         ], dim=0)
         cov = shrinkage_covariance(pooled, shrinkage=shrinkage)
-        ridge = 1e-4 * cov.diagonal().mean().clamp(min=1e-8)
+        # Ridge floor is an ABSOLUTE term (1e-4), not just proportional to
+        # cov's own scale. A small/tightly-clustered group (e.g. a substyle_k
+        # sub-cluster with few samples) can have a near-zero covariance
+        # diagonal, in which case the old purely-proportional ridge
+        # (1e-4 * diag.mean(), clamped only at 1e-8) also shrinks toward
+        # zero and stops regularizing right when the solve needs it most --
+        # torch.linalg.solve on a near-singular matrix can then return
+        # enormous or non-finite values that used to propagate straight into
+        # the saved bank undetected. Keeping an absolute floor alongside the
+        # proportional one bounds the solve's condition number regardless of
+        # how small the group's own variance happens to be.
+        ridge = torch.clamp(1e-4 * cov.diagonal().mean(), min=1e-4)
         cov = cov + ridge * torch.eye(dim, dtype=cov.dtype, device=cov.device)
         w = torch.linalg.solve(cov, mean_diff[layer].unsqueeze(1)).squeeze(1)
         lda_dir[layer] = w
@@ -312,6 +323,17 @@ def compute_direction(latents, mask_high, mask_low, min_samples=50,
     lda_norm = lda_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     mean_norm = mean_diff.norm(dim=-1, keepdim=True)
     rescaled = lda_dir / lda_norm * mean_norm
+
+    # Safety net: never let a non-finite (NaN/Inf) direction reach the
+    # caller silently. This is what actually produced the eyeglasses
+    # ID_ind/Leak == nan and the Male ID-collapse-with-flat-AccCLIP pattern
+    # (garbage direction, not a real edit) seen after enabling --substyle_k
+    # on an already-small stratum -- an ill-conditioned covariance solve on
+    # too few samples slipped through uncaught. Treat it as a failed
+    # direction (same signal as too-few-samples) so the normal fallback
+    # path handles it instead of corrupting the bank.
+    if not torch.isfinite(rescaled).all():
+        return None, n_high, n_low
     return rescaled, n_high, n_low
 
 

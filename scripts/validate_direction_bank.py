@@ -69,6 +69,20 @@ def load_bank(path):
     # averaging precompute_directions_stratified.py uses for decorrelation.
     raw = layer_norms.unsqueeze(-1) * direction_units          # (num_attrs, K, 18, 512)
     representative = raw.mean(dim=1)                            # (num_attrs, 18, 512)
+
+    # precompute_directions_stratified.py now rejects non-finite directions
+    # at the source (see compute_direction's isfinite check), but a bank
+    # saved before that fix -- or one hand-edited/spliced -- can still carry
+    # NaN/Inf, which averaging over K silently spreads to every K slot for
+    # that attribute. Surface it loudly here instead of letting it show up
+    # downstream as unexplained nan ID_ind/Leak cells.
+    for i, a in enumerate(attribute_index):
+        finite_per_k = torch.isfinite(raw[i]).reshape(raw[i].shape[0], -1).all(dim=-1)
+        bad_k = (~finite_per_k).nonzero(as_tuple=True)[0].tolist()
+        if bad_k:
+            print(f'[WARN] attr {a}: direction_units/layer_norms non-finite at K-slots {bad_k} '
+                  f'-- this bank needs recomputing (re-run precompute_directions_stratified.py; '
+                  f'the isfinite guard there now rejects this instead of saving it).')
     return attribute_index, representative
 
 
