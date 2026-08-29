@@ -103,13 +103,26 @@ def load_paths(path):
 # Direction computation
 # ---------------------------------------------------------------------------
 
-def extreme_masks(scores, pct=20.0):
+def extreme_masks(scores, pct=20.0, cross_scores=None):
     """Boolean high/low masks from the top/bottom `pct` percent of a
     continuous score.
 
     Replaces a fixed 0.5 decision-boundary split so the direction is
     computed from confidently-labeled samples instead of ones near the
     classifier's most ambiguous region, where label noise is worst.
+
+    cross_scores: optional independent-judge continuous score (same shape
+    as `scores`, e.g. from extract_continuous_attr.py --cross_judge clip).
+    When given, a sample only counts as 'high' if the cross-judge ALSO puts
+    it above 0.5, and 'low' only if the cross-judge ALSO puts it below --
+    i.e. the percentile-extreme selection is additionally cross-validated
+    against an architecturally different judge. WHY: `scores` typically
+    comes from the same r34 classifier used as the frozen training-time
+    teacher, so a sample it is confidently (but wrongly) extreme on would
+    otherwise flow straight into the direction geometry with no check --
+    the exact "same-classifier blind spot" failure mode this project has
+    documented a large gap for on eyeglasses specifically (r34 ~91% vs an
+    independent CLIP judge far lower). See --require_cross_judge_agree.
     """
     if scores.numel() == 0:
         empty = torch.zeros_like(scores, dtype=torch.bool)
@@ -118,6 +131,9 @@ def extreme_masks(scores, pct=20.0):
     lo_thresh = torch.quantile(scores, pct / 100.0)
     mask_high = scores >= hi_thresh
     mask_low = scores <= lo_thresh
+    if cross_scores is not None:
+        mask_high = mask_high & (cross_scores >= 0.5)
+        mask_low = mask_low & (cross_scores < 0.5)
     return mask_high, mask_low
 
 
@@ -278,10 +294,10 @@ def compute_direction(latents, mask_high, mask_low, min_samples=50,
 
 
 def _fallback_direction(latents, attr_scores, pct=20.0, method="lda", shrinkage=None,
-                         group_center="mean", group_trim_frac=0.1):
+                         group_center="mean", group_trim_frac=0.1, cross_scores=None):
     """Unconditional direction as fallback, using percentile extremes of a
     continuous score instead of a fixed 0.5 split."""
-    mask_high, mask_low = extreme_masks(attr_scores, pct=pct)
+    mask_high, mask_low = extreme_masks(attr_scores, pct=pct, cross_scores=cross_scores)
     d, _, _ = compute_direction(latents, mask_high, mask_low, method=method, shrinkage=shrinkage,
                                 group_center=group_center, group_trim_frac=group_trim_frac)
     return d
@@ -293,7 +309,8 @@ def _fallback_direction(latents, attr_scores, pct=20.0, method="lda", shrinkage=
 
 def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
                                 pct=20.0, method="lda", shrinkage=None,
-                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
+                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
+                                cross_scores=None):
     """
     Attr 15 (Eyeglasses), conditioned on gender x age.
       K0: male   x young    K1: male   x old
@@ -302,6 +319,7 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
     Conditioning (gender/age) strata require confidence >= strata_margin
     away from 0.5 (see confident_strata_masks); ambiguous samples on either
     conditioning attribute are dropped from all four strata.
+    cross_scores: optional independent-judge score (see extreme_masks).
     """
     glasses_cont = continuous[:, 15]
     gender_cont = continuous[:, 20]
@@ -315,7 +333,8 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
     for name, sub_mask in strata:
         sub_lat = latents[sub_mask]
         sub_scores = glasses_cont[sub_mask]
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
+        sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
                                        method=method, shrinkage=shrinkage,
                                        group_center=group_center, group_trim_frac=group_trim_frac)
@@ -326,20 +345,21 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
         else:
             print(f"  glasses/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
             directions.append(_fallback_direction(latents, glasses_cont, pct, method, shrinkage,
-                                                   group_center, group_trim_frac))
+                                                   group_center, group_trim_frac, cross_scores))
 
     return torch.stack(directions[:K])   # (K, 18, 512)
 
 
 def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
                                pct=20.0, method="lda", shrinkage=None,
-                               strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
+                               strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
+                               cross_scores=None):
     """
     Attr 20 (Male), conditioned on age x glasses.
       K0: young x no-glasses    K1: young x glasses
       K2: old   x no-glasses    K3: old   x glasses
     High/low split uses the top/bottom `pct`% of the continuous gender score.
-    See compute_glasses_directions for strata_margin/group_center semantics.
+    See compute_glasses_directions for strata_margin/group_center/cross_scores semantics.
     """
     gender_cont = continuous[:, 20]
     young_cont = continuous[:, 39]
@@ -353,7 +373,8 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
     for name, sub_mask in strata:
         sub_lat = latents[sub_mask]
         sub_scores = gender_cont[sub_mask]
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
+        sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
                                        method=method, shrinkage=shrinkage,
                                        group_center=group_center, group_trim_frac=group_trim_frac)
@@ -364,14 +385,15 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
         else:
             print(f"  gender/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
             directions.append(_fallback_direction(latents, gender_cont, pct, method, shrinkage,
-                                                   group_center, group_trim_frac))
+                                                   group_center, group_trim_frac, cross_scores))
 
     return torch.stack(directions[:K])
 
 
 def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_samples=50,
                                 pct=20.0, method="lda", shrinkage=None,
-                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
+                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
+                                cross_scores=None):
     """
     Generic stratified direction for any CelebA attribute not given a
     dedicated hand-tuned conditioning scheme (glasses/gender/age). Stratifies
@@ -391,7 +413,8 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
     for name, sub_mask in strata:
         sub_lat = latents[sub_mask]
         sub_scores = attr_cont[sub_mask]
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
+        sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
                                        method=method, shrinkage=shrinkage,
                                        group_center=group_center, group_trim_frac=group_trim_frac)
@@ -402,20 +425,21 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
         else:
             print(f"  attr{attr_idx}/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
             directions.append(_fallback_direction(latents, attr_cont, pct, method, shrinkage,
-                                                   group_center, group_trim_frac))
+                                                   group_center, group_trim_frac, cross_scores))
 
     return torch.stack(directions[:K])
 
 
 def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
                             pct=20.0, method="lda", shrinkage=None,
-                            strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
+                            strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
+                            cross_scores=None):
     """
     Attr 39 (Young), conditioned on gender x glasses.
       K0: male   x no-glasses    K1: male   x glasses
       K2: female x no-glasses    K3: female x glasses
     High/low split uses the top/bottom `pct`% of the continuous age score.
-    See compute_glasses_directions for strata_margin/group_center semantics.
+    See compute_glasses_directions for strata_margin/group_center/cross_scores semantics.
     """
     age_cont = continuous[:, 39]
     gender_cont = continuous[:, 20]
@@ -429,7 +453,8 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
     for name, sub_mask in strata:
         sub_lat = latents[sub_mask]
         sub_scores = age_cont[sub_mask]
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
+        sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
                                        method=method, shrinkage=shrinkage,
                                        group_center=group_center, group_trim_frac=group_trim_frac)
@@ -440,14 +465,15 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
         else:
             print(f"  age/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
             directions.append(_fallback_direction(latents, age_cont, pct, method, shrinkage,
-                                                   group_center, group_trim_frac))
+                                                   group_center, group_trim_frac, cross_scores))
 
     return torch.stack(directions[:K])
 
 
 def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
                                pct=20.0, method="lda", shrinkage=None,
-                               strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
+                               strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
+                               cross_scores=None):
     """Debiased K=1 age direction via stratum-size-weighted average.
 
     Computes 4 sub-directions conditioned on gender x glasses, then averages
@@ -473,7 +499,8 @@ def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
     for name, sub_mask in strata:
         sub_lat = latents[sub_mask]
         sub_scores = age_cont[sub_mask]
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
+        sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
                                        method=method, shrinkage=shrinkage,
                                        group_center=group_center, group_trim_frac=group_trim_frac)
@@ -744,6 +771,14 @@ def main():
     parser.add_argument("--group_trim_frac", type=float, default=0.1,
                         help="Trim fraction for --group_center trimmed_mean (per side, per "
                              "coordinate). 0.1 = drop the most extreme 10%% on each end.")
+    parser.add_argument("--require_cross_judge_agree", action="store_true",
+                        help="Require an independent judge to agree before a sample counts as "
+                             "confidently high/low on the TARGET attribute (see extreme_masks). "
+                             "Needs --continuous_preds_file to have been built with "
+                             "extract_continuous_attr.py --cross_judge clip (its 'values_cross_clip' "
+                             "/ 'cross_attribute_index' keys); attributes not covered by that file's "
+                             "--cross_judge_attrs fall back to the old r34-only behavior with a "
+                             "warning. Off by default -- r34-only, old behavior.")
     parser.add_argument("--attribute_index", nargs="*", type=int, default=[15, 20, 39])
     parser.add_argument("--decorrelate_cross_attr", action="store_true",
                          help="Generic pairwise decorrelation: for every attribute in "
@@ -798,6 +833,22 @@ def main():
         print(f"  attr {idx} ({attr_name}): binary unique={uniq}, "
               f"continuous mean={cont.mean():.3f} std={cont.std():.3f}")
 
+    cross_by_attr = {}
+    if args.require_cross_judge_agree:
+        _cross_raw = torch.load(args.continuous_preds_file, map_location="cpu")
+        if not (isinstance(_cross_raw, dict) and "values_cross_clip" in _cross_raw):
+            parser.error(
+                "--require_cross_judge_agree needs --continuous_preds_file built with "
+                "extract_continuous_attr.py --cross_judge clip (missing 'values_cross_clip' key)."
+            )
+        _cross_vals = _cross_raw["values_cross_clip"].float()
+        _cross_attrs = [int(a) for a in _cross_raw["cross_attribute_index"]]
+        cross_by_attr = {a: _cross_vals[:, i] for i, a in enumerate(_cross_attrs)}
+        missing = [a for a in args.attribute_index if a not in cross_by_attr]
+        print(f"[CrossJudge] agreement required for attrs {sorted(cross_by_attr)}"
+              + (f"; falling back to r34-only for {missing} (not in --cross_judge_attrs "
+                 f"when the continuous file was built)" if missing else ""))
+
     print(f"\nmethod={args.direction_method}, extreme_pct={args.extreme_pct}, "
           f"K glasses/gender={K}, K age={age_k}, residual_age={args.residual_age}, "
           f"strata_margin={args.strata_margin}, group_center={args.group_center}"
@@ -808,10 +859,12 @@ def main():
                          group_trim_frac=args.group_trim_frac)
 
     print(f"\n=== Eyeglasses (attr 15), K={K} ===")
-    glasses_dirs = compute_glasses_directions(latents, preds, continuous, K, args.min_samples, **common_kwargs)
+    glasses_dirs = compute_glasses_directions(latents, preds, continuous, K, args.min_samples,
+                                              cross_scores=cross_by_attr.get(15), **common_kwargs)
 
     print(f"\n=== Gender / Male (attr 20), K={K} ===")
-    gender_dirs = compute_gender_directions(latents, preds, continuous, K, args.min_samples, **common_kwargs)
+    gender_dirs = compute_gender_directions(latents, preds, continuous, K, args.min_samples,
+                                            cross_scores=cross_by_attr.get(20), **common_kwargs)
 
     # ── Age direction ──────────────────────────────────────────────────────────
     # When --residual_age: build a W+ where the representative glasses and gender
@@ -832,11 +885,13 @@ def main():
 
     print(f"\n=== Age / Young (attr 39), K={age_k} ===")
     if age_k == 1:
-        age_dir_k1 = compute_age_k1_stratified(latents_for_age, preds, continuous, args.min_samples, **common_kwargs)
+        age_dir_k1 = compute_age_k1_stratified(latents_for_age, preds, continuous, args.min_samples,
+                                               cross_scores=cross_by_attr.get(39), **common_kwargs)
         age_dirs = age_dir_k1.expand(K, -1, -1).clone()   # (K, L, D) — tiled
         skip_age_orth = True
     else:
-        age_dirs = compute_age_directions(latents_for_age, preds, continuous, age_k, args.min_samples, **common_kwargs)
+        age_dirs = compute_age_directions(latents_for_age, preds, continuous, age_k, args.min_samples,
+                                          cross_scores=cross_by_attr.get(39), **common_kwargs)
         if age_k < K:
             pad = age_dirs[-1:].expand(K - age_k, -1, -1).clone()
             age_dirs = torch.cat([age_dirs, pad], dim=0)
@@ -886,7 +941,8 @@ def main():
     for attr_idx in extra_attr_ids:
         print(f"\n=== Attr {attr_idx} (generic), K={K} ===")
         extra_dirs[attr_idx] = compute_generic_directions(
-            attr_idx, latents, preds, continuous, K, args.min_samples, **common_kwargs
+            attr_idx, latents, preds, continuous, K, args.min_samples,
+            cross_scores=cross_by_attr.get(attr_idx), **common_kwargs
         )
 
     # Stack in the order given by args.attribute_index.
