@@ -26,11 +26,22 @@ scale as before -- only the *angle* of the direction changes.
 Both upgrades (percentile splits, LDA/whitened direction) apply uniformly to
 all three attributes; there is no attribute-specific special-casing.
 
-The stratification conditioning variables (e.g. gender/glasses used to
-define strata for the age direction) still use the classifier's binary 0/1
-predictions -- those are meant to be discrete groups, and only the target
-attribute's own high/low split benefits from continuous percentile
-selection.
+Two further precision knobs, off by default (reproduce the old behavior
+unless passed):
+  --strata_margin: the stratification conditioning variables (e.g. gender/
+    glasses used to define strata for the age direction) used to accept the
+    classifier's binary 0/1 predictions at face value -- a sample the
+    classifier was 51% sure of counted the same as one it was 99% sure of
+    when deciding which STRATUM computes a direction, even though only the
+    TARGET attribute's own split got the confidence-margin treatment
+    (--extreme_pct). --strata_margin extends the same idea to the
+    conditioning side: a sample must sit at least this far from 0.5 on the
+    conditioning attribute's own continuous score to count toward any
+    stratum; ambiguous ones are dropped rather than guessed into a bucket.
+  --group_center trimmed_mean: replace each high/low group's plain mean
+    with a coordinate-wise trimmed mean before differencing, so a handful
+    of mislabeled or atypical samples in a small stratum can't single-
+    handedly drag the direction toward them.
 """
 
 import argparse
@@ -110,6 +121,63 @@ def extreme_masks(scores, pct=20.0):
     return mask_high, mask_low
 
 
+def confident_strata_masks(cond_a_cont, cond_b_cont, margin=0.0):
+    """2x2 stratification masks from two continuous conditioning scores,
+    each required to sit confidently on one side of 0.5.
+
+    margin=0.0 (default) reproduces the old behavior of thresholding each
+    conditioning score at 0.5 -- equivalent to the binary predictions the
+    strata used to be built from directly. margin>0 additionally REQUIRES
+    the conditioning attribute's own score to sit at least `margin` away
+    from 0.5 before a sample counts toward a stratum, instead of trusting a
+    razor-thin >0.5-vs-<0.5 call.
+
+    WHY THIS MATTERS: only the TARGET attribute's own high/low split used a
+    confidence margin (--extreme_pct on its continuous score, see
+    extreme_masks). The CONDITIONING attributes -- e.g. gender/age when
+    stratifying the glasses direction -- still used a bare 0.5 threshold on
+    the same, possibly noisy, classifier output. A sample the classifier is
+    51% sure is "male" got treated identically to one it is 99% sure about
+    when deciding which STRATUM computes the glasses direction, even though
+    that's the exact same label-noise problem --extreme_pct exists to avoid
+    on the target side. Ambiguous conditioning samples are simply DROPPED
+    (excluded from all four strata) rather than forced into a bucket they
+    may not really belong in -- same philosophy as extreme_masks.
+
+    Returns list of 4 (label_suffix, mask) tuples in order:
+        (a=hi,b=hi), (a=hi,b=lo), (a=lo,b=hi), (a=lo,b=lo)
+    """
+    a_hi = cond_a_cont >= 0.5 + margin
+    a_lo = cond_a_cont <= 0.5 - margin
+    b_hi = cond_b_cont >= 0.5 + margin
+    b_lo = cond_b_cont <= 0.5 - margin
+    return [
+        ("hi_hi", a_hi & b_hi),
+        ("hi_lo", a_hi & b_lo),
+        ("lo_hi", a_lo & b_hi),
+        ("lo_lo", a_lo & b_lo),
+    ]
+
+
+def trimmed_mean(x, trim_frac=0.1, dim=0):
+    """Coordinate-wise trimmed mean along `dim`: drop the top/bottom
+    `trim_frac` fraction of samples per-coordinate before averaging.
+
+    A plain mean is unboundedly sensitive to a single outlier (one
+    mislabeled or atypical sample can drag the whole group centroid, and
+    therefore the direction, toward it). Trimming is the standard cheap fix:
+    still an average, just no longer letting the most extreme handful of
+    samples on EACH coordinate dominate it. Falls back to a plain mean if
+    trimming would remove too much of the group.
+    """
+    n = x.shape[dim]
+    k = int(n * trim_frac)
+    if k <= 0 or n - 2 * k <= 0:
+        return x.mean(dim=dim)
+    sorted_x, _ = torch.sort(x, dim=dim)
+    return sorted_x.narrow(dim, k, n - 2 * k).mean(dim=dim)
+
+
 def shrinkage_covariance(X, shrinkage=None):
     """Ledoit-Wolf shrinkage-to-scaled-identity covariance estimate.
 
@@ -147,7 +215,8 @@ def shrinkage_covariance(X, shrinkage=None):
 
 
 def compute_direction(latents, mask_high, mask_low, min_samples=50,
-                       method="lda", shrinkage=None):
+                       method="lda", shrinkage=None, group_center="mean",
+                       group_trim_frac=0.1):
     """Direction between two subsets of latents.
 
     method="mean_diff": high_mean - low_mean (legacy behaviour).
@@ -158,6 +227,12 @@ def compute_direction(latents, mask_high, mask_low, min_samples=50,
         source of imprecision in a raw mean-diff direction; rescaling keeps
         the physical displacement magnitude (used by layer_norms /
         magnitude_net) unchanged so only the angle is affected.
+    group_center="mean" (default) or "trimmed_mean": how each group's
+        centroid is computed before differencing. trimmed_mean drops the
+        most extreme group_trim_frac of samples per-coordinate first (see
+        trimmed_mean()), reducing sensitivity to any single mislabeled or
+        atypical sample -- worth trying if a stratum is small enough that
+        one outlier can visibly shift its direction.
     """
     n_high = int(mask_high.sum().item())
     n_low = int(mask_low.sum().item())
@@ -166,7 +241,15 @@ def compute_direction(latents, mask_high, mask_low, min_samples=50,
 
     high = latents[mask_high]
     low = latents[mask_low]
-    mean_diff = high.mean(dim=0) - low.mean(dim=0)   # (L, D)
+    if group_center == "trimmed_mean":
+        center_high = trimmed_mean(high, trim_frac=group_trim_frac, dim=0)
+        center_low = trimmed_mean(low, trim_frac=group_trim_frac, dim=0)
+    elif group_center == "mean":
+        center_high = high.mean(dim=0)
+        center_low = low.mean(dim=0)
+    else:
+        raise ValueError(f"Unknown group_center: {group_center}")
+    mean_diff = center_high - center_low   # (L, D)
     if mean_diff.norm() < 1e-6:
         return None, n_high, n_low
 
@@ -194,11 +277,13 @@ def compute_direction(latents, mask_high, mask_low, min_samples=50,
     return rescaled, n_high, n_low
 
 
-def _fallback_direction(latents, attr_scores, pct=20.0, method="lda", shrinkage=None):
+def _fallback_direction(latents, attr_scores, pct=20.0, method="lda", shrinkage=None,
+                         group_center="mean", group_trim_frac=0.1):
     """Unconditional direction as fallback, using percentile extremes of a
     continuous score instead of a fixed 0.5 split."""
     mask_high, mask_low = extreme_masks(attr_scores, pct=pct)
-    d, _, _ = compute_direction(latents, mask_high, mask_low, method=method, shrinkage=shrinkage)
+    d, _, _ = compute_direction(latents, mask_high, mask_low, method=method, shrinkage=shrinkage,
+                                group_center=group_center, group_trim_frac=group_trim_frac)
     return d
 
 
@@ -207,25 +292,24 @@ def _fallback_direction(latents, attr_scores, pct=20.0, method="lda", shrinkage=
 # ---------------------------------------------------------------------------
 
 def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
-                                pct=20.0, method="lda", shrinkage=None):
+                                pct=20.0, method="lda", shrinkage=None,
+                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
     """
-    Attr 15 (Eyeglasses), conditioned on gender x age (binary strata).
-      K0: male   x young    (gender=1, young=1)
-      K1: male   x old      (gender=1, young=0)
-      K2: female x young    (gender=0, young=1)
-      K3: female x old      (gender=0, young=0)
+    Attr 15 (Eyeglasses), conditioned on gender x age.
+      K0: male   x young    K1: male   x old
+      K2: female x young    K3: female x old
     High/low split uses the top/bottom `pct`% of the continuous glasses score.
+    Conditioning (gender/age) strata require confidence >= strata_margin
+    away from 0.5 (see confident_strata_masks); ambiguous samples on either
+    conditioning attribute are dropped from all four strata.
     """
     glasses_cont = continuous[:, 15]
-    gender = preds[:, 20]
-    young = preds[:, 39]
+    gender_cont = continuous[:, 20]
+    young_cont = continuous[:, 39]
 
-    strata = [
-        ("male_young",   (gender == 1) & (young == 1)),
-        ("male_old",     (gender == 1) & (young == 0)),
-        ("female_young", (gender == 0) & (young == 1)),
-        ("female_old",   (gender == 0) & (young == 0)),
-    ]
+    labels = ["male_young", "male_old", "female_young", "female_old"]
+    strata = [(labels[i], m) for i, (_, m) in
+              enumerate(confident_strata_masks(gender_cont, young_cont, margin=strata_margin))]
 
     directions = []
     for name, sub_mask in strata:
@@ -233,37 +317,37 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
         sub_scores = glasses_cont[sub_mask]
         mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
-                                       method=method, shrinkage=shrinkage)
+                                       method=method, shrinkage=shrinkage,
+                                       group_center=group_center, group_trim_frac=group_trim_frac)
         if d is not None:
-            print(f"  glasses/{name}: high={nh}, low={nl}, norm={d.norm():.3f}")
+            print(f"  glasses/{name}: high={nh}, low={nl}, norm={d.norm():.3f} "
+                  f"(stratum n={int(sub_mask.sum())})")
             directions.append(d)
         else:
             print(f"  glasses/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
-            directions.append(_fallback_direction(latents, glasses_cont, pct, method, shrinkage))
+            directions.append(_fallback_direction(latents, glasses_cont, pct, method, shrinkage,
+                                                   group_center, group_trim_frac))
 
     return torch.stack(directions[:K])   # (K, 18, 512)
 
 
 def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
-                               pct=20.0, method="lda", shrinkage=None):
+                               pct=20.0, method="lda", shrinkage=None,
+                               strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
     """
-    Attr 20 (Male), conditioned on age x glasses (binary strata).
-      K0: young x no-glasses  (young=1, glasses=0)
-      K1: young x glasses     (young=1, glasses=1)
-      K2: old   x no-glasses  (young=0, glasses=0)
-      K3: old   x glasses     (young=0, glasses=1)
+    Attr 20 (Male), conditioned on age x glasses.
+      K0: young x no-glasses    K1: young x glasses
+      K2: old   x no-glasses    K3: old   x glasses
     High/low split uses the top/bottom `pct`% of the continuous gender score.
+    See compute_glasses_directions for strata_margin/group_center semantics.
     """
     gender_cont = continuous[:, 20]
-    young = preds[:, 39]
-    glasses = preds[:, 15]
+    young_cont = continuous[:, 39]
+    glasses_cont = continuous[:, 15]
 
-    strata = [
-        ("young_noglasses", (young == 1) & (glasses == 0)),
-        ("young_glasses",   (young == 1) & (glasses == 1)),
-        ("old_noglasses",   (young == 0) & (glasses == 0)),
-        ("old_glasses",     (young == 0) & (glasses == 1)),
-    ]
+    labels = ["young_noglasses", "young_glasses", "old_noglasses", "old_glasses"]
+    strata = [(labels[i], m) for i, (_, m) in
+              enumerate(confident_strata_masks(young_cont, glasses_cont, margin=strata_margin))]
 
     directions = []
     for name, sub_mask in strata:
@@ -271,19 +355,23 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
         sub_scores = gender_cont[sub_mask]
         mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
-                                       method=method, shrinkage=shrinkage)
+                                       method=method, shrinkage=shrinkage,
+                                       group_center=group_center, group_trim_frac=group_trim_frac)
         if d is not None:
-            print(f"  gender/{name}: high={nh}, low={nl}, norm={d.norm():.3f}")
+            print(f"  gender/{name}: high={nh}, low={nl}, norm={d.norm():.3f} "
+                  f"(stratum n={int(sub_mask.sum())})")
             directions.append(d)
         else:
             print(f"  gender/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
-            directions.append(_fallback_direction(latents, gender_cont, pct, method, shrinkage))
+            directions.append(_fallback_direction(latents, gender_cont, pct, method, shrinkage,
+                                                   group_center, group_trim_frac))
 
     return torch.stack(directions[:K])
 
 
 def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_samples=50,
-                                pct=20.0, method="lda", shrinkage=None):
+                                pct=20.0, method="lda", shrinkage=None,
+                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
     """
     Generic stratified direction for any CelebA attribute not given a
     dedicated hand-tuned conditioning scheme (glasses/gender/age). Stratifies
@@ -292,15 +380,12 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
     visual confounds. Falls back per-stratum like the specialized functions.
     """
     attr_cont = continuous[:, attr_idx]
-    gender = preds[:, 20]
-    young = preds[:, 39]
+    gender_cont = continuous[:, 20]
+    young_cont = continuous[:, 39]
 
-    strata = [
-        ("male_young",   (gender == 1) & (young == 1)),
-        ("male_old",     (gender == 1) & (young == 0)),
-        ("female_young", (gender == 0) & (young == 1)),
-        ("female_old",   (gender == 0) & (young == 0)),
-    ]
+    labels = ["male_young", "male_old", "female_young", "female_old"]
+    strata = [(labels[i], m) for i, (_, m) in
+              enumerate(confident_strata_masks(gender_cont, young_cont, margin=strata_margin))]
 
     directions = []
     for name, sub_mask in strata:
@@ -308,37 +393,37 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
         sub_scores = attr_cont[sub_mask]
         mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
-                                       method=method, shrinkage=shrinkage)
+                                       method=method, shrinkage=shrinkage,
+                                       group_center=group_center, group_trim_frac=group_trim_frac)
         if d is not None:
-            print(f"  attr{attr_idx}/{name}: high={nh}, low={nl}, norm={d.norm():.3f}")
+            print(f"  attr{attr_idx}/{name}: high={nh}, low={nl}, norm={d.norm():.3f} "
+                  f"(stratum n={int(sub_mask.sum())})")
             directions.append(d)
         else:
             print(f"  attr{attr_idx}/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
-            directions.append(_fallback_direction(latents, attr_cont, pct, method, shrinkage))
+            directions.append(_fallback_direction(latents, attr_cont, pct, method, shrinkage,
+                                                   group_center, group_trim_frac))
 
     return torch.stack(directions[:K])
 
 
 def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
-                            pct=20.0, method="lda", shrinkage=None):
+                            pct=20.0, method="lda", shrinkage=None,
+                            strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
     """
-    Attr 39 (Young), conditioned on gender x glasses (binary strata).
-      K0: male   x no-glasses  (gender=1, glasses=0)
-      K1: male   x glasses     (gender=1, glasses=1)
-      K2: female x no-glasses  (gender=0, glasses=0)
-      K3: female x glasses     (gender=0, glasses=1)
+    Attr 39 (Young), conditioned on gender x glasses.
+      K0: male   x no-glasses    K1: male   x glasses
+      K2: female x no-glasses    K3: female x glasses
     High/low split uses the top/bottom `pct`% of the continuous age score.
+    See compute_glasses_directions for strata_margin/group_center semantics.
     """
     age_cont = continuous[:, 39]
-    gender = preds[:, 20]
-    glasses = preds[:, 15]
+    gender_cont = continuous[:, 20]
+    glasses_cont = continuous[:, 15]
 
-    strata = [
-        ("male_noglasses",   (gender == 1) & (glasses == 0)),
-        ("male_glasses",     (gender == 1) & (glasses == 1)),
-        ("female_noglasses", (gender == 0) & (glasses == 0)),
-        ("female_glasses",   (gender == 0) & (glasses == 1)),
-    ]
+    labels = ["male_noglasses", "male_glasses", "female_noglasses", "female_glasses"]
+    strata = [(labels[i], m) for i, (_, m) in
+              enumerate(confident_strata_masks(gender_cont, glasses_cont, margin=strata_margin))]
 
     directions = []
     for name, sub_mask in strata:
@@ -346,19 +431,23 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
         sub_scores = age_cont[sub_mask]
         mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
-                                       method=method, shrinkage=shrinkage)
+                                       method=method, shrinkage=shrinkage,
+                                       group_center=group_center, group_trim_frac=group_trim_frac)
         if d is not None:
-            print(f"  age/{name}: high={nh}, low={nl}, norm={d.norm():.3f}")
+            print(f"  age/{name}: high={nh}, low={nl}, norm={d.norm():.3f} "
+                  f"(stratum n={int(sub_mask.sum())})")
             directions.append(d)
         else:
             print(f"  age/{name}: FAILED (high={nh}, low={nl}) -> using fallback")
-            directions.append(_fallback_direction(latents, age_cont, pct, method, shrinkage))
+            directions.append(_fallback_direction(latents, age_cont, pct, method, shrinkage,
+                                                   group_center, group_trim_frac))
 
     return torch.stack(directions[:K])
 
 
 def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
-                               pct=20.0, method="lda", shrinkage=None):
+                               pct=20.0, method="lda", shrinkage=None,
+                               strata_margin=0.0, group_center="mean", group_trim_frac=0.1):
     """Debiased K=1 age direction via stratum-size-weighted average.
 
     Computes 4 sub-directions conditioned on gender x glasses, then averages
@@ -373,15 +462,12 @@ def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
     Returns: (1, 18, 512) -- single direction, ready to be tiled to fill K slots.
     """
     age_cont = continuous[:, 39]
-    gender = preds[:, 20]
-    glasses = preds[:, 15]
+    gender_cont = continuous[:, 20]
+    glasses_cont = continuous[:, 15]
 
-    strata = [
-        ("male_noglasses",   (gender == 1) & (glasses == 0)),
-        ("male_glasses",     (gender == 1) & (glasses == 1)),
-        ("female_noglasses", (gender == 0) & (glasses == 0)),
-        ("female_glasses",   (gender == 0) & (glasses == 1)),
-    ]
+    labels = ["male_noglasses", "male_glasses", "female_noglasses", "female_glasses"]
+    strata = [(labels[i], m) for i, (_, m) in
+              enumerate(confident_strata_masks(gender_cont, glasses_cont, margin=strata_margin))]
 
     sub_dirs, weights = [], []
     for name, sub_mask in strata:
@@ -389,7 +475,8 @@ def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
         sub_scores = age_cont[sub_mask]
         mask_high, mask_low = extreme_masks(sub_scores, pct=pct)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
-                                       method=method, shrinkage=shrinkage)
+                                       method=method, shrinkage=shrinkage,
+                                       group_center=group_center, group_trim_frac=group_trim_frac)
         n_total = int(sub_mask.sum().item())
         if d is not None:
             print(f"  age/{name}: high={nh}, low={nl}, norm={d.norm():.4f}, stratum_size={n_total}")
@@ -485,13 +572,15 @@ def compute_image_color_scores(image_root, paths, resize=32, face_crop=True):
 
 
 def compute_color_confound_direction(latents, color_scores, min_samples=50,
-                                      pct=20.0, method="lda", shrinkage=None):
+                                      pct=20.0, method="lda", shrinkage=None,
+                                      group_center="mean", group_trim_frac=0.1):
     """Direction in W+ that explains color-tone variation, independent of any
     attribute label. Same primitive as attribute directions (percentile
     split + LDA/whitened), just conditioned on the color score instead."""
     mask_high, mask_low = extreme_masks(color_scores, pct=pct)
     d, n_high, n_low = compute_direction(
-        latents, mask_high, mask_low, min_samples, method=method, shrinkage=shrinkage
+        latents, mask_high, mask_low, min_samples, method=method, shrinkage=shrinkage,
+        group_center=group_center, group_trim_frac=group_trim_frac,
     )
     if d is None:
         raise ValueError(
@@ -638,6 +727,23 @@ def main():
                              "stratum's usable pool shrinks to roughly 2*extreme_pct%% of its size, "
                              "so small strata may need a lower --min_samples (e.g. 20-30) or a "
                              "larger --extreme_pct to avoid falling back to the unconditional direction.")
+    parser.add_argument("--strata_margin", type=float, default=0.0,
+                        help="Confidence margin (see confident_strata_masks) required on each "
+                             "CONDITIONING attribute's own continuous score before a sample counts "
+                             "toward a stratum, instead of a bare 0.5 threshold. 0.0 (default) "
+                             "reproduces the old behavior. Try 0.15-0.25 to drop samples the "
+                             "classifier itself is unsure about on the conditioning side too --  "
+                             "only the target attribute's split got this treatment before "
+                             "(--extreme_pct); this extends the same idea to the strata that decide "
+                             "which K-slot a sample's direction gets computed from.")
+    parser.add_argument("--group_center", choices=["mean", "trimmed_mean"], default="mean",
+                        help="How each high/low group's centroid is computed. trimmed_mean drops "
+                             "the most extreme --group_trim_frac fraction of samples per-coordinate "
+                             "first, reducing sensitivity to a handful of mislabeled/atypical "
+                             "samples in small strata. mean = old behavior.")
+    parser.add_argument("--group_trim_frac", type=float, default=0.1,
+                        help="Trim fraction for --group_center trimmed_mean (per side, per "
+                             "coordinate). 0.1 = drop the most extreme 10%% on each end.")
     parser.add_argument("--attribute_index", nargs="*", type=int, default=[15, 20, 39])
     parser.add_argument("--decorrelate_cross_attr", action="store_true",
                          help="Generic pairwise decorrelation: for every attribute in "
@@ -693,9 +799,13 @@ def main():
               f"continuous mean={cont.mean():.3f} std={cont.std():.3f}")
 
     print(f"\nmethod={args.direction_method}, extreme_pct={args.extreme_pct}, "
-          f"K glasses/gender={K}, K age={age_k}, residual_age={args.residual_age}")
+          f"K glasses/gender={K}, K age={age_k}, residual_age={args.residual_age}, "
+          f"strata_margin={args.strata_margin}, group_center={args.group_center}"
+          + (f" (trim_frac={args.group_trim_frac})" if args.group_center == "trimmed_mean" else ""))
 
-    common_kwargs = dict(pct=args.extreme_pct, method=args.direction_method, shrinkage=args.shrinkage)
+    common_kwargs = dict(pct=args.extreme_pct, method=args.direction_method, shrinkage=args.shrinkage,
+                         strata_margin=args.strata_margin, group_center=args.group_center,
+                         group_trim_frac=args.group_trim_frac)
 
     print(f"\n=== Eyeglasses (attr 15), K={K} ===")
     glasses_dirs = compute_glasses_directions(latents, preds, continuous, K, args.min_samples, **common_kwargs)
@@ -749,6 +859,7 @@ def main():
             latents, color_scores, args.min_samples,
             pct=(args.color_confound_pct if args.color_confound_pct is not None else args.extreme_pct),
             method=args.direction_method, shrinkage=args.shrinkage,
+            group_center=args.group_center, group_trim_frac=args.group_trim_frac,
         )
 
         # Report overlap BEFORE removal so the fix's effect size is visible,
