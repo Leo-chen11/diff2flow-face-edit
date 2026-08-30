@@ -928,6 +928,57 @@ def intra_attr_orthogonalize_safe(directions, iters=5, min_norm_ratio=0.1, max_n
     return result
 
 
+def sanitize_non_finite_directions(all_dirs, attribute_index, latents, continuous, pct, method,
+                                    shrinkage, group_center, group_trim_frac):
+    """Final, unconditional safety net -- replace any STILL-non-finite (attr,
+    K) direction slot with a freshly computed unconditional fallback, no
+    matter which upstream stage produced it.
+
+    compute_direction() and intra_attr_orthogonalize_safe() each already
+    reject non-finite output at their OWN stage, but a large enough
+    --substyle_k (K=16 from --substyle_k 4, observed in practice) can push
+    the orthogonalization's Newton-Schulz iteration to genuine float32
+    overflow. Because that iteration's update is a shared (K, D) @ (D, K)
+    matrix product across ALL K rows of one attribute at once, a single row
+    overflowing to inf/nan during an iteration can spread to every OTHER row
+    through that same matrix multiply before the per-row isfinite check at
+    the end of the function ever gets a chance to isolate just the one bad
+    row -- so entire attributes can come back fully non-finite despite that
+    guard. --decorrelate_cross_attr then compounds this: an attribute with a
+    now-corrupted representative direction can carry that corruption into
+    every OTHER attribute that projects against it (observed: an attribute
+    that never used --substyle_k still came back fully non-finite after
+    decorrelating against one that did).
+
+    This runs on `all_dirs` right before it is turned into layer_norms/
+    direction_units and saved -- the one chokepoint every direction passes
+    through regardless of which upstream stage actually failed in a given
+    run -- so it is the last line of defense rather than a replacement for
+    the earlier, stage-specific guards.
+    """
+    num_attrs, K = all_dirs.shape[0], all_dirs.shape[1]
+    for a_i, attr in enumerate(attribute_index):
+        finite_per_k = torch.isfinite(all_dirs[a_i]).reshape(K, -1).all(dim=-1)
+        bad_k = (~finite_per_k).nonzero(as_tuple=True)[0].tolist()
+        if not bad_k:
+            continue
+        print(f"[SANITIZE] attr {attr}: non-finite at K-slots {bad_k} after decorrelation/"
+              f"orthogonalization -- recomputing an unconditional fallback direction for them "
+              f"instead of saving inf/nan into the bank.")
+        fb = _fallback_direction(latents, continuous[:, attr], pct=pct, method=method,
+                                 shrinkage=shrinkage, group_center=group_center,
+                                 group_trim_frac=group_trim_frac)
+        if fb is None or not torch.isfinite(fb).all():
+            raise RuntimeError(
+                f"attr {attr}: even the unconditional fallback direction is non-finite -- this is "
+                f"not a K-slot-specific issue, check --latent_file/--continuous_preds_file for this "
+                f"attribute directly."
+            )
+        for k in bad_k:
+            all_dirs[a_i, k] = fb
+    return all_dirs
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1322,6 +1373,12 @@ def main():
         print("Intra-attribute orthogonalization (age) ...")
     else:
         print("Age orthogonalization: SKIPPED (age_k=1, tiled direction)")
+
+    all_dirs = sanitize_non_finite_directions(
+        all_dirs, args.attribute_index, latents, continuous,
+        pct=args.extreme_pct, method=args.direction_method, shrinkage=args.shrinkage,
+        group_center=args.group_center, group_trim_frac=args.group_trim_frac,
+    )
 
     # Norms and unit vectors
     layer_norms = all_dirs.norm(dim=-1)                    # (num_attrs, K, 18)
