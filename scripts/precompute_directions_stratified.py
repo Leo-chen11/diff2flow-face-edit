@@ -867,12 +867,36 @@ def remove_direction_components(w_all, unit_directions):
 # Orthogonalization
 # ---------------------------------------------------------------------------
 
-def intra_attr_orthogonalize_safe(directions, iters=5, min_norm_ratio=0.1):
-    """Symmetric orthogonalization with fallback for near-degenerate cases.
+def intra_attr_orthogonalize_safe(directions, iters=5, min_norm_ratio=0.1, max_norm_ratio=5.0):
+    """Symmetric (Löwdin/Newton-Schulz) orthogonalization with fallback for
+    near-degenerate cases.
 
-    If a direction collapses below min_norm_ratio of its original norm after
-    orthogonalization, fall back to the original (unorthogonalized) direction.
-    This happens when two strata produce nearly identical direction vectors.
+    If a direction's norm ends up outside [min_norm_ratio, max_norm_ratio] x
+    its original norm after orthogonalization, fall back to the original
+    (unorthogonalized) direction instead. Two distinct failure modes need
+    two distinct checks here, not one:
+      - COLLAPSE (norm -> ~0): happens when two strata/sub-clusters produce
+        nearly identical direction vectors -- this is the case the
+        min_norm_ratio check has always caught.
+      - EXPLOSION (norm -> huge but finite, e.g. ~1e12): the iteration
+        `D_unit = 1.5*D_unit - 0.5*(D_unit @ D_unit.t()) @ D_unit` is
+        Newton-Schulz for the orthogonal polar factor, which only CONVERGES
+        when D_unit's singular values lie in (0, sqrt(3)). K unit vectors
+        that are highly correlated/near-duplicate (e.g. --substyle_k
+        sub-clusters of an already-narrow stratum that didn't have much
+        real visual diversity to split on, or several strata falling back
+        to the same padded direction) push the largest singular value past
+        sqrt(3), and the iteration then DIVERGES -- doubling its error each
+        pass instead of shrinking it, so 5 iterations is enough to reach
+        an astronomical but still torch.isfinite() norm. A finite-but-huge
+        result silently passes the isfinite() guard in compute_direction
+        (that guard runs on a different, earlier stage) and previously had
+        no check here at all, so it reached the saved bank undetected --
+        this is what produced the ~2e12 mean_norm seen on the gender
+        direction after enabling --substyle_k_attrs on it.
+    Both checks compare against the PRE-orthogonalization norm, so this is a
+    "did this operation do something numerically sane" test, not a fixed
+    absolute threshold.
 
     Args:
         directions: (K, 18, 512)
@@ -889,12 +913,17 @@ def intra_attr_orthogonalize_safe(directions, iters=5, min_norm_ratio=0.1):
         for _ in range(iters):
             D_unit = 1.5 * D_unit - 0.5 * (D_unit @ D_unit.t()) @ D_unit
         orth = D_unit * orig_norms
-        # Fallback: if norm collapsed, keep original direction
+        # Fallback: if the norm collapsed OR exploded, or went non-finite,
+        # keep the original (unorthogonalized) direction for those rows.
         new_norms = orth.norm(dim=-1)
         orig_norms_flat = orig_norms.squeeze(-1)
-        collapsed = new_norms < min_norm_ratio * orig_norms_flat
-        if collapsed.any():
-            orth[collapsed] = original[:, layer][collapsed]
+        bad = (
+            (new_norms < min_norm_ratio * orig_norms_flat)
+            | (new_norms > max_norm_ratio * orig_norms_flat)
+            | ~torch.isfinite(new_norms)
+        )
+        if bad.any():
+            orth[bad] = original[:, layer][bad]
         result[:, layer] = orth
     return result
 
