@@ -49,6 +49,19 @@ Usage:
         --img_list data/ffhq.txt \
         --output data/ffhq_e4e_preds_continuous.pth \
         --cross_judge clip
+
+Already have an r34-only continuous-preds file from an earlier run and just
+want to add the CLIP cross-judge scores to it, without paying for another
+full r34 forward pass over the whole dataset? Use --merge_into instead of
+recomputing everything from scratch:
+    python scripts/extract_continuous_attrs.py \
+        --img_dir data/FFHQ \
+        --merge_into data/ffhq_e4e_preds_continuous.pth \
+        --output data/ffhq_e4e_preds_continuous.pth \
+        --cross_judge clip
+This reuses that file's own paths/r34 values as-is and only runs the CLIP
+model. Point --output at the same path to update the file in place, or
+elsewhere to keep the r34-only original untouched.
 """
 
 import argparse
@@ -117,21 +130,48 @@ def main():
                         help='Which attribute indices to cross-check (CLIPAttributeJudge has '
                              'hand-written prompts for 15/20/24/31/33/39; others fall back to '
                              'a generic prompt pair and are less meaningful to cross-check).')
+    parser.add_argument('--merge_into', default=None,
+                        help='Path to an EXISTING continuous-preds .pth (r34-only, i.e. no '
+                             "values_cross_clip yet) to add CLIP cross-judge scores to, without "
+                             "re-running the (slower, and already-done) r34 forward pass. "
+                             "Requires --cross_judge clip. Reuses that file's own 'paths' and "
+                             "'values' (r34 scores) as-is -- the CLIP judge is scored over "
+                             "exactly those same images in the same order, so the two score "
+                             "columns stay row-aligned -- and only runs the CLIP model, skipping "
+                             "AttributeClassifier entirely. Save target is still --output (default "
+                             "unchanged); pass --output pointing at the same path as --merge_into "
+                             "to update it in place, or a different path to keep both.")
     args = parser.parse_args()
+
+    if args.merge_into is not None and args.cross_judge != 'clip':
+        parser.error('--merge_into only adds something when combined with --cross_judge clip '
+                     '(it exists to skip re-running r34, not to skip cross-judge scoring).')
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
-    print(f'Loading model from {args.model_path} ...')
-    classifier = AttributeClassifier()
-    classifier.load_state_dict(torch.load(args.model_path, map_location='cpu'))
-    classifier.eval().to(device)
-    print('Loaded AttributeClassifier (forward_attr: 40 binary attribute heads, pre-threshold)')
+    if args.merge_into is not None:
+        print(f'Loading existing r34 scores from {args.merge_into} (merge mode -- skipping '
+              f'AttributeClassifier load and its forward pass entirely) ...')
+        existing = torch.load(args.merge_into, map_location='cpu')
+        if not (isinstance(existing, dict) and 'paths' in existing and 'values' in existing):
+            parser.error(f"--merge_into {args.merge_into} doesn't look like a continuous-preds "
+                         "file (missing 'paths'/'values' keys).")
+        paths = list(existing['paths'])
+        scores = existing['values']
+        classifier = None
+        print(f'  reused {len(paths)} paths, values shape={tuple(scores.shape)}')
+    else:
+        print(f'Loading model from {args.model_path} ...')
+        classifier = AttributeClassifier()
+        classifier.load_state_dict(torch.load(args.model_path, map_location='cpu'))
+        classifier.eval().to(device)
+        print('Loaded AttributeClassifier (forward_attr: 40 binary attribute heads, pre-threshold)')
 
-    with open(args.img_list, newline='') as f:
-        reader = csv.DictReader(f)
-        paths = [row['path'] for row in reader]
-    print(f'Images: {len(paths)} from {args.img_list}')
+        with open(args.img_list, newline='') as f:
+            reader = csv.DictReader(f)
+            paths = [row['path'] for row in reader]
+        print(f'Images: {len(paths)} from {args.img_list}')
 
     dataset = _ImageDataset(args.img_dir, paths, img_size=args.img_size)
     loader = DataLoader(
@@ -147,25 +187,29 @@ def main():
         from evaluation.evaluate_sdflow import CLIPAttributeJudge
         clip_judge = CLIPAttributeJudge(args.cross_judge_attrs, args.cross_judge_model, device)
         print(f'[CrossJudge] CLIP zero-shot ({args.cross_judge_model}) scoring attrs '
-              f'{args.cross_judge_attrs} alongside the r34 continuous scores.')
+              f'{args.cross_judge_attrs}'
+              + (' alongside the r34 continuous scores.' if classifier is not None
+                 else ' only (r34 scores reused from --merge_into, not recomputed).'))
 
-    all_scores = []
+    all_scores = [] if classifier is not None else None
     all_cross = [] if clip_judge is not None else None
     for batch in tqdm(loader, desc='continuous attr scores'):
         batch = batch.to(device)
-        logits, _ = classifier.forward_attr(batch)   # (B, 40)
-        all_scores.append(torch.sigmoid(logits).cpu())
+        if classifier is not None:
+            logits, _ = classifier.forward_attr(batch)   # (B, 40)
+            all_scores.append(torch.sigmoid(logits).cpu())
         if clip_judge is not None:
             all_cross.append(clip_judge.scores(batch).cpu())   # (B, len(cross_judge_attrs))
 
-    scores = torch.cat(all_scores)   # (N, 40)
+    if classifier is not None:
+        scores = torch.cat(all_scores)   # (N, 40)
     print(f'\nShape: {tuple(scores.shape)}')
     for idx, name in [(15, 'Eyeglasses'), (20, 'Male'), (39, 'Young')]:
         col = scores[:, idx]
         print(f'  attr {idx:>2} ({name:<10}): mean={col.mean():.3f} std={col.std():.3f} '
               f'min={col.min():.3f} max={col.max():.3f}')
 
-    out = {'paths': paths, 'values': scores}
+    out = dict(existing) if args.merge_into is not None else {'paths': paths, 'values': scores}
 
     if clip_judge is not None:
         cross_scores = torch.cat(all_cross)   # (N, len(cross_judge_attrs))
