@@ -36,6 +36,11 @@ Usage, two passes:
 """
 import argparse
 import os
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'models', 'stylegan2'))
+sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 import torch.nn.functional as F
