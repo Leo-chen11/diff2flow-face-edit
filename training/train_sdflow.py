@@ -923,6 +923,24 @@ if __name__ == '__main__':
                              'output, instead of the frozen (~95% of the edit) direction dominating '
                              'regardless of what the residual learns. residual_scale is still learned '
                              'via gradient descent from this starting point, not fixed.')
+    parser.add_argument('--male_residual_scale', type=float, default=-1.0,
+                        help='Separate INITIAL residual_scale for gender (attr 20) at TRAINING '
+                             'time, same mechanism as --age_residual_scale/--glasses_residual_scale. '
+                             '<0 (default) falls back to the shared --direction_residual_scale. '
+                             'Independent-judge eval on a trained checkpoint found gender the most '
+                             'expensive of the three attributes per unit of accuracy: highest LPIPS '
+                             '(~2x eyeglasses/age at every tested scale), fastest-declining ID_ind '
+                             'across the scale sweep, and the highest LeakCLIP -- while its AccCLIP '
+                             'was already strong. Unlike eyeglasses/age, gender was never given its '
+                             'own reduced budget, so it shares the same residual_scale as every other '
+                             'attribute despite already having a well-calibrated (LDA + cross-attr-'
+                             'decorrelated) frozen direction to lean on instead. LOWERING this (e.g. '
+                             '0.05-0.10, below the shared default 0.15) hands gender LESS of the edit '
+                             'budget from the freely-learned, less-constrained flow residual and MORE '
+                             'from the frozen direction, trading a bit of headroom on AccCLIP (already '
+                             'comfortably ahead of eyeglasses/age) for less collateral pixel change and '
+                             'identity drift. residual_scale is still learned via gradient descent from '
+                             'this starting point, not fixed.')
     parser.add_argument('--direction_freeze', '--direction-freeze',
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--direction_orth_weight', type=float, default=0.0)
@@ -1461,9 +1479,10 @@ if __name__ == '__main__':
         if _bank_num_k != args.direction_k:
             print(f'** Direction Bank: --direction_k={args.direction_k} ignored, '
                   f'using num_k={_bank_num_k} from {args.direction_bank_path}')
-        # No per-attribute direction_scale/layer_scale/delta_max_norm. Age and
-        # glasses DO get their own residual_scale INIT (--age_residual_scale,
-        # --glasses_residual_scale) -- every other attribute still starts from
+        # No per-attribute direction_scale/layer_scale/delta_max_norm. Age,
+        # glasses, and gender DO get their own residual_scale INIT
+        # (--age_residual_scale, --glasses_residual_scale,
+        # --male_residual_scale) -- every other attribute still starts from
         # the same shared --direction_residual_scale. All of them keep
         # learning their own value from that starting point via gradient
         # descent (see AttributeDirectionBank.residual_scale_raw); the only
@@ -1471,6 +1490,7 @@ if __name__ == '__main__':
         _per_attr_residual_scale = [
             args.age_residual_scale if (idx == 39 and args.age_residual_scale >= 0)
             else args.glasses_residual_scale if (idx == 15 and args.glasses_residual_scale >= 0)
+            else args.male_residual_scale if (idx == 20 and args.male_residual_scale >= 0)
             else args.direction_residual_scale
             for idx in args.attribute_index
         ]
