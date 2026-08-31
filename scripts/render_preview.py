@@ -164,6 +164,11 @@ if __name__ == '__main__':
     parser.add_argument('--stygan2_weights', default='./data/stylegan2-ffhq-config-f.pt')
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth')
     parser.add_argument('--direction_bank_path', default=None)
+    parser.add_argument('--force_bank_directions', action='store_true',
+                        help='See evaluation/evaluate_sdflow.py --force_bank_directions -- '
+                             'load_models() (shared with this script) reads this attribute '
+                             'unconditionally, so it must be defined here even though this '
+                             'script normally just previews the checkpoint as trained.')
 
     # Model structure (auto-aligned from config.json when present)
     parser.add_argument('--img_size',         type=int,   default=512)
@@ -185,6 +190,12 @@ if __name__ == '__main__':
     parser.add_argument('--bypass_glasses_direction_bank',
                         action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--guided_delta_max_norm', type=float, default=0.0)
+    parser.add_argument('--controlnet_embed_res', type=int, default=64,
+                        help='Must match training --controlnet_embed_res if enabled.')
+    parser.add_argument('--controlnet_channels', type=int, default=512,
+                        help='Must match training --controlnet_channels if enabled.')
+    parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
+                        help='Must match training --controlnet_hidden_dim if enabled.')
     parser.add_argument('--disable_controlnet', action='store_true',
                         help='ABLATION: skip control_encoder even if the run was trained with '
                              'it, to render the same faces through the W+ path alone.')
