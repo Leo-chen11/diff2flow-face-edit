@@ -51,7 +51,7 @@ from torch.utils import data
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CLIPAttributeJudge, apply_run_config, edit_single_attribute,
     resolve_controlnet_disable_attrs,
-    load_models,
+    load_models, _latest_step,
 )
 from models.dataset import SDFlowDataset
 
@@ -114,6 +114,18 @@ def _stratified_indices(continuous_path, attr, image_list, n_per_bin, n_bins=5, 
 
 @torch.no_grad()
 def do_dump(args):
+    if args.step is None:
+        # load_models() has no fallback for this -- unlike evaluate_sdflow.py's
+        # own __main__, which resolves args.step before calling load_models(),
+        # this script calls load_models() directly. Without this, _ckpt_path()
+        # does f'{module_name}-{str(None).zfill(7)}' -> 'prior-000None' and
+        # crashes with a FileNotFoundError that gives no hint why.
+        args.step = _latest_step(args.checkpoint_dir)
+        if args.step is None:
+            raise SystemExit(f'No checkpoints found under {args.checkpoint_dir}/save_models -- '
+                             'pass --step explicitly if they use a different naming scheme.')
+        print(f'Auto-detected latest step: {args.step}')
+
     os.makedirs(os.path.join(args.out_dir, 'unsorted'), exist_ok=True)
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank, control_encoder = load_models(args)
