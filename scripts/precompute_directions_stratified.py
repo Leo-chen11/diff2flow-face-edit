@@ -125,13 +125,30 @@ def load_paths(path):
 # Direction computation
 # ---------------------------------------------------------------------------
 
-def extreme_masks(scores, pct=20.0, cross_scores=None):
+def extreme_masks(scores, pct=20.0, cross_scores=None, min_conf=0.0):
     """Boolean high/low masks from the top/bottom `pct` percent of a
     continuous score.
 
     Replaces a fixed 0.5 decision-boundary split so the direction is
     computed from confidently-labeled samples instead of ones near the
     classifier's most ambiguous region, where label noise is worst.
+
+    min_conf: additional ABSOLUTE confidence floor, independent of `pct`.
+    WHY THIS EXISTS: `pct` alone only ever guarantees a fixed COUNT (top/
+    bottom pct% by RANK) -- it says nothing about how confident those
+    samples actually are. When a stratum's true attribute prevalence is far
+    below `pct`, e.g. eyeglasses among the female_young stratum, the "top
+    20%" bucket is still exactly 20% of the stratum by construction, but is
+    then dominated by low-confidence/near-0.5 samples rather than genuine
+    positives -- confirmed empirically on this project's own data: the
+    female_young glasses "high" bucket had median score 0.014 (essentially
+    NOT glasses) versus 0.995-0.998 for every other gender/age stratum,
+    despite having the largest raw sample count of the four. min_conf > 0
+    additionally requires scores >= min_conf for 'high' and <= 1-min_conf
+    for 'low', so a stratum like that shrinks below --min_samples and falls
+    back to the (much more reliable) unconditional direction instead of
+    silently building geometry from noise. Default 0.0 preserves the old
+    percentile-only behavior exactly.
 
     cross_scores: optional independent-judge continuous score (same shape
     as `scores`, e.g. from extract_continuous_attr.py --cross_judge clip).
@@ -153,6 +170,9 @@ def extreme_masks(scores, pct=20.0, cross_scores=None):
     lo_thresh = torch.quantile(scores, pct / 100.0)
     mask_high = scores >= hi_thresh
     mask_low = scores <= lo_thresh
+    if min_conf > 0.0:
+        mask_high = mask_high & (scores >= min_conf)
+        mask_low = mask_low & (scores <= 1.0 - min_conf)
     if cross_scores is not None:
         mask_high = mask_high & (cross_scores >= 0.5)
         mask_low = mask_low & (cross_scores < 0.5)
@@ -454,10 +474,12 @@ def compute_direction_substyle(latents, mask_high, mask_low, min_samples=50,
 
 
 def _fallback_direction(latents, attr_scores, pct=20.0, method="lda", shrinkage=None,
-                         group_center="mean", group_trim_frac=0.1, cross_scores=None):
+                         group_center="mean", group_trim_frac=0.1, cross_scores=None,
+                         min_conf=0.0):
     """Unconditional direction as fallback, using percentile extremes of a
     continuous score instead of a fixed 0.5 split."""
-    mask_high, mask_low = extreme_masks(attr_scores, pct=pct, cross_scores=cross_scores)
+    mask_high, mask_low = extreme_masks(attr_scores, pct=pct, cross_scores=cross_scores,
+                                        min_conf=min_conf)
     d, _, _ = compute_direction(latents, mask_high, mask_low, method=method, shrinkage=shrinkage,
                                 group_center=group_center, group_trim_frac=group_trim_frac)
     return d
@@ -470,7 +492,7 @@ def _fallback_direction(latents, attr_scores, pct=20.0, method="lda", shrinkage=
 def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
                                 pct=20.0, method="lda", shrinkage=None,
                                 strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
-                                cross_scores=None, substyle_k=1):
+                                cross_scores=None, substyle_k=1, min_conf=0.0):
     """
     Attr 15 (Eyeglasses), conditioned on gender x age.
       K0: male   x young    K1: male   x old
@@ -495,7 +517,7 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
         sub_lat = latents[sub_mask]
         sub_scores = glasses_cont[sub_mask]
         sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross, min_conf=min_conf)
         results = compute_direction_substyle(sub_lat, mask_high, mask_low, min_samples,
                                              method=method, shrinkage=shrinkage,
                                              group_center=group_center, group_trim_frac=group_trim_frac,
@@ -509,7 +531,7 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
             print(f"  glasses/{name}: FAILED (stratum n={int(sub_mask.sum())}) -> using fallback"
                   + (f" (x{substyle_k})" if substyle_k > 1 else ""))
             fb = _fallback_direction(latents, glasses_cont, pct, method, shrinkage,
-                                     group_center, group_trim_frac, cross_scores)
+                                     group_center, group_trim_frac, cross_scores, min_conf=min_conf)
             directions.extend(_pad_directions([fb], substyle_k))
 
     # Pad up to K if this attribute produced fewer directions than the bank's
@@ -524,7 +546,7 @@ def compute_glasses_directions(latents, preds, continuous, K=4, min_samples=50,
 def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
                                pct=20.0, method="lda", shrinkage=None,
                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
-                               cross_scores=None, substyle_k=1):
+                               cross_scores=None, substyle_k=1, min_conf=0.0):
     """
     Attr 20 (Male), conditioned on age x glasses.
       K0: young x no-glasses    K1: young x glasses
@@ -546,7 +568,7 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
         sub_lat = latents[sub_mask]
         sub_scores = gender_cont[sub_mask]
         sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross, min_conf=min_conf)
         results = compute_direction_substyle(sub_lat, mask_high, mask_low, min_samples,
                                              method=method, shrinkage=shrinkage,
                                              group_center=group_center, group_trim_frac=group_trim_frac,
@@ -560,7 +582,7 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
             print(f"  gender/{name}: FAILED (stratum n={int(sub_mask.sum())}) -> using fallback"
                   + (f" (x{substyle_k})" if substyle_k > 1 else ""))
             fb = _fallback_direction(latents, gender_cont, pct, method, shrinkage,
-                                     group_center, group_trim_frac, cross_scores)
+                                     group_center, group_trim_frac, cross_scores, min_conf=min_conf)
             directions.extend(_pad_directions([fb], substyle_k))
 
     if len(directions) < K:
@@ -571,7 +593,7 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
 def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_samples=50,
                                 pct=20.0, method="lda", shrinkage=None,
                                 strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
-                                cross_scores=None, substyle_k=1):
+                                cross_scores=None, substyle_k=1, min_conf=0.0):
     """
     Generic stratified direction for any CelebA attribute not given a
     dedicated hand-tuned conditioning scheme (glasses/gender/age). Stratifies
@@ -593,7 +615,7 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
         sub_lat = latents[sub_mask]
         sub_scores = attr_cont[sub_mask]
         sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross, min_conf=min_conf)
         results = compute_direction_substyle(sub_lat, mask_high, mask_low, min_samples,
                                              method=method, shrinkage=shrinkage,
                                              group_center=group_center, group_trim_frac=group_trim_frac,
@@ -607,7 +629,7 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
             print(f"  attr{attr_idx}/{name}: FAILED (stratum n={int(sub_mask.sum())}) -> using fallback"
                   + (f" (x{substyle_k})" if substyle_k > 1 else ""))
             fb = _fallback_direction(latents, attr_cont, pct, method, shrinkage,
-                                     group_center, group_trim_frac, cross_scores)
+                                     group_center, group_trim_frac, cross_scores, min_conf=min_conf)
             directions.extend(_pad_directions([fb], substyle_k))
 
     if len(directions) < K:
@@ -618,7 +640,7 @@ def compute_generic_directions(attr_idx, latents, preds, continuous, K=4, min_sa
 def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
                             pct=20.0, method="lda", shrinkage=None,
                             strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
-                            cross_scores=None, substyle_k=1):
+                            cross_scores=None, substyle_k=1, min_conf=0.0):
     """
     Attr 39 (Young), conditioned on gender x glasses.
       K0: male   x no-glasses    K1: male   x glasses
@@ -640,7 +662,7 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
         sub_lat = latents[sub_mask]
         sub_scores = age_cont[sub_mask]
         sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross, min_conf=min_conf)
         results = compute_direction_substyle(sub_lat, mask_high, mask_low, min_samples,
                                              method=method, shrinkage=shrinkage,
                                              group_center=group_center, group_trim_frac=group_trim_frac,
@@ -654,7 +676,7 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
             print(f"  age/{name}: FAILED (stratum n={int(sub_mask.sum())}) -> using fallback"
                   + (f" (x{substyle_k})" if substyle_k > 1 else ""))
             fb = _fallback_direction(latents, age_cont, pct, method, shrinkage,
-                                     group_center, group_trim_frac, cross_scores)
+                                     group_center, group_trim_frac, cross_scores, min_conf=min_conf)
             directions.extend(_pad_directions([fb], substyle_k))
 
     if len(directions) < K:
@@ -665,7 +687,7 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
 def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
                                pct=20.0, method="lda", shrinkage=None,
                                strata_margin=0.0, group_center="mean", group_trim_frac=0.1,
-                               cross_scores=None, substyle_k=1):
+                               cross_scores=None, substyle_k=1, min_conf=0.0):
     """Debiased K=1 age direction via stratum-size-weighted average.
 
     Computes 4 sub-directions conditioned on gender x glasses, then averages
@@ -702,7 +724,7 @@ def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
         sub_lat = latents[sub_mask]
         sub_scores = age_cont[sub_mask]
         sub_cross = cross_scores[sub_mask] if cross_scores is not None else None
-        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross)
+        mask_high, mask_low = extreme_masks(sub_scores, pct=pct, cross_scores=sub_cross, min_conf=min_conf)
         d, nh, nl = compute_direction(sub_lat, mask_high, mask_low, min_samples,
                                        method=method, shrinkage=shrinkage,
                                        group_center=group_center, group_trim_frac=group_trim_frac)
@@ -997,6 +1019,21 @@ def main():
     parser.add_argument("--extreme_pct", type=float, default=20.0,
                         help="Use the top/bottom this-percent of the continuous score as the "
                              "high/low groups, instead of a fixed 0.5 threshold. Must be < 50.")
+    parser.add_argument("--extreme_min_conf", type=float, default=0.0,
+                        help="Additional ABSOLUTE confidence floor on top of --extreme_pct: a "
+                             "sample only counts as 'high' if its score is also >= this value "
+                             "(and 'low' only if <= 1-this). --extreme_pct alone guarantees a "
+                             "fixed COUNT (top/bottom pct%% by rank) but nothing about actual "
+                             "confidence -- when a stratum's true attribute prevalence is far "
+                             "below pct%%, its 'high' bucket is dominated by near-0.5 samples "
+                             "instead of genuine positives. Confirmed on this project's own data: "
+                             "the female_young eyeglasses stratum's 'top 20%%' bucket had median "
+                             "score 0.014 (essentially non-glasses) vs 0.995-0.998 for every other "
+                             "gender/age stratum, despite having the largest raw sample count of "
+                             "the four. Setting e.g. 0.7 here makes such a stratum fall below "
+                             "--min_samples and use the unconditional fallback direction instead "
+                             "of building geometry from noise. Default 0.0 = disabled (old "
+                             "percentile-only behavior).")
     parser.add_argument("--shrinkage", type=float, default=None,
                         help="Fixed Ledoit-Wolf shrinkage in [0,1]. Default: estimated automatically per layer.")
     parser.add_argument("--K", type=int, default=4,
@@ -1112,6 +1149,8 @@ def main():
 
     if not (0 < args.extreme_pct < 50):
         parser.error("--extreme_pct must be between 0 and 50 (exclusive) so high/low groups don't overlap.")
+    if not (0.0 <= args.extreme_min_conf < 0.5):
+        parser.error("--extreme_min_conf must be in [0, 0.5) so high/low groups don't overlap.")
 
     K = args.K
     age_k = args.age_k
@@ -1210,6 +1249,7 @@ def main():
         return 1
 
     print(f"\nmethod={args.direction_method}, extreme_pct={args.extreme_pct}, "
+          f"extreme_min_conf={args.extreme_min_conf}, "
           f"K glasses/gender={K}, K age={age_k}, residual_age={args.residual_age}, "
           f"strata_margin={args.strata_margin}, group_center={args.group_center}"
           + (f" (trim_frac={args.group_trim_frac})" if args.group_center == "trimmed_mean" else "")
@@ -1218,7 +1258,7 @@ def main():
 
     common_kwargs = dict(pct=args.extreme_pct, method=args.direction_method, shrinkage=args.shrinkage,
                          strata_margin=args.strata_margin, group_center=args.group_center,
-                         group_trim_frac=args.group_trim_frac)
+                         group_trim_frac=args.group_trim_frac, min_conf=args.extreme_min_conf)
 
     print(f"\n=== Eyeglasses (attr 15), K={K}, substyle_k={_substyle_k_for(15)} ===")
     glasses_dirs = compute_glasses_directions(latents, preds, continuous, K, args.min_samples,
