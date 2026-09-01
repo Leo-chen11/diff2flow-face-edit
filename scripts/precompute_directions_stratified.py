@@ -1149,8 +1149,8 @@ def main():
 
     if not (0 < args.extreme_pct < 50):
         parser.error("--extreme_pct must be between 0 and 50 (exclusive) so high/low groups don't overlap.")
-    if not (0.0 <= args.extreme_min_conf < 0.5):
-        parser.error("--extreme_min_conf must be in [0, 0.5) so high/low groups don't overlap.")
+    if not (0.0 <= args.extreme_min_conf < 1.0):
+        parser.error("--extreme_min_conf must be in [0, 1.0).")
 
     K = args.K
     age_k = args.age_k
