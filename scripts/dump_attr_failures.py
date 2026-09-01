@@ -47,6 +47,7 @@ from evaluation.evaluate_sdflow import (
 )
 from common.face_parser import FaceParser
 from models.dataset import SDFlowDataset
+from models.flows.constant import CELEBA_ATTRIBUTES
 
 
 def to_pil(img_tensor):
@@ -155,9 +156,10 @@ def main(args):
                              num_workers=4, drop_last=False)
 
     fails, succs = [], []
+    fail_preds, succ_preds = [], []
     n_dir, n_fail = 0, 0
     watch_leak_abs = {name: [] for name in watch_names}
-    for img, latent, _pred in loader:
+    for img, latent, pred in loader:
         img = img.cuda(); latent = latent.cuda()
         _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
 
@@ -206,13 +208,38 @@ def main(args):
                 n_fail += 1
                 if len(fails) < args.num_fail:
                     fails.append(make_pair(src_face[b], edited[b], s, e, attr_name, False, watch=watch))
+                    fail_preds.append(pred[b, :40].clone())
             elif len(succs) < args.num_success:
                 succs.append(make_pair(src_face[b], edited[b], s, e, attr_name, True, watch=watch))
+                succ_preds.append(pred[b, :40].clone())
         if len(fails) >= args.num_fail and len(succs) >= args.num_success:
             break
 
     print(f'\n{attr_name} {args.direction}: samples seen={n_dir}, judge-failed={n_fail} '
           f'({n_fail / max(1, n_dir):.1%})')
+
+    if fail_preds and succ_preds:
+        # What does the failure group actually have in common, beyond
+        # whatever pattern eyeballing the montage suggests? Compare the
+        # r34 binary prediction for every OTHER CelebA attribute between
+        # the failure and success groups collected above -- a real,
+        # data-driven signal (e.g. "78% of failures are Pale_Skin=1 vs
+        # 25% of successes") is worth acting on; a guess from thumbnails
+        # (skin tone, hair style, makeup) is not, until it shows up here.
+        fail_mat = torch.stack(fail_preds)   # (n_fail_saved, 40)
+        succ_mat = torch.stack(succ_preds)   # (n_succ_saved, 40)
+        fail_rate = fail_mat.mean(dim=0)
+        succ_rate = succ_mat.mean(dim=0)
+        diff = (fail_rate - succ_rate).abs()
+        order = [i for i in torch.argsort(diff, descending=True).tolist() if i != args.attr]
+        print(f'\n=== Failure vs success group: other-attribute fraction "1" '
+              f'(fail n={fail_mat.shape[0]}, success n={succ_mat.shape[0]}) ===')
+        print('Sorted by |difference| -- top of the list is what the failure group '
+              'actually has more/less of, not what it looks like it has:')
+        for i in order[:15]:
+            name = CELEBA_ATTRIBUTES[i] if i < len(CELEBA_ATTRIBUTES) else f'attr{i}'
+            print(f'  {name:<20} fail={fail_rate[i]:.2f}  success={succ_rate[i]:.2f}  '
+                  f'|Δ|={diff[i]:.2f}')
 
     for wname, vals in watch_leak_abs.items():
         if not vals:
