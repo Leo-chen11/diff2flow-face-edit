@@ -58,7 +58,7 @@ def main(args):
     if direction_bank is None:
         raise SystemExit('This checkpoint has no direction_bank -- nothing to inspect.')
 
-    local_idx = attribute_index.index(args.attr)
+    local_idx = args.attribute_index.index(args.attr)
     attr_name = ATTR_NAMES.get(args.attr, f'attr{args.attr}')
 
     if args.attr == 15 and args.glasses_judge == 'parser':
