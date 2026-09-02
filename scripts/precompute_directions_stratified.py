@@ -559,7 +559,13 @@ def compute_gender_directions(latents, preds, continuous, K=4, min_samples=50,
     young_cont = continuous[:, 39]
     glasses_cont = continuous[:, 15]
 
-    labels = ["young_noglasses", "young_glasses", "old_noglasses", "old_glasses"]
+    # confident_strata_masks(a, b) yields [hi_hi, hi_lo, lo_hi, lo_lo] with
+    # a=young_cont, b=glasses_cont -- i.e. [young&glasses, young&noglasses,
+    # old&glasses, old&noglasses]. Labels must follow that exact order or
+    # the printed stratum name doesn't match the boolean mask actually used
+    # (a pure logging bug -- the mask itself, and therefore the direction
+    # geometry, was always correct regardless of this string).
+    labels = ["young_glasses", "young_noglasses", "old_glasses", "old_noglasses"]
     strata = [(labels[i], m) for i, (_, m) in
               enumerate(confident_strata_masks(young_cont, glasses_cont, margin=strata_margin))]
 
@@ -653,7 +659,13 @@ def compute_age_directions(latents, preds, continuous, K=4, min_samples=50,
     gender_cont = continuous[:, 20]
     glasses_cont = continuous[:, 15]
 
-    labels = ["male_noglasses", "male_glasses", "female_noglasses", "female_glasses"]
+    # confident_strata_masks(a, b) yields [hi_hi, hi_lo, lo_hi, lo_lo] with
+    # a=gender_cont, b=glasses_cont -- i.e. [male&glasses, male&noglasses,
+    # female&glasses, female&noglasses]. Labels must follow that exact
+    # order or the printed stratum name doesn't match the boolean mask
+    # actually used (a pure logging bug -- the mask itself, and therefore
+    # the direction geometry, was always correct regardless of this string).
+    labels = ["male_glasses", "male_noglasses", "female_glasses", "female_noglasses"]
     strata = [(labels[i], m) for i, (_, m) in
               enumerate(confident_strata_masks(gender_cont, glasses_cont, margin=strata_margin))]
 
@@ -715,7 +727,13 @@ def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
     gender_cont = continuous[:, 20]
     glasses_cont = continuous[:, 15]
 
-    labels = ["male_noglasses", "male_glasses", "female_noglasses", "female_glasses"]
+    # confident_strata_masks(a, b) yields [hi_hi, hi_lo, lo_hi, lo_lo] with
+    # a=gender_cont, b=glasses_cont -- i.e. [male&glasses, male&noglasses,
+    # female&glasses, female&noglasses]. Labels must follow that exact
+    # order or the printed stratum name doesn't match the boolean mask
+    # actually used (a pure logging bug -- the mask itself, and therefore
+    # the direction geometry, was always correct regardless of this string).
+    labels = ["male_glasses", "male_noglasses", "female_glasses", "female_noglasses"]
     strata = [(labels[i], m) for i, (_, m) in
               enumerate(confident_strata_masks(gender_cont, glasses_cont, margin=strata_margin))]
 
@@ -1451,9 +1469,9 @@ def main():
         "decorrelate_cross_attr": bool(args.decorrelate_cross_attr),
         "stratification": {
             15: ["male_young", "male_old", "female_young", "female_old"],
-            20: ["young_noglasses", "young_glasses", "old_noglasses", "old_glasses"],
+            20: ["young_glasses", "young_noglasses", "old_glasses", "old_noglasses"],
             39: ["weighted_avg_k1"] * K if age_k == 1 else
-                ["male_noglasses", "male_glasses", "female_noglasses", "female_glasses"],
+                ["male_glasses", "male_noglasses", "female_glasses", "female_noglasses"],
             **{a: ["male_young", "male_old", "female_young", "female_old"] for a in extra_attr_ids},
         },
     }

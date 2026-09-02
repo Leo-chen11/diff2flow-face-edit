@@ -149,6 +149,7 @@ def main(args):
                 gate_entropy[b].item() if gate_entropy is not None else float('nan'),
                 gate_max[b].item() if gate_max is not None else float('nan'),
                 int(gate_argmax[b].item()) if gate_argmax is not None else -1,
+                int(pred[b, 15].item() >= 0.5),   # Eyeglasses binary (source)
                 int(pred[b, 20].item() >= 0.5),   # Male binary (source)
                 int(pred[b, 39].item() >= 0.5),   # Young binary (source)
             ))
@@ -165,8 +166,9 @@ def main(args):
     gate_max = np.array([r[5] for r in rows])
     gate_argmax = np.array([r[6] for r in rows])
 
-    male_bin = np.array([r[7] for r in rows])
-    young_bin = np.array([r[8] for r in rows])
+    glasses_bin = np.array([r[7] for r in rows])
+    male_bin = np.array([r[8] for r in rows])
+    young_bin = np.array([r[9] for r in rows])
 
     zero_mask = delta < args.zero_thresh
     moved_mask = ~zero_mask
@@ -211,47 +213,61 @@ def main(args):
         )
 
     # ---- demographic vs slot routing: does the gate actually send a
-    # source face to ITS OWN gender x age sub-direction, or does it default
-    # to a couple of generic slots regardless of who the face is? Only
-    # meaningful for attr 15 (Eyeglasses), whose bank was stratified in this
-    # exact order (see compute_glasses_directions): male_young, male_old,
-    # female_young, female_old, each contributing num_k//4 consecutive
-    # slots -- e.g. num_k=12 -> male_young=[0,1,2], male_old=[3,4,5],
-    # female_young=[6,7,8], female_old=[9,10,11]. A different attribute (or
-    # a bank built without --substyle_k_attrs 15) uses a different
-    # conditioning scheme, so this mapping would be wrong there. ----
-    if args.attr == 15 and (gate_argmax >= 0).any():
+    # source face to ITS OWN conditioning-attribute sub-direction, or does
+    # it default to a couple of generic slots regardless of who the face
+    # is? The bank's stratification order/axes are attribute-specific (see
+    # precompute_directions_stratified.py's compute_*_directions functions)
+    # -- Eyeglasses is conditioned on gender x age, Male on age x glasses;
+    # Young only gets this per-stratum structure at --age_k 4 (the default
+    # --age_k 1 collapses 4 sub-directions into ONE weighted-average
+    # direction with no gate to inspect). Each stratum contributes
+    # num_k//4 consecutive slots in the order below, e.g. num_k=12 ->
+    # stratum0=[0,1,2], stratum1=[3,4,5], stratum2=[6,7,8], stratum3=[9,10,11].
+    _STRATA_CONFIG = {
+        15: (['male_young', 'male_old', 'female_young', 'female_old'],
+             lambda: np.where(male_bin == 1, np.where(young_bin == 1, 0, 1),
+                                             np.where(young_bin == 1, 2, 3))),
+        20: (['young_noglasses', 'young_glasses', 'old_noglasses', 'old_glasses'],
+             lambda: np.where(young_bin == 1, np.where(glasses_bin == 1, 1, 0),
+                                              np.where(glasses_bin == 1, 3, 2))),
+        39: (['male_noglasses', 'male_glasses', 'female_noglasses', 'female_glasses'],
+             lambda: np.where(male_bin == 1, np.where(glasses_bin == 1, 1, 0),
+                                             np.where(glasses_bin == 1, 3, 2))),
+    }
+    if args.attr in _STRATA_CONFIG and (gate_argmax >= 0).any():
+        strata, demo_fn = _STRATA_CONFIG[args.attr]
         num_k = int(gate_argmax.max()) + 1
         if num_k % 4 == 0:
             per_stratum = num_k // 4
-            strata = ['male_young', 'male_old', 'female_young', 'female_old']
-            demo_group = np.where(male_bin == 1,
-                                  np.where(young_bin == 1, 0, 1),   # male: young=0, old=1
-                                  np.where(young_bin == 1, 2, 3))   # female: young=2, old=3
-            print(f'\nDemographic routing (attr 15 only, num_k={num_k}, '
+            demo_group = demo_fn()
+            print(f'\nDemographic routing (attr {args.attr}, num_k={num_k}, '
                   f'{per_stratum} slots/stratum, strata order {strata}):')
-            print(f'  {"source demo":<16}{"n":<8}{"own-slot %":<14}{"most-used slot":<18}{"top-slot %":<12}')
+            print(f'  {"source demo":<20}{"n":<8}{"own-slot %":<14}{"most-used slot":<18}{"top-slot %":<12}')
             for g, name in enumerate(strata):
                 g_mask = demo_group == g
                 n = int(g_mask.sum())
                 if n == 0:
-                    print(f'  {name:<16}{0:<8}(no samples)')
+                    print(f'  {name:<20}{0:<8}(no samples)')
                     continue
                 own_lo, own_hi = g * per_stratum, (g + 1) * per_stratum
                 own_pct = float(((gate_argmax[g_mask] >= own_lo) & (gate_argmax[g_mask] < own_hi)).mean())
                 slots, counts = np.unique(gate_argmax[g_mask], return_counts=True)
                 top_slot = int(slots[counts.argmax()])
                 top_pct = float(counts.max() / n)
-                print(f'  {name:<16}{n:<8}{own_pct:<14.1%}{top_slot:<18}{top_pct:<12.1%}')
+                print(f'  {name:<20}{n:<8}{own_pct:<14.1%}{top_slot:<18}{top_pct:<12.1%}')
             print(
-                '\n  "own-slot %" = fraction of that demographic\'s samples routed to THEIR OWN\n'
-                '  stratum\'s slots. Low own-slot % (especially for female_young, right after\n'
-                '  the --extreme_min_conf fix) means the gate is largely ignoring the source\n'
-                '  face\'s actual demographic and defaulting to whichever slot(s) look best on\n'
-                '  average across the whole training population -- a gate-routing/training\n'
-                '  problem, not a direction-quality problem. If female_young\'s own-slot % is\n'
-                '  near 0, the clean direction we fixed is essentially unused.'
+                '\n  "own-slot %" = fraction of that stratum\'s samples routed to THEIR OWN\n'
+                '  stratum\'s slots. Low own-slot % across the board means the gate is largely\n'
+                '  ignoring the source face\'s actual demographic and defaulting to whichever\n'
+                '  slot(s) look best on average across the whole training population -- a\n'
+                '  gate-routing/training problem (see --dir_gate_diversity_weight in\n'
+                '  train_sdflow.py), not a direction-quality problem.'
             )
+        elif args.attr == 39:
+            print(f'\n(Demographic routing skipped: num_k={num_k} for attr 39 -- if this run '
+                  f'used the default --age_k 1, Young collapses its 4 sub-directions into ONE '
+                  f'weighted-average direction with no gate to inspect; use --age_k 4 to get '
+                  f'per-stratum sub-directions like Eyeglasses/Male.)')
 
     print(
         '\nRead the two-group comparison above as:\n'
