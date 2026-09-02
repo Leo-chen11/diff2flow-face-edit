@@ -38,6 +38,7 @@ class AttributeDirectionBank(nn.Module):
         use_attr_lora=False,
         attr_lora_rank=4,
         signed_magnitude_input=False,
+        gate_usage_ema_decay=0.98,
     ):
         super().__init__()
         self.num_attrs = int(num_attrs)
@@ -164,6 +165,36 @@ class AttributeDirectionBank(nn.Module):
         else:
             self.gate_net = None
 
+        # gate_usage_ema: (num_attrs, num_k) running average of how much each
+        # K-slot actually gets used, per attribute -- feeds both gate_load_balance_loss()
+        # and the per-attribute entropy wandb logs. WHY AN EMA INSTEAD OF THE RAW
+        # PER-STEP BATCH MEAN: nothing in this project's loss previously supervised
+        # gate_net's routing AT ALL -- it only ever got gradient indirectly through
+        # the final guided_delta, with no signal rewarding correct (demographic-
+        # appropriate) OR even diverse routing. Measured on a real trained checkpoint
+        # (eyeglasses, K=12 from --K 4 x --substyle_k 3): the gate collapsed within
+        # the first few thousand steps onto ~2 of the 12 slots for 81% of samples,
+        # regardless of the source face's actual gender/age -- including almost NEVER
+        # routing female_young samples to the female_young-conditioned slots that
+        # --extreme_min_conf specifically cleaned up, which is why that direction-bank
+        # fix alone did not move the eyeglasses-add failure rate. A single training
+        # step's batch (e.g. --batch 4) spread over K=12 slots is far too noisy to
+        # regularize directly -- an EMA smooths that out across many steps, matching
+        # the pattern this project already uses for --balance_ema_decay.
+        # persistent=False: this is a training-time running stat, not part of the
+        # frozen/learned state a checkpoint needs to reproduce inference -- excluding
+        # it from state_dict avoids key-mismatch noise when eval scripts load_state_dict
+        # with strict=False anyway.
+        if self.num_k > 1:
+            self.register_buffer(
+                "gate_usage_ema",
+                torch.full((self.num_attrs, self.num_k), 1.0 / self.num_k),
+                persistent=False,
+            )
+        else:
+            self.gate_usage_ema = None
+        self.gate_usage_ema_decay = float(gate_usage_ema_decay)
+
         # residual_scale: (num_attrs,) — learned, not hand-tuned. per_attr_residual_scale
         # (or the scalar residual_scale) only sets the *initial* value; gradient descent
         # on the normal training losses (id/reg/changed/preserve) decides from there how
@@ -283,6 +314,22 @@ class AttributeDirectionBank(nn.Module):
         # ── Gate mixture ──────────────────────────────────────────────────
         alpha = self._gate_weights(latent, B, device, dtype)          # (B, A, K)
         self._last_alpha = alpha                                        # expose for selection loss
+
+        # Update the per-attribute gate usage EMA from THIS batch's active
+        # attribute(s) only -- alpha for an attribute other than the one(s)
+        # actually being edited this step never receives gradient (its
+        # signed_magnitudes are masked to exactly 0 below, see forward()'s
+        # docstring on gate_usage_ema), so folding it into the EMA would
+        # just average in untrained noise.
+        if self.num_k > 1 and attr_idx is not None and self.training:
+            with torch.no_grad():
+                attr_idx_long = attr_idx.view(-1).long()
+                for a in attr_idx_long.unique():
+                    batch_mean = alpha[attr_idx_long == a, a, :].mean(dim=0)   # (K,)
+                    self.gate_usage_ema[a].mul_(self.gate_usage_ema_decay).add_(
+                        batch_mean, alpha=1.0 - self.gate_usage_ema_decay
+                    )
+
         # mix_dirs: weighted sum of K direction vectors per attribute
         mix_dirs = (alpha.unsqueeze(-1).unsqueeze(-1)                  # (B, A, K, 1, 1)
                     * dirs.unsqueeze(0)).sum(dim=2)                    # (B, A, 18, 512)
@@ -379,8 +426,21 @@ class AttributeDirectionBank(nn.Module):
                 "dir_bank_global_delta_max_norm": active_global_delta_max_norm.detach(),
             }
             if self.num_k > 1:
+                # Raw current-step entropy, kept for backward compat -- averages
+                # over EVERY attribute row including ones not active this step
+                # (their alpha is untrained noise, see gate_usage_ema comment
+                # above), so this number is noisier and less meaningful than the
+                # per-attribute EMA entropy below. Prefer dir_gate_entropy_per_attr.
                 entropy = -(alpha * (alpha + 1e-8).log()).sum(dim=-1).mean()
                 logs["dir_gate_entropy"] = entropy.detach()
+                # Per-attribute entropy computed from the EMA usage vector, not
+                # this step's raw alpha -- see gate_usage_ema for why. Keyed by
+                # LOCAL attribute row index; train_sdflow.py maps this to the
+                # actual CelebA attribute id for wandb.
+                p = self.gate_usage_ema.clamp(min=1e-8)
+                p = p / p.sum(dim=-1, keepdim=True)
+                ema_entropy = -(p * p.log()).sum(dim=-1)   # (num_attrs,)
+                logs["dir_gate_entropy_per_attr"] = ema_entropy.detach()
             self.last_logs = logs
 
         return guided_delta
@@ -416,3 +476,31 @@ class AttributeDirectionBank(nn.Module):
                     ).abs().mean()
                     count += 1
         return loss / max(count, 1)
+
+    def gate_load_balance_loss(self):
+        """Batch-level load-balancing loss for the K-mixture gate (Shazeer-style
+        importance loss), computed against gate_usage_ema rather than the raw
+        current-batch mean -- see the comment on gate_usage_ema in __init__ for
+        why an EMA is necessary here (small batches vs many K slots) and why
+        this problem exists at all (gate_net previously had zero supervision).
+
+        Returns, per attribute, how far that attribute's EMA usage distribution
+        sits from uniform (0 = perfectly uniform, 1 = fully collapsed onto one
+        slot), averaged over attributes -- NOT weighted toward whichever
+        attribute the current batch happens to be editing, so this is safe to
+        add into the loss on every step regardless of --attribute_sampling mode.
+
+        WHAT THIS DOES NOT DO: this has no notion of which slot is "correct"
+        for a given face (that would need a demographic label fed in as a
+        target) -- it only discourages the gate from collapsing onto a
+        minority of slots. Necessary, not sufficient, for the geometry a
+        stratum-level fix like --extreme_min_conf produces to actually get
+        used by the model.
+        """
+        if self.num_k <= 1 or self.gate_usage_ema is None:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        p = self.gate_usage_ema.clamp(min=1e-8)
+        p = p / p.sum(dim=-1, keepdim=True)
+        entropy = -(p * p.log()).sum(dim=-1)              # (num_attrs,)
+        max_entropy = torch.log(torch.tensor(float(self.num_k), device=p.device))
+        return ((max_entropy - entropy) / max_entropy).mean()

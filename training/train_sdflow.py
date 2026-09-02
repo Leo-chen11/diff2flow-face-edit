@@ -944,6 +944,32 @@ if __name__ == '__main__':
     parser.add_argument('--direction_freeze', '--direction-freeze',
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--direction_orth_weight', type=float, default=0.0)
+    parser.add_argument('--dir_gate_diversity_weight', type=float, default=0.0,
+                        help='Weight on AttributeDirectionBank.gate_load_balance_loss(), which '
+                             'penalizes the K-mixture gate (gate_net, active whenever the bank has '
+                             'num_k>1, e.g. from --K/--age_k combined with --substyle_k) for '
+                             'collapsing onto a minority of its K slots regardless of the source '
+                             'face. WHY THIS EXISTS: nothing in this project previously supervised '
+                             'gate routing at all -- it only received gradient indirectly through '
+                             'the final guided_delta, with no signal rewarding correct or even '
+                             'diverse routing. Measured on a real trained checkpoint (Eyeglasses, '
+                             'K=12 from --K 4 x --substyle_k 3): the gate collapsed within the first '
+                             'few thousand steps onto ~2 of the 12 slots for 81% of samples '
+                             'regardless of the source face\'s actual gender/age, including almost '
+                             'NEVER routing female_young samples to the female_young-conditioned '
+                             'slots --extreme_min_conf specifically cleaned up in '
+                             'precompute_directions_stratified.py -- which is why that direction-'
+                             'bank fix alone did not move the eyeglasses-add failure rate. This '
+                             'loss does NOT know which slot is demographically correct for a given '
+                             'face (no label fed in for that) -- it only discourages collapsing onto '
+                             'too few slots, a necessary but not sufficient condition for a clean '
+                             'stratum-level direction to actually get used. 0 (default) disables; '
+                             'try 0.05-0.2 to start. No effect when num_k<=1 (K=1, no substyle_k).')
+    parser.add_argument('--gate_usage_ema_decay', type=float, default=0.98,
+                        help='EMA decay for AttributeDirectionBank.gate_usage_ema (per-attribute, '
+                             'per-K-slot usage, used by --dir_gate_diversity_weight and the '
+                             'dir_gate_entropy_per_attr wandb logs). Higher = smoother/slower to '
+                             'react; matches the convention of --balance_ema_decay.')
     parser.add_argument('--direction_k', type=int, default=1,
                         help='Number of mixture directions per attribute in the Direction Bank.')
     parser.add_argument('--direction_guided_delta_max_norm', type=float, default=0.0,
@@ -1512,6 +1538,7 @@ if __name__ == '__main__':
             use_attr_lora=args.use_attr_lora,
             attr_lora_rank=args.attr_lora_rank,
             signed_magnitude_input=args.signed_magnitude_input,
+            gate_usage_ema_decay=args.gate_usage_ema_decay,
         ).cuda()
         if args.freeze_direction_bank_nets:
             for p in direction_bank.parameters():
@@ -2210,9 +2237,14 @@ if __name__ == '__main__':
             if direction_bank is not None:
                 dir_orth_loss = direction_bank.orthogonality_loss()
                 dir_logs = direction_bank.last_logs if direction_bank_applied else {}
+                dir_gate_diversity_loss = (
+                    direction_bank.gate_load_balance_loss()
+                    if args.dir_gate_diversity_weight > 0 else _zero.clone()
+                )
             else:
                 dir_orth_loss = _zero.clone()
                 dir_logs = {}
+                dir_gate_diversity_loss = _zero.clone()
 
             diffusion_loss = _zero.clone()       # non-age DDS (glasses/gender)
             age_diffusion_loss = _zero.clone()   # age DDS, separately weighted
@@ -2322,6 +2354,7 @@ if __name__ == '__main__':
                 args.gate_smooth_weight * lag_gate_smooth +\
                 args.gate_sparse_weight * lag_gate_sparse +\
                 args.direction_orth_weight * dir_orth_loss +\
+                args.dir_gate_diversity_weight * dir_gate_diversity_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
                 (args.age_diffusion_weight if args.age_diffusion_weight >= 0
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
@@ -2459,6 +2492,7 @@ if __name__ == '__main__':
                 'dir_bank_active_delta_max_norm': dir_logs.get('dir_bank_active_delta_max_norm', _zero.detach().clone()),
                 'dir_bank_global_delta_max_norm': dir_logs.get('dir_bank_global_delta_max_norm', _zero.detach().clone()),
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
+                'dir_gate_diversity_loss': dir_gate_diversity_loss,
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
@@ -2481,6 +2515,10 @@ if __name__ == '__main__':
                 current_residual_scales = direction_bank.current_residual_scale().detach()
                 for _i, _attr_abs_idx in enumerate(args.attribute_index):
                     _log_dict[f'residual_scale/attr_{_attr_abs_idx}'] = current_residual_scales[_i]
+                _gate_entropy_per_attr = dir_logs.get('dir_gate_entropy_per_attr')
+                if _gate_entropy_per_attr is not None:
+                    for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                        _log_dict[f'dir_gate_entropy_ema/attr_{_attr_abs_idx}'] = _gate_entropy_per_attr[_i]
             current_reg_weights = reg_loss_weights.current_weights()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'reg_weight_global/attr_{_attr_abs_idx}'] = current_reg_weights[_i, 0]
