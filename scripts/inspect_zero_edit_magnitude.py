@@ -88,9 +88,11 @@ def main(args):
             entropy = -(a * (a + 1e-8).log()).sum(dim=-1)     # (B,)
             captured['gate_entropy'] = entropy
             captured['gate_max'] = a.max(dim=-1).values
+            captured['gate_argmax'] = a.argmax(dim=-1)        # (B,) which K-slot each sample leans on
         else:
             captured['gate_entropy'] = None
             captured['gate_max'] = None
+            captured['gate_argmax'] = None
 
     handle = direction_bank.register_forward_hook(_hook)
 
@@ -130,6 +132,7 @@ def main(args):
         guided_norm = captured.get('guided_norm')
         gate_entropy = captured.get('gate_entropy')
         gate_max = captured.get('gate_max')
+        gate_argmax = captured.get('gate_argmax')
 
         for b in range(img.size(0)):
             s = src_scores[b].item(); e = edit_scores[b].item()
@@ -145,6 +148,7 @@ def main(args):
                 captured['dir_norm'], captured['residual_norm'],
                 gate_entropy[b].item() if gate_entropy is not None else float('nan'),
                 gate_max[b].item() if gate_max is not None else float('nan'),
+                int(gate_argmax[b].item()) if gate_argmax is not None else -1,
             ))
         seen += img.size(0)
 
@@ -157,6 +161,7 @@ def main(args):
     guided_norm = np.array([r[1] for r in rows])
     gate_entropy = np.array([r[4] for r in rows])
     gate_max = np.array([r[5] for r in rows])
+    gate_argmax = np.array([r[6] for r in rows])
 
     zero_mask = delta < args.zero_thresh
     moved_mask = ~zero_mask
@@ -177,8 +182,31 @@ def main(args):
     _stats(zero_mask, 'near-zero Δscore')
     _stats(moved_mask, 'moved normally')
 
+    # ---- per-K-slot breakdown: which sub-direction is each sample's gate
+    # actually leaning on (argmax alpha), and does near-zero-Δscore cluster
+    # on one particular slot? A K-slot with a much higher near-zero RATE
+    # than the others is a specific bad sub-direction to go recompute/drop,
+    # separate from (and more targeted than) the stratum-level
+    # --extreme_min_conf fix. ----
+    if (gate_argmax >= 0).any():
+        print('\nPer K-slot (gate argmax) breakdown:')
+        print(f'  {"slot":<6}{"n":<8}{"near-zero":<12}{"near-zero rate":<16}{"mean guided_norm":<18}')
+        for k in sorted(set(gate_argmax.tolist())):
+            slot_mask = gate_argmax == k
+            n = int(slot_mask.sum())
+            nz = int((slot_mask & zero_mask).sum())
+            print(f'  {k:<6}{n:<8}{nz:<12}{nz / max(1, n):<16.1%}{guided_norm[slot_mask].mean():<18.4f}')
+        print(
+            '\n  A slot with a near-zero rate much higher than the others (and roughly\n'
+            '  the same guided_norm as the rest, per the table above) is a specific bad\n'
+            '  sub-direction: that K-slot\'s own direction_units for this attribute is\n'
+            '  likely degenerate (built from too few / too noisy samples in whichever\n'
+            '  substyle_k sub-cluster produced it) and worth recomputing or dropping,\n'
+            '  rather than re-tuning --extreme_min_conf at the whole-stratum level again.'
+        )
+
     print(
-        '\nRead this as:\n'
+        '\nRead the two-group comparison above as:\n'
         '  guided_delta_norm much SMALLER in the near-zero group -> the edit genuinely\n'
         '    isn\'t being applied for these faces (gate/magnitude collapsed for them) --\n'
         '    a training-dynamics problem, direction-bank fixes like --extreme_min_conf\n'
@@ -188,7 +216,7 @@ def main(args):
         '    quality/placement or judge sensitivity instead.\n'
         '  gate_entropy much LOWER (closer to 0) in the near-zero group with substyle_k>1\n'
         '    -> gate has collapsed onto one sub-direction for these faces specifically;\n'
-        '    check which one and whether its own direction_units norm is degenerate.'
+        '    see the per-K-slot breakdown above for which one.'
     )
 
 
