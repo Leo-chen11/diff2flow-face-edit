@@ -2237,9 +2237,18 @@ if __name__ == '__main__':
             if direction_bank is not None:
                 dir_orth_loss = direction_bank.orthogonality_loss()
                 dir_logs = direction_bank.last_logs if direction_bank_applied else {}
+                # gate_load_balance_loss() returns a value computed INSIDE the
+                # most recent direction_bank(...) forward call (see
+                # _last_gate_diversity_loss in direction_bank.py) -- only valid
+                # to read/backward through when that forward call actually
+                # happened THIS step (direction_bank_applied). Reading it on a
+                # step where direction_bank wasn't called would reuse a stale
+                # tensor from a previous step whose autograd graph has already
+                # been freed by that step's own .backward().
                 dir_gate_diversity_loss = (
                     direction_bank.gate_load_balance_loss()
-                    if args.dir_gate_diversity_weight > 0 else _zero.clone()
+                    if (args.dir_gate_diversity_weight > 0 and direction_bank_applied)
+                    else _zero.clone()
                 )
             else:
                 dir_orth_loss = _zero.clone()

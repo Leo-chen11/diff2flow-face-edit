@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -321,14 +323,38 @@ class AttributeDirectionBank(nn.Module):
         # signed_magnitudes are masked to exactly 0 below, see forward()'s
         # docstring on gate_usage_ema), so folding it into the EMA would
         # just average in untrained noise.
-        if self.num_k > 1 and attr_idx is not None and self.training:
-            with torch.no_grad():
-                attr_idx_long = attr_idx.view(-1).long()
-                for a in attr_idx_long.unique():
-                    batch_mean = alpha[attr_idx_long == a, a, :].mean(dim=0)   # (K,)
-                    self.gate_usage_ema[a].mul_(self.gate_usage_ema_decay).add_(
-                        batch_mean, alpha=1.0 - self.gate_usage_ema_decay
-                    )
+        #
+        # gate_usage_ema itself is updated under no_grad -- it is a plain
+        # buffer (requires_grad=False), used ONLY for the dir_gate_entropy_per_attr
+        # LOG (a smoothed, low-variance number to look at, not a value gradients
+        # ever need to flow through). self._last_gate_diversity_loss below is a
+        # SEPARATE, genuinely differentiable quantity computed from this same
+        # step's live `alpha` (no detach) -- that is the one train_sdflow.py's
+        # --dir_gate_diversity_weight actually optimizes. An earlier version of
+        # this method computed the trained loss FROM gate_usage_ema directly,
+        # which silently contributed ZERO gradient (the buffer has no grad_fn),
+        # making --dir_gate_diversity_weight a complete no-op -- confirmed by
+        # training a real run with it that showed no change in gate collapse
+        # behavior traceable to this loss. Fixed here; the EMA is for display only.
+        if self.num_k > 1 and attr_idx is not None:
+            attr_idx_long = attr_idx.view(-1).long()
+            div_losses = []
+            for a in attr_idx_long.unique():
+                m = attr_idx_long == a
+                batch_mean = alpha[m, a, :].mean(dim=0)   # (K,) -- LIVE, keeps gradient
+                if self.training:
+                    with torch.no_grad():
+                        self.gate_usage_ema[a].mul_(self.gate_usage_ema_decay).add_(
+                            batch_mean.detach(), alpha=1.0 - self.gate_usage_ema_decay
+                        )
+                p = batch_mean.clamp(min=1e-8)
+                p = p / p.sum()
+                entropy = -(p * p.log()).sum()
+                max_entropy = math.log(self.num_k)
+                div_losses.append((max_entropy - entropy) / max_entropy)
+            self._last_gate_diversity_loss = torch.stack(div_losses).mean()
+        else:
+            self._last_gate_diversity_loss = torch.zeros([], device=device, dtype=dtype)
 
         # mix_dirs: weighted sum of K direction vectors per attribute
         mix_dirs = (alpha.unsqueeze(-1).unsqueeze(-1)                  # (B, A, K, 1, 1)
@@ -479,16 +505,18 @@ class AttributeDirectionBank(nn.Module):
 
     def gate_load_balance_loss(self):
         """Batch-level load-balancing loss for the K-mixture gate (Shazeer-style
-        importance loss), computed against gate_usage_ema rather than the raw
-        current-batch mean -- see the comment on gate_usage_ema in __init__ for
-        why an EMA is necessary here (small batches vs many K slots) and why
-        this problem exists at all (gate_net previously had zero supervision).
+        importance loss). Returns the value computed in the MOST RECENT
+        forward() call (self._last_gate_diversity_loss) -- see that computation
+        for why it must be built from THIS step's live `alpha`, not from
+        gate_usage_ema (a plain buffer with no gradient; using it directly here
+        was an earlier bug that made --dir_gate_diversity_weight a silent
+        no-op). Call this AFTER calling direction_bank(...) in the same step.
 
-        Returns, per attribute, how far that attribute's EMA usage distribution
-        sits from uniform (0 = perfectly uniform, 1 = fully collapsed onto one
-        slot), averaged over attributes -- NOT weighted toward whichever
-        attribute the current batch happens to be editing, so this is safe to
-        add into the loss on every step regardless of --attribute_sampling mode.
+        Returns, per attribute active in the last forward() call, how far that
+        attribute's per-batch usage distribution sits from uniform (0 =
+        perfectly uniform, 1 = fully collapsed onto one slot), averaged over
+        whichever attribute(s) were active -- safe to add into the loss every
+        step regardless of --attribute_sampling mode.
 
         WHAT THIS DOES NOT DO: this has no notion of which slot is "correct"
         for a given face (that would need a demographic label fed in as a
@@ -497,10 +525,9 @@ class AttributeDirectionBank(nn.Module):
         stratum-level fix like --extreme_min_conf produces to actually get
         used by the model.
         """
-        if self.num_k <= 1 or self.gate_usage_ema is None:
+        if self.num_k <= 1:
             return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
-        p = self.gate_usage_ema.clamp(min=1e-8)
-        p = p / p.sum(dim=-1, keepdim=True)
-        entropy = -(p * p.log()).sum(dim=-1)              # (num_attrs,)
-        max_entropy = torch.log(torch.tensor(float(self.num_k), device=p.device))
-        return ((max_entropy - entropy) / max_entropy).mean()
+        loss = getattr(self, '_last_gate_diversity_loss', None)
+        if loss is None:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        return loss
