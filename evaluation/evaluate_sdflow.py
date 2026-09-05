@@ -1772,7 +1772,7 @@ if __name__ == '__main__':
                         help='BiSeNet weights for --glasses_judge parser and '
                              '--composite_face_region.')
     parser.add_argument('--composite_face_region',
-                        action=argparse.BooleanOptionalAction, default=True,
+                        action=argparse.BooleanOptionalAction, default=False,
                         help='Training-free post-process: composite the edited face back onto '
                              'the source-RECONSTRUCTION background/hair using the BiSeNet face '
                              'mask (common/face_parser.py FaceParser.composite), for every '
@@ -1781,9 +1781,12 @@ if __name__ == '__main__':
                              'leak into background/hair) and directly helps both ID score '
                              '(background/hair no longer contaminate the crop) and perceived '
                              'ghosting/artifacts at the face boundary. Zero training risk -- pure '
-                             'inference-time compositing. DEFAULT: on; pass --no-composite_face_region '
-                             'to disable (falls back automatically with a warning if '
-                             '--face_parser_weights is unavailable).')
+                             'inference-time compositing. DEFAULT: off -- the Poisson blend leaves '
+                             'a visible tonal seam at the face boundary that inflates LPIPS/depresses '
+                             'ID scores relative to the raw uncomposited output (confirmed by '
+                             're-evaluating the same checkpoint with and without this flag); pass '
+                             '--composite_face_region to enable (falls back automatically with a '
+                             'warning if --face_parser_weights is unavailable).')
     parser.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'],
                         help="'alpha' (default) feather-blends by mask weight -- fast, but a "
                              "visible seam shows wherever the edited face's brightness/color "

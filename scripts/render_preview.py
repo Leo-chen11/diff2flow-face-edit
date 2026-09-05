@@ -219,11 +219,11 @@ if __name__ == '__main__':
                         help='BiSeNet weights for --composite_face_region and the parser '
                              'eyeglasses judge.')
     parser.add_argument('--composite_face_region',
-                        action=argparse.BooleanOptionalAction, default=True,
+                        action=argparse.BooleanOptionalAction, default=False,
                         help='Composite the edited face back onto the source-reconstruction '
                              'background/hair (same mitigation/default as evaluate_sdflow.py). '
-                             'Pass --no-composite_face_region to render the raw, uncomposited '
-                             'edit instead.')
+                             'DEFAULT: off -- the Poisson blend leaves a visible tonal seam at the '
+                             'face boundary. Pass --composite_face_region to enable it.')
     parser.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'],
                         help='Blend method for --composite_face_region (same as '
                              'evaluate_sdflow.py; poisson removes the alpha-blend seam).')

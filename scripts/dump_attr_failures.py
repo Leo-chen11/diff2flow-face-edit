@@ -275,7 +275,10 @@ if __name__ == '__main__':
     p.add_argument('--glasses_area_thresh', type=float, default=0.0010)
     p.add_argument('--glasses_area_sharpness', type=float, default=0.5)
     p.add_argument('--glasses_min_component_frac', type=float, default=0.00015)
-    p.add_argument('--composite_face_region', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--composite_face_region', action=argparse.BooleanOptionalAction, default=False,
+                   help='DEFAULT: off -- the Poisson blend leaves a visible tonal seam at the face '
+                        'boundary that inflates LPIPS/depresses ID scores. Pass '
+                        '--composite_face_region to enable it.')
     p.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'])
     p.add_argument('--composite_blur_sigma', type=float, default=15)
     p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
