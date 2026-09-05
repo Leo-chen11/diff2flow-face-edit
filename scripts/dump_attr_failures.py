@@ -43,10 +43,11 @@ from PIL import Image, ImageDraw
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CLIPAttributeJudge, CelebAAttrClassifierJudge, GlassesParserJudge,
     _latest_step, apply_run_config, edit_single_attribute, is_clear, load_models,
-    parse_clip_calibration,
+    parse_clip_calibration, resolve_controlnet_disable_attrs,
 )
 from common.face_parser import FaceParser
 from models.dataset import SDFlowDataset
+from models.flows.constant import CELEBA_ATTRIBUTES
 
 
 def to_pil(img_tensor):
@@ -106,7 +107,8 @@ def main(args):
     if args.attr == 15 and args.glasses_judge == 'parser':
         pj = GlassesParserJudge(args.face_parser_weights, 'cuda',
                                 area_thresh=args.glasses_area_thresh,
-                                sharpness=args.glasses_area_sharpness)
+                                sharpness=args.glasses_area_sharpness,
+                                min_component_frac=getattr(args, 'glasses_min_component_frac', 0.00015))
         print(f'[Judge] {attr_name} = BiSeNet parser (class 6)')
         score_fn = lambda imgs: pj.glasses_prob(imgs)
     else:
@@ -133,9 +135,13 @@ def main(args):
 
     composite_face_parser = None
     if args.composite_face_region:
-        composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-        print(f'[Composite] method={args.composite_method} '
-              f'blur_sigma={args.composite_blur_sigma}')
+        try:
+            composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            print(f'[Composite] method={args.composite_method} '
+                  f'blur_sigma={args.composite_blur_sigma}')
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --composite_face_region requested but face parser unavailable '
+                  f'({exc}); compositing disabled.')
 
     img_transform = T.Compose([
         T.ToTensor(), T.Resize((args.img_size, args.img_size)),
@@ -150,9 +156,10 @@ def main(args):
                              num_workers=4, drop_last=False)
 
     fails, succs = [], []
+    fail_preds, succ_preds = [], []
     n_dir, n_fail = 0, 0
     watch_leak_abs = {name: [] for name in watch_names}
-    for img, latent, _pred in loader:
+    for img, latent, pred in loader:
         img = img.cuda(); latent = latent.cuda()
         _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
 
@@ -169,6 +176,7 @@ def main(args):
             composite_blur_sigma=args.composite_blur_sigma,
             control_encoder=control_encoder,
             controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+            controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
         )
         edited_256 = F.interpolate(edited, (256, 256))
         edit_scores = score_fn(edited_256)
@@ -200,13 +208,38 @@ def main(args):
                 n_fail += 1
                 if len(fails) < args.num_fail:
                     fails.append(make_pair(src_face[b], edited[b], s, e, attr_name, False, watch=watch))
+                    fail_preds.append(pred[b, :40].clone())
             elif len(succs) < args.num_success:
                 succs.append(make_pair(src_face[b], edited[b], s, e, attr_name, True, watch=watch))
+                succ_preds.append(pred[b, :40].clone())
         if len(fails) >= args.num_fail and len(succs) >= args.num_success:
             break
 
     print(f'\n{attr_name} {args.direction}: samples seen={n_dir}, judge-failed={n_fail} '
           f'({n_fail / max(1, n_dir):.1%})')
+
+    if fail_preds and succ_preds:
+        # What does the failure group actually have in common, beyond
+        # whatever pattern eyeballing the montage suggests? Compare the
+        # r34 binary prediction for every OTHER CelebA attribute between
+        # the failure and success groups collected above -- a real,
+        # data-driven signal (e.g. "78% of failures are Pale_Skin=1 vs
+        # 25% of successes") is worth acting on; a guess from thumbnails
+        # (skin tone, hair style, makeup) is not, until it shows up here.
+        fail_mat = torch.stack(fail_preds)   # (n_fail_saved, 40)
+        succ_mat = torch.stack(succ_preds)   # (n_succ_saved, 40)
+        fail_rate = fail_mat.mean(dim=0)
+        succ_rate = succ_mat.mean(dim=0)
+        diff = (fail_rate - succ_rate).abs()
+        order = [i for i in torch.argsort(diff, descending=True).tolist() if i != args.attr]
+        print(f'\n=== Failure vs success group: other-attribute fraction "1" '
+              f'(fail n={fail_mat.shape[0]}, success n={succ_mat.shape[0]}) ===')
+        print('Sorted by |difference| -- top of the list is what the failure group '
+              'actually has more/less of, not what it looks like it has:')
+        for i in order[:15]:
+            name = CELEBA_ATTRIBUTES[i] if i < len(CELEBA_ATTRIBUTES) else f'attr{i}'
+            print(f'  {name:<20} fail={fail_rate[i]:.2f}  success={succ_rate[i]:.2f}  '
+                  f'|Δ|={diff[i]:.2f}')
 
     for wname, vals in watch_leak_abs.items():
         if not vals:
@@ -241,9 +274,16 @@ if __name__ == '__main__':
     p.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth')
     p.add_argument('--glasses_area_thresh', type=float, default=0.0010)
     p.add_argument('--glasses_area_sharpness', type=float, default=0.5)
-    p.add_argument('--composite_face_region', action='store_true')
-    p.add_argument('--composite_method', default='alpha', choices=['alpha', 'poisson'])
+    p.add_argument('--glasses_min_component_frac', type=float, default=0.00015)
+    p.add_argument('--composite_face_region', action=argparse.BooleanOptionalAction, default=False,
+                   help='DEFAULT: off -- the Poisson blend leaves a visible tonal seam at the face '
+                        'boundary that inflates LPIPS/depresses ID scores. Pass '
+                        '--composite_face_region to enable it.')
+    p.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'])
     p.add_argument('--composite_blur_sigma', type=float, default=15)
+    p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                    help='Same knob/default as evaluate_sdflow.py: omitted -> auto-resolved '
+                         'to gender/age (20, 39) via resolve_controlnet_disable_attrs().')
 
     p.add_argument('--index_file',   default='./data/ffhq.txt')
     p.add_argument('--image_root',   default='data/FFHQ')
@@ -283,7 +323,7 @@ if __name__ == '__main__':
     p.add_argument('--guided_delta_max_norm', type=float, default=0.0)
     p.add_argument('--override_residual_scale', type=float, default=None)
     p.add_argument('--age_fine_layer_scale', type=float, default=None)
-    p.add_argument('--age_fine_layer_start', type=int, default=4)
+    p.add_argument('--age_fine_layer_start', type=int, default=10)
     p.add_argument('--force_bank_directions', action='store_true')
     p.add_argument('--disable_controlnet', action='store_true',
                    help='ABLATION: skip control_encoder even if the run was trained with it, '
@@ -293,6 +333,7 @@ if __name__ == '__main__':
 
     args = p.parse_args()
     args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
         if args.step is None:

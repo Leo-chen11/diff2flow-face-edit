@@ -79,13 +79,45 @@ class AttributeControlEncoder(nn.Module):
     """
 
     def __init__(self, num_attrs, out_channels=512, out_res=64, seed_res=4, hidden_dim=256,
-                 init_gain=1.0, per_direction=False):
+                 init_gain=1.0, per_direction=False, latent_cond=False, latent_dim=512):
+        """
+        latent_cond: condition the injected feature map on the SOURCE LATENT
+            (this face) in addition to attr_delta.
+
+            WHY THIS EXISTS: without it, forward() sees only attr_delta -- a
+            (B, num_attrs) vector that, for a given attribute and direction, is
+            essentially the SAME value for every sample in the batch. The seed,
+            the decoder head, and therefore the entire 512x64x64 injected
+            feature map are then identical for every face. The module adds one
+            fixed, face-agnostic spatial pattern to a generator feature map
+            whose content is different for every identity, pose and framing.
+
+            For a local, position-critical structure like eyeglasses that is
+            close to the worst case: the "glasses" perturbation lands at fixed
+            spatial coordinates rather than on THIS face's eyes. It can still
+            produce enough glasses-like texture for a detector to fire (which
+            is how a parser/CLIP judge can score it as present) while never
+            forming a correctly placed, well-shaped frame -- exactly the
+            "score is high but the glasses are not properly rendered" symptom.
+            The real ControlNet is conditioned on a spatial input (edges, pose,
+            depth) for precisely this reason; this module had no spatial
+            conditioning at all.
+
+            With latent_cond=True the shared trunk additionally consumes the
+            per-sample W+ latent (mean-pooled over layers), so the injected
+            map can be placed and shaped per face. Off by default because it
+            adds parameters: a checkpoint trained without it cannot be loaded
+            into a model built with it (and vice versa). Turn it on for new
+            runs.
+        """
         super().__init__()
         self.num_attrs = int(num_attrs)
         self.out_channels = int(out_channels)
         self.out_res = int(out_res)
         self.seed_res = int(seed_res)
         self.per_direction = bool(per_direction)
+        self.latent_cond = bool(latent_cond)
+        self.latent_dim = int(latent_dim)
         self.num_slots = self.num_attrs * 2 if self.per_direction else self.num_attrs
         assert self.out_res % self.seed_res == 0 and \
             (self.out_res // self.seed_res) & (self.out_res // self.seed_res - 1) == 0, \
@@ -96,8 +128,30 @@ class AttributeControlEncoder(nn.Module):
         # Shared across attributes AND directions (like magnitude_net), since
         # this only sets up a generic starting point; per-slot specialization
         # happens entirely in each slot's own decoder head below.
+        # With latent_cond the trunk also consumes the per-sample source latent,
+        # so the seed (and therefore the injected map) varies per face instead
+        # of being one fixed pattern shared by the whole dataset.
+        #
+        # The latent goes through its own LayerNorm + projection before being
+        # concatenated: raw StyleGAN W+ coordinates are far larger in scale
+        # than attr_delta (which lives in [-1, 1]), so concatenating them
+        # directly would let the latent dominate the shared trunk's first
+        # layer and effectively drown out the attribute signal -- the module
+        # would condition on "which face" while barely reacting to "which
+        # edit". Normalizing puts the two inputs on a comparable footing.
+        if self.latent_cond:
+            latent_feat_dim = min(hidden_dim, self.latent_dim)
+            self.latent_proj = nn.Sequential(
+                nn.LayerNorm(self.latent_dim),
+                nn.Linear(self.latent_dim, latent_feat_dim),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            latent_feat_dim = 0
+            self.latent_proj = None
+        trunk_in = self.num_attrs + latent_feat_dim
         self.fc = nn.Sequential(
-            nn.Linear(self.num_attrs, hidden_dim),
+            nn.Linear(trunk_in, hidden_dim),
             nn.ReLU(inplace=True),
         )
         self.seed_proj = nn.Linear(hidden_dim, self.out_channels * self.seed_res * self.seed_res)
@@ -140,7 +194,7 @@ class AttributeControlEncoder(nn.Module):
         layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1))
         return nn.Sequential(*layers)
 
-    def forward(self, attr_delta, attr_idx, is_rm=None):
+    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None):
         """
         attr_delta: (B, num_attrs) -- same tensor passed to AttributeDirectionBank.
         attr_idx:   (B,) long -- which attribute is being edited, per sample.
@@ -149,12 +203,25 @@ class AttributeControlEncoder(nn.Module):
                     per_direction=True, same convention as
                     AttributeDirectionBank/JudgePeakDeclineBalancer/
                     LearnableAttributeScales; ignored otherwise.
+        latent:     (B, num_layers, latent_dim) source W+ latent. REQUIRED when
+                    latent_cond=True -- it is what makes the injected feature
+                    map depend on THIS face rather than being one fixed pattern
+                    shared by every sample (see __init__ docstring). Ignored
+                    when latent_cond=False.
         Returns: (B, out_channels, out_res, out_res), to pass as
                  StyleGAN2 Generator's `skips=` argument.
         """
         B = attr_delta.size(0)
         device, dtype = attr_delta.device, attr_delta.dtype
-        hidden = self.fc(attr_delta)
+        trunk_in = attr_delta
+        if self.latent_cond:
+            if latent is None:
+                raise ValueError(
+                    'AttributeControlEncoder(latent_cond=True) needs the source latent; '
+                    'pass latent=<W+ tensor>.')
+            w = latent.mean(dim=1).to(device=device, dtype=dtype)   # (B, latent_dim)
+            trunk_in = torch.cat([attr_delta, self.latent_proj(w)], dim=1)
+        hidden = self.fc(trunk_in)
         seed = self.seed_proj(hidden).view(B, self.out_channels, self.seed_res, self.seed_res)
 
         out = torch.zeros(B, self.out_channels, self.out_res, self.out_res,

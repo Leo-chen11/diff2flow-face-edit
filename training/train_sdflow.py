@@ -764,18 +764,20 @@ if __name__ == '__main__':
                              'between teacher and CLIP accuracy without it).')
     parser.add_argument('--teacher_aug_noise', type=float, default=0.02,
                         help='Std of the shared gaussian noise in --teacher_aug.')
-    parser.add_argument('--local_region_loss_weight', type=float, default=0.0,
+    parser.add_argument('--local_region_loss_weight', type=float, default=0.5,
                         help='Weight for the face-parser locality loss on LOCAL attributes '
                              '(currently eyeglasses, see LOCAL_REGION_CLASSES): outside the '
                              'allowed region, the edited image must match the source '
                              'reconstruction pixel-wise. Directly attacks the ~55-60%% real '
                              'eyeglasses accuracy ceiling by forcing the edit budget into '
                              'the eye region instead of a diffuse whole-face "glasses-ness". '
-                             '0 disables (default). Suggested when enabling: 0.5.')
+                             'DEFAULT changed from 0.0 (off) to 0.5 (the previously-suggested '
+                             'value) -- eyeglasses structure was found incomplete/imperfect '
+                             'without it. Pass 0 to fully disable.')
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
                         help='BiSeNet weights for --local_region_loss_weight and '
                              '--dds_face_mask.')
-    parser.add_argument('--dds_face_mask', action='store_true',
+    parser.add_argument('--dds_face_mask', action=argparse.BooleanOptionalAction, default=True,
                         help='Restrict the DDS diffusion-guidance gradient (models/'
                              'diffusion_guidance.py) to the region the edit is allowed to touch, '
                              'instead of the whole latent. Unmasked, DDS asks the frozen '
@@ -788,9 +790,10 @@ if __name__ == '__main__':
                              '"receding hairline" prompt cue is not cut by this. Loads a '
                              'FaceParser the same way --local_region_loss_weight does (shared '
                              'instance if both are set). 0 risk to identity/leakage, upside '
-                             'only if DDS was actually spending gradient off-face; off by '
-                             'default because it changes DDS numerics for existing --resume_dir '
-                             'runs.')
+                             'only if DDS was actually spending gradient off-face. DEFAULT '
+                             'changed from off to on -- pass --no-dds_face_mask to resume an '
+                             'existing --resume_dir run unmasked (matching the DDS numerics it '
+                             'was trained with) instead of introducing the mask mid-run.')
     parser.add_argument('--local_region_add_blur', type=float, default=15,
                         help='Mask dilation (gaussian blur sigma) for ADDITION-direction '
                              'local edits. The source face has no glasses pixels for '
@@ -799,7 +802,24 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
-    parser.add_argument('--color_shift_loss_weight', type=float, default=0.0,
+    parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
+                        help='Compare the edited image against the source RECONSTRUCTION '
+                             'G(latent) instead of the real photo in id_loss, the directional '
+                             'CLIP loss, and the DDS diffusion guidance. The real photo differs '
+                             'from any generated image by (inversion gap) + (edit); referencing '
+                             'it charges the fixed e4e/StyleGAN reconstruction error to the edit, '
+                             'which the flow cannot remove without spending W+ budget on '
+                             'reconstruction instead of the attribute. Concretely: id_loss then '
+                             'optimizes a different quantity than evaluate_sdflow.py reports '
+                             '(it measures edited-vs-reconstruction), the directional CLIP delta '
+                             'carries a constant inversion offset that pulls it off the pos/neg '
+                             'text axis, and the DDS source-branch subtraction no longer cancels '
+                             'cleanly. The locality and color-shift losses already compare '
+                             'against G(latent) for exactly this reason -- this makes the other '
+                             'three consistent with them. Costs one extra frozen G forward per '
+                             'step (no_grad) when no face-parser loss already needed it. Pass '
+                             '--no-losses_vs_recon to restore the old real-photo references.')
+    parser.add_argument('--color_shift_loss_weight', type=float, default=1.0,
                         help='Penalize the mean-RGB shift of the BiSeNet skin region between '
                              'source and edited face, for --color_shift_attrs samples. '
                              'A visual audit (scripts/dump_attr_failures.py, attr 39 direction '
@@ -812,8 +832,12 @@ if __name__ == '__main__':
                              'vector or edit magnitude, it makes the color-shift shortcut itself '
                              'costly, so satisfying the attribute loss has to come from '
                              'elsewhere. Genuine structural aging is a texture/geometry change, '
-                             'not a uniform tone shift, so it is barely affected. 0 disables '
-                             '(default). Suggested when enabling: 0.5-2.0.')
+                             'not a uniform tone shift, so it is barely affected. DEFAULT raised '
+                             'from 0.0 (off) to 1.0, the middle of the previously-suggested '
+                             '0.5-2.0 range: this is the only mechanism in this file that acts '
+                             'directly on the color-cast shortcut, and the reported symptom '
+                             '("aging looks like a color wash, not real aging") is exactly what '
+                             'it targets. Requires a loadable --face_parser_weights. 0 disables.')
     parser.add_argument('--color_shift_attrs', nargs='*', type=int, default=[39],
                         help='Attribute indices the color-shift regularizer applies to. '
                              'Default is age (39) only, since that is the attribute the visual '
@@ -861,6 +885,29 @@ if __name__ == '__main__':
     # run, so Eyeglasses/Young hit a dataset-mean-direction ceiling (~60% real
     # accuracy). Start higher so the flow's personalization is actually in play.
     parser.add_argument('--direction_residual_scale', type=float, default=0.15)
+    parser.add_argument('--glasses_residual_scale', type=float, default=0.35,
+                        help='Separate INITIAL residual_scale for eyeglasses (attr 15) at TRAINING '
+                             'time, same mechanism as --age_residual_scale. scripts/'
+                             'validate_direction_bank.py measures the eyeglasses direction ALONE '
+                             '(no residual, no ControlNet, no local_region_loss) reaching only '
+                             '~12%% AccCLIP even at 1.5x its natural magnitude -- markedly weaker '
+                             'than gender or age\'s response curve at the same alphas. This is '
+                             'architectural, not a calibration bug: eyeglasses is a discrete, '
+                             'multi-modal, spatially-precise structure (thin/thick frames, '
+                             'rimless, sunglasses, all at slightly different positions), and a '
+                             'single per-stratum mean-difference direction averages those styles '
+                             'together, which for a high-frequency local structure washes out '
+                             'detail rather than reinforcing it (unlike age/gender, which are '
+                             'smoother, closer to single-axis semantic shifts that a linear '
+                             'direction represents well). DEFAULT 0.35 (more than double the '
+                             'shared 0.15) hands the trainable flow residual more of the budget '
+                             'for glasses specifically, instead of leaning on a frozen direction '
+                             'that is confirmed too weak to carry the edit alone -- the flow, '
+                             'local_region_loss, ControlNet (if enabled) and '
+                             '--clip_prompt_glasses_weight do the real work; the direction only '
+                             'needs to point roughly the right way. Still just an INIT value, '
+                             'learned further via gradient descent from there. <0 falls back to '
+                             '--direction_residual_scale (old behavior).')
     parser.add_argument('--age_residual_scale', type=float, default=-1.0,
                         help='Separate INITIAL residual_scale for age (attr 39) at TRAINING time. '
                              '<0 (default) falls back to the shared --direction_residual_scale, i.e. '
@@ -876,9 +923,53 @@ if __name__ == '__main__':
                              'output, instead of the frozen (~95% of the edit) direction dominating '
                              'regardless of what the residual learns. residual_scale is still learned '
                              'via gradient descent from this starting point, not fixed.')
+    parser.add_argument('--male_residual_scale', type=float, default=-1.0,
+                        help='Separate INITIAL residual_scale for gender (attr 20) at TRAINING '
+                             'time, same mechanism as --age_residual_scale/--glasses_residual_scale. '
+                             '<0 (default) falls back to the shared --direction_residual_scale. '
+                             'Independent-judge eval on a trained checkpoint found gender the most '
+                             'expensive of the three attributes per unit of accuracy: highest LPIPS '
+                             '(~2x eyeglasses/age at every tested scale), fastest-declining ID_ind '
+                             'across the scale sweep, and the highest LeakCLIP -- while its AccCLIP '
+                             'was already strong. Unlike eyeglasses/age, gender was never given its '
+                             'own reduced budget, so it shares the same residual_scale as every other '
+                             'attribute despite already having a well-calibrated (LDA + cross-attr-'
+                             'decorrelated) frozen direction to lean on instead. LOWERING this (e.g. '
+                             '0.05-0.10, below the shared default 0.15) hands gender LESS of the edit '
+                             'budget from the freely-learned, less-constrained flow residual and MORE '
+                             'from the frozen direction, trading a bit of headroom on AccCLIP (already '
+                             'comfortably ahead of eyeglasses/age) for less collateral pixel change and '
+                             'identity drift. residual_scale is still learned via gradient descent from '
+                             'this starting point, not fixed.')
     parser.add_argument('--direction_freeze', '--direction-freeze',
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--direction_orth_weight', type=float, default=0.0)
+    parser.add_argument('--dir_gate_diversity_weight', type=float, default=0.0,
+                        help='Weight on AttributeDirectionBank.gate_load_balance_loss(), which '
+                             'penalizes the K-mixture gate (gate_net, active whenever the bank has '
+                             'num_k>1, e.g. from --K/--age_k combined with --substyle_k) for '
+                             'collapsing onto a minority of its K slots regardless of the source '
+                             'face. WHY THIS EXISTS: nothing in this project previously supervised '
+                             'gate routing at all -- it only received gradient indirectly through '
+                             'the final guided_delta, with no signal rewarding correct or even '
+                             'diverse routing. Measured on a real trained checkpoint (Eyeglasses, '
+                             'K=12 from --K 4 x --substyle_k 3): the gate collapsed within the first '
+                             'few thousand steps onto ~2 of the 12 slots for 81% of samples '
+                             'regardless of the source face\'s actual gender/age, including almost '
+                             'NEVER routing female_young samples to the female_young-conditioned '
+                             'slots --extreme_min_conf specifically cleaned up in '
+                             'precompute_directions_stratified.py -- which is why that direction-'
+                             'bank fix alone did not move the eyeglasses-add failure rate. This '
+                             'loss does NOT know which slot is demographically correct for a given '
+                             'face (no label fed in for that) -- it only discourages collapsing onto '
+                             'too few slots, a necessary but not sufficient condition for a clean '
+                             'stratum-level direction to actually get used. 0 (default) disables; '
+                             'try 0.05-0.2 to start. No effect when num_k<=1 (K=1, no substyle_k).')
+    parser.add_argument('--gate_usage_ema_decay', type=float, default=0.98,
+                        help='EMA decay for AttributeDirectionBank.gate_usage_ema (per-attribute, '
+                             'per-K-slot usage, used by --dir_gate_diversity_weight and the '
+                             'dir_gate_entropy_per_attr wandb logs). Higher = smoother/slower to '
+                             'react; matches the convention of --balance_ema_decay.')
     parser.add_argument('--direction_k', type=int, default=1,
                         help='Number of mixture directions per attribute in the Direction Bank.')
     parser.add_argument('--direction_guided_delta_max_norm', type=float, default=0.0,
@@ -925,7 +1016,7 @@ if __name__ == '__main__':
                              '(512 for the default channel_multiplier=2 at 64x64).')
     parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
                         help='Hidden width of the shared trunk in AttributeControlEncoder.')
-    parser.add_argument('--controlnet_reg_weight', type=float, default=0.001,
+    parser.add_argument('--controlnet_reg_weight', type=float, default=0.01,
                         help='L2 penalty weight on the per-sample norm of control_skips (the '
                              'AttributeControlEncoder output actually added into the StyleGAN2 '
                              'feature map). Unlike the W+ guided_delta, control_skips has NO loss '
@@ -935,7 +1026,12 @@ if __name__ == '__main__':
                              'Over long fine-tunes this let the injected signal grow large enough '
                              'to visibly corrupt images (LPIPS blew up, AccCeleb collapsed, while '
                              'ID stayed misleadingly high) with no warning in any other loss curve. '
-                             'Set 0 to disable (not recommended once this is enabled).')
+                             'DEFAULT raised from 0.001 to 0.01: eval found ControlNet injection '
+                             'earns its keep on eyeglasses but gives gender/age no measured '
+                             'accuracy benefit while adding a sparkle artifact -- the stronger '
+                             'penalty lets training itself shrink the injection toward zero for '
+                             'attributes that do not need it, rather than a hard eval-time '
+                             '--controlnet_disable_attrs override. Set 0 to disable.')
     parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
                         help='Hard per-sample cap on control_skips norm (like guided_delta_max_norm '
                              'for the W+ path). 0 disables the cap; only the L2 penalty above still '
@@ -960,6 +1056,20 @@ if __name__ == '__main__':
                              '-- run scripts/measure_feature_norm.py rather than guessing.')
     parser.add_argument('--controlnet_lr_mult', type=float, default=1.0,
                         help='LR multiplier for control_encoder only (own Adam param group).')
+    parser.add_argument('--controlnet_latent_cond', action='store_true',
+                        help='Condition the injected feature map on the SOURCE LATENT, not just '
+                             'on attr_delta. WITHOUT this, AttributeControlEncoder.forward() sees '
+                             'only a (B, num_attrs) vector that is effectively identical for every '
+                             'sample editing the same attribute in the same direction -- so it '
+                             'adds ONE fixed, face-agnostic 512x64x64 pattern to a generator '
+                             'feature map that differs for every identity, pose and framing. For '
+                             'eyeglasses that means the perturbation lands at fixed spatial '
+                             'coordinates instead of on THIS face\'s eyes: enough glasses-like '
+                             'texture for a detector to fire, never a correctly placed frame. The '
+                             'real ControlNet is conditioned on a spatial input for exactly this '
+                             'reason. RECOMMENDED for new runs. Off by default because it changes '
+                             'the module\'s parameter shapes -- a checkpoint trained without it '
+                             'cannot be loaded into a model built with it, or vice versa.')
     parser.add_argument('--controlnet_per_direction',
                         action=argparse.BooleanOptionalAction, default=False,
                         help="Give add and rm their own decoder head and their own learnable gain "
@@ -1041,8 +1151,17 @@ if __name__ == '__main__':
                         help='Load direction_bank checkpoint state. Keep false when changing bank path/safety settings.')
 
     # ── Frozen pretrained diffusion guidance ───────────────────────────────
-    parser.add_argument('--use_diffusion_guidance', action='store_true',
-                        help='Use a frozen Stable Diffusion model as auxiliary DDS semantic guidance.')
+    parser.add_argument('--use_diffusion_guidance', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use a frozen Stable Diffusion model as auxiliary DDS semantic '
+                             'guidance. DEFAULT changed from off to on -- this is what lets '
+                             '--age_dds_fine_layer_start/--age_diffusion_weight/'
+                             '--age_diffusion_interval (below) do anything; without it those are '
+                             'silently no-ops. COST: downloads/loads --diffusion_model_id (a few '
+                             'GB from HuggingFace on first run) and adds a forward/backward pass '
+                             'through it every --diffusion_guidance_interval steps -- meaningfully '
+                             'more VRAM and time per step. Pass --no-use_diffusion_guidance to '
+                             'restore the old default if you don\'t have network access to '
+                             'HuggingFace or want the old resource footprint.')
     parser.add_argument('--diffusion_model_id', default='SG161222/Realistic_Vision_V5.1_noVAE', type=str,
                         help='HuggingFace model id or local path for the frozen diffusion model.')
     parser.add_argument('--diffusion_vae_model_id', default='stabilityai/sd-vae-ft-mse', type=str,
@@ -1062,9 +1181,15 @@ if __name__ == '__main__':
 
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='Gradient accumulation steps. Effective batch = batch * grad_accum_steps.')
-    parser.add_argument('--residual_max_norm', type=float, default=None,
+    parser.add_argument('--residual_max_norm', type=float, default=10.0,
                         help='Hard clip per-sample residual norm in Direction Bank forward(). '
-                             'Prevents residual explosion from large DDS gradients. Suggested: 10.0.')
+                             'Prevents residual explosion from large DDS gradients. DEFAULT '
+                             'changed from None (off) to 10.0 (the previously-suggested value). '
+                             'There is no CLI value that means "off" any more (the consuming code '
+                             'in AttributeDirectionBank checks `is not None`, and a negative norm '
+                             'would flip the residual\'s sign rather than disable clipping) -- pass '
+                             'a very large value (e.g. 1e6) to make the clip effectively a no-op, '
+                             'or edit this default back to None to fully restore the old behavior.')
     parser.add_argument('--dds_fine_layer_start', type=int, default=7,
                         help='W+ layer index from which DDS gradients are blocked (fine layers). '
                              'Set 0 to disable masking.')
@@ -1072,61 +1197,83 @@ if __name__ == '__main__':
                         help='Min timestep for age-specific DDS pass (coarse structure).')
     parser.add_argument('--age_diffusion_timestep_max', type=int, default=900,
                         help='Max timestep for age-specific DDS pass.')
-    parser.add_argument('--age_diffusion_interval', type=int, default=16,
+    parser.add_argument('--age_diffusion_interval', type=int, default=8,
                         help='Run age DDS guidance every N steps (independent of --diffusion_guidance_interval). '
-                             'NOTE: default 16 is LESS frequent than non-age (8), i.e. the hardest '
-                             'attribute currently gets the least diffusion supervision. Lower it '
-                             '(e.g. 4-8) to give aging more of the diffusion teacher.')
-    parser.add_argument('--age_diffusion_weight', type=float, default=-1.0,
-                        help='Separate loss weight for the AGE DDS pass. <0 (default) falls back to '
-                             'the shared --diffusion_guidance_weight (0.01), i.e. age currently gets '
-                             'the same tiny weight as glasses/gender. Set higher (e.g. 0.05-0.2) to '
-                             'give the diffusion teacher real pull on aging without touching the '
-                             'other attributes.')
-    parser.add_argument('--age_dds_fine_layer_start', type=int, default=-1,
-                        help='Fine-layer cutoff for the AGE DDS pass specifically. <0 (default) reuses '
-                             '--dds_fine_layer_start (7), which blocks DDS gradients from the fine W+ '
-                             'layers (7-17) -- exactly the layers that carry wrinkles / skin texture / '
-                             'gray hair, so the diffusion teacher currently CANNOT teach real aging '
-                             'texture and the model falls back on the coarse/global color-shift '
-                             'shortcut. Set to 18 to let age DDS reach all layers (teach true aging '
-                             'texture), or a higher value like 12-14 for a middle ground.')
+                             'DEFAULT lowered from 16 to 8 (matching non-age) -- 16 was LESS '
+                             'frequent than non-age despite age being the hardest attribute, i.e. '
+                             'the hardest attribute was getting the least diffusion supervision.')
+    parser.add_argument('--age_diffusion_weight', type=float, default=0.1,
+                        help='Separate loss weight for the AGE DDS pass. DEFAULT changed from -1 '
+                             '(fall back to the shared --diffusion_guidance_weight, 0.01, same tiny '
+                             'weight as glasses/gender) to 0.1 -- gives the diffusion teacher real '
+                             'pull on aging without touching the other attributes. Pass a negative '
+                             'value to restore the old fall-back-to-shared-weight behavior.')
+    parser.add_argument('--age_dds_fine_layer_start', type=int, default=12,
+                        help='Fine-layer cutoff for the AGE DDS pass specifically. DEFAULT changed '
+                             'from -1 (fall back to the shared --dds_fine_layer_start, 7, which '
+                             'blocks DDS gradients from the fine W+ layers 7-17 -- exactly the '
+                             'layers that carry wrinkles/skin texture/gray hair, so the diffusion '
+                             'teacher could not teach real aging texture and the model fell back on '
+                             'the coarse/global color-shift shortcut) to 12: the documented '
+                             'middle-ground value, letting the teacher reach most texture layers. '
+                             'Set to 18 for fully unblocked (higher risk), or a negative value to '
+                             'restore the old fall-back-to-7 behavior.')
 
     # ── Frozen CLIP semantic target loss ───────────────────────────────
-    parser.add_argument('--use_clip_prompt_loss', action='store_true',
-                        help='Enable frozen CLIP prompt loss for semantic direction supervision.')
+    parser.add_argument('--use_clip_prompt_loss', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable frozen CLIP prompt loss for semantic direction supervision. '
+                             'DEFAULT changed from off to on -- required for --clip_prompt_mode/'
+                             '--clip_prompt_glasses_weight/--clip_prompt_age_weight (below) to have '
+                             'any effect; without it those are silently no-ops. Pass '
+                             '--no-use_clip_prompt_loss to restore the old default.')
     parser.add_argument('--clip_prompt_model', type=str, default='ViT-B/32',
                         help='OpenAI CLIP model name.')
     parser.add_argument('--clip_prompt_weight', type=float, default=0.03,
                         help='Weight for CLIP prompt loss. Suggested range: 0.02–0.05.')
     parser.add_argument('--clip_prompt_temperature', type=float, default=1.0,
                         help='Temperature for softplus sharpness in CLIP loss (absolute mode only).')
-    parser.add_argument('--clip_prompt_mode', default='absolute', choices=['absolute', 'directional'],
-                        help="'absolute' (default) pulls the edited image toward the target "
-                             "prompt regardless of the source. A visual audit (attr 39, "
-                             "direction rm) found this lets the model reach a high CLIP "
-                             "'looks old' score via a red/orange color shift instead of real "
-                             "structural aging -- a shortcut, not the intended edit. "
-                             "'directional' (StyleGAN-NADA style) instead rewards moving the "
-                             "image, from ITS OWN source, along the same CLIP-space axis that "
-                             "separates the pos/neg prompts -- closing off shortcuts that shift "
-                             "every image the same way regardless of content. Costs one extra "
-                             "CLIP image encode per step (source image).")
+    parser.add_argument('--clip_prompt_mode', default='directional', choices=['absolute', 'directional'],
+                        help="'absolute' pulls the edited image toward the target prompt "
+                             "regardless of the source. A visual audit (attr 39, direction rm) "
+                             "found this lets the model reach a high CLIP 'looks old' score via a "
+                             "red/orange color shift instead of real structural aging -- a "
+                             "shortcut, not the intended edit, and the actual source of the "
+                             "age color-cast artifact. 'directional' (StyleGAN-NADA style, now "
+                             "DEFAULT, was 'absolute') instead rewards moving the image, from ITS "
+                             "OWN source, along the same CLIP-space axis that separates the pos/"
+                             "neg prompts -- closing off shortcuts that shift every image the same "
+                             "way regardless of content. Costs one extra CLIP image encode per "
+                             "step (source image). Pass 'absolute' to restore the old default.")
     parser.add_argument('--clip_prompt_interval', type=int, default=1,
                         help='Compute CLIP loss every N steps (1 = every step).')
+    parser.add_argument('--clip_prompt_num_augs', type=int, default=4,
+                        help='Number of random crop/flip views the CLIP prompt loss averages '
+                             'its score over, per image. 1 = the old single fixed full-frame '
+                             'view, which the generator can attack with spatially-fixed '
+                             'high-frequency patterns that raise the CLIP score with no semantic '
+                             'change -- the CLIP-side twin of the r34 teacher-fooling --teacher_aug '
+                             'already defends against. Averaging over views forces a pattern to '
+                             'survive translation/scale/flip to keep scoring. Costs this many CLIP '
+                             'image encodes per step (doubled in directional mode); lower it to 2 '
+                             'if step time matters, 1 to restore the old behavior.')
+    parser.add_argument('--clip_prompt_aug_min_scale', type=float, default=0.75,
+                        help='Smallest random crop side, as a fraction of the image, for '
+                             '--clip_prompt_num_augs. Too small and the crop can miss the '
+                             'attribute entirely (e.g. crop out the eyes on a glasses edit).')
     parser.add_argument('--clip_prompt_age_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for age (attr 39) in CLIP loss.')
     parser.add_argument('--clip_prompt_gender_weight', type=float, default=1.0,
                         help='Per-sample weight multiplier for gender (attr 20) in CLIP loss.')
-    parser.add_argument('--clip_prompt_glasses_weight', type=float, default=1.0,
+    parser.add_argument('--clip_prompt_glasses_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for eyeglasses (attr 15) in CLIP '
                              'loss. Eyeglasses-add is the biggest independent-judge gap (r34 '
                              'teacher ~91%% but CLIP judge ~44%%, i.e. teacher-fooling) AND '
-                             'the attribute that historically got the LEAST semantic help '
+                             'was historically the attribute that got the LEAST semantic help '
                              '(age has a 3x CLIP weight and its own diffusion guidance; '
-                             'glasses had neither). Try 3.0-5.0 to force real, CLIP-visible '
-                             'glasses instead of a decision-boundary trick the frozen r34 '
-                             'classifier alone rewards.')
+                             'glasses had neither). DEFAULT raised from 1.0 to 3.0 to force '
+                             'real, CLIP-visible glasses instead of a decision-boundary trick '
+                             'the frozen r34 classifier alone rewards. Try up to 5.0 if '
+                             'eyeglasses structure is still incomplete.')
     parser.add_argument('--balance_clip_prompt_loss', action=argparse.BooleanOptionalAction, default=False,
                         help='Replace the fixed --clip_prompt_{age,gender,glasses}_weight constants '
                              'with a CrossAttributeLossBalancer tracking CLIP loss progress per '
@@ -1358,13 +1505,18 @@ if __name__ == '__main__':
         if _bank_num_k != args.direction_k:
             print(f'** Direction Bank: --direction_k={args.direction_k} ignored, '
                   f'using num_k={_bank_num_k} from {args.direction_bank_path}')
-        # No per-attribute direction_scale/layer_scale/delta_max_norm, and no
-        # per-attribute residual_scale init either: every attribute starts from
-        # the same residual_scale value and learns its own from there via
-        # gradient descent (see AttributeDirectionBank.residual_scale_raw). The
-        # only magnitude safety net set here in advance is guided_delta_max_norm.
+        # No per-attribute direction_scale/layer_scale/delta_max_norm. Age,
+        # glasses, and gender DO get their own residual_scale INIT
+        # (--age_residual_scale, --glasses_residual_scale,
+        # --male_residual_scale) -- every other attribute still starts from
+        # the same shared --direction_residual_scale. All of them keep
+        # learning their own value from that starting point via gradient
+        # descent (see AttributeDirectionBank.residual_scale_raw); the only
+        # magnitude safety net fixed in advance is guided_delta_max_norm.
         _per_attr_residual_scale = [
             args.age_residual_scale if (idx == 39 and args.age_residual_scale >= 0)
+            else args.glasses_residual_scale if (idx == 15 and args.glasses_residual_scale >= 0)
+            else args.male_residual_scale if (idx == 20 and args.male_residual_scale >= 0)
             else args.direction_residual_scale
             for idx in args.attribute_index
         ]
@@ -1386,6 +1538,7 @@ if __name__ == '__main__':
             use_attr_lora=args.use_attr_lora,
             attr_lora_rank=args.attr_lora_rank,
             signed_magnitude_input=args.signed_magnitude_input,
+            gate_usage_ema_decay=args.gate_usage_ema_decay,
         ).cuda()
         if args.freeze_direction_bank_nets:
             for p in direction_bank.parameters():
@@ -1415,6 +1568,7 @@ if __name__ == '__main__':
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=args.controlnet_init_gain,
             per_direction=args.controlnet_per_direction,
+            latent_cond=args.controlnet_latent_cond,
         ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
@@ -1625,26 +1779,44 @@ if __name__ == '__main__':
 
     diffusion_guidance = None
     if args.use_diffusion_guidance:
-        from models.diffusion_guidance import FrozenDiffusionDDSGuidance
-        diffusion_guidance = FrozenDiffusionDDSGuidance(
-            model_id=args.diffusion_model_id,
-            vae_model_id=args.diffusion_vae_model_id or None,
-            image_size=args.diffusion_image_size,
-            timestep_min=args.diffusion_timestep_min,
-            timestep_max=args.diffusion_timestep_max,
-            guidance_scale=args.diffusion_guidance_scale,
-            fp16=args.diffusion_fp16,
-        ).cuda()
-        print(f'** Frozen diffusion DDS guidance enabled: {args.diffusion_model_id}  '
-              f'weight={args.diffusion_guidance_weight}  interval={args.diffusion_guidance_interval}')
+        try:
+            from models.diffusion_guidance import FrozenDiffusionDDSGuidance
+            diffusion_guidance = FrozenDiffusionDDSGuidance(
+                model_id=args.diffusion_model_id,
+                vae_model_id=args.diffusion_vae_model_id or None,
+                image_size=args.diffusion_image_size,
+                timestep_min=args.diffusion_timestep_min,
+                timestep_max=args.diffusion_timestep_max,
+                guidance_scale=args.diffusion_guidance_scale,
+                fp16=args.diffusion_fp16,
+            ).cuda()
+            print(f'** Frozen diffusion DDS guidance enabled: {args.diffusion_model_id}  '
+                  f'weight={args.diffusion_guidance_weight}  interval={args.diffusion_guidance_interval}')
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                f'--use_diffusion_guidance is on by default but failed to load '
+                f'{args.diffusion_model_id} ({exc}). This needs the `diffusers` package plus '
+                f'either network access to HuggingFace or a local cache of the model. Pass '
+                f'--no-use_diffusion_guidance to train without it (age gets less diffusion '
+                f'supervision but everything else is unaffected).'
+            ) from exc
 
     clip_prompt_loss_fn = None
     if args.use_clip_prompt_loss:
-        from models.clip_prompt_loss import FrozenCLIPPromptLoss
+        try:
+            from models.clip_prompt_loss import FrozenCLIPPromptLoss
+        except ImportError as exc:
+            raise RuntimeError(
+                f'--use_clip_prompt_loss is on by default but failed to import ({exc}). Install '
+                f'OpenAI CLIP (pip install git+https://github.com/openai/CLIP.git) or pass '
+                f'--no-use_clip_prompt_loss to train without it.'
+            ) from exc
         clip_prompt_loss_fn = FrozenCLIPPromptLoss(
             clip_model=args.clip_prompt_model,
             temperature=args.clip_prompt_temperature,
             mode=args.clip_prompt_mode,
+            num_augs=args.clip_prompt_num_augs,
+            aug_min_scale=args.clip_prompt_aug_min_scale,
         ).cuda().eval()
         for p in clip_prompt_loss_fn.parameters():
             p.requires_grad_(False)
@@ -1746,7 +1918,8 @@ if __name__ == '__main__':
                 # direction_bank branch above; control_encoder requires
                 # direction_bank to be enabled (checked at arg-parse time).
                 control_skips = control_encoder(attr_delta, mid_idx,
-                                                is_rm=(src_attr_flow > 0.5))
+                                                is_rm=(src_attr_flow > 0.5),
+                                                latent=latent)
 
                 # control_skips has no OTHER loss term constraining its
                 # magnitude -- it's only shaped indirectly through downstream
@@ -1812,6 +1985,32 @@ if __name__ == '__main__':
             # aging is a texture/geometry change, not a uniform tone shift,
             # so it should be largely unaffected by this penalty.
             color_shift_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+
+            # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
+            # Hoisted out of the face-parser branch below so the identity /
+            # CLIP / DDS losses can use it as their reference too (see
+            # --losses_vs_recon). Computed at most once per step and reused.
+            #
+            # WHY THIS MATTERS: `img` is the REAL photo; `new_face_tensors` is
+            # G(latent + delta). The difference between them is (inversion gap)
+            # + (edit). Any loss that compares the edited image against `img`
+            # therefore charges the e4e/StyleGAN inversion error to the edit --
+            # error the flow did not cause and cannot usefully remove, since
+            # fixing it would mean spending W+ budget on reconstruction rather
+            # than on the attribute. The locality/color-shift losses below
+            # already deliberately compare against src_recon for exactly this
+            # reason; --losses_vs_recon extends the same principle to the other
+            # three losses that were still referencing `img`.
+            src_recon = None
+            if (args.losses_vs_recon
+                    or face_parser is not None):
+                with torch.no_grad():
+                    src_recon = G([latent], input_is_latent=True,
+                                  randomize_noise=False)[0].clamp(-1, 1)
+                    src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
+            # Reference image for id_loss / directional CLIP / DDS.
+            loss_ref_img = src_recon if (args.losses_vs_recon and src_recon is not None) else img
+
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
                 _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
@@ -1819,11 +2018,6 @@ if __name__ == '__main__':
                 _is_color = torch.tensor([a in args.color_shift_attrs for a in _mid_abs],
                                          device=latent.device)
                 if _is_local.any() or _is_color.any():
-                    with torch.no_grad():
-                        src_recon = G([latent], input_is_latent=True,
-                                      randomize_noise=False)[0].clamp(-1, 1)
-                        src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
-
                     if _is_local.any():
                         _is_removal = src_attr_flow > 0.5
                         _terms = []
@@ -1877,7 +2071,12 @@ if __name__ == '__main__':
             # is at or above --id_hinge_threshold, so the model can spend its full
             # editing budget above that floor instead of a continuous pull fighting
             # counter_attr_loss even when identity is already well preserved.
-            id_src_feat = F.normalize(id_criterion.extract_features(img), dim=1).detach()
+            # Reference is the source RECONSTRUCTION by default (--losses_vs_recon),
+            # not the real photo: otherwise the fixed inversion gap sits inside
+            # id_loss as a constant penalty the edit cannot remove, and training
+            # optimizes a different quantity than evaluate_sdflow.py reports
+            # (which measures edited-vs-reconstruction identity).
+            id_src_feat = F.normalize(id_criterion.extract_features(loss_ref_img), dim=1).detach()
             id_edit_feat = F.normalize(id_criterion.extract_features(new_face_tensors), dim=1)
             id_cos_sim = F.cosine_similarity(id_edit_feat, id_src_feat, dim=1)
             if args.id_loss_hinge:
@@ -1985,7 +2184,17 @@ if __name__ == '__main__':
                     attr_abs_idx=_clip_abs_idx,
                     target_values=soft_target_for_loss,
                     reduction='none',
-                    src_images=img if args.clip_prompt_mode == 'directional' else None,
+                    # Directional CLIP measures cos(clip(edit) - clip(src), text_delta).
+                    # The source MUST be the reconstruction, not the real photo:
+                    # with the real photo, every img_delta carries the same
+                    # inversion-gap offset in CLIP space on top of the actual
+                    # edit direction, which drags the cosine toward that offset
+                    # and away from the pos/neg text axis the loss is supposed
+                    # to align to. That is very likely why this file's own notes
+                    # record "directional CLIP loss left the color-cast
+                    # unchanged" -- the directional signal was diluted, so it
+                    # never got a fair test.
+                    src_images=loss_ref_img if args.clip_prompt_mode == 'directional' else None,
                 )   # clip_loss_each: (B,)
                 if clip_loss_balancer is not None:
                     # Auto-balanced: tracks THIS loss's own per-attribute progress
@@ -2028,9 +2237,23 @@ if __name__ == '__main__':
             if direction_bank is not None:
                 dir_orth_loss = direction_bank.orthogonality_loss()
                 dir_logs = direction_bank.last_logs if direction_bank_applied else {}
+                # gate_load_balance_loss() returns a value computed INSIDE the
+                # most recent direction_bank(...) forward call (see
+                # _last_gate_diversity_loss in direction_bank.py) -- only valid
+                # to read/backward through when that forward call actually
+                # happened THIS step (direction_bank_applied). Reading it on a
+                # step where direction_bank wasn't called would reuse a stale
+                # tensor from a previous step whose autograd graph has already
+                # been freed by that step's own .backward().
+                dir_gate_diversity_loss = (
+                    direction_bank.gate_load_balance_loss()
+                    if (args.dir_gate_diversity_weight > 0 and direction_bank_applied)
+                    else _zero.clone()
+                )
             else:
                 dir_orth_loss = _zero.clone()
                 dir_logs = {}
+                dir_gate_diversity_loss = _zero.clone()
 
             diffusion_loss = _zero.clone()       # non-age DDS (glasses/gender)
             age_diffusion_loss = _zero.clone()   # age DDS, separately weighted
@@ -2095,8 +2318,14 @@ if __name__ == '__main__':
                 non_age_mask = ~is_age
                 if non_age_fires:
                     _face_non_age = _dds_face(args.dds_fine_layer_start)
+                    # DDS subtracts the source branch's noise residual as a bias
+                    # correction; that cancellation is only valid when src and
+                    # edit differ ONLY by the edit. Passing the real photo makes
+                    # the residual difference also contain the inversion gap,
+                    # leaving an uncancelled "fix the reconstruction" component
+                    # in the gradient. See --losses_vs_recon.
                     _loss, _logs = diffusion_guidance(
-                        src_images=img[non_age_mask],
+                        src_images=loss_ref_img[non_age_mask],
                         edit_images=_face_non_age[non_age_mask],
                         attr_abs_idx=mid_abs_idx[non_age_mask],
                         target_values=soft_target[non_age_mask].detach(),
@@ -2114,7 +2343,7 @@ if __name__ == '__main__':
                                        else args.dds_fine_layer_start)
                     _face_age = _dds_face(_age_fine_start)
                     _loss, _logs = diffusion_guidance(
-                        src_images=img[is_age],
+                        src_images=loss_ref_img[is_age],
                         edit_images=_face_age[is_age],
                         attr_abs_idx=mid_abs_idx[is_age],
                         target_values=soft_target[is_age].detach(),
@@ -2134,6 +2363,7 @@ if __name__ == '__main__':
                 args.gate_smooth_weight * lag_gate_smooth +\
                 args.gate_sparse_weight * lag_gate_sparse +\
                 args.direction_orth_weight * dir_orth_loss +\
+                args.dir_gate_diversity_weight * dir_gate_diversity_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
                 (args.age_diffusion_weight if args.age_diffusion_weight >= 0
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
@@ -2271,6 +2501,7 @@ if __name__ == '__main__':
                 'dir_bank_active_delta_max_norm': dir_logs.get('dir_bank_active_delta_max_norm', _zero.detach().clone()),
                 'dir_bank_global_delta_max_norm': dir_logs.get('dir_bank_global_delta_max_norm', _zero.detach().clone()),
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
+                'dir_gate_diversity_loss': dir_gate_diversity_loss,
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
@@ -2293,6 +2524,10 @@ if __name__ == '__main__':
                 current_residual_scales = direction_bank.current_residual_scale().detach()
                 for _i, _attr_abs_idx in enumerate(args.attribute_index):
                     _log_dict[f'residual_scale/attr_{_attr_abs_idx}'] = current_residual_scales[_i]
+                _gate_entropy_per_attr = dir_logs.get('dir_gate_entropy_per_attr')
+                if _gate_entropy_per_attr is not None:
+                    for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                        _log_dict[f'dir_gate_entropy_ema/attr_{_attr_abs_idx}'] = _gate_entropy_per_attr[_i]
             current_reg_weights = reg_loss_weights.current_weights()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'reg_weight_global/attr_{_attr_abs_idx}'] = current_reg_weights[_i, 0]

@@ -287,7 +287,8 @@ class GlassesParserJudge(nn.Module):
     """
     GLASSES_CLASS = 6
 
-    def __init__(self, weights_path, device='cuda', area_thresh=0.0010, sharpness=0.5):
+    def __init__(self, weights_path, device='cuda', area_thresh=0.0010, sharpness=0.5,
+                 min_component_frac=0.00015):
         super().__init__()
         from common.face_parser import FaceParser
         self.parser = FaceParser(weights_path=weights_path).to(device).eval()
@@ -295,14 +296,42 @@ class GlassesParserJudge(nn.Module):
             p.requires_grad_(False)
         self.area_thresh = float(area_thresh)
         self.sharpness = float(sharpness)
+        # Drop connected components smaller than this fraction of the 512x512
+        # mask before summing the glasses area. WHY: with the raw whole-mask
+        # area fraction, denom = sharpness*area_thresh ~= 5e-4, so a dozen
+        # stray pixels BiSeNet mislabels as class 6 (reflections, hair strands,
+        # a compression artifact near the eye) alone saturate the sigmoid to
+        # ~1.0 -- the score reads "confidently has glasses" even when nothing
+        # glasses-shaped was ever drawn, which is exactly the "score is fake"
+        # failure mode reported from visually auditing high-scoring samples.
+        # A real frame (even thin/rimless) forms a connected blob far larger
+        # than sensor noise, so filtering by component size removes the noise
+        # without needing to blunt area_thresh/sharpness (which would also
+        # suppress genuine thin-frame detections).
+        self.min_component_px = max(1, int(round(min_component_frac * 512 * 512)))
 
     @torch.no_grad()
     def glasses_prob(self, images):
         """images: [-1,1] (B,3,H,W) -> (B,) probability eyeglasses are present."""
+        import cv2
+        import numpy as np
         inp = F.interpolate(images, 512, mode='bilinear', align_corners=False)
         inp = (inp * 0.5 + 0.5 - self.parser.mean) / self.parser.std
         seg = self.parser.net(inp).argmax(dim=1)                     # (B,512,512)
-        frac = (seg == self.GLASSES_CLASS).float().mean(dim=(1, 2))  # (B,) area fraction
+        glasses_mask = (seg == self.GLASSES_CLASS)
+
+        fracs = []
+        for b in range(glasses_mask.size(0)):
+            m = glasses_mask[b].byte().cpu().numpy()
+            if m.sum() == 0:
+                fracs.append(0.0)
+                continue
+            num, _labels, stats, _cent = cv2.connectedComponentsWithStats(m, connectivity=8)
+            areas = stats[1:, cv2.CC_STAT_AREA]   # component 0 is background
+            kept = areas[areas >= self.min_component_px].sum() if num > 1 else 0
+            fracs.append(float(kept) / (512 * 512))
+        frac = glasses_mask.new_tensor(fracs, dtype=torch.float32)   # (B,) filtered area fraction
+
         denom = self.sharpness * self.area_thresh + 1e-8
         return torch.sigmoid((frac - self.area_thresh) / denom)      # 0.5 at frac==thresh
 
@@ -412,6 +441,7 @@ def build_optional_judges(args, attribute_index, id_criterion):
                 args.face_parser_weights, device,
                 area_thresh=args.glasses_area_thresh,
                 sharpness=args.glasses_area_sharpness,
+                min_component_frac=getattr(args, 'glasses_min_component_frac', 0.00015),
             )
             print(f'[Judge] Eyeglasses scored by BiSeNet parser (class 6, '
                   f'area_thresh={args.glasses_area_thresh}) -- REPLACES CLIP for '
@@ -461,7 +491,7 @@ RUN_CONFIG_KEYS = [
     'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
-    'controlnet_per_direction',
+    'controlnet_per_direction', 'controlnet_latent_cond',
 ]
 
 
@@ -492,6 +522,35 @@ def apply_run_config(args):
         if old != new:
             print(f'[RunConfig] {key}: {old} -> {new} (from config.json)')
             setattr(args, key, new)
+    return args
+
+
+def resolve_controlnet_disable_attrs(args):
+    """Auto-default for --controlnet_disable_attrs: when ControlNet injection
+    is active and the caller did not explicitly choose which attributes get
+    it (the flag is left at its argparse default of None), skip gender/age
+    (20, 39) and keep the injection only for eyeglasses.
+
+    WHY as a default and not just a documented flag: the finding (see
+    edit_single_attribute) is that ControlNet is load-bearing for eyeglasses
+    structure (AccCeleb add 93%->12% without it) but measured NO accuracy
+    benefit for gender/age (~70.7% either way) while it DOES introduce a
+    hairline/collar sparkle artifact that scale sweeps don't remove. Leaving
+    that as an opt-in flag means every eval/render run pays the artifact cost
+    for attributes that get nothing from it, unless the user remembers to
+    pass the flag by hand. Call this once right after argument parsing (and
+    after apply_run_config, so config.json's use_controlnet_injection has
+    already been applied) in every entry point that edits attributes.
+    """
+    using_controlnet = (getattr(args, 'use_controlnet_injection', False)
+                         and not getattr(args, 'disable_controlnet', False))
+    if using_controlnet and getattr(args, 'controlnet_disable_attrs', None) is None:
+        auto = [i for i in (20, 39) if i in args.attribute_index]
+        if auto:
+            args.controlnet_disable_attrs = auto
+            print(f'[Default] ControlNet injection auto-disabled for {auto} (gender/age) -- '
+                  f'no measured accuracy benefit, causes a hairline/collar sparkle artifact; '
+                  f'kept for eyeglasses. Pass --controlnet_disable_attrs explicitly to override.')
     return args
 
 
@@ -653,30 +712,49 @@ def load_models(args):
                   f'{args.override_residual_scale} for ALL attributes '
                   f'(trained value ignored)')
 
-        if getattr(args, 'age_fine_layer_scale', None) is not None and 39 in args.attribute_index:
-            # Diagnostic knob: render_preview.py with --override_residual_scale 0
-            # showed the color-cast artifact on age edits comes 100% from the
-            # precomputed direction_units for attribute 39 (age), independent of
-            # the flow/residual entirely -- residual=0 (pure Direction Bank
-            # output) still reproduces the identical artifact. StyleGAN's fine
-            # W+ layers (index >=4, matching the reg_loss_fine grouping used
-            # elsewhere in this codebase) control color/texture, while
-            # global/coarse layers (<4) control structure (face shape,
-            # wrinkles-as-geometry, hairline). This scales down the age
-            # direction's fine-layer components at inference time -- no
-            # retraining, no bank recomputation -- to test whether the color
-            # confound specifically lives in those layers.
+        if 39 in args.attribute_index:
+            # StyleGAN's fine W+ layers (index >=4, matching the reg_loss_fine
+            # grouping used elsewhere in this codebase) control color/texture,
+            # while global/coarse layers (<4) control structure (face shape,
+            # wrinkles-as-geometry, hairline). A visual audit confirmed the
+            # color-cast artifact on age edits comes 100% from the precomputed
+            # direction_units for attribute 39, independent of the flow/
+            # residual entirely (residual=0, i.e. pure Direction Bank output,
+            # still reproduces it).
             _age_local = args.attribute_index.index(39)
-            _start = int(args.age_fine_layer_start)
-            with torch.no_grad():
-                direction_bank.layer_scale[_age_local, _start:] = float(args.age_fine_layer_scale)
-            print(f'[Override] age (attr 39) direction layer scale forced to '
-                  f'{args.age_fine_layer_scale} for layers [{_start}:18] '
-                  f'(layers [0:{_start}] untouched). 500-sample eval showed a '
-                  f'blanket cut at layer 4 kills real aging signal (rm-direction '
-                  f'AccCLIP 76%->17%) along with the color artifact -- they are '
-                  f'not cleanly separable at that boundary; narrow the cut to '
-                  f'the very last layers first.')
+            _start = int(getattr(args, 'age_fine_layer_start', 10))
+            _scale = getattr(args, 'age_fine_layer_scale', None)
+            if _scale is not None:
+                # Explicit override: flat cut, same as before.
+                with torch.no_grad():
+                    direction_bank.layer_scale[_age_local, _start:] = float(_scale)
+                print(f'[Override] age (attr 39) direction layer scale forced to '
+                      f'{_scale} for layers [{_start}:18] (layers [0:{_start}] untouched).')
+            else:
+                # DEFAULT mitigation (was previously off by default, requiring
+                # --age_fine_layer_scale to be discovered and set by hand). A
+                # blanket cut at layer 4 was measured to also kill real aging
+                # signal (500-sample eval: rm-direction AccCLIP 76%->17%),
+                # because texture-level aging cues (wrinkles) and the color
+                # artifact are not cleanly separable that early. Default here
+                # to a GRADUATED ramp starting later (layer 10, matching the
+                # "try 10-14" recommendation) down to a floor of 0.6 -- not
+                # 0.0 -- at the last layer, so most of the aging signal in
+                # layers 10-17 survives while the strongest color-cast
+                # contribution (concentrated in the very last, most texture/
+                # color-dominated layers) is damped rather than deleted
+                # outright. Pass --age_fine_layer_scale explicitly (1.0 to
+                # disable this mitigation, 0.0 to reproduce the old hard cut)
+                # to override.
+                n_fine = direction_bank.layer_scale.shape[1] - _start
+                if n_fine > 0:
+                    ramp = torch.linspace(1.0, 0.6, steps=n_fine,
+                                          device=direction_bank.layer_scale.device)
+                    with torch.no_grad():
+                        direction_bank.layer_scale[_age_local, _start:] = ramp
+                    print(f'[Default] age (attr 39) fine-layer color-cast mitigation: '
+                          f'graduated damping 1.0->0.6 over layers [{_start}:18]. '
+                          f'Pass --age_fine_layer_scale to override (e.g. 1.0 to disable).')
 
     # ── ControlNet-style attribute control encoder (optional) ─────────────
     control_encoder = None
@@ -693,6 +771,7 @@ def load_models(args):
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=getattr(args, 'controlnet_init_gain', 1.0),
             per_direction=getattr(args, 'controlnet_per_direction', False),
+            latent_cond=getattr(args, 'controlnet_latent_cond', False),
         ).to(device).eval()
         ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
         if os.path.exists(ce_ckpt_path):
@@ -753,9 +832,28 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
     the color-mismatch seam that a feathered alpha blend cannot fix. Runs
     per-sample on CPU (cv2), so it's slower than the alpha path; fine for
     eval/deployment post-processing, not for anything in the training loop.
+
+    MASK SOURCE: the face region is taken as the UNION (elementwise max) of
+    the source's and the edited image's BiSeNet face masks, not just the
+    source's. Using only `orig` (as an earlier version of this function did)
+    silently truncates any structure the edit ADDS that extends past the
+    pre-edit face silhouette -- e.g. eyeglasses temple arms reaching past the
+    ears, which a glasses-free source has no reason for BiSeNet to have
+    labeled "face". Those newly-added pixels would then fall outside the
+    orig-only mask and get overwritten by the ORIGINAL (glasses-less)
+    background at composite time, i.e. compositing would cut the very
+    structure it's supposed to only be protecting the background around --
+    directly lowering eyeglasses-add accuracy, not just leaving it flat.
+    Taking the union costs a small amount of background/hair protection
+    right at that boundary; it does not reintroduce the leakage problem
+    compositing exists to fix, since both masks still exclude everything far
+    from the face on both sides.
     """
     if method == 'alpha':
-        mask = face_parser.get_mask(orig, blur_sigma=int(blur_sigma))
+        mask = torch.maximum(
+            face_parser.get_mask(orig, blur_sigma=int(blur_sigma)),
+            face_parser.get_mask(edited, blur_sigma=int(blur_sigma)),
+        )
         return edited * mask + orig * (1.0 - mask)
 
     if method != 'poisson':
@@ -763,7 +861,11 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
 
     import cv2
     import numpy as np
-    mask = face_parser.get_mask(orig, blur_sigma=0)   # hard silhouette; Poisson handles the boundary
+    # hard silhouette (union of both masks -- see docstring); Poisson handles the boundary
+    mask = torch.maximum(
+        face_parser.get_mask(orig, blur_sigma=0),
+        face_parser.get_mask(edited, blur_sigma=0),
+    )
     out = []
     for b in range(orig.size(0)):
         o = ((orig[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
@@ -844,7 +946,8 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         if control_encoder is not None and (
                 controlnet_disable_attrs is None
                 or attr_global_idx not in controlnet_disable_attrs):
-            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
+            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+                                            latent=latent)
             if controlnet_max_norm > 0:
                 skip_norm = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -870,7 +973,8 @@ def edit_sequential_attribute(prior, conditioner, G, id_criterion,
                               img, latent, attr_cond, id_cond,
                               attr_local_idxs, edit_scales, direction_bank,
                               control_encoder=None, controlnet_max_norm=0.0,
-                              controlnet_embed_res=64):
+                              controlnet_embed_res=64,
+                              attr_global_idxs=None, controlnet_disable_attrs=None):
     """Edit several attributes on the same face ONE AFTER ANOTHER, instead of
     edit_multi_attribute's parallel sum of independently-computed deltas.
 
@@ -901,7 +1005,7 @@ def edit_sequential_attribute(prior, conditioner, G, id_criterion,
     current_latent = latent
     current_attr_cond = attr_cond.clone()
     combined_skips = None
-    for local_idx, scale in zip(attr_local_idxs, edit_scales):
+    for i, (local_idx, scale) in enumerate(zip(attr_local_idxs, edit_scales)):
         src_cond = torch.cat([id_cond, current_attr_cond], dim=1)
         mid_latent, _ = prior(current_latent, src_cond, zero_pad)
 
@@ -917,8 +1021,15 @@ def edit_sequential_attribute(prior, conditioner, G, id_criterion,
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=current_latent)
 
-        if control_encoder is not None:
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
+        this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
+        use_controlnet_here = (control_encoder is not None and not (
+            controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
+        if use_controlnet_here:
+            # Sequential edits condition on the EVOLVING latent, matching how
+            # direction_bank above receives current_latent -- so a latent_cond
+            # control encoder sees the state this step actually starts from.
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+                                   latent=current_latent)
             if controlnet_max_norm > 0:
                 skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -1066,7 +1177,7 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
                          img, latent, attr_cond, id_cond,
                          attr_local_idxs, edit_scales, direction_bank,
                          attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0,
-                         controlnet_embed_res=64):
+                         controlnet_embed_res=64, controlnet_disable_attrs=None):
     """Edit several attributes on the same face at once.
 
     Composes N independently-computed single-attribute guided deltas by
@@ -1087,8 +1198,11 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     attr_local_idxs: list of local indices (into args.attribute_index) to edit.
     edit_scales: float, or list of floats matching attr_local_idxs.
     attr_global_idxs: optional list of absolute CelebA indices, same order
-        as attr_local_idxs (only needed if you rely on bypass_glasses_direction_bank
-        elsewhere; not handled here, direction_bank is always used per attribute).
+        as attr_local_idxs. Needed for controlnet_disable_attrs (below) to know
+        which of these edits are gender/age vs eyeglasses; direction_bank
+        itself is always used per attribute regardless.
+    controlnet_disable_attrs: absolute attribute indices to skip ControlNet
+        injection for, same semantics as edit_single_attribute.
     """
     if isinstance(edit_scales, (int, float)):
         edit_scales = [edit_scales] * len(attr_local_idxs)
@@ -1103,7 +1217,7 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
 
     combined_delta = torch.zeros_like(latent)
     combined_skips = None
-    for local_idx, scale in zip(attr_local_idxs, edit_scales):
+    for i, (local_idx, scale) in enumerate(zip(attr_local_idxs, edit_scales)):
         new_attr_cond = attr_cond.clone()
         src = attr_cond[:, local_idx]
         new_attr_cond[:, local_idx] = src * (1.0 - scale) + (1.0 - src) * scale
@@ -1116,8 +1230,12 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent)
         combined_delta = combined_delta + guided_delta
-        if control_encoder is not None:
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
+        this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
+        use_controlnet_here = (control_encoder is not None and not (
+            controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
+        if use_controlnet_here:
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+                                   latent=latent)
             if controlnet_max_norm > 0:
                 skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
                 clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
@@ -1579,6 +1697,11 @@ if __name__ == '__main__':
     parser.add_argument('--controlnet_per_direction', action='store_true',
                         help='Must match training --controlnet_per_direction if enabled. '
                              'Auto-restored from config.json.')
+    parser.add_argument('--controlnet_latent_cond', action='store_true',
+                        help='Must match training --controlnet_latent_cond. Changes the control '
+                             'encoder\'s parameter shapes, so a mismatch is a hard checkpoint '
+                             'load error rather than silently wrong numbers. Auto-restored from '
+                             'config.json.')
     parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
                         help='Must match training --controlnet_init_gain. Only sets the log_gain '
                              'init; the trained value comes from the checkpoint. Auto-restored '
@@ -1590,17 +1713,21 @@ if __name__ == '__main__':
                              'what the feature-map injection contributes. Deliberately NOT in '
                              'RUN_CONFIG_KEYS -- an eval-time override, never restored from config.')
     parser.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
-                        help='ABLATION: keep control_encoder loaded and active, but skip its '
-                             'injection for these ABSOLUTE attribute indices only (e.g. 20 39 for '
-                             'gender/age), letting others (e.g. eyeglasses) keep it. Found via '
+                        help='Keep control_encoder loaded and active, but skip its injection for '
+                             'these ABSOLUTE attribute indices only (e.g. 20 39 for gender/age), '
+                             'letting others (e.g. eyeglasses) keep it. Found via '
                              '--disable_controlnet + visual audit: eyeglasses ADD accuracy '
                              'collapses without ControlNet (93%%->12%%, it synthesizes frame '
                              'structure the W+ direction bank cannot), but gender/age saw no '
                              'measurable accuracy benefit from it (~70.7%% either way) while it '
                              'introduced a hairline/collar sparkle artifact that --scale sweeps '
-                             "(1.0/0.8/0.6) did not change. Use this instead of the all-or-nothing "
-                             '--disable_controlnet once you know which attributes actually need '
-                             'it. Deliberately NOT in RUN_CONFIG_KEYS -- an eval-time override.')
+                             "(1.0/0.8/0.6) did not change. DEFAULT (when this flag is omitted "
+                             'entirely): auto-resolved by resolve_controlnet_disable_attrs() to '
+                             '[20, 39] (whichever are in --attribute_index) so gender/age skip '
+                             'ControlNet by default and eyeglasses keeps it. Pass this flag '
+                             'explicitly (with any list, including none of your attributes) to '
+                             'take control back. Deliberately NOT in RUN_CONFIG_KEYS -- an '
+                             'eval-time override.')
     parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
                         help='Must match training --controlnet_max_norm if it was set (0 = no cap '
                              'was applied at training time either). Auto-restored from config.json.')
@@ -1629,28 +1756,38 @@ if __name__ == '__main__':
                              'CelebA attribute without per-attribute CLIP prompt/threshold '
                              'tuning. Adds an "AccCeleb" column and becomes the preferred '
                              'headline accuracy number when set.')
-    parser.add_argument('--glasses_judge', default='clip', choices=['clip', 'parser'],
+    parser.add_argument('--glasses_judge', default='parser', choices=['clip', 'parser'],
                         help="How to score EYEGLASSES (attr 15). 'clip' = CLIP zero-shot "
                              "(under-detects thin frames; a visual audit showed ~44%% of "
                              "glasses-add edits that visibly had glasses were scored as "
                              "failures). 'parser' = BiSeNet face-parser glasses class (label "
                              "6), a purpose-built pixel-level detector that matches the eye "
                              "far better -- REPLACES CLIP for the glasses cell only; gender/age "
-                             "still use CLIP. Recommended: parser. Re-run the dumper to "
-                             "visually confirm calibration after switching.")
+                             "still use CLIP. DEFAULT as of this change: parser, with connected-"
+                             "component noise filtering (see GlassesParserJudge/"
+                             "--glasses_min_component_frac) so stray segmentation pixels can no "
+                             "longer saturate the score. Re-run the dumper to visually confirm "
+                             "calibration; pass --glasses_judge clip to restore the old default.")
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
                         help='BiSeNet weights for --glasses_judge parser and '
                              '--composite_face_region.')
-    parser.add_argument('--composite_face_region', action='store_true',
+    parser.add_argument('--composite_face_region',
+                        action=argparse.BooleanOptionalAction, default=False,
                         help='Training-free post-process: composite the edited face back onto '
                              'the source-RECONSTRUCTION background/hair using the BiSeNet face '
                              'mask (common/face_parser.py FaceParser.composite), for every '
                              'attribute. Targets the long-standing complaint that gender/age '
                              'edits move far more of the image than intended (global W+ edits '
-                             'leak into background/hair). Zero training risk -- pure inference-'
-                             'time compositing -- so try this before any further training-loss '
-                             'changes for identity/leakage.')
-    parser.add_argument('--composite_method', default='alpha', choices=['alpha', 'poisson'],
+                             'leak into background/hair) and directly helps both ID score '
+                             '(background/hair no longer contaminate the crop) and perceived '
+                             'ghosting/artifacts at the face boundary. Zero training risk -- pure '
+                             'inference-time compositing. DEFAULT: off -- the Poisson blend leaves '
+                             'a visible tonal seam at the face boundary that inflates LPIPS/depresses '
+                             'ID scores relative to the raw uncomposited output (confirmed by '
+                             're-evaluating the same checkpoint with and without this flag); pass '
+                             '--composite_face_region to enable (falls back automatically with a '
+                             'warning if --face_parser_weights is unavailable).')
+    parser.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'],
                         help="'alpha' (default) feather-blends by mask weight -- fast, but a "
                              "visible seam shows wherever the edited face's brightness/color "
                              "differs from the background at the boundary (a wider "
@@ -1668,6 +1805,13 @@ if __name__ == '__main__':
     parser.add_argument('--glasses_area_sharpness', type=float, default=0.5,
                         help='Relative width of the parser presence sigmoid; smaller = sharper '
                              '(more binary) present/absent decision.')
+    parser.add_argument('--glasses_min_component_frac', type=float, default=0.00015,
+                        help='Connected components of the BiSeNet glasses mask smaller than '
+                             'this fraction of the 512x512 image are dropped before computing '
+                             'the area fraction, so a handful of stray mislabeled pixels cannot '
+                             'saturate the score on their own. Default ~39px; raise if the dumper '
+                             'still shows noise-driven false positives, lower if it is dropping '
+                             'real thin-frame detections.')
     parser.add_argument('--id_indep_pretrained', default='casia-webface',
                         choices=['casia-webface', 'vggface2'],
                         help='Pretrained weights for the facenet-pytorch id_indep judge. '
@@ -1692,12 +1836,13 @@ if __name__ == '__main__':
                              'age direction fine layers -- but a blanket cut at layer 4 also '
                              'kills real aging signal (500-sample eval: rm-direction AccCLIP '
                              '76%->17%), so narrow the range with --age_fine_layer_start.')
-    parser.add_argument('--age_fine_layer_start', type=int, default=4,
-                        help='First W+ layer index (0-17) affected by --age_fine_layer_scale. '
-                             'Default 4 matches the reg_loss_fine grouping used elsewhere in '
-                             'this codebase, but that boundary was shown to cut into real '
-                             'aging signal too. Try 10-14 to target only the very last, most '
-                             'texture/color-dominated layers.')
+    parser.add_argument('--age_fine_layer_start', type=int, default=10,
+                        help='First W+ layer index (0-17) affected by the age fine-layer '
+                             'color-cast mitigation (see load_models). The reg_loss_fine '
+                             'grouping used elsewhere in this codebase starts at layer 4, but '
+                             'that boundary was shown to also cut into real aging signal '
+                             '(rm-direction AccCLIP 76%%->17%%); default 10 targets only the '
+                             'very last, most texture/color-dominated layers.')
     parser.add_argument('--success_margin', type=float, default=0.0,
                         help='Strict success requires the edited score to cross 0.5 by this '
                              'margin. 0.0 = just cross the decision boundary.')
@@ -1713,6 +1858,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
 
     # Auto-detect latest step if not specified
     if args.step is None:
