@@ -339,9 +339,12 @@ class AttributeDirectionBank(nn.Module):
         if self.num_k > 1 and attr_idx is not None:
             attr_idx_long = attr_idx.view(-1).long()
             div_losses = []
+            sharp_losses = []
+            max_entropy = math.log(self.num_k)
             for a in attr_idx_long.unique():
                 m = attr_idx_long == a
-                batch_mean = alpha[m, a, :].mean(dim=0)   # (K,) -- LIVE, keeps gradient
+                sample_alpha = alpha[m, a, :]             # (n, K) -- LIVE, per-sample
+                batch_mean = sample_alpha.mean(dim=0)      # (K,)
                 if self.training:
                     with torch.no_grad():
                         self.gate_usage_ema[a].mul_(self.gate_usage_ema_decay).add_(
@@ -349,12 +352,31 @@ class AttributeDirectionBank(nn.Module):
                         )
                 p = batch_mean.clamp(min=1e-8)
                 p = p / p.sum()
-                entropy = -(p * p.log()).sum()
-                max_entropy = math.log(self.num_k)
-                div_losses.append((max_entropy - entropy) / max_entropy)
+                marginal_entropy = -(p * p.log()).sum()
+                div_losses.append((max_entropy - marginal_entropy) / max_entropy)
+
+                # Conditional entropy (per-sample sharpness): the marginal
+                # term above only requires the BATCH AVERAGE alpha to stay
+                # spread across K -- satisfied just as well by every sample
+                # independently converging to an identical near-uniform
+                # mixture as by samples genuinely routing to different
+                # slots. Confirmed on a real trained checkpoint (Young,
+                # K=12): dir_gate_entropy_ema/attr_39 sat pinned at exactly
+                # log(K) with ~1e-7 variance for 40k steps -- gate_net had
+                # collapsed to a constant output, not a face-dependent one.
+                # This term (see models/direction_selection.py, written but
+                # never wired up until now) pushes each SAMPLE toward a
+                # confident, low-entropy choice, which the marginal term
+                # alone cannot enforce.
+                sp = sample_alpha.clamp(min=1e-8)
+                sp = sp / sp.sum(dim=-1, keepdim=True)
+                cond_entropy = -(sp * sp.log()).sum(dim=-1).mean()
+                sharp_losses.append(cond_entropy / max_entropy)
             self._last_gate_diversity_loss = torch.stack(div_losses).mean()
+            self._last_gate_sharpness_loss = torch.stack(sharp_losses).mean()
         else:
             self._last_gate_diversity_loss = torch.zeros([], device=device, dtype=dtype)
+            self._last_gate_sharpness_loss = torch.zeros([], device=device, dtype=dtype)
 
         # mix_dirs: weighted sum of K direction vectors per attribute
         mix_dirs = (alpha.unsqueeze(-1).unsqueeze(-1)                  # (B, A, K, 1, 1)
@@ -528,6 +550,38 @@ class AttributeDirectionBank(nn.Module):
         if self.num_k <= 1:
             return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
         loss = getattr(self, '_last_gate_diversity_loss', None)
+        if loss is None:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        return loss
+
+    def gate_sharpness_loss(self):
+        """Per-sample conditional-entropy loss for the K-mixture gate.
+
+        gate_load_balance_loss() above only constrains the BATCH-AVERAGE
+        usage distribution to stay spread across K slots -- a constraint
+        every sample independently outputting an identical near-uniform
+        alpha satisfies exactly as well as genuine per-sample routing does.
+        Confirmed as the actual failure mode on a real trained checkpoint:
+        Young's dir_gate_entropy_ema sat pinned at exactly log(K) (K=12)
+        with ~1e-7 variance across 40k steps -- gate_net had collapsed to a
+        constant, face-independent output despite gate_load_balance_loss
+        being active the whole run.
+
+        This loss instead penalizes each SAMPLE's own entropy directly
+        (mirrors models/direction_selection.py's cond_ent term, written
+        earlier but never wired into training). Minimizing it pushes every
+        sample toward a confident, low-entropy choice among the K
+        directions; used together with gate_load_balance_loss (which still
+        stops that choice from collapsing onto the same one or two slots
+        for everyone), the pair is the standard cond-entropy / marginal-
+        entropy pairing for mixture-of-experts load balancing.
+
+        Returns the value computed in the MOST RECENT forward() call, same
+        call-after-forward contract as gate_load_balance_loss().
+        """
+        if self.num_k <= 1:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        loss = getattr(self, '_last_gate_sharpness_loss', None)
         if loss is None:
             return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
         return loss

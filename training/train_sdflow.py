@@ -970,6 +970,22 @@ if __name__ == '__main__':
                              'per-K-slot usage, used by --dir_gate_diversity_weight and the '
                              'dir_gate_entropy_per_attr wandb logs). Higher = smoother/slower to '
                              'react; matches the convention of --balance_ema_decay.')
+    parser.add_argument('--dir_gate_sharpness_weight', type=float, default=0.0,
+                        help='Weight on AttributeDirectionBank.gate_sharpness_loss(), the per-sample '
+                             'conditional-entropy complement to --dir_gate_diversity_weight (which '
+                             'only constrains the BATCH-AVERAGE usage to look spread across K -- '
+                             'satisfied just as well by every sample outputting an identical '
+                             'near-uniform alpha as by real per-sample routing). Confirmed on a real '
+                             'trained checkpoint: with --dir_gate_diversity_weight alone, Young '
+                             '(K=12) had dir_gate_entropy_ema pinned at exactly log(K) with ~1e-7 '
+                             'variance for 40k steps -- gate_net had collapsed to a constant, '
+                             'face-independent output. This loss pushes each sample toward a sharp, '
+                             'confident choice among the K directions instead. 0 (default) disables; '
+                             'try 0.05-0.2 alongside a nonzero --dir_gate_diversity_weight (the pair '
+                             'is the standard cond-entropy / marginal-entropy mixture-of-experts load '
+                             'balancing combination -- using sharpness alone with no diversity term '
+                             'risks collapsing onto a small subset of slots instead of spreading '
+                             'routing across all of them). No effect when num_k<=1.')
     parser.add_argument('--direction_k', type=int, default=1,
                         help='Number of mixture directions per attribute in the Direction Bank.')
     parser.add_argument('--direction_guided_delta_max_norm', type=float, default=0.0,
@@ -2250,10 +2266,19 @@ if __name__ == '__main__':
                     if (args.dir_gate_diversity_weight > 0 and direction_bank_applied)
                     else _zero.clone()
                 )
+                # Same stale-tensor caveat as dir_gate_diversity_loss above --
+                # gate_sharpness_loss() also reads a value computed inside
+                # THIS step's direction_bank(...) forward call.
+                dir_gate_sharpness_loss = (
+                    direction_bank.gate_sharpness_loss()
+                    if (args.dir_gate_sharpness_weight > 0 and direction_bank_applied)
+                    else _zero.clone()
+                )
             else:
                 dir_orth_loss = _zero.clone()
                 dir_logs = {}
                 dir_gate_diversity_loss = _zero.clone()
+                dir_gate_sharpness_loss = _zero.clone()
 
             diffusion_loss = _zero.clone()       # non-age DDS (glasses/gender)
             age_diffusion_loss = _zero.clone()   # age DDS, separately weighted
@@ -2364,6 +2389,7 @@ if __name__ == '__main__':
                 args.gate_sparse_weight * lag_gate_sparse +\
                 args.direction_orth_weight * dir_orth_loss +\
                 args.dir_gate_diversity_weight * dir_gate_diversity_loss +\
+                args.dir_gate_sharpness_weight * dir_gate_sharpness_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
                 (args.age_diffusion_weight if args.age_diffusion_weight >= 0
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
@@ -2502,6 +2528,7 @@ if __name__ == '__main__':
                 'dir_bank_global_delta_max_norm': dir_logs.get('dir_bank_global_delta_max_norm', _zero.detach().clone()),
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
                 'dir_gate_diversity_loss': dir_gate_diversity_loss,
+                'dir_gate_sharpness_loss': dir_gate_sharpness_loss,
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
