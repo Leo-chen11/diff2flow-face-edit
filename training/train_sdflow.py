@@ -1383,6 +1383,10 @@ if __name__ == '__main__':
         json.dump(vars(args), _f, indent=2, default=str)
     print(f'** run config saved to {os.path.join(save_root, "config.json")}')
     attribute_index = torch.tensor(args.attribute_index,dtype=int)
+    # Local column of src_probs/target_probs (both ordered by attribute_index)
+    # that holds the source image's Male probability, for the age DDS
+    # prompt's gender-conditioned wording. None when 20 isn't being trained.
+    gender_local_idx = args.attribute_index.index(20) if 20 in args.attribute_index else None
     base_condition_dim = args.id_cond_dim + len(args.attribute_index)
     condition_dim = base_condition_dim
     prior = cnf(
@@ -2375,6 +2379,8 @@ if __name__ == '__main__':
                         timestep_min=args.age_diffusion_timestep_min,
                         timestep_max=args.age_diffusion_timestep_max,
                         face_mask=_dds_mask(_face_age[is_age], mid_abs_idx[is_age]),
+                        gender_prob=(src_probs[is_age, gender_local_idx].detach()
+                                    if gender_local_idx is not None else None),
                     )
                     age_diffusion_loss = age_diffusion_loss + _loss
                     diffusion_logs.update({f'age_{k}': v for k, v in _logs.items()})

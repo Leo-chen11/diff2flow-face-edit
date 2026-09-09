@@ -1163,6 +1163,16 @@ def main():
                               "on female training faces), age direction dragging Male toward 1.0 "
                               "even with age_k=4 gender-stratified sub-directions (see "
                               "dump_attr_failures.py --watch_attrs 20).")
+    parser.add_argument("--dup_slot_cos_thresh", type=float, default=0.99,
+                        help="Two K-slots of the same attribute whose mean |cosine| over all 18 "
+                             "layers reaches this are treated as duplicates and abort the run. "
+                             "Distinct strata normally land well under 0.1, so the gap is wide; "
+                             "raise toward 1.0 only to tolerate near-tied strata.")
+    parser.add_argument("--allow_duplicate_slots", action="store_true",
+                        help="Downgrade the duplicate-slot check to a warning and save the bank "
+                             "anyway. Only for deliberately degenerate configs (e.g. probing what "
+                             "a collapsed bank does); a bank that trips this check cannot benefit "
+                             "from gate routing.")
     args = parser.parse_args()
 
     if not (0 < args.extreme_pct < 50):
@@ -1442,21 +1452,60 @@ def main():
     layer_norms = all_dirs.norm(dim=-1)                    # (num_attrs, K, 18)
     direction_units = F.normalize(all_dirs, dim=-1, eps=1e-8)  # (num_attrs, K, 18, 512)
 
-    # Intra-attr cosine similarity check (glasses, gender, extra attrs)
-    print("\n=== Intra-attribute cosine similarity after orthogonalization ===")
-    for attr_idx in [15, 20] + extra_attr_ids:
-        if attr_idx not in attr_index_map:
-            continue
+    # Duplicate-slot check. Two K-slots of the same attribute must not end up
+    # (near-)identical: intra_attr_orthogonalize_safe deliberately RESTORES the
+    # original direction when orthogonalization collapses it, which is the right
+    # numerical choice but means genuinely degenerate strata -- several falling
+    # back to the same stratum-agnostic direction, or padded/tiled from one
+    # another -- survive into the saved bank looking perfectly well-formed.
+    # Nothing else in the file reveals it: direction_units is F.normalize'd per
+    # layer, so every slot's flattened norm is sqrt(18) whatever it contains,
+    # and layer_norms won't show it either. Slot-vs-slot cosine is the only
+    # signal. This checks EVERY attribute (the previous version skipped 39) at
+    # EVERY layer (it sampled 0/8/17) and raises (it only printed -- which is
+    # how a fully collapsed age bank shipped and then trained for ~40k steps).
+    print("\n=== Intra-attribute slot cosine similarity after orthogonalization ===")
+    dup_failures = []
+    for attr_idx in args.attribute_index:
         a = attr_index_map[attr_idx]
-        for layer in [0, 8, 17]:
-            for i in range(K):
-                for j in range(i + 1, K):
-                    cos = F.cosine_similarity(
-                        direction_units[a, i, layer].unsqueeze(0),
-                        direction_units[a, j, layer].unsqueeze(0),
-                    ).item()
-                    if abs(cos) > 0.1:
-                        print(f"  attr {attr_idx} layer {layer}: K{i} vs K{j}: {cos:.4f}")
+        # (K, K, L) pairwise cosine; slots are already unit-norm per layer.
+        cos_kkl = torch.einsum("ild,jld->ijl", direction_units[a], direction_units[a])
+        pair_mean = cos_kkl.abs().mean(dim=-1)                  # (K, K), mean over 18 layers
+        if attr_idx == 39 and skip_age_orth:
+            print(f"  attr {attr_idx}: all K slots identical by design (age_k=1 tiling) — skipped")
+            continue
+        worst = 0.0
+        for i in range(K):
+            for j in range(i + 1, K):
+                m = pair_mean[i, j].item()
+                worst = max(worst, m)
+                if m >= args.dup_slot_cos_thresh:
+                    dup_failures.append((attr_idx, i, j, m))
+                elif m > 0.1:
+                    print(f"  attr {attr_idx}: K{i} vs K{j}: mean|cos| = {m:.4f}")
+        print(f"  attr {attr_idx}: worst slot pair mean|cos| = {worst:.4f}")
+
+    if dup_failures:
+        detail = "\n".join(
+            f"    attr {ai}: K{i} vs K{j}  mean|cos| = {m:.4f}"
+            for ai, i, j, m in dup_failures
+        )
+        msg = (
+            f"{len(dup_failures)} duplicate K-slot pair(s) "
+            f"(mean|cos| >= {args.dup_slot_cos_thresh}):\n{detail}\n"
+            "  Duplicate slots make the gate's choice meaningless -- every slot it can\n"
+            "  route to applies the same edit -- so per-sample routing cannot help and\n"
+            "  the gate collapses to a uniform distribution during training.\n"
+            "  Likely causes: a stratum too small to yield its own direction (raise\n"
+            "  --min_samples or lower --extreme_pct so each stratum keeps a usable\n"
+            "  pool), --substyle_k splitting a stratum with no real sub-structure, or\n"
+            "  K exceeding the number of genuinely distinct strata so slots get padded.\n"
+            "  Pass --allow_duplicate_slots to save the bank anyway."
+        )
+        if args.allow_duplicate_slots:
+            print(f"\nWARNING: {msg}")
+        else:
+            raise RuntimeError(msg)
 
     bank = {
         "direction_units": direction_units,   # (num_attrs, K, 18, 512)
