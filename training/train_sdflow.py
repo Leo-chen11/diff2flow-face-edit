@@ -1601,17 +1601,51 @@ if __name__ == '__main__':
             raise ValueError('--use_controlnet_injection requires --direction_bank_path '
                               '(and --velocity_field != original) -- attr_delta, needed to '
                               'condition the control encoder, is only computed on that branch.')
-        from models.control_encoder import AttributeControlEncoder
+        from models.control_encoder import (AttributeControlEncoder,
+                                            LegacySingleResControlEncoder,
+                                            is_legacy_state_dict)
         _cn_res = args.controlnet_res or [args.controlnet_embed_res]
-        control_encoder = AttributeControlEncoder(
-            num_attrs=len(args.attribute_index),
-            out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
-            out_res=_cn_res,
-            hidden_dim=args.controlnet_hidden_dim,
-            init_gain=args.controlnet_init_gain,
-            per_direction=args.controlnet_per_direction,
-            latent_cond=args.controlnet_latent_cond,
-        ).cuda()
+        # When resuming, the checkpoint decides the architecture -- otherwise a
+        # run resumed from a pre-multi-resolution checkpoint would build the new
+        # module, fail to match a single key, and silently start its control
+        # encoder from scratch while every other module carried on. That looks
+        # like "the injection stopped working after resuming" and is invisible
+        # except in one non-strict-load line.
+        _legacy_resume = False
+        if args.resume_dir is not None and args.resume_step is not None:
+            _ce_path = os.path.join(resolve_resume_save_dir(args.resume_dir),
+                                    'control_encoder-{}'.format(str(int(args.resume_step)).zfill(7)))
+            if os.path.exists(_ce_path):
+                _legacy_resume = is_legacy_state_dict(torch.load(_ce_path, map_location='cpu'))
+        if _legacy_resume:
+            if args.controlnet_res and len(_cn_res) > 1:
+                raise ValueError(
+                    f'--controlnet_res {_cn_res} cannot be applied to a resumed run: the '
+                    f'checkpoint at {_ce_path} was trained with single-resolution injection, '
+                    f'and adding resolutions changes the module shape. Train multi-resolution '
+                    f'from scratch (drop --resume_dir/--resume_step), or drop --controlnet_res '
+                    f'to continue this run at {args.controlnet_embed_res} only.')
+            print(f'[Resume] control_encoder checkpoint predates multi-resolution injection; '
+                  f'building the single-resolution architecture at {args.controlnet_embed_res}.')
+            control_encoder = LegacySingleResControlEncoder(
+                num_attrs=len(args.attribute_index),
+                out_channels=args.controlnet_channels,
+                out_res=args.controlnet_embed_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=args.controlnet_init_gain,
+                per_direction=args.controlnet_per_direction,
+                latent_cond=args.controlnet_latent_cond,
+            ).cuda()
+        else:
+            control_encoder = AttributeControlEncoder(
+                num_attrs=len(args.attribute_index),
+                out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
+                out_res=_cn_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=args.controlnet_init_gain,
+                per_direction=args.controlnet_per_direction,
+                latent_cond=args.controlnet_latent_cond,
+            ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
         _cn_chans = ', '.join(f'{r}:{c}ch' for r, c in control_encoder.res_channels.items())

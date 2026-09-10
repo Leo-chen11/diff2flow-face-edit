@@ -778,20 +778,43 @@ def load_models(args):
               'through the W+ path (flow + Direction Bank) only, even though this run was '
               'trained with the injection active.')
     elif getattr(args, 'use_controlnet_injection', False):
-        from models.control_encoder import AttributeControlEncoder
+        from models.control_encoder import (AttributeControlEncoder,
+                                            LegacySingleResControlEncoder,
+                                            is_legacy_state_dict)
         _cn_res = getattr(args, 'controlnet_res', None) or [args.controlnet_embed_res]
-        control_encoder = AttributeControlEncoder(
-            num_attrs=num_attrs,
-            out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
-            out_res=_cn_res,
-            hidden_dim=args.controlnet_hidden_dim,
-            init_gain=getattr(args, 'controlnet_init_gain', 1.0),
-            per_direction=getattr(args, 'controlnet_per_direction', False),
-            latent_cond=getattr(args, 'controlnet_latent_cond', False),
-        ).to(device).eval()
         ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
-        if os.path.exists(ce_ckpt_path):
-            result = control_encoder.load_state_dict(load_network(ce_ckpt_path), strict=False)
+        # Which architecture to build is decided by the CHECKPOINT, not by the
+        # flags: a single-resolution baseline and a multi-resolution challenger
+        # are by construction on opposite sides of this change, and comparing
+        # them is the whole point. Building the wrong one turns every metric
+        # into noise (or, with strict loading, a hard error mid-eval).
+        _ce_state = load_network(ce_ckpt_path) if os.path.exists(ce_ckpt_path) else None
+        if _ce_state is not None and is_legacy_state_dict(_ce_state):
+            if len(_cn_res) > 1:
+                print(f'[Compat] control_encoder checkpoint predates multi-resolution '
+                      f'injection; building the single-resolution architecture at '
+                      f'{args.controlnet_embed_res} and ignoring --controlnet_res {_cn_res}.')
+            control_encoder = LegacySingleResControlEncoder(
+                num_attrs=num_attrs,
+                out_channels=args.controlnet_channels,
+                out_res=args.controlnet_embed_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=getattr(args, 'controlnet_init_gain', 1.0),
+                per_direction=getattr(args, 'controlnet_per_direction', False),
+                latent_cond=getattr(args, 'controlnet_latent_cond', False),
+            ).to(device).eval()
+        else:
+            control_encoder = AttributeControlEncoder(
+                num_attrs=num_attrs,
+                out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
+                out_res=_cn_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=getattr(args, 'controlnet_init_gain', 1.0),
+                per_direction=getattr(args, 'controlnet_per_direction', False),
+                latent_cond=getattr(args, 'controlnet_latent_cond', False),
+            ).to(device).eval()
+        if _ce_state is not None:
+            result = control_encoder.load_state_dict(_ce_state, strict=False)
             if result.missing_keys:
                 print(f'[WARN] control_encoder missing keys: {result.missing_keys[:8]}')
             if result.unexpected_keys:

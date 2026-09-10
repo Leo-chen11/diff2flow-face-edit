@@ -142,6 +142,125 @@ def add_skips(a, b):
     return out
 
 
+def is_legacy_state_dict(state):
+    """True when a saved control_encoder came from LegacySingleResControlEncoder.
+
+    The two architectures store different parameter names ('attr_heads.*' vs
+    'stages.*'/'heads.*'), so a checkpoint can be identified without knowing
+    which flags produced it -- which matters because the runs that need
+    comparing (a single-resolution baseline against a multi-resolution
+    challenger) are by construction on opposite sides of this change.
+    """
+    return any(k.startswith('attr_heads.') for k in state)
+
+
+class LegacySingleResControlEncoder(nn.Module):
+    """The original single-resolution encoder, kept verbatim so checkpoints
+    trained before multi-resolution injection stay loadable.
+
+    This is not the architecture to train new runs with -- it exists so the
+    single-resolution baseline can still be evaluated with the same command
+    as the run being compared against it. Deleting it would make every
+    pre-existing control_encoder checkpoint unloadable, which is exactly the
+    baseline an A/B needs.
+
+    Structure and parameter names are unchanged from the version that trained
+    those checkpoints: shared trunk -> seed, one full ConvTranspose2d stack
+    per slot ('attr_heads'), one gain per slot ('log_gain'), single output
+    tensor at out_res.
+    """
+
+    def __init__(self, num_attrs, out_channels=512, out_res=64, seed_res=4, hidden_dim=256,
+                 init_gain=1.0, per_direction=False, latent_cond=False, latent_dim=512):
+        super().__init__()
+        self.num_attrs = int(num_attrs)
+        self.out_channels = int(out_channels)
+        self.out_res = int(out_res)
+        self.seed_res = int(seed_res)
+        self.per_direction = bool(per_direction)
+        self.latent_cond = bool(latent_cond)
+        self.latent_dim = int(latent_dim)
+        self.num_slots = self.num_attrs * 2 if self.per_direction else self.num_attrs
+        assert self.out_res % self.seed_res == 0 and \
+            (self.out_res // self.seed_res) & (self.out_res // self.seed_res - 1) == 0, \
+            "out_res / seed_res must be a power of 2"
+        num_upsamples = int(math.log2(self.out_res // self.seed_res))
+
+        if self.latent_cond:
+            latent_feat_dim = min(hidden_dim, self.latent_dim)
+            self.latent_proj = nn.Sequential(
+                nn.LayerNorm(self.latent_dim),
+                nn.Linear(self.latent_dim, latent_feat_dim),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            latent_feat_dim = 0
+            self.latent_proj = None
+        trunk_in = self.num_attrs + latent_feat_dim
+        self.fc = nn.Sequential(
+            nn.Linear(trunk_in, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.seed_proj = nn.Linear(hidden_dim, self.out_channels * self.seed_res * self.seed_res)
+        self.attr_heads = nn.ModuleList([
+            self._build_head(self.out_channels, num_upsamples) for _ in range(self.num_slots)
+        ])
+        init_gain = max(float(init_gain), 1e-4)
+        raw = math.log(math.expm1(init_gain))
+        self.log_gain = nn.Parameter(torch.full((self.num_slots,), raw))
+        # Mirrors the multi-resolution attribute so callers can report the
+        # injected width the same way for either architecture.
+        self.res_channels = {self.out_res: self.out_channels}
+        self.out_res_list = [self.out_res]
+
+    def slot_index(self, attr_idx, is_rm=None):
+        if not self.per_direction:
+            return attr_idx
+        if is_rm is None:
+            raise ValueError('per_direction AttributeControlEncoder needs is_rm per sample')
+        return attr_idx * 2 + is_rm.long()
+
+    def _build_head(self, channels, num_upsamples):
+        layers = []
+        for _ in range(num_upsamples):
+            layers += [
+                nn.ConvTranspose2d(channels, channels, kernel_size=4, stride=2, padding=1),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+        layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None):
+        """Returns {out_res: (B, C, out_res, out_res)} -- a one-entry dict, so
+        callers handle either architecture through the same interface. The
+        generator accepts a dict at any number of resolutions, including one."""
+        B = attr_delta.size(0)
+        device, dtype = attr_delta.device, attr_delta.dtype
+        trunk_in = attr_delta
+        if self.latent_cond:
+            if latent is None:
+                raise ValueError(
+                    'LegacySingleResControlEncoder(latent_cond=True) needs the source '
+                    'latent; pass latent=<W+ tensor>.')
+            w = latent.mean(dim=1).to(device=device, dtype=dtype)
+            trunk_in = torch.cat([attr_delta, self.latent_proj(w)], dim=1)
+        hidden = self.fc(trunk_in)
+        seed = self.seed_proj(hidden).view(B, self.out_channels, self.seed_res, self.seed_res)
+
+        out = torch.zeros(B, self.out_channels, self.out_res, self.out_res,
+                          device=device, dtype=dtype)
+        attr_idx = attr_idx.view(-1).long()
+        slot_idx = self.slot_index(attr_idx, is_rm)
+        for s in range(self.num_slots):
+            mask = slot_idx == s
+            if mask.any():
+                out[mask] = self.attr_heads[s](seed[mask])
+
+        out = F.normalize(out.reshape(B, -1), dim=1).view_as(out)
+        gain = F.softplus(self.log_gain)[slot_idx].to(device=device, dtype=dtype)
+        return {self.out_res: out * gain.view(-1, 1, 1, 1)}
+
+
 class AttributeControlEncoder(nn.Module):
     """Predicts additive feature-map corrections at one or more StyleGAN2
     resolutions, from the attribute being edited and (optionally) the source
