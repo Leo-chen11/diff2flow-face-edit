@@ -25,6 +25,7 @@ from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
+from models.control_encoder import clip_skips, skips_norm_per_sample
 from models.direction_bank import AttributeDirectionBank
 from models.layer_mask import AttributeLayerMask
 from models.stylegan2.model import Generator
@@ -1025,8 +1026,28 @@ if __name__ == '__main__':
                              '--direction_bank_path. See models/control_encoder.py module '
                              'docstring for the motivation.')
     parser.add_argument('--controlnet_embed_res', type=int, default=64,
-                        help='Must match Generator.forward()\'s embed_res (default 64) -- the '
-                             'feature-map resolution the injection targets.')
+                        help='Single-resolution injection target; must match '
+                             'Generator.forward()\'s embed_res (default 64). Superseded by '
+                             '--controlnet_res when that is given.')
+    parser.add_argument('--controlnet_res', nargs='*', type=int, default=None,
+                        help='Inject at SEVERAL StyleGAN2 feature-map resolutions instead of '
+                             'only --controlnet_embed_res, e.g. --controlnet_res 64 128. '
+                             'WHY: StyleGAN2 puts mid-level STRUCTURE around 64x64 and fine '
+                             'TEXTURE at 128-512. The two worst edits in eval are the two that '
+                             'must SYNTHESIZE what the source lacks -- Eyeglasses add (58.0%%, '
+                             'needs a frame) and Young rm (58.8%%, needs wrinkles) -- while '
+                             'every edit that only removes or displaces existing structure '
+                             'scores 72-96%%. A frame is mid-level structure so 64x64 can carry '
+                             'it, which is why injection measured load-bearing for eyeglasses '
+                             '(AccCeleb add 93%%->12%% with it off) and useless for age (~70.7%% '
+                             'either way): wrinkles live in a band a 64x64 injection never '
+                             'reaches. Channel width per resolution is forced to the '
+                             'generator\'s own (512 at 64, 256 at 128, 128 at 256) so the add '
+                             'broadcasts; --controlnet_channels is then ignored. Costs '
+                             'activation memory that grows with the finest band, so start at '
+                             '64 128 and add 256 only if the fine-texture edits still lag. '
+                             'CHANGES MODEL SHAPE -- needs a fresh run, cannot --resume_dir '
+                             'into a single-resolution checkpoint.')
     parser.add_argument('--controlnet_channels', type=int, default=512,
                         help='Must match StyleGAN2\'s channel count at --controlnet_embed_res '
                              '(512 for the default channel_multiplier=2 at 64x64).')
@@ -1581,10 +1602,11 @@ if __name__ == '__main__':
                               '(and --velocity_field != original) -- attr_delta, needed to '
                               'condition the control encoder, is only computed on that branch.')
         from models.control_encoder import AttributeControlEncoder
+        _cn_res = args.controlnet_res or [args.controlnet_embed_res]
         control_encoder = AttributeControlEncoder(
             num_attrs=len(args.attribute_index),
-            out_channels=args.controlnet_channels,
-            out_res=args.controlnet_embed_res,
+            out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
+            out_res=_cn_res,
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=args.controlnet_init_gain,
             per_direction=args.controlnet_per_direction,
@@ -1592,9 +1614,10 @@ if __name__ == '__main__':
         ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
-        print(f'** ControlNet-style feature injection enabled: embed_res='
-              f'{args.controlnet_embed_res}, channels={args.controlnet_channels}, '
-              f'init_gain={args.controlnet_init_gain} (= control_skip_norm once active)'
+        _cn_chans = ', '.join(f'{r}:{c}ch' for r, c in control_encoder.res_channels.items())
+        print(f'** ControlNet-style feature injection enabled at {len(_cn_res)} '
+              f'resolution(s) [{_cn_chans}], '
+              f'init_gain={args.controlnet_init_gain} (= per-band control_skip_norm once active)'
               + (f'; held off until step {_warm} so the W+ path matures first'
                  if _warm > 0 else '; active from step 0'))
 
@@ -1927,6 +1950,7 @@ if __name__ == '__main__':
 
             control_skips = None
             control_skip_norm = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            control_band_logs = {}
             loss_control_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
             controlnet_active = (control_encoder is not None
                                  and n_iter >= args.controlnet_warmup_steps)
@@ -1950,12 +1974,17 @@ if __name__ == '__main__':
                 # corruption didn't destroy ArcFace's coarse face embedding).
                 # An explicit L2 penalty plus optional hard cap closes that
                 # gap, mirroring guided_delta_max_norm on the W+ path.
-                skip_norm_per_sample = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
+                skip_norm_per_sample = skips_norm_per_sample(control_skips)
                 loss_control_reg = skip_norm_per_sample.pow(2).mean()
-                if args.controlnet_max_norm > 0:
-                    clip = (args.controlnet_max_norm / skip_norm_per_sample.clamp(min=1e-8)).clamp(max=1.0)
-                    control_skips = control_skips * clip.view(-1, 1, 1, 1)
+                control_skips = clip_skips(control_skips, args.controlnet_max_norm)
                 control_skip_norm = skip_norm_per_sample.mean().detach()
+                # Per-band norms too: with several resolutions the combined
+                # number above hides which band the model actually leans on,
+                # and that is the whole question this change exists to answer.
+                with torch.no_grad():
+                    for _r, _t in control_skips.items():
+                        control_band_logs[f'control_skip_norm_r{_r}'] = (
+                            _t.reshape(_t.shape[0], -1).norm(dim=1).mean().detach())
 
             new_face_tensors = G([new_latents], skips=control_skips,
                                  embed_res=args.controlnet_embed_res,
@@ -2550,6 +2579,7 @@ if __name__ == '__main__':
                 'clip_prompt_gender_fraction': clip_logs.get('clip_prompt_gender_fraction', latent.new_tensor(0.0)),
                 'clip_prompt_glasses_fraction': clip_logs.get('clip_prompt_glasses_fraction', latent.new_tensor(0.0)),
             }
+            _log_dict.update(control_band_logs)
             current_attr_scales = attr_scales.current_scales()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'attr_scale/attr_{_attr_abs_idx}'] = current_attr_scales[_i]

@@ -60,6 +60,7 @@ from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
+from models.control_encoder import add_skips, clip_skips
 from models.stylegan2.model import Generator
 
 
@@ -491,7 +492,7 @@ RUN_CONFIG_KEYS = [
     'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
-    'controlnet_per_direction', 'controlnet_latent_cond',
+    'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
 ]
 
 
@@ -545,12 +546,26 @@ def resolve_controlnet_disable_attrs(args):
     using_controlnet = (getattr(args, 'use_controlnet_injection', False)
                          and not getattr(args, 'disable_controlnet', False))
     if using_controlnet and getattr(args, 'controlnet_disable_attrs', None) is None:
+        # The "no benefit for age/gender" measurement that motivates this
+        # default was taken with SINGLE-resolution (64x64) injection, and
+        # 64x64 is the band where mid-level structure lives, not the 128-512
+        # bands that carry wrinkles and skin texture. A multi-resolution run
+        # reaches a band the old finding never tested, so applying the old
+        # default there would silently switch off exactly the thing the run
+        # was built to measure. Keep the default only for single-resolution.
+        multi_res = len(getattr(args, 'controlnet_res', None) or []) > 1
         auto = [i for i in (20, 39) if i in args.attribute_index]
-        if auto:
+        if multi_res:
+            print('[Default] ControlNet injection kept for ALL attributes: this checkpoint '
+                  f'injects at {sorted(args.controlnet_res)}, and the gender/age auto-disable '
+                  'was measured on 64x64-only injection (which cannot reach fine texture). '
+                  'Pass --controlnet_disable_attrs 20 39 to restore the old behaviour.')
+        elif auto:
             args.controlnet_disable_attrs = auto
             print(f'[Default] ControlNet injection auto-disabled for {auto} (gender/age) -- '
-                  f'no measured accuracy benefit, causes a hairline/collar sparkle artifact; '
-                  f'kept for eyeglasses. Pass --controlnet_disable_attrs explicitly to override.')
+                  f'no measured accuracy benefit at 64x64, causes a hairline/collar sparkle '
+                  f'artifact; kept for eyeglasses. Pass --controlnet_disable_attrs explicitly '
+                  f'to override.')
     return args
 
 
@@ -764,10 +779,11 @@ def load_models(args):
               'trained with the injection active.')
     elif getattr(args, 'use_controlnet_injection', False):
         from models.control_encoder import AttributeControlEncoder
+        _cn_res = getattr(args, 'controlnet_res', None) or [args.controlnet_embed_res]
         control_encoder = AttributeControlEncoder(
             num_attrs=num_attrs,
-            out_channels=args.controlnet_channels,
-            out_res=args.controlnet_embed_res,
+            out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
+            out_res=_cn_res,
             hidden_dim=args.controlnet_hidden_dim,
             init_gain=getattr(args, 'controlnet_init_gain', 1.0),
             per_direction=getattr(args, 'controlnet_per_direction', False),
@@ -948,10 +964,7 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                 or attr_global_idx not in controlnet_disable_attrs):
             control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
                                             latent=latent)
-            if controlnet_max_norm > 0:
-                skip_norm = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
-                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
-                control_skips = control_skips * clip.view(-1, 1, 1, 1)
+            control_skips = clip_skips(control_skips, controlnet_max_norm)
     else:
         new_latents = new_latents_raw
 
@@ -1030,11 +1043,8 @@ def edit_sequential_attribute(prior, conditioner, G, id_criterion,
             # control encoder sees the state this step actually starts from.
             skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
                                    latent=current_latent)
-            if controlnet_max_norm > 0:
-                skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
-                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
-                skip = skip * clip.view(-1, 1, 1, 1)
-            combined_skips = skip if combined_skips is None else combined_skips + skip
+            skip = clip_skips(skip, controlnet_max_norm)
+            combined_skips = add_skips(combined_skips, skip)
 
         current_latent = current_latent + guided_delta
         current_attr_cond = new_attr_cond
@@ -1236,11 +1246,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         if use_controlnet_here:
             skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
                                    latent=latent)
-            if controlnet_max_norm > 0:
-                skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
-                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
-                skip = skip * clip.view(-1, 1, 1, 1)
-            combined_skips = skip if combined_skips is None else combined_skips + skip
+            skip = clip_skips(skip, controlnet_max_norm)
+            combined_skips = add_skips(combined_skips, skip)
 
     new_latents = latent + combined_delta
     edited_face = G([new_latents], skips=combined_skips, embed_res=controlnet_embed_res,
@@ -1690,6 +1697,9 @@ if __name__ == '__main__':
                              'Auto-restored from config.json if the checkpoint was trained with it.')
     parser.add_argument('--controlnet_embed_res', type=int, default=64,
                         help='Must match training --controlnet_embed_res if enabled.')
+    parser.add_argument('--controlnet_res', nargs='*', type=int, default=None,
+                        help='Must match training --controlnet_res if enabled (multi-resolution '
+                             'feature injection). Auto-restored from config.json.')
     parser.add_argument('--controlnet_channels', type=int, default=512,
                         help='Must match training --controlnet_channels if enabled.')
     parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
