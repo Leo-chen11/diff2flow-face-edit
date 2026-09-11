@@ -25,7 +25,7 @@ from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
-from models.control_encoder import clip_skips, skips_norm_per_sample
+from models.control_encoder import clip_skips, skips_norm_per_sample, skips_reg_per_sample
 from models.direction_bank import AttributeDirectionBank
 from models.layer_mask import AttributeLayerMask
 from models.stylegan2.model import Generator
@@ -2009,7 +2009,12 @@ if __name__ == '__main__':
                 # An explicit L2 penalty plus optional hard cap closes that
                 # gap, mirroring guided_delta_max_norm on the W+ path.
                 skip_norm_per_sample = skips_norm_per_sample(control_skips)
-                loss_control_reg = skip_norm_per_sample.pow(2).mean()
+                # Mean squared norm PER BAND, not the total: summing would make
+                # this penalty grow with the number of injected resolutions, so
+                # adding a band would itself push every gain down. See
+                # skips_reg_per_sample. Identical to the old value when there is
+                # one band, so --controlnet_reg_weight keeps its calibration.
+                loss_control_reg = skips_reg_per_sample(control_skips).mean()
                 control_skips = clip_skips(control_skips, args.controlnet_max_norm)
                 control_skip_norm = skip_norm_per_sample.mean().detach()
                 # Per-band norms too: with several resolutions the combined

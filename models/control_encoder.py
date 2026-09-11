@@ -103,12 +103,36 @@ def stylegan2_channels(channel_multiplier=2):
 def skips_norm_per_sample(skips):
     """(B,) tensor: total L2 norm across every injected resolution.
 
-    Reported as one number so --controlnet_reg_weight and the
-    control_skip_norm log line keep the same meaning they had when there
-    was only one resolution.
+    For LOGGING and for the hard cap. Do not use this for the L2 penalty --
+    see skips_reg_per_sample, which is scale-free in the number of bands.
     """
     norms = [t.reshape(t.size(0), -1).pow(2).sum(dim=1) for t in skips.values()]
     return torch.stack(norms, dim=0).sum(dim=0).clamp(min=1e-12).sqrt()
+
+
+def skips_reg_per_sample(skips):
+    """(B,) tensor: MEAN squared norm per band -- the quantity
+    --controlnet_reg_weight multiplies.
+
+    Averaged over bands, not summed, so the penalty measures "how hard is
+    each band pushing" rather than "how many bands are there". Summing (the
+    total norm squared) makes the penalty scale linearly with band count:
+    two bands sitting at gain 1.0 would be charged 2.0 where a single band
+    at the same per-band strength is charged 1.0, so merely ADDING a
+    resolution doubles the pressure to shrink every gain. That turns
+    --controlnet_reg_weight into a penalty on using multi-resolution
+    injection at all, which is the opposite of what the flag is for, and it
+    is not hypothetical: the first multi-resolution run (v12) decayed both
+    control_skip_norm_r64 and control_skip_norm_r128 from 1.0 to ~0.2 along
+    near-identical curves over 50k steps -- the signature of a penalty
+    dominating the task gradient uniformly, not of the model judging one
+    band more useful than the other.
+
+    With a single band this is identical to the old definition, so
+    single-resolution runs keep their calibration for --controlnet_reg_weight.
+    """
+    sq = [t.reshape(t.size(0), -1).pow(2).sum(dim=1) for t in skips.values()]
+    return torch.stack(sq, dim=0).mean(dim=0)
 
 
 def clip_skips(skips, max_norm):
