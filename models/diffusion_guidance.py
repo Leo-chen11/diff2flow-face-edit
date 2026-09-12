@@ -66,6 +66,17 @@ def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None):
             # coarser cues male aging actually shows. male_like reads the
             # SOURCE image's Male probability from the same frozen attr_teacher
             # soft_target already uses, so this needs no new signal.
+            #
+            # Third fix, same underlying cause: neither branch of "old" asked
+            # for scalp hair to go gray/white -- male mentioned graying
+            # eyebrows and stubble but not scalp hair, female mentioned no
+            # hair cue at all. Visual audit (dump_attr_failures.py
+            # --primary_judge celeba, attr 39 rm) showed edits the classifier
+            # scored as confidently old (edited Young<=0.15) with wrinkle
+            # texture added but hair color completely untouched -- DDS can
+            # only push toward what the target prompt describes, and hair
+            # color was simply absent from that description, not a cue the
+            # model failed to learn.
             male_like = gender_prob_list is not None and gender_prob_list[i] >= 0.5
             if enabled:
                 prompts.append(
@@ -77,16 +88,17 @@ def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None):
                 )
             else:
                 prompts.append(
-                    "a realistic face photo of an elderly man with a sagging "
-                    "jawline, sunken cheeks, deep-set eyes, a receding hairline, "
-                    "thick graying eyebrows, gray or white stubble, and deeply "
-                    "wrinkled, weathered skin with heavy forehead furrows, "
-                    "prominent nasolabial folds, and crow's feet"
+                    "a realistic face photo of an elderly man with gray or white "
+                    "hair, a sagging jawline, sunken cheeks, deep-set eyes, a "
+                    "receding hairline, thick graying eyebrows, gray or white "
+                    "stubble, and deeply wrinkled, weathered skin with heavy "
+                    "forehead furrows, prominent nasolabial folds, and crow's feet"
                     if male_like else
-                    "a realistic face photo of an elderly woman with a sagging "
-                    "jawline, sunken cheeks, deep-set eyes, a receding hairline, "
-                    "and deeply wrinkled, weathered skin with visible forehead "
-                    "lines, crow's feet, and age spots"
+                    "a realistic face photo of an elderly woman with gray or "
+                    "white hair, a sagging jawline, sunken cheeks, deep-set eyes, "
+                    "a receding hairline, thin graying eyebrows, and deeply "
+                    "wrinkled, weathered skin with visible forehead lines, "
+                    "crow's feet, and age spots"
                 )
         else:
             prompts.append("a realistic face photo of a person")
