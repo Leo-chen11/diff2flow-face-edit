@@ -1782,13 +1782,20 @@ if __name__ == '__main__':
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
-    parser.add_argument('--celeba_attr_judge_weights', default=None,
+    parser.add_argument('--celeba_attr_judge_weights',
+                        default='./data/celeba_attr_resnet18.pth',
                         help='Path to a CelebAAttrClassifierJudge checkpoint (ResNet18, '
                              'https://github.com/Hawaii0821/FaceAttr-Analysis format). '
                              'A supervised 40-attribute classifier that generalizes to any '
                              'CelebA attribute without per-attribute CLIP prompt/threshold '
                              'tuning. Adds an "AccCeleb" column and becomes the preferred '
-                             'headline accuracy number when set.')
+                             'headline accuracy number when set. Defaults to a conventional '
+                             'path under ./data/ so every eval run picks it up automatically '
+                             'once the checkpoint is placed there -- no flag needed on the '
+                             'command line, and nothing changes if that file does not exist '
+                             '(build_judges() catches the missing file and continues without '
+                             'AccCeleb, same as before this default existed). Pass a different '
+                             'path, or an empty string to force it off, to override.')
     parser.add_argument('--glasses_judge', default='parser', choices=['clip', 'parser'],
                         help="How to score EYEGLASSES (attr 15). 'clip' = CLIP zero-shot "
                              "(under-detects thin frames; a visual audit showed ~44%% of "
@@ -1879,9 +1886,13 @@ if __name__ == '__main__':
     parser.add_argument('--success_margin', type=float, default=0.0,
                         help='Strict success requires the edited score to cross 0.5 by this '
                              'margin. 0.0 = just cross the decision boundary.')
-    parser.add_argument('--compute_fid', action='store_true',
-                        help='Compute FID (edited vs source reconstructions). Needs '
-                             'torchmetrics + torch-fidelity.')
+    parser.add_argument('--compute_fid', action=argparse.BooleanOptionalAction, default=True,
+                        help='Compute FID (edited vs source reconstructions). On by default so '
+                             'every eval run reports it without remembering the flag; pass '
+                             '--no-compute_fid to skip (e.g. a quick smoke-test eval). Needs '
+                             'torchmetrics + torch-fidelity -- build_fid() catches ImportError '
+                             'and continues without FID, printing a WARN, so a missing '
+                             'dependency does not crash the rest of eval.')
 
     # Eval config
     parser.add_argument('--batch',        type=int,   default=4)
