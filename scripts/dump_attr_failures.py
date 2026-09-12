@@ -103,7 +103,7 @@ def main(args):
     local_idx = args.attribute_index.index(args.attr)
     attr_name = ATTR_NAMES.get(args.attr, f'attr{args.attr}')
 
-    # Judge: parser for glasses if asked, else CLIP.
+    # Judge: parser for glasses if asked, else --primary_judge (clip / celeba).
     if args.attr == 15 and args.glasses_judge == 'parser':
         pj = GlassesParserJudge(args.face_parser_weights, 'cuda',
                                 area_thresh=args.glasses_area_thresh,
@@ -111,6 +111,13 @@ def main(args):
                                 min_component_frac=getattr(args, 'glasses_min_component_frac', 0.00015))
         print(f'[Judge] {attr_name} = BiSeNet parser (class 6)')
         score_fn = lambda imgs: pj.glasses_prob(imgs)
+    elif args.primary_judge == 'celeba':
+        if not args.celeba_attr_judge_weights:
+            raise SystemExit('--primary_judge celeba requires --celeba_attr_judge_weights.')
+        pcj = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, 'cuda')
+        print(f'[Judge] {attr_name} = CelebAAttrClassifierJudge (independent supervised '
+              f'ResNet18, matches evaluate_sdflow.py\'s AccCeleb)')
+        score_fn = lambda imgs: pcj.scores(imgs)[:, args.attr]
     else:
         cj = CLIPAttributeJudge(args.attribute_index, args.clip_judge_model, 'cuda',
                                  calibration=parse_clip_calibration(args.clip_calibration))
@@ -312,7 +319,20 @@ if __name__ == '__main__':
                          'attributes not being edited here (e.g. --attr 39 --watch_attrs 20 '
                          'checks whether editing Young alone shifts Male).')
     p.add_argument('--celeba_attr_judge_weights', default=None,
-                    help='Used for --watch_attrs scoring if given (preferred over CLIP).')
+                    help='Used for --watch_attrs scoring if given (preferred over CLIP). Also '
+                         'used for the AUDITED attribute itself when --primary_judge celeba.')
+    p.add_argument('--primary_judge', default='clip', choices=['clip', 'celeba'],
+                    help="Which judge scores the attribute being audited (--attr), i.e. what "
+                         "decides success/failure in the montage and the fail/success table. "
+                         "Default 'clip' matches this script's original behavior. 'celeba' "
+                         "requires --celeba_attr_judge_weights and switches to "
+                         "CelebAAttrClassifierJudge -- use this to see whether a CLIP-vs-Celeb "
+                         "AccCLIP/AccCeleb disagreement in evaluate_sdflow.py (e.g. attr 39 rm: "
+                         "CLIP 45.6%% vs Celeb 84.2%% at scale 0.9) is CLIP misjudging real "
+                         "edits or Celeb missing what CLIP catches: rerun the SAME command with "
+                         "only this flag flipped and compare which judge's failures actually "
+                         "look like failures by eye. Ignored for attr 15 with "
+                         "--glasses_judge parser (the parser always wins for glasses).")
     p.add_argument('--fused_hidden_dim', type=int, default=256)
     p.add_argument('--lag_gate_hidden_dim', type=int,   default=64)
     p.add_argument('--lag_gate_init_bias',  type=float, default=-0.5)
