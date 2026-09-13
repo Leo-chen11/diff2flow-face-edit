@@ -302,10 +302,6 @@ LOCAL_REGION_CLASSES = {
     15: [2, 3, 4, 5, 6],
 }
 
-# BiSeNet 'skin' class, used by --color_shift_loss_weight to measure whether
-# an edit shifted the overall skin tone rather than changing texture/geometry.
-SKIN_CLASS = [1]
-
 
 def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
     """attribute_index: the --attribute_index list mapping local -> absolute idx."""
@@ -820,29 +816,6 @@ if __name__ == '__main__':
                              'three consistent with them. Costs one extra frozen G forward per '
                              'step (no_grad) when no face-parser loss already needed it. Pass '
                              '--no-losses_vs_recon to restore the old real-photo references.')
-    parser.add_argument('--color_shift_loss_weight', type=float, default=1.0,
-                        help='Penalize the mean-RGB shift of the BiSeNet skin region between '
-                             'source and edited face, for --color_shift_attrs samples. '
-                             'A visual audit (scripts/dump_attr_failures.py, attr 39 direction '
-                             'rm) found the model satisfies the aging edit largely via a '
-                             'uniform red/orange skin-tone shift rather than genuine structural '
-                             'aging (wrinkles, gray hair) -- confirmed across every fix tried so '
-                             'far (direction changes, scale changes, directional CLIP loss all '
-                             'left the color-cast unchanged). Unlike those, this acts directly '
-                             'on the generated image pixels: it does not touch the direction '
-                             'vector or edit magnitude, it makes the color-shift shortcut itself '
-                             'costly, so satisfying the attribute loss has to come from '
-                             'elsewhere. Genuine structural aging is a texture/geometry change, '
-                             'not a uniform tone shift, so it is barely affected. DEFAULT raised '
-                             'from 0.0 (off) to 1.0, the middle of the previously-suggested '
-                             '0.5-2.0 range: this is the only mechanism in this file that acts '
-                             'directly on the color-cast shortcut, and the reported symptom '
-                             '("aging looks like a color wash, not real aging") is exactly what '
-                             'it targets. Requires a loadable --face_parser_weights. 0 disables.')
-    parser.add_argument('--color_shift_attrs', nargs='*', type=int, default=[39],
-                        help='Attribute indices the color-shift regularizer applies to. '
-                             'Default is age (39) only, since that is the attribute the visual '
-                             'audit found relying on the color-shift shortcut.')
 
     # ── Cross-attribute loss balancing ──────────────────────────────────────
     parser.add_argument('--balance_attr_losses', action=argparse.BooleanOptionalAction, default=False,
@@ -855,18 +828,21 @@ if __name__ == '__main__':
                         help='How aggressively weights move toward equalizing relative progress each update.')
     parser.add_argument('--balance_min_weight', type=float, default=0.25)
     parser.add_argument('--balance_max_weight', type=float, default=4.0)
-    parser.add_argument('--orth_loss_weight', type=float, default=0.005)
-    parser.add_argument('--gate_smooth_weight', type=float, default=0.003)
-    parser.add_argument('--gate_sparse_weight', type=float, default=0.01,
-                        help='L_sparse = mean|g_a|, from the method doc but never wired '
-                             'into the loss until now. gate_smooth only pulls adjacent '
-                             'layers toward each other -- it has no gradient pushing any '
-                             'layer toward 0, so the gate has no incentive to ever close a '
-                             'layer. scripts/inspect_gate.py confirmed this on a trained '
-                             'checkpoint: every layer stayed in 0.79-0.99 regardless of '
-                             'attribute or ODE time (degenerated to an always-open, '
-                             'attribute-agnostic constant). Method doc suggested 0.01, '
-                             'try 0.003 if edits become too weak.')
+    parser.add_argument('--lag_reg_weight', type=float, default=1.0,
+                        help='Overall scale on the LAG-DOF velocity field\'s three internal '
+                             'regularizers (orth, gate_smooth, gate_sparse -- only active when '
+                             '--velocity_field is lag/lag_dof), combined at fixed 0.005:0.003:0.01 '
+                             'relative weights (their old individual defaults, kept as constants '
+                             'here since no run in this project has ever set them to anything else '
+                             '-- 1.0 here reproduces that default exactly; scale all three together '
+                             'by raising or lowering this one number). gate_sparse (L_sparse = '
+                             'mean|g_a|) is in the method doc but was never wired into the loss '
+                             'until it was added here: gate_smooth alone only pulls adjacent layers '
+                             'toward each other, with no gradient ever pushing a layer toward 0, so '
+                             'the gate had no incentive to close a layer at all -- '
+                             'scripts/inspect_gate.py confirmed this on a trained checkpoint, every '
+                             'layer stuck at 0.79-0.99 regardless of attribute or ODE time '
+                             '(degenerated to an always-open, attribute-agnostic constant).')
     parser.add_argument('--reg_global_weight_init', type=float, default=2.0,
                         help='Initial global-layer reg_loss weight, per attribute; then learned '
                              '(see LearnableRegLossWeights). Has no effect after the first step.')
@@ -944,49 +920,34 @@ if __name__ == '__main__':
                              'this starting point, not fixed.')
     parser.add_argument('--direction_freeze', '--direction-freeze',
                         action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--direction_orth_weight', type=float, default=0.0)
-    parser.add_argument('--dir_gate_diversity_weight', type=float, default=0.0,
-                        help='Weight on AttributeDirectionBank.gate_load_balance_loss(), which '
-                             'penalizes the K-mixture gate (gate_net, active whenever the bank has '
-                             'num_k>1, e.g. from --K/--age_k combined with --substyle_k) for '
-                             'collapsing onto a minority of its K slots regardless of the source '
-                             'face. WHY THIS EXISTS: nothing in this project previously supervised '
-                             'gate routing at all -- it only received gradient indirectly through '
-                             'the final guided_delta, with no signal rewarding correct or even '
-                             'diverse routing. Measured on a real trained checkpoint (Eyeglasses, '
-                             'K=12 from --K 4 x --substyle_k 3): the gate collapsed within the first '
-                             'few thousand steps onto ~2 of the 12 slots for 81% of samples '
-                             'regardless of the source face\'s actual gender/age, including almost '
-                             'NEVER routing female_young samples to the female_young-conditioned '
-                             'slots --extreme_min_conf specifically cleaned up in '
-                             'precompute_directions_stratified.py -- which is why that direction-'
-                             'bank fix alone did not move the eyeglasses-add failure rate. This '
-                             'loss does NOT know which slot is demographically correct for a given '
-                             'face (no label fed in for that) -- it only discourages collapsing onto '
-                             'too few slots, a necessary but not sufficient condition for a clean '
-                             'stratum-level direction to actually get used. 0 (default) disables; '
-                             'try 0.05-0.2 to start. No effect when num_k<=1 (K=1, no substyle_k).')
+    parser.add_argument('--dir_gate_reg_weight', type=float, default=0.0,
+                        help='Weight on the K-mixture gate\'s combined load-balancing loss: '
+                             'gate_load_balance_loss() (marginal/batch-average entropy across K, '
+                             'active whenever the bank has num_k>1) PLUS gate_sharpness_loss() '
+                             '(per-sample conditional entropy). Merges what were --dir_gate_'
+                             'diversity_weight and --dir_gate_sharpness_weight into one knob -- '
+                             'every run in this project has always set them equal (both 0.1), so '
+                             'nothing is lost by summing them with a single weight; if a future '
+                             'run needs them decoupled again, reintroduce a second flag then. '
+                             'WHY BOTH TERMS TOGETHER MATTER: nothing else supervises gate routing '
+                             '(it otherwise only gets indirect gradient through guided_delta). The '
+                             'marginal term alone let a real checkpoint collapse onto ~2 of 12 slots '
+                             'for 81%% of samples (Eyeglasses, K=12) while still reporting spread '
+                             'usage on average, and a separate run pinned dir_gate_entropy_ema at '
+                             'exactly log(K) with ~1e-7 variance for 40k steps -- every sample '
+                             'outputting an identical near-uniform alpha satisfies "spread on '
+                             'average" just as well as real per-sample routing does. The two terms '
+                             'are the standard marginal-entropy / conditional-entropy '
+                             'mixture-of-experts pairing: marginal keeps usage spread across all K '
+                             'slots, conditional pushes each sample toward a sharp, confident choice '
+                             'among them; using either alone risks the collapse mode the other one '
+                             'exists to prevent. 0 (default) disables both; try 0.1 to start. No '
+                             'effect when num_k<=1 (K=1, no substyle_k).')
     parser.add_argument('--gate_usage_ema_decay', type=float, default=0.98,
                         help='EMA decay for AttributeDirectionBank.gate_usage_ema (per-attribute, '
-                             'per-K-slot usage, used by --dir_gate_diversity_weight and the '
+                             'per-K-slot usage, used by --dir_gate_reg_weight and the '
                              'dir_gate_entropy_per_attr wandb logs). Higher = smoother/slower to '
                              'react; matches the convention of --balance_ema_decay.')
-    parser.add_argument('--dir_gate_sharpness_weight', type=float, default=0.0,
-                        help='Weight on AttributeDirectionBank.gate_sharpness_loss(), the per-sample '
-                             'conditional-entropy complement to --dir_gate_diversity_weight (which '
-                             'only constrains the BATCH-AVERAGE usage to look spread across K -- '
-                             'satisfied just as well by every sample outputting an identical '
-                             'near-uniform alpha as by real per-sample routing). Confirmed on a real '
-                             'trained checkpoint: with --dir_gate_diversity_weight alone, Young '
-                             '(K=12) had dir_gate_entropy_ema pinned at exactly log(K) with ~1e-7 '
-                             'variance for 40k steps -- gate_net had collapsed to a constant, '
-                             'face-independent output. This loss pushes each sample toward a sharp, '
-                             'confident choice among the K directions instead. 0 (default) disables; '
-                             'try 0.05-0.2 alongside a nonzero --dir_gate_diversity_weight (the pair '
-                             'is the standard cond-entropy / marginal-entropy mixture-of-experts load '
-                             'balancing combination -- using sharpness alone with no diversity term '
-                             'risks collapsing onto a small subset of slots instead of spreading '
-                             'routing across all of them). No effect when num_k<=1.')
     parser.add_argument('--direction_k', type=int, default=1,
                         help='Number of mixture directions per attribute in the Direction Bank.')
     parser.add_argument('--direction_guided_delta_max_norm', type=float, default=0.0,
@@ -1835,7 +1796,7 @@ if __name__ == '__main__':
               f'{judge_balancer.num_slots} slots)')
 
     face_parser = None
-    if args.local_region_loss_weight > 0 or args.color_shift_loss_weight > 0 or args.dds_face_mask:
+    if args.local_region_loss_weight > 0 or args.dds_face_mask:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -1843,9 +1804,6 @@ if __name__ == '__main__':
                 local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
                 print(f'** Face-parser locality loss enabled (weight='
                       f'{args.local_region_loss_weight}) for local attrs {local_attrs}')
-            if args.color_shift_loss_weight > 0:
-                print(f'** Color-shift regularizer enabled (weight='
-                      f'{args.color_shift_loss_weight}) for attrs {args.color_shift_attrs}')
             if args.dds_face_mask:
                 print('** DDS face mask enabled: diffusion-guidance gradient restricted to '
                       'the region each attribute is allowed to touch.')
@@ -2058,21 +2016,6 @@ if __name__ == '__main__':
             #     (--local_region_add_blur) as a geometric prior for where a
             #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
-            # ── Color-shift regularizer (--color_shift_loss_weight) ──────────
-            # A visual audit (scripts/dump_attr_failures.py, attr 39 direction
-            # rm) found the model satisfies the aging edit largely by shifting
-            # the whole face's skin tone toward red/orange, not by drawing
-            # genuine texture/geometry aging (wrinkles, gray hair) -- and this
-            # was unchanged by every fix tried so far that operates on the
-            # direction vector or edit magnitude (direction swaps, scale
-            # sweeps, residual overrides, directional CLIP loss). This
-            # regularizer instead acts directly on the generated pixels: it
-            # penalizes the change in mean skin-region RGB between source and
-            # edited face, making the color-shift shortcut itself costly so
-            # the attribute loss has to be satisfied some other way. Genuine
-            # aging is a texture/geometry change, not a uniform tone shift,
-            # so it should be largely unaffected by this penalty.
-            color_shift_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
             # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
             # Hoisted out of the face-parser branch below so the identity /
@@ -2085,8 +2028,8 @@ if __name__ == '__main__':
             # therefore charges the e4e/StyleGAN inversion error to the edit --
             # error the flow did not cause and cannot usefully remove, since
             # fixing it would mean spending W+ budget on reconstruction rather
-            # than on the attribute. The locality/color-shift losses below
-            # already deliberately compare against src_recon for exactly this
+            # than on the attribute. The locality loss below already
+            # deliberately compares against src_recon for exactly this
             # reason; --losses_vs_recon extends the same principle to the other
             # three losses that were still referencing `img`.
             src_recon = None
@@ -2103,47 +2046,32 @@ if __name__ == '__main__':
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
                 _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
                                          device=latent.device)
-                _is_color = torch.tensor([a in args.color_shift_attrs for a in _mid_abs],
-                                         device=latent.device)
-                if _is_local.any() or _is_color.any():
-                    if _is_local.any():
-                        _is_removal = src_attr_flow > 0.5
-                        _terms = []
-                        for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
-                            _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
-                                                     device=latent.device)
-                            for _dir_sel, _sigma in [
-                                (_attr_sel & _is_removal, 5),
-                                (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
-                            ]:
-                                if not _dir_sel.any():
-                                    continue
-                                with torch.no_grad():
-                                    region = face_parser.get_region_mask(
-                                        src_recon[_dir_sel],
-                                        LOCAL_REGION_CLASSES[_abs_idx],
-                                        blur_sigma=_sigma,
-                                    )
-                                outside = (1.0 - region)
-                                diff_sq = (new_face_tensors[_dir_sel] - src_recon[_dir_sel]).pow(2)
-                                _terms.append(
-                                    (diff_sq * outside).sum()
-                                    / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
+                if _is_local.any():
+                    _is_removal = src_attr_flow > 0.5
+                    _terms = []
+                    for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
+                        _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
+                                                 device=latent.device)
+                        for _dir_sel, _sigma in [
+                            (_attr_sel & _is_removal, 5),
+                            (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
+                        ]:
+                            if not _dir_sel.any():
+                                continue
+                            with torch.no_grad():
+                                region = face_parser.get_region_mask(
+                                    src_recon[_dir_sel],
+                                    LOCAL_REGION_CLASSES[_abs_idx],
+                                    blur_sigma=_sigma,
                                 )
-                        if _terms:
-                            local_region_loss = torch.stack(_terms).mean()
-
-                    if _is_color.any():
-                        with torch.no_grad():
-                            skin_mask = face_parser.get_region_mask(
-                                src_recon[_is_color], SKIN_CLASS, blur_sigma=5,
-                            )   # (N, 1, H, W)
-                        _src_c = src_recon[_is_color]
-                        _edit_c = new_face_tensors[_is_color]
-                        _pixel_count = skin_mask.sum(dim=(2, 3)).clamp(min=1e-6)   # (N, 1)
-                        mean_src = (_src_c * skin_mask).sum(dim=(2, 3)) / _pixel_count    # (N, 3)
-                        mean_edit = (_edit_c * skin_mask).sum(dim=(2, 3)) / _pixel_count  # (N, 3)
-                        color_shift_loss = (mean_edit - mean_src).pow(2).sum(dim=1).mean()
+                            outside = (1.0 - region)
+                            diff_sq = (new_face_tensors[_dir_sel] - src_recon[_dir_sel]).pow(2)
+                            _terms.append(
+                                (diff_sq * outside).sum()
+                                / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
+                            )
+                    if _terms:
+                        local_region_loss = torch.stack(_terms).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -2319,11 +2247,15 @@ if __name__ == '__main__':
                 lag_orth = lag_dof_losses['orth']
                 lag_gate_smooth = lag_dof_losses['gate_smooth']
                 lag_gate_sparse = lag_dof_losses['gate_sparse']
+            # Fixed relative weights are the three terms' pre-merge individual
+            # defaults (0.005 / 0.003 / 0.01) -- see --lag_reg_weight help.
+            # Individual terms above are kept (and still logged below) purely
+            # for diagnostics; only this combined value is trained on.
+            lag_reg_loss = 0.005 * lag_orth + 0.003 * lag_gate_smooth + 0.01 * lag_gate_sparse
 
             id_warmup_steps = 1500
             id_weight = args.id_loss_weight * min(1.0, n_iter / max(1, id_warmup_steps))
             if direction_bank is not None:
-                dir_orth_loss = direction_bank.orthogonality_loss()
                 dir_logs = direction_bank.last_logs if direction_bank_applied else {}
                 # gate_load_balance_loss() returns a value computed INSIDE the
                 # most recent direction_bank(...) forward call (see
@@ -2335,7 +2267,7 @@ if __name__ == '__main__':
                 # been freed by that step's own .backward().
                 dir_gate_diversity_loss = (
                     direction_bank.gate_load_balance_loss()
-                    if (args.dir_gate_diversity_weight > 0 and direction_bank_applied)
+                    if (args.dir_gate_reg_weight > 0 and direction_bank_applied)
                     else _zero.clone()
                 )
                 # Same stale-tensor caveat as dir_gate_diversity_loss above --
@@ -2343,14 +2275,17 @@ if __name__ == '__main__':
                 # THIS step's direction_bank(...) forward call.
                 dir_gate_sharpness_loss = (
                     direction_bank.gate_sharpness_loss()
-                    if (args.dir_gate_sharpness_weight > 0 and direction_bank_applied)
+                    if (args.dir_gate_reg_weight > 0 and direction_bank_applied)
                     else _zero.clone()
                 )
             else:
-                dir_orth_loss = _zero.clone()
                 dir_logs = {}
                 dir_gate_diversity_loss = _zero.clone()
                 dir_gate_sharpness_loss = _zero.clone()
+            # Marginal + conditional entropy, the standard mixture-of-experts
+            # load-balancing pair -- see --dir_gate_reg_weight help for why
+            # both terms are needed together.
+            dir_gate_reg_loss = dir_gate_diversity_loss + dir_gate_sharpness_loss
 
             diffusion_loss = _zero.clone()       # non-age DDS (glasses/gender)
             age_diffusion_loss = _zero.clone()   # age DDS, separately weighted
@@ -2458,18 +2393,13 @@ if __name__ == '__main__':
                 args.reg_loss_weight * reg_loss +\
                 id_weight * id_loss +\
                 args.counter_attr_weight * counter_attr_loss +\
-                args.orth_loss_weight * lag_orth +\
-                args.gate_smooth_weight * lag_gate_smooth +\
-                args.gate_sparse_weight * lag_gate_sparse +\
-                args.direction_orth_weight * dir_orth_loss +\
-                args.dir_gate_diversity_weight * dir_gate_diversity_loss +\
-                args.dir_gate_sharpness_weight * dir_gate_sharpness_loss +\
+                args.lag_reg_weight * lag_reg_loss +\
+                args.dir_gate_reg_weight * dir_gate_reg_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
                 (args.age_diffusion_weight if args.age_diffusion_weight >= 0
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
-                args.color_shift_loss_weight * color_shift_loss +\
                 args.controlnet_reg_weight * loss_control_reg
 
             attr_scale_grad_norm = _zero.detach().clone()
@@ -2590,7 +2520,6 @@ if __name__ == '__main__':
                 'final_delta_max_norm': torch.tensor(args.final_delta_max_norm),
                 'control_skip_norm': control_skip_norm,
                 'loss_control_reg': loss_control_reg.detach(),
-                'dir_orth': dir_orth_loss,
                 'dir_bank_flow_delta_norm': dir_logs.get('dir_bank_flow_delta_norm', _zero.detach().clone()),
                 'dir_bank_dir_delta_norm': dir_logs.get('dir_bank_dir_delta_norm', _zero.detach().clone()),
                 'dir_bank_residual_norm': dir_logs.get('dir_bank_residual_norm', _zero.detach().clone()),
@@ -2603,11 +2532,12 @@ if __name__ == '__main__':
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
                 'dir_gate_diversity_loss': dir_gate_diversity_loss,
                 'dir_gate_sharpness_loss': dir_gate_sharpness_loss,
+                'dir_gate_reg_loss': dir_gate_reg_loss,
+                'lag_reg_loss': lag_reg_loss,
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
-                'loss_color_shift':   color_shift_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
