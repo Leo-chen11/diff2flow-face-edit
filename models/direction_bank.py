@@ -40,6 +40,7 @@ class AttributeDirectionBank(nn.Module):
         use_attr_lora=False,
         attr_lora_rank=4,
         signed_magnitude_input=False,
+        magnitude_latent_cond=False,
         gate_usage_ema_decay=0.98,
     ):
         super().__init__()
@@ -152,6 +153,44 @@ class AttributeDirectionBank(nn.Module):
             self.attr_lora_A = nn.Parameter(torch.randn(self.num_attrs, rank, hidden_dim) * 0.01)
             self.attr_lora_B = nn.Parameter(torch.zeros(self.num_attrs, self.num_layers, rank))
             print(f"[DirectionBank] per-attribute LoRA adapter enabled (rank={rank})")
+
+        # Per-face magnitude conditioning. Without this, magnitude_net's ONLY
+        # input is attr_delta -- so every face gets the identical step size for
+        # a given (attribute, direction), and the whole dir_delta path is
+        # face-independent by construction. The only per-face term left is the
+        # K-slot gate, which measurably collapses to a constant (see the
+        # gate_usage_ema comment below: entropy pinned at log(K) with ~1e-7
+        # variance for 40k steps).
+        #
+        # A residual-ablation scale sweep is what makes this load-bearing: with
+        # the flow residual forced to 0, a single GLOBAL scale from 0.90 to 1.20
+        # recovers five of six add/rm directions back to (Male add: past) the
+        # full model's accuracy. So magnitude, not direction, is the binding
+        # constraint -- and a global scale is the wrong instrument for it,
+        # because it overshoots the easy faces (spending identity for accuracy
+        # already won) while still undershooting the hard ones. That trades
+        # along the Acc/ID frontier instead of moving it. Conditioning the
+        # magnitude on the source face is what lets the two move together.
+        #
+        # Added into magnitude_net's hidden pre-activation rather than
+        # concatenated onto its input, so magnitude_net[0] keeps its shape and
+        # existing checkpoints still load. LayerNorm first because w's large DC
+        # component (the StyleGAN W mean) would otherwise dominate the signal
+        # and make this learn a constant offset instead of a per-face one. The
+        # projection is zero-initialized, so this is a strict no-op until
+        # trained -- same convention as attr_lora_B above and the ControlNet
+        # injection heads.
+        self.magnitude_latent_cond = bool(magnitude_latent_cond)
+        if self.magnitude_latent_cond:
+            hidden_dim = self.magnitude_net[0].out_features   # 64
+            self.mag_w_cond = nn.Sequential(
+                nn.LayerNorm(self.latent_dim),
+                nn.Linear(self.latent_dim, hidden_dim),
+            )
+            with torch.no_grad():
+                self.mag_w_cond[-1].weight.zero_()
+                self.mag_w_cond[-1].bias.zero_()
+            print("[DirectionBank] per-face magnitude conditioning enabled")
 
         # gate_net: learns per-sample mixture weights over K directions (only when K>1)
         if self.num_k > 1:
@@ -289,7 +328,13 @@ class AttributeDirectionBank(nn.Module):
         # forces them equal. The sign of the edit still comes from attr_delta
         # below either way, so this only affects how far each side travels.
         mag_input = attr_delta if self.signed_magnitude_input else attr_delta.abs()
-        mag_hidden = torch.tanh(self.magnitude_net[0](mag_input))          # (B, 64)
+        mag_pre = self.magnitude_net[0](mag_input)                         # (B, 64)
+        if self.magnitude_latent_cond and latent is not None:
+            # Same pooling as _gate_weights, so both per-face paths read the
+            # source latent identically.
+            w_pooled = latent.mean(dim=1).to(device=device, dtype=dtype)   # (B, 512)
+            mag_pre = mag_pre + self.mag_w_cond(w_pooled)
+        mag_hidden = torch.tanh(mag_pre)                                   # (B, 64)
         mag_logits = self.magnitude_net[2](mag_hidden)                     # (B, A*L)
         mag_logits = mag_logits.view(B, self.num_attrs, self.num_layers)
 
@@ -458,13 +503,24 @@ class AttributeDirectionBank(nn.Module):
         # ── Logging ───────────────────────────────────────────────────────
         with torch.no_grad():
             flow_norm = flow_delta.reshape(B, -1).norm(dim=1).mean()
-            dir_norm = dir_delta.reshape(B, -1).norm(dim=1).mean()
+            dir_per_sample = dir_delta.reshape(B, -1).norm(dim=1)          # (B,)
+            dir_norm = dir_per_sample.mean()
+            # Coefficient of variation of the per-sample edit magnitude. This
+            # is the direct check that --magnitude_latent_cond is doing
+            # something: with it off (and the K-gate collapsed) every sample
+            # sharing an attribute gets an identical magnitude, so this sits at
+            # ~0. It should become and stay clearly positive once per-face
+            # conditioning trains. Batches mixing attributes inflate it for a
+            # reason unrelated to per-face adaptivity, so read it on
+            # --attribute_sampling cycle runs.
+            dir_cv = dir_per_sample.std(unbiased=False) / dir_norm.clamp(min=1e-8)
             residual_norm = residual.reshape(B, -1).norm(dim=1).mean()
             guided_pre_clip_norm = guided_delta_pre_clip.reshape(B, -1).norm(dim=1).mean()
             guided_norm = guided_delta.reshape(B, -1).norm(dim=1).mean()
             logs = {
                 "dir_bank_flow_delta_norm": flow_norm.detach(),
                 "dir_bank_dir_delta_norm": dir_norm.detach(),
+                "dir_bank_dir_delta_norm_cv": dir_cv.detach(),
                 "dir_bank_residual_norm": residual_norm.detach(),
                 "dir_bank_guided_delta_norm_pre_clip": guided_pre_clip_norm.detach(),
                 "dir_bank_guided_delta_norm": guided_norm.detach(),

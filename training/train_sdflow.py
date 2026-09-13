@@ -977,6 +977,23 @@ if __name__ == '__main__':
                              "moves the compensation inside the model so edit_scale stays at 1.0. "
                              "Parameter shapes are unchanged, so an existing checkpoint can be "
                              "fine-tuned with --resume_dir rather than retrained from scratch.")
+    parser.add_argument('--magnitude_latent_cond', action='store_true',
+                        help="Condition the edit magnitude on the SOURCE FACE. Without this, "
+                             "magnitude_net's only input is attr_delta, so every face gets the "
+                             "identical step size for a given (attribute, direction) -- the whole "
+                             "dir_delta path is face-independent by construction, and the one "
+                             "per-face term that remains (the K-slot gate) measurably collapses to "
+                             "a constant. A residual-ablation scale sweep is what makes this "
+                             "load-bearing: with the flow residual forced to 0, one GLOBAL scale "
+                             "from 0.90 to 1.20 recovers five of six add/rm directions back to (Male "
+                             "add: past) the full model's accuracy, so magnitude is the binding "
+                             "constraint. But a global scale overshoots easy faces -- spending "
+                             "identity on accuracy already won -- while still undershooting hard "
+                             "ones, which trades along the Acc/ID frontier instead of moving it. "
+                             "Zero-initialized projection, so this is a strict no-op at step 0 and "
+                             "magnitude_net keeps its shape: safe to enable on an existing "
+                             "checkpoint via --resume_dir. Watch dir_bank_dir_delta_norm_cv to "
+                             "confirm it actually trains away from face-independence.")
     parser.add_argument('--use_controlnet_injection', action='store_true',
                         help='ControlNet-style additive injection into an INTERMEDIATE StyleGAN2 '
                              'feature map (models/stylegan2/model.py Generator\'s dormant `skips` '
@@ -1540,6 +1557,7 @@ if __name__ == '__main__':
             use_attr_lora=args.use_attr_lora,
             attr_lora_rank=args.attr_lora_rank,
             signed_magnitude_input=args.signed_magnitude_input,
+            magnitude_latent_cond=args.magnitude_latent_cond,
             gate_usage_ema_decay=args.gate_usage_ema_decay,
         ).cuda()
         if args.freeze_direction_bank_nets:

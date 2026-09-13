@@ -490,6 +490,7 @@ RUN_CONFIG_KEYS = [
     'attr_backbone', 'conditioner_backbone', 'clip_model', 'fused_hidden_dim',
     'img_size', 'direction_residual_scale', 'direction_bank_path',
     'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
+    'magnitude_latent_cond',
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
@@ -677,6 +678,7 @@ def load_models(args):
             use_attr_lora=getattr(args, 'use_attr_lora', False),
             attr_lora_rank=getattr(args, 'attr_lora_rank', 4),
             signed_magnitude_input=getattr(args, 'signed_magnitude_input', False),
+            magnitude_latent_cond=getattr(args, 'magnitude_latent_cond', False),
         ).to(device).eval()
         if os.path.exists(db_ckpt_path):
             # The frozen direction_units are a registered buffer, so they live
@@ -1712,6 +1714,9 @@ if __name__ == '__main__':
                         help='Must match training --attr_lora_rank if --use_attr_lora is set.')
     parser.add_argument('--signed_magnitude_input', action='store_true',
                         help='Must match training --signed_magnitude_input. Auto-restored from '
+                             'config.json.')
+    parser.add_argument('--magnitude_latent_cond', action='store_true',
+                        help='Must match training --magnitude_latent_cond. Auto-restored from '
                              'config.json.')
     parser.add_argument('--use_controlnet_injection', action='store_true',
                         help='Load the ControlNet-style AttributeControlEncoder and inject its '
