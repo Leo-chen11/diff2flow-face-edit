@@ -817,15 +817,28 @@ if __name__ == '__main__':
                              'measured mean RGB over the WHOLE FACE, which structurally cannot '
                              'see a spatially local change (it averages to ~0) -- hair graying IS '
                              'a global property of one region, so a mean-based measure is the '
-                             'right instrument here. Hinge-style (only penalizes ABOVE '
-                             '--hair_gray_target_sat), so already-gray hair costs nothing. '
-                             'Pass 0 (default) to fully disable -- builds a FaceParser the same '
-                             'way --local_region_loss_weight does (shared instance if either is '
-                             'set).')
-    parser.add_argument('--hair_gray_target_sat', type=float, default=0.15,
-                        help='Target mean HSV-style saturation ((max-min)/max) for the hair '
-                             'region under --hair_gray_loss_weight. Real gray/white hair sits '
-                             'low; brown/black hair is well above this.')
+                             'right instrument here. Target is RELATIVE to each sample\'s OWN '
+                             'source hair saturation (see --hair_gray_relative_ratio), not one '
+                             'hardcoded color -- works uniformly whether the source hair is '
+                             'black, brown, blonde, red, or already partly gray, instead of '
+                             'assuming a single numerical definition of "old hair". Hinge-style '
+                             '(only penalizes ABOVE the target), so already-gray hair costs '
+                             'nothing. Pass 0 (default) to fully disable -- builds a FaceParser '
+                             'the same way --local_region_loss_weight does (shared instance if '
+                             'any of the three is set).')
+    parser.add_argument('--hair_gray_relative_ratio', type=float, default=0.5,
+                        help='Under --hair_gray_loss_weight: the edited hair region\'s mean '
+                             'saturation must drop to at most this fraction of the SAME sample\'s '
+                             'source hair saturation (measured on src_recon). Scales the required '
+                             'change to each source\'s own starting color instead of a fixed '
+                             'absolute target -- vivid dyed hair and dark brown hair both need '
+                             'real desaturation but by different absolute amounts, while hair '
+                             'that already reads as gray needs almost none.')
+    parser.add_argument('--hair_gray_abs_cap', type=float, default=0.25,
+                        help='Absolute ceiling on the --hair_gray_relative_ratio target. Without '
+                             'this, a source with only mild saturation to begin with could '
+                             'satisfy the loss while remaining visibly colored, since the '
+                             'relative ratio alone never asks for MORE than proportional change.')
     parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
                         help='Compare the edited image against the source RECONSTRUCTION '
                              'G(latent) instead of the real photo in id_loss, the directional '
@@ -1854,7 +1867,8 @@ if __name__ == '__main__':
                       'the region each attribute is allowed to touch.')
             if args.hair_gray_loss_weight > 0:
                 print(f'** Hair-graying loss enabled (weight={args.hair_gray_loss_weight}, '
-                      f'target_sat={args.hair_gray_target_sat}) for age(39) removal edits')
+                      f'target={args.hair_gray_relative_ratio}x source sat, capped at '
+                      f'{args.hair_gray_abs_cap}) for age(39) removal edits')
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
             print(f'[WARN] Face parser unavailable ({exc}); locality/hair-gray/DDS-mask '
@@ -2030,6 +2044,15 @@ if __name__ == '__main__':
                     for _r, _t in control_skips.items():
                         control_band_logs[f'control_skip_norm_r{_r}'] = (
                             _t.reshape(_t.shape[0], -1).norm(dim=1).mean().detach())
+                    # Spatial-gate coverage per band (see AttributeControlEncoder
+                    # heads' +1-channel comment): starts ~0.98 (near-full-coverage
+                    # init) everywhere. A local attribute (eyeglasses) should drift
+                    # down over training as local_region_loss's gradient teaches it
+                    # to close outside the allowed region; a global attribute
+                    # (Male/Young), which local_region_loss never touches, has no
+                    # reason to move and should stay near its init.
+                    for _r, _g in getattr(control_encoder, 'last_gate_mean', {}).items():
+                        control_band_logs[f'control_gate_mean_r{_r}'] = _g
 
             new_face_tensors = G([new_latents], skips=control_skips,
                                  embed_res=args.controlnet_embed_res,
@@ -2126,28 +2149,53 @@ if __name__ == '__main__':
                 # See --hair_gray_loss_weight help for the failure-audit evidence
                 # motivating this. Only touches samples where THIS step's edited
                 # attribute is age AND the edit direction is removal (src already
-                # Young -> aging). Measured on the EDITED image (new_face_tensors),
-                # not src_recon -- unlike local_region_loss we WANT this region to
-                # have changed; the whole point is grading how much it changed.
+                # Young -> aging).
+                #
+                # Target is RELATIVE to each sample's OWN source saturation, not
+                # a fixed absolute constant -- a single hardcoded target (e.g.
+                # "saturation must drop below 0.15") implicitly assumes one
+                # numerical definition of "gray" that does not fit every source
+                # hair color/lighting condition equally: a person who starts
+                # with vivid dyed-red hair and one who starts with dark brown
+                # both need real desaturation, but by different absolute
+                # amounts, while someone whose hair is already close to gray
+                # needs almost none. Scaling the target off src_recon's own
+                # measured saturation generalizes across any starting hair
+                # color instead of encoding an assumption about what "old hair"
+                # numerically looks like. The abs cap is a floor under that
+                # scaling: without it, a sample that starts only mildly
+                # saturated could satisfy the loss while remaining visibly
+                # colored, since relative_ratio alone never asks for MORE than
+                # proportional change.
                 if args.hair_gray_loss_weight > 0:
                     _is_age_rm = torch.tensor([a == 39 for a in _mid_abs],
                                               device=latent.device) & _is_removal
                     if _is_age_rm.any():
                         with torch.no_grad():
-                            hair_mask = face_parser.get_region_mask(
+                            src_hair_mask = face_parser.get_region_mask(
+                                src_recon[_is_age_rm], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                            edit_hair_mask = face_parser.get_region_mask(
                                 new_face_tensors[_is_age_rm], HAIR_REGION_CLASS, blur_sigma=3,
                             )
-                        _hair_img = new_face_tensors[_is_age_rm] * 0.5 + 0.5   # [-1,1] -> [0,1]
-                        _mx = _hair_img.max(dim=1, keepdim=True).values
-                        _mn = _hair_img.min(dim=1, keepdim=True).values
-                        _sat = (_mx - _mn) / _mx.clamp(min=1e-4)               # (N,1,H,W)
-                        _mask_sum = hair_mask.sum().clamp(min=1e-4)
-                        # Skip samples where BiSeNet found ~no hair pixels (bald,
-                        # hat, hair out of frame) -- the mean would be dominated
-                        # by a handful of misclassified pixels.
-                        if hair_mask.sum() > 0.01 * hair_mask.numel():
-                            mean_sat = (_sat * hair_mask).sum() / _mask_sum
-                            hair_gray_loss = F.relu(mean_sat - args.hair_gray_target_sat)
+                        # Skip samples where BiSeNet found ~no hair pixels in
+                        # EITHER pass (bald, hat, hair out of frame) -- the mean
+                        # would be dominated by a handful of misclassified pixels.
+                        _min_px = 0.01 * src_hair_mask.numel()
+                        if src_hair_mask.sum() > _min_px and edit_hair_mask.sum() > _min_px:
+                            def _region_sat(img_pm1, mask):
+                                img01 = img_pm1 * 0.5 + 0.5                   # [-1,1] -> [0,1]
+                                mx = img01.max(dim=1, keepdim=True).values
+                                mn = img01.min(dim=1, keepdim=True).values
+                                sat = (mx - mn) / mx.clamp(min=1e-4)          # (N,1,H,W)
+                                return (sat * mask).sum() / mask.sum().clamp(min=1e-4)
+
+                            with torch.no_grad():
+                                src_sat = _region_sat(src_recon[_is_age_rm], src_hair_mask)
+                            edit_sat = _region_sat(new_face_tensors[_is_age_rm], edit_hair_mask)
+                            target = (src_sat * args.hair_gray_relative_ratio).clamp(
+                                max=args.hair_gray_abs_cap)
+                            hair_gray_loss = F.relu(edit_sat - target)
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))

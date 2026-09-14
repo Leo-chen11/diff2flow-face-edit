@@ -449,13 +449,37 @@ class AttributeControlEncoder(nn.Module):
         # NOT zero-initialized: the output is L2-normalized in forward(), so a
         # zero conv would divide by zero. Magnitude safety comes from the gain
         # (and --controlnet_max_norm) instead.
+        #
+        # +1 output channel: a per-pixel spatial gate logit, sigmoid'd and
+        # multiplied into the content BEFORE the L2 normalize in _tap(). Without
+        # it, injection has no mechanism telling it WHERE the face/eyes/glasses
+        # are -- the seed is a spatial pattern grown purely from a pooled
+        # attribute+latent vector, so nothing rewards concentrating energy in
+        # one region over spreading it across the whole map, and for local
+        # attributes (currently eyeglasses, see LOCAL_REGION_CLASSES in
+        # train_sdflow.py) that fights --local_region_loss_weight: it penalizes
+        # injected content landing outside the allowed region, but the encoder
+        # had no cheap way to comply short of shrinking its output everywhere,
+        # spending its whole magnitude budget to satisfy a spatial constraint.
+        # The gate gives it a direct lever -- local_region_loss's existing
+        # gradient now teaches THIS gate where to close, instead of fighting
+        # through the whole conv stack. No new loss needed: local_region_loss
+        # already supplies the signal, this just gives it something cheap to
+        # act on. Bias-initialized wide open (see below) so a global attribute
+        # (Male/Young), which local_region_loss never touches, has no gradient
+        # pushing its gate anywhere and stays effectively full-coverage.
         self.heads = nn.ModuleList([
             nn.ModuleList([
-                nn.Conv2d(self.res_channels[r], self.res_channels[r], kernel_size=3, padding=1)
+                nn.Conv2d(self.res_channels[r], self.res_channels[r] + 1, kernel_size=3, padding=1)
                 for r in self.out_res
             ])
             for _ in range(self.num_slots)
         ])
+        with torch.no_grad():
+            for _slot_heads in self.heads:
+                for _head in _slot_heads:
+                    _head.bias[-1] = 4.0          # sigmoid(4) ~= 0.982: starts near fully-open
+                    _head.weight[-1].mul_(0.01)   # low input-sensitivity at step 0
 
         # One learnable magnitude per (slot, resolution), through softplus so
         # it stays positive. Stored inverted from init_gain so that at step 0
@@ -509,6 +533,12 @@ class AttributeControlEncoder(nn.Module):
 
         # Climb the shared ladder once for the whole batch, tapping off a
         # per-slot output conv wherever the current resolution is one we inject at.
+        # last_gate_mean: {res: scalar} mean spatial-gate value this forward call,
+        # logging only (see heads' +1-channel comment in __init__) -- read this
+        # after a forward pass to watch a local attribute's gate close in on its
+        # allowed region over training, and confirm a global attribute's gate
+        # stays near its ~0.98 init.
+        self.last_gate_mean = {}
         wanted = set(self.out_res)
         skips = {}
         for stage, res in zip(self.stages, self.stage_res):
@@ -518,13 +548,25 @@ class AttributeControlEncoder(nn.Module):
         return skips
 
     def _tap(self, feat, res, slot_idx, gains, B, device, dtype):
-        """Per-slot output conv at one resolution, L2-normalized then scaled
-        by that (slot, resolution)'s learnable gain."""
+        """Per-slot output conv at one resolution: split into content + a
+        spatial gate logit, sigmoid the gate and apply it to the content BEFORE
+        the L2 normalize, then scale by that (slot, resolution)'s learnable
+        gain. Gating before normalize is what lets the gate actually
+        concentrate the fixed energy budget into the gated region instead of
+        just attenuating the whole map uniformly (which normalize would undo)."""
         r_i = self.out_res.index(res)
-        out = torch.zeros(B, self.res_channels[res], res, res, device=device, dtype=dtype)
+        C = self.res_channels[res]
+        out = torch.zeros(B, C, res, res, device=device, dtype=dtype)
+        gate_logit = torch.zeros(B, 1, res, res, device=device, dtype=dtype)
         for s in range(self.num_slots):
             mask = slot_idx == s
             if mask.any():
-                out[mask] = self.heads[s][r_i](feat[mask])
+                raw = self.heads[s][r_i](feat[mask])       # (n, C+1, res, res)
+                out[mask] = raw[:, :C]
+                gate_logit[mask] = raw[:, C:]
+        gate = torch.sigmoid(gate_logit)                     # (B, 1, res, res)
+        with torch.no_grad():
+            self.last_gate_mean[res] = gate.mean().detach()
+        out = out * gate
         out = F.normalize(out.reshape(B, -1), dim=1).view_as(out)
         return out * gains[slot_idx, r_i].view(-1, 1, 1, 1)
