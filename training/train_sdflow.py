@@ -302,6 +302,9 @@ LOCAL_REGION_CLASSES = {
     15: [2, 3, 4, 5, 6],
 }
 
+# BiSeNet hair class, used by --hair_gray_loss_weight (see that flag's help).
+HAIR_REGION_CLASS = [17]
+
 
 def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
     """attribute_index: the --attribute_index list mapping local -> absolute idx."""
@@ -799,6 +802,30 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
+    parser.add_argument('--hair_gray_loss_weight', type=float, default=0.0,
+                        help='Age(39) REMOVAL-direction only (src already Young -> aging edit): '
+                             'push the HAIR region (BiSeNet class 17, see HAIR_REGION_CLASS) '
+                             'toward lower saturation, i.e. graying, instead of relying only on '
+                             'the DDS text prompt (diffusion_guidance.py already asks for '
+                             '"gray or white hair"). dump_attr_failures.py failure-vs-success '
+                             'audit on Young rm found Brown_Hair present in 38%% of judge-failed '
+                             'samples vs 12%% of successes -- the single strongest correlate of a '
+                             'failed aging edit, despite that DDS prompt cue already existing, so '
+                             'the text prompt alone is not reliably winning against '
+                             'higher-frequency wrinkle texture for gradient budget. This is NOT '
+                             'the removed --color_shift_loss_weight mistake repeated: that one '
+                             'measured mean RGB over the WHOLE FACE, which structurally cannot '
+                             'see a spatially local change (it averages to ~0) -- hair graying IS '
+                             'a global property of one region, so a mean-based measure is the '
+                             'right instrument here. Hinge-style (only penalizes ABOVE '
+                             '--hair_gray_target_sat), so already-gray hair costs nothing. '
+                             'Pass 0 (default) to fully disable -- builds a FaceParser the same '
+                             'way --local_region_loss_weight does (shared instance if either is '
+                             'set).')
+    parser.add_argument('--hair_gray_target_sat', type=float, default=0.15,
+                        help='Target mean HSV-style saturation ((max-min)/max) for the hair '
+                             'region under --hair_gray_loss_weight. Real gray/white hair sits '
+                             'low; brown/black hair is well above this.')
     parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
                         help='Compare the edited image against the source RECONSTRUCTION '
                              'G(latent) instead of the real photo in id_loss, the directional '
@@ -1814,7 +1841,7 @@ if __name__ == '__main__':
               f'{judge_balancer.num_slots} slots)')
 
     face_parser = None
-    if args.local_region_loss_weight > 0 or args.dds_face_mask:
+    if args.local_region_loss_weight > 0 or args.dds_face_mask or args.hair_gray_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -1825,9 +1852,12 @@ if __name__ == '__main__':
             if args.dds_face_mask:
                 print('** DDS face mask enabled: diffusion-guidance gradient restricted to '
                       'the region each attribute is allowed to touch.')
+            if args.hair_gray_loss_weight > 0:
+                print(f'** Hair-graying loss enabled (weight={args.hair_gray_loss_weight}, '
+                      f'target_sat={args.hair_gray_target_sat}) for age(39) removal edits')
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
-            print(f'[WARN] Face parser unavailable ({exc}); locality/color-shift/DDS-mask '
+            print(f'[WARN] Face parser unavailable ({exc}); locality/hair-gray/DDS-mask '
                   f'disabled.')
 
     diffusion_guidance = None
@@ -2034,6 +2064,7 @@ if __name__ == '__main__':
             #     (--local_region_add_blur) as a geometric prior for where a
             #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
             # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
             # Hoisted out of the face-parser branch below so the identity /
@@ -2062,10 +2093,10 @@ if __name__ == '__main__':
 
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
+                _is_removal = src_attr_flow > 0.5
                 _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
                                          device=latent.device)
                 if _is_local.any():
-                    _is_removal = src_attr_flow > 0.5
                     _terms = []
                     for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
                         _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
@@ -2090,6 +2121,33 @@ if __name__ == '__main__':
                             )
                     if _terms:
                         local_region_loss = torch.stack(_terms).mean()
+
+                # ── Hair-graying (age/39 removal direction only) ────────────
+                # See --hair_gray_loss_weight help for the failure-audit evidence
+                # motivating this. Only touches samples where THIS step's edited
+                # attribute is age AND the edit direction is removal (src already
+                # Young -> aging). Measured on the EDITED image (new_face_tensors),
+                # not src_recon -- unlike local_region_loss we WANT this region to
+                # have changed; the whole point is grading how much it changed.
+                if args.hair_gray_loss_weight > 0:
+                    _is_age_rm = torch.tensor([a == 39 for a in _mid_abs],
+                                              device=latent.device) & _is_removal
+                    if _is_age_rm.any():
+                        with torch.no_grad():
+                            hair_mask = face_parser.get_region_mask(
+                                new_face_tensors[_is_age_rm], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                        _hair_img = new_face_tensors[_is_age_rm] * 0.5 + 0.5   # [-1,1] -> [0,1]
+                        _mx = _hair_img.max(dim=1, keepdim=True).values
+                        _mn = _hair_img.min(dim=1, keepdim=True).values
+                        _sat = (_mx - _mn) / _mx.clamp(min=1e-4)               # (N,1,H,W)
+                        _mask_sum = hair_mask.sum().clamp(min=1e-4)
+                        # Skip samples where BiSeNet found ~no hair pixels (bald,
+                        # hat, hair out of frame) -- the mean would be dominated
+                        # by a handful of misclassified pixels.
+                        if hair_mask.sum() > 0.01 * hair_mask.numel():
+                            mean_sat = (_sat * hair_mask).sum() / _mask_sum
+                            hair_gray_loss = F.relu(mean_sat - args.hair_gray_target_sat)
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -2418,6 +2476,7 @@ if __name__ == '__main__':
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
+                args.hair_gray_loss_weight * hair_gray_loss +\
                 args.controlnet_reg_weight * loss_control_reg
 
             attr_scale_grad_norm = _zero.detach().clone()
@@ -2556,6 +2615,7 @@ if __name__ == '__main__':
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
+                'loss_hair_gray':     hair_gray_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
