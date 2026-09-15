@@ -409,10 +409,9 @@ class AttributeDirectionBank(nn.Module):
                 # K=12): dir_gate_entropy_ema/attr_39 sat pinned at exactly
                 # log(K) with ~1e-7 variance for 40k steps -- gate_net had
                 # collapsed to a constant output, not a face-dependent one.
-                # This term (see models/direction_selection.py, written but
-                # never wired up until now) pushes each SAMPLE toward a
-                # confident, low-entropy choice, which the marginal term
-                # alone cannot enforce.
+                # This term pushes each SAMPLE toward a confident,
+                # low-entropy choice, which the marginal term alone cannot
+                # enforce.
                 sp = sample_alpha.clamp(min=1e-8)
                 sp = sp / sp.sum(dim=-1, keepdim=True)
                 cond_entropy = -(sp * sp.log()).sum(dim=-1).mean()
@@ -549,37 +548,6 @@ class AttributeDirectionBank(nn.Module):
 
         return guided_delta
 
-    def orthogonality_loss(self):
-        """Cross-attribute orthogonality, averaged over all K combinations."""
-        dirs = self.direction_units   # (A, K, 18, 512)
-        loss = torch.zeros([], device=dirs.device, dtype=dirs.dtype)
-        count = 0
-        for i in range(self.num_attrs):
-            for j in range(i + 1, self.num_attrs):
-                for ki in range(self.num_k):
-                    for kj in range(self.num_k):
-                        loss = loss + F.cosine_similarity(
-                            dirs[i, ki], dirs[j, kj], dim=-1
-                        ).abs().mean()
-                        count += 1
-        return loss / max(count, 1)
-
-    def diversity_loss(self):
-        """Intra-attribute diversity: penalize high cosine similarity among the K
-        directions belonging to the same attribute."""
-        if self.num_k <= 1:
-            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
-        dirs = self.direction_units   # (A, K, 18, 512)
-        loss = torch.zeros([], device=dirs.device, dtype=dirs.dtype)
-        count = 0
-        for i in range(self.num_attrs):
-            for ki in range(self.num_k):
-                for kj in range(ki + 1, self.num_k):
-                    loss = loss + F.cosine_similarity(
-                        dirs[i, ki], dirs[i, kj], dim=-1
-                    ).abs().mean()
-                    count += 1
-        return loss / max(count, 1)
 
     def gate_load_balance_loss(self):
         """Batch-level load-balancing loss for the K-mixture gate (Shazeer-style
@@ -623,9 +591,8 @@ class AttributeDirectionBank(nn.Module):
         constant, face-independent output despite gate_load_balance_loss
         being active the whole run.
 
-        This loss instead penalizes each SAMPLE's own entropy directly
-        (mirrors models/direction_selection.py's cond_ent term, written
-        earlier but never wired into training). Minimizing it pushes every
+        This loss instead penalizes each SAMPLE's own conditional entropy
+        directly. Minimizing it pushes every
         sample toward a confident, low-entropy choice among the K
         directions; used together with gate_load_balance_loss (which still
         stops that choice from collapsing onto the same one or two slots

@@ -306,6 +306,97 @@ LOCAL_REGION_CLASSES = {
 HAIR_REGION_CLASS = [17]
 
 
+# Startup mechanism report. 144 CLI flags is far more surface than any single
+# run uses (a typical command sets ~19), and the ones left at their defaults
+# are invisible -- which has repeatedly cost whole training runs: --id_loss_hinge,
+# --signed_magnitude_input, --use_attr_lora, --dir_gate_reg_weight and
+# --target_loss were each silently inactive across runs that were launched
+# specifically to test them, and the mistake only surfaced days later when the
+# logs did not match the hypothesis. Printing every switchable mechanism with
+# its resolved state turns that class of error into something visible in the
+# first ten lines of stdout.
+#
+# Each entry is (label, value, note-when-notable). The note fires only for
+# states worth a second look, so a correct run stays quiet and an unintended
+# one does not.
+def _mechanism_report(args):
+    def onoff(v):
+        return 'ON ' if v else 'off'
+
+    edit = [
+        ('direction_bank', args.direction_bank_path or 'DISABLED',
+         None if args.direction_bank_path else 'no bank -- raw flow delta only'),
+        ('  magnitude_latent_cond', onoff(args.magnitude_latent_cond),
+         None if args.magnitude_latent_cond else 'magnitude identical for every face'),
+        ('  signed_magnitude_input', onoff(args.signed_magnitude_input),
+         None if args.signed_magnitude_input else 'add/rm forced to the same magnitude'),
+        ('  attr_lora', f'{onoff(args.use_attr_lora)} rank={args.attr_lora_rank}'
+         if args.use_attr_lora else 'off', None),
+        ('  dir_gate_reg', f'w={args.dir_gate_reg_weight:g}',
+         None if args.dir_gate_reg_weight > 0 else 'K-slot gate unsupervised'),
+        ('  residual_scale', f'{args.direction_residual_scale:g} (learned from here)', None),
+        ('velocity_field', args.velocity_field, None),
+    ]
+
+    inject = [
+        ('controlnet', onoff(args.use_controlnet_injection), None),
+    ]
+    if args.use_controlnet_injection:
+        inject += [
+            ('  resolutions', str(args.controlnet_res or [args.controlnet_embed_res]), None),
+            ('  per_direction', onoff(args.controlnet_per_direction), None),
+            ('  latent_cond', onoff(args.controlnet_latent_cond), None),
+            ('  warmup_steps', f'{args.controlnet_warmup_steps}',
+             'injection is exactly 0 until this step' if args.controlnet_warmup_steps else None),
+            ('  disable_attrs', str(getattr(args, 'controlnet_disable_attrs', None) or 'none'), None),
+        ]
+
+    losses = [
+        ('kd', args.kd_loss_weight), ('nll', args.nll_loss_weight),
+        ('reg', args.reg_loss_weight), ('id', args.id_loss_weight),
+        ('counter_attr', args.counter_attr_weight), ('lag_reg', args.lag_reg_weight),
+        ('dir_gate_reg', args.dir_gate_reg_weight),
+        ('diffusion_dds', args.diffusion_guidance_weight),
+        ('age_dds', args.age_diffusion_weight), ('clip_prompt', args.clip_prompt_weight),
+        ('local_region', args.local_region_loss_weight),
+        ('hair_gray', args.hair_gray_loss_weight),
+        ('controlnet_reg', args.controlnet_reg_weight),
+    ]
+
+    shape = [
+        ('id_loss', f'hinge@{args.id_hinge_threshold:g}' if args.id_loss_hinge else 'continuous (1-cos)',
+         None if args.id_loss_hinge else 'keeps pulling even when identity is already preserved'),
+        ('target_loss', args.target_loss,
+         None if args.target_loss == 'hinge' else 'mse keeps pulling samples already past the boundary'),
+    ]
+
+    w = 34
+    print('\n' + '=' * 62)
+    print('ACTIVE MECHANISMS')
+    print('=' * 62)
+    for title, rows in (('W+ EDITING PATH', edit), ('GENERATOR INJECTION', inject),
+                        ('LOSS SHAPE', shape)):
+        print(f'-- {title}')
+        for label, val, note in rows:
+            line = f'   {label:<{w}} {val}'
+            print(f'{line}   <- {note}' if note else line)
+    print('-- LOSS WEIGHTS (0 = term contributes nothing)')
+    active = [f'{n}={v:g}' for n, v in losses if v and v > 0]
+    zeroed = [n for n, v in losses if not v or v <= 0]
+    print('   active: ' + ', '.join(active))
+    if zeroed:
+        print('   zero:   ' + ', '.join(zeroed))
+    if args.resume_dir:
+        print('-- RESUME')
+        print(f'   {"from":<{w}} {args.resume_dir} @ step {args.resume_step}')
+        for label, flag, warn in (('direction_bank', args.resume_direction_bank,
+                                   'magnitude_net will be RE-INITIALISED'),
+                                  ('optimizer', args.resume_optimizer,
+                                   'fresh momentum + LR schedule restarts')):
+            print(f'   {"  " + label:<{w}} {onoff(flag)}' + ('' if flag else f'   <- {warn}'))
+    print('=' * 62 + '\n')
+
+
 def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
     """attribute_index: the --attribute_index list mapping local -> absolute idx."""
     targets = torch.empty_like(src_vals)
@@ -1421,6 +1512,7 @@ if __name__ == '__main__':
     with open(os.path.join(save_root, 'config.json'), 'w') as _f:
         json.dump(vars(args), _f, indent=2, default=str)
     print(f'** run config saved to {os.path.join(save_root, "config.json")}')
+    _mechanism_report(args)
     attribute_index = torch.tensor(args.attribute_index,dtype=int)
     # Local column of src_probs/target_probs (both ordered by attribute_index)
     # that holds the source image's Male probability, for the age DDS
