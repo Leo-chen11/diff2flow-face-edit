@@ -5,9 +5,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def build_edit_prompts(attr_abs_idx, target_values):
+def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None):
+    """Build the per-sample DDS target-prompt strings.
+
+    gender_prob: optional (B,) tensor, the source image's Male probability
+    from the frozen attribute teacher (same one soft_target/src_attr use).
+    Only attr 39 (age) reads it -- see the branch below for why.
+    """
     prompts = []
-    for attr, value in zip(attr_abs_idx.detach().cpu().tolist(), target_values.detach().cpu().tolist()):
+    gender_prob_list = (
+        gender_prob.detach().cpu().tolist() if gender_prob is not None else None
+    )
+    for i, (attr, value) in enumerate(zip(
+        attr_abs_idx.detach().cpu().tolist(), target_values.detach().cpu().tolist()
+    )):
         enabled = value >= 0.5
         if attr == 15:
             prompts.append(
@@ -34,18 +45,61 @@ def build_edit_prompts(attr_abs_idx, target_values):
                 "a realistic face photo of a person with straight hair"
             )
         elif attr == 39:
-            # Structural/mid-layer aging cues, not skin-texture words (wrinkles,
-            # smooth skin, forehead lines). The DDS gradient below only reaches
-            # W+ layers < args.dds_fine_layer_start (coarse/mid); fine-grained
-            # skin texture lives in the fine layers it never touches, so asking
-            # for it here just wastes signal on something this loss can't move.
-            prompts.append(
-                "a realistic face photo of a young person with a full, firm "
-                "jawline, high round cheeks, and a smooth brow"
-                if enabled else
-                "a realistic face photo of an elderly person with a sagging "
-                "jawline, sunken cheeks, deep-set eyes, and a receding hairline"
-            )
+            # Age uses --age_dds_fine_layer_start (default 12), not the shared
+            # --dds_fine_layer_start (default 7) -- it unlocks gradient flow into
+            # the fine W+ layers where wrinkle/skin-texture detail actually lives
+            # (see --age_residual_scale help text). The prompt below asks for
+            # that texture explicitly; the older structural-only wording predated
+            # --age_dds_fine_layer_start and was never updated after that cutoff
+            # diverged from the shared default, so the loss never had a reason to
+            # push skin texture even once the layer access existed for it.
+            #
+            # Gender-conditioned wording (male vs female) is a second fix on top
+            # of that one: dump_attr_failures.py on the "make older" (rm)
+            # direction showed the failure group is disproportionately Male
+            # (fail=0.55-0.63 vs success=0.10-0.20 across two independent
+            # samples, the single largest gap of any attribute) and the gap
+            # barely moved when edit_scale was lowered -- ruling out "not
+            # enough magnitude" and pointing at the shared prompt's aging cues
+            # (forehead lines, crow's feet, age spots -- all fine, low-contrast
+            # texture) simply being less diagnostic on male skin than the
+            # coarser cues male aging actually shows. male_like reads the
+            # SOURCE image's Male probability from the same frozen attr_teacher
+            # soft_target already uses, so this needs no new signal.
+            #
+            # Third fix, same underlying cause: neither branch of "old" asked
+            # for scalp hair to go gray/white -- male mentioned graying
+            # eyebrows and stubble but not scalp hair, female mentioned no
+            # hair cue at all. Visual audit (dump_attr_failures.py
+            # --primary_judge celeba, attr 39 rm) showed edits the classifier
+            # scored as confidently old (edited Young<=0.15) with wrinkle
+            # texture added but hair color completely untouched -- DDS can
+            # only push toward what the target prompt describes, and hair
+            # color was simply absent from that description, not a cue the
+            # model failed to learn.
+            male_like = gender_prob_list is not None and gender_prob_list[i] >= 0.5
+            if enabled:
+                prompts.append(
+                    "a realistic face photo of a young man with a full, firm "
+                    "jawline, high round cheeks, and smooth, unlined skin"
+                    if male_like else
+                    "a realistic face photo of a young woman with a full, firm "
+                    "jawline, high round cheeks, and smooth, unlined skin"
+                )
+            else:
+                prompts.append(
+                    "a realistic face photo of an elderly man with gray or white "
+                    "hair, a sagging jawline, sunken cheeks, deep-set eyes, a "
+                    "receding hairline, thick graying eyebrows, gray or white "
+                    "stubble, and deeply wrinkled, weathered skin with heavy "
+                    "forehead furrows, prominent nasolabial folds, and crow's feet"
+                    if male_like else
+                    "a realistic face photo of an elderly woman with gray or "
+                    "white hair, a sagging jawline, sunken cheeks, deep-set eyes, "
+                    "a receding hairline, thin graying eyebrows, and deeply "
+                    "wrinkled, weathered skin with visible forehead lines, "
+                    "crow's feet, and age spots"
+                )
         else:
             prompts.append("a realistic face photo of a person")
     return prompts
@@ -159,12 +213,12 @@ class FrozenDiffusionDDSGuidance(nn.Module):
         return latents * self.latent_scale
 
     def forward(self, src_images, edit_images, attr_abs_idx, target_values, source_prompt=None,
-                timestep_min=None, timestep_max=None, face_mask=None):
+                timestep_min=None, timestep_max=None, face_mask=None, gender_prob=None):
         device = edit_images.device
         B = edit_images.shape[0]
         source_prompt = source_prompt or "a realistic face photo of a person"
         src_prompts = [source_prompt] * B
-        edit_prompts = build_edit_prompts(attr_abs_idx, target_values)
+        edit_prompts = build_edit_prompts(attr_abs_idx, target_values, gender_prob=gender_prob)
 
         src_text = self._encode_text(src_prompts, device)
         edit_text = self._encode_text(edit_prompts, device)

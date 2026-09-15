@@ -6,10 +6,6 @@ import torch
 import torch.distributed as dist
 import random
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 
 def modify_one_attribute(attributes:torch.Tensor,idx:int=-1,scale:float=None,mode='random'):
@@ -49,72 +45,8 @@ def modify_one_attribute(attributes:torch.Tensor,idx:int=-1,scale:float=None,mod
     
     return idx,new_attributes
 
-class AverageValueMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0.0
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0.0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-def gaussian_log_likelihood(x, mean, logvar, clip=True):
-    if clip:
-        logvar = torch.clamp(logvar, min=-4, max=3)
-    a = log(2 * pi)
-    b = logvar
-    c = (x - mean) ** 2 / torch.exp(logvar)
-    return -0.5 * torch.sum(a + b + c)
-
-
-def bernoulli_log_likelihood(x, p, clip=True, eps=1e-6):
-    if clip:
-        p = torch.clamp(p, min=eps, max=1 - eps)
-    return torch.sum((x * torch.log(p)) + ((1 - x) * torch.log(1 - p)))
-
-
-def kl_diagnormal_stdnormal(mean, logvar):
-    a = mean ** 2
-    b = torch.exp(logvar)
-    c = -1
-    d = -logvar
-    return 0.5 * torch.sum(a + b + c + d)
-
-
-def kl_diagnormal_diagnormal(q_mean, q_logvar, p_mean, p_logvar):
-    # Ensure correct shapes since no numpy broadcasting yet
-    p_mean = p_mean.expand_as(q_mean)
-    p_logvar = p_logvar.expand_as(q_logvar)
-
-    a = p_logvar
-    b = - 1
-    c = - q_logvar
-    d = ((q_mean - p_mean) ** 2 + torch.exp(q_logvar)) / torch.exp(p_logvar)
-    return 0.5 * torch.sum(a + b + c + d)
-
 
 # Taken from https://discuss.pytorch.org/t/implementing-truncated-normal-initializer/4778/15
-def truncated_normal(tensor, mean=0, std=1, trunc_std=2):
-    size = tensor.shape
-    tmp = tensor.new_empty(size + (4,)).normal_()
-    valid = (tmp < trunc_std) & (tmp > -trunc_std)
-    ind = valid.max(-1, keepdim=True)[1]
-    tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
-    tensor.data.mul_(std).add_(mean)
-    return tensor
 
 
 def reduce_tensor(tensor, world_size=None):
@@ -132,80 +64,11 @@ def standard_normal_logprob(z):
     log_z = -0.5 * dim * log(2 * pi)
     return log_z - z.pow(2) / 2
 
-def normal_logprob(z, mean, logvar):
-    dim = z.size(-1)
-    log_z = -0.5 * dim * log(2 * pi)
-    return log_z - logvar / 2 - (z - mean).pow(2) / (2 * torch.exp(logvar))
-
-
-def set_random_seed(seed):
-    """set random seed"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
 
 # Visualization
-def visualize_point_clouds(pts, gtr, idx, pert_order=[0, 1, 2]):
-    pts = pts.cpu().detach().numpy()[:, pert_order]
-    gtr = gtr.cpu().detach().numpy()[:, pert_order]
-
-    fig = plt.figure(figsize=(6, 3))
-    ax1 = fig.add_subplot(121, projection='3d')
-    ax1.set_title("Sample:%s" % idx)
-    ax1.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=5)
-
-    ax2 = fig.add_subplot(122, projection='3d')
-    ax2.set_title("Ground Truth:%s" % idx)
-    ax2.scatter(gtr[:, 0], gtr[:, 1], gtr[:, 2], s=5)
-
-    fig.canvas.draw()
-
-    # grab the pixel buffer and dump it into a numpy array
-    res = np.array(fig.canvas.renderer._renderer)
-    res = np.transpose(res, (2, 0, 1))
-
-    plt.close()
-    return res
 
 
 # Augmentation
-def apply_random_rotation(pc, rot_axis=1):
-    B = pc.shape[0]
-
-    theta = np.random.rand(B) * 2 * np.pi
-    zeros = np.zeros(B)
-    ones = np.ones(B)
-    cos = np.cos(theta)
-    sin = np.sin(theta)
-
-    if rot_axis == 0:
-        rot = np.stack([
-            cos, -sin, zeros,
-            sin, cos, zeros,
-            zeros, zeros, ones
-        ]).T.reshape(B, 3, 3)
-    elif rot_axis == 1:
-        rot = np.stack([
-            cos, zeros, -sin,
-            zeros, ones, zeros,
-            sin, zeros, cos
-        ]).T.reshape(B, 3, 3)
-    elif rot_axis == 2:
-        rot = np.stack([
-            ones, zeros, zeros,
-            zeros, cos, -sin,
-            zeros, sin, cos
-        ]).T.reshape(B, 3, 3)
-    else:
-        raise Exception("Invalid rotation axis")
-    rot = torch.from_numpy(rot).to(pc)
-
-    # (B, N, 3) mul (B, 3, 3) -> (B, N, 3)
-    pc_rotated = torch.bmm(pc, rot)
-    return pc_rotated, rot, theta
 
 
 def validate_classification(loaders, model, args):
@@ -372,49 +235,4 @@ def resume(path, model, optimizer=None, strict=True):
         optimizer.load_state_dict(ckpt['optimizer'])
     return model, optimizer, start_epoch
 
-
-def validate(test_loader, model, epoch, writer, save_dir, args, clf_loaders=None):
-    model.eval()
-
-    # Make epoch wise save directory
-    if writer is not None and args.save_val_results:
-        save_dir = os.path.join(save_dir, 'epoch-%d' % epoch)
-        if not os.path.isdir(save_dir):
-            os.makedirs(save_dir)
-    else:
-        save_dir = None
-
-    # classification
-    if args.eval_classification and clf_loaders is not None:
-        for clf_expr, loaders in clf_loaders.items():
-            with torch.no_grad():
-                clf_val_res = validate_classification(loaders, model, args)
-
-            for k, v in clf_val_res.items():
-                if writer is not None and v is not None:
-                    writer.add_scalar('val_%s/%s' % (clf_expr, k), v, epoch)
-
-    # samples
-    if args.use_latent_flow:
-        with torch.no_grad():
-            val_sample_res = validate_sample(
-                test_loader, model, args, max_samples=args.max_validate_shapes,
-                save_dir=save_dir)
-
-        for k, v in val_sample_res.items():
-            if not isinstance(v, float):
-                v = v.cpu().detach().item()
-            if writer is not None and v is not None:
-                writer.add_scalar('val_sample/%s' % k, v, epoch)
-
-    # reconstructions
-    with torch.no_grad():
-        val_res = validate_conditioned(
-            test_loader, model, args, max_samples=args.max_validate_shapes,
-            save_dir=save_dir)
-    for k, v in val_res.items():
-        if not isinstance(v, float):
-            v = v.cpu().detach().item()
-        if writer is not None and v is not None:
-            writer.add_scalar('val_conditioned/%s' % k, v, epoch)
 

@@ -79,11 +79,38 @@ class FrozenCLIPPromptLoss(nn.Module):
         image_size: int = 224,
         temperature: float = 1.0,
         mode: str = "absolute",
+        num_augs: int = 4,
+        aug_min_scale: float = 0.75,
     ):
+        """
+        num_augs: number of randomly cropped/flipped views to average the CLIP
+            score over, per image (1 = the old single-view behavior).
+
+            WHY: a frozen CLIP score computed on ONE fixed, full-frame view is
+            trivially attackable. The generator can find high-frequency,
+            spatially-fixed patterns that raise cos(image, text) without any
+            semantic change -- the image-space equivalent of the r34
+            teacher-fooling this project already documents (teacher ~91% vs
+            CLIP judge ~44% on eyeglasses), and the reason
+            --teacher_aug exists for the attribute teacher. The CLIP loss had
+            no such defense. Averaging over several random crops means a
+            pattern has to survive translation/scale/flip to keep scoring,
+            which adversarial high-frequency texture does not and a real
+            attribute change does. This is the same multi-view trick
+            StyleGAN-NADA and StyleCLIP-style CLIP guidance use for the same
+            reason.
+
+            Cost: num_augs image encodes instead of 1 (x2 in directional mode,
+            which also encodes the source). Crops are differentiable, so the
+            generator still gets gradient through them.
+        aug_min_scale: smallest random crop side as a fraction of the image.
+        """
         super().__init__()
         if mode not in ("absolute", "directional"):
             raise ValueError(f"Unknown FrozenCLIPPromptLoss mode: {mode}")
         self.mode = mode
+        self.num_augs = max(1, int(num_augs))
+        self.aug_min_scale = float(aug_min_scale)
         try:
             import clip as openai_clip
         except ImportError as exc:
@@ -183,6 +210,49 @@ class FrozenCLIPPromptLoss(nn.Module):
         feats = self.clip.encode_image(x.to(dtype=self.clip_mean.dtype))
         return F.normalize(feats.float(), dim=-1)   # (B, D)
 
+    def _random_view(self, images: torch.Tensor, params) -> torch.Tensor:
+        """One differentiable random crop + optional horizontal flip.
+
+        `params` is shared between the edited and source image so directional
+        mode compares the SAME view of both -- otherwise the delta would
+        contain the difference between two different crops, not the edit.
+        """
+        top, left, ch, cw, do_flip = params
+        x = images[:, :, top:top + ch, left:left + cw]
+        if do_flip:
+            x = torch.flip(x, [-1])
+        return x
+
+    def _sample_view_params(self, h: int, w: int):
+        scale = float(torch.empty(1).uniform_(self.aug_min_scale, 1.0))
+        ch, cw = max(1, int(h * scale)), max(1, int(w * scale))
+        top = int(torch.randint(0, h - ch + 1, (1,)))
+        left = int(torch.randint(0, w - cw + 1, (1,)))
+        do_flip = bool(torch.rand(1) < 0.5)
+        return top, left, ch, cw, do_flip
+
+    def _encode_multiview(self, images: torch.Tensor, src_images: torch.Tensor = None):
+        """Average CLIP features over num_augs random views.
+
+        Returns (edit_feats, src_feats_or_None), each (B, D), L2-normalized
+        after averaging so downstream cosine math is unchanged.
+        """
+        if self.num_augs <= 1:
+            return (self._encode_images(images),
+                    self._encode_images(src_images) if src_images is not None else None)
+
+        h, w = images.shape[-2:]
+        edit_acc, src_acc = 0.0, 0.0
+        for _ in range(self.num_augs):
+            params = self._sample_view_params(h, w)
+            edit_acc = edit_acc + self._encode_images(self._random_view(images, params))
+            if src_images is not None:
+                src_acc = src_acc + self._encode_images(self._random_view(src_images, params))
+        edit_feats = F.normalize(edit_acc / self.num_augs, dim=-1, eps=1e-6)
+        src_feats = (F.normalize(src_acc / self.num_augs, dim=-1, eps=1e-6)
+                     if src_images is not None else None)
+        return edit_feats, src_feats
+
     def _text_deltas(self, attr_abs_idx: torch.Tensor, device):
         """Per-sample (pos, neg) text features gathered by attribute id."""
         attr_list = attr_abs_idx.detach().cpu().tolist()
@@ -229,7 +299,7 @@ class FrozenCLIPPromptLoss(nn.Module):
     def _forward_absolute(self, images, attr_abs_idx, target_values, reduction):
         B = images.shape[0]
 
-        img_feats = self._encode_images(images)
+        img_feats, _ = self._encode_multiview(images)
         pos_feats, neg_feats = self._text_deltas(attr_abs_idx, images.device)
 
         # ── Scores ────────────────────────────────────────────────────
@@ -259,8 +329,9 @@ class FrozenCLIPPromptLoss(nn.Module):
         B = images.shape[0]
 
         # ── Image-space delta: where did the edit actually move the image ──
-        feat_edit = self._encode_images(images)
-        feat_src = self._encode_images(src_images)
+        # Both images go through the SAME random views (shared crop params) so
+        # the delta reflects the edit, not a difference between two crops.
+        feat_edit, feat_src = self._encode_multiview(images, src_images)
         img_delta = F.normalize(feat_edit - feat_src, dim=-1, eps=1e-6)   # (B, D)
 
         # ── Text-space delta: where SHOULD it move, for this attribute ─────

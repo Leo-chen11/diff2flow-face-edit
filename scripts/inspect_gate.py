@@ -177,7 +177,7 @@ if __name__ == '__main__':
     parser.add_argument('--guided_delta_max_norm', type=float, default=0.0)
     parser.add_argument('--override_residual_scale', type=float, default=None)
     parser.add_argument('--age_fine_layer_scale', type=float, default=None)
-    parser.add_argument('--age_fine_layer_start', type=int, default=4)
+    parser.add_argument('--age_fine_layer_start', type=int, default=10)
     parser.add_argument('--ignore_run_config', action='store_true')
 
     args = parser.parse_args()
