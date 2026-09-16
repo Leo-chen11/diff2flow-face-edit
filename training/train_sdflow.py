@@ -351,6 +351,15 @@ def _mechanism_report(args):
             ('  disable_attrs', str(getattr(args, 'controlnet_disable_attrs', None) or 'none'), None),
         ]
 
+    realism = [
+        ('disc_realism', onoff(args.disc_realism_weight > 0), None),
+    ]
+    if args.disc_realism_weight > 0:
+        realism += [
+            ('  weight', f'{args.disc_realism_weight:g}', None),
+            ('  attrs', str(args.disc_realism_attrs or 'all'), None),
+        ]
+
     losses = [
         ('kd', args.kd_loss_weight), ('nll', args.nll_loss_weight),
         ('reg', args.reg_loss_weight), ('id', args.id_loss_weight),
@@ -376,7 +385,7 @@ def _mechanism_report(args):
     print('ACTIVE MECHANISMS')
     print('=' * 62)
     for title, rows in (('W+ EDITING PATH', edit), ('GENERATOR INJECTION', inject),
-                        ('LOSS SHAPE', shape)):
+                        ('REALISM PRIOR', realism), ('LOSS SHAPE', shape)):
         print(f'-- {title}')
         for label, val, note in rows:
             line = f'   {label:<{w}} {val}'
@@ -947,8 +956,11 @@ if __name__ == '__main__':
                              'unrelated architecture/loss configurations. The discriminator was '
                              'adversarially trained specifically to catch exactly this class of '
                              'artifact against real FFHQ photos, which no other term here does. '
-                             'Applied every step regardless of which attribute is active -- a '
-                             'general realism prior, not attribute-specific. Input is upsampled to '
+                             'Applies to every attribute by default; pass --disc_realism_attrs to '
+                             'restrict it to specific ones (e.g. the Young/39 samples the visual '
+                             'audit above actually found the artifact on) for a clean single-variable '
+                             'test that does not also touch attributes with no evidence of this '
+                             'problem. Input is upsampled to '
                              '1024x1024 (the resolution D was trained at) rather than loading D at '
                              'a smaller size via strict=False, to keep the loaded weights an exact '
                              'match with no partial-load risk; this adds one extra discriminator '
@@ -959,6 +971,11 @@ if __name__ == '__main__':
                              '--counter_attr_weight\'s gradient; this is a prior toward realism, '
                              'not toward any particular attribute value, so an overly large weight '
                              'will fight the edit itself, not just the artifact.')
+    parser.add_argument('--disc_realism_attrs', nargs='*', type=int, default=None,
+                        help='Absolute CelebA attribute ids to apply --disc_realism_weight to '
+                             '(e.g. "39" for Young only). Default (unset) applies to every '
+                             'attribute\'s steps. Has no effect when --disc_realism_weight is 0 '
+                             '(the discriminator is not even loaded in that case).')
     parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
                         help='Compare the edited image against the source RECONSTRUCTION '
                              'G(latent) instead of the real photo in id_loss, the directional '
@@ -2200,11 +2217,23 @@ if __name__ == '__main__':
             # help for the visual-audit evidence motivating this. Upsampled to
             # 1024 (D's native training resolution) rather than loading D at
             # img_size via strict=False, so the loaded weights match exactly.
+            #
+            # --disc_realism_attrs restricts which samples feed the discriminator
+            # this step, same masking pattern as the hair-graying/local-region
+            # losses below: map this step's LOCAL mid_idx to absolute CelebA ids,
+            # then select. None (default) = no restriction, every sample counts.
             disc_realism_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             if discriminator is not None:
-                _disc_input = F.interpolate(new_face_tensors, (1024, 1024),
-                                            mode='bilinear', align_corners=False)
-                disc_realism_loss = F.softplus(-discriminator(_disc_input)).mean()
+                _disc_sel = new_face_tensors
+                if args.disc_realism_attrs is not None:
+                    _mid_abs_r = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
+                    _realism_mask = torch.tensor(
+                        [a in args.disc_realism_attrs for a in _mid_abs_r], device=latent.device)
+                    _disc_sel = new_face_tensors[_realism_mask]
+                if _disc_sel.shape[0] > 0:
+                    _disc_input = F.interpolate(_disc_sel, (1024, 1024),
+                                                mode='bilinear', align_corners=False)
+                    disc_realism_loss = F.softplus(-discriminator(_disc_input)).mean()
 
             # ── Face-parser locality loss (local attributes only) ────────────
             # Outside the attribute's allowed facial region, the edited image
