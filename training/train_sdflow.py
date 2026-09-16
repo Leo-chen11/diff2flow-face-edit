@@ -28,7 +28,7 @@ from models.conditioner import IdentityAttributeConditioner
 from models.control_encoder import clip_skips, skips_norm_per_sample, skips_reg_per_sample
 from models.direction_bank import AttributeDirectionBank
 from models.layer_mask import AttributeLayerMask
-from models.stylegan2.model import Generator
+from models.stylegan2.model import Generator, Discriminator
     
 
 class LearnableAttributeScales(nn.Module):
@@ -361,6 +361,7 @@ def _mechanism_report(args):
         ('local_region', args.local_region_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
+        ('disc_realism', args.disc_realism_weight),
     ]
 
     shape = [
@@ -930,6 +931,34 @@ if __name__ == '__main__':
                              'this, a source with only mild saturation to begin with could '
                              'satisfy the loss while remaining visibly colored, since the '
                              'relative ratio alone never asks for MORE than proportional change.')
+    parser.add_argument('--disc_realism_weight', type=float, default=0.0,
+                        help='Frozen StyleGAN2-FFHQ discriminator (loaded from the same '
+                             '--stygan2_weights checkpoint\'s "d" key, alongside "g_ema") as a '
+                             'realism regularizer: non-saturating softplus(-D(edited_face)).mean(). '
+                             'Nothing else in this loss set asks "does this look like a real photo" '
+                             '-- counter_attr/id/reg/DDS all measure a specific proxy (a '
+                             'classifier score, a feature-space distance, a W+ displacement, a '
+                             'frozen diffusion model\'s noise residual), and each has independently '
+                             'been shown to be satisfiable by an unrealistic shortcut: v14\'s aging '
+                             'edits added thin, scratchy fake wrinkle lines; v17\'s (after the fix '
+                             'that motivated that finding) show blotchy, mottled skin discoloration '
+                             'instead -- same underlying gap in a different shape, confirmed by '
+                             'visual audit (scripts/dump_attr_failures.py) across two otherwise '
+                             'unrelated architecture/loss configurations. The discriminator was '
+                             'adversarially trained specifically to catch exactly this class of '
+                             'artifact against real FFHQ photos, which no other term here does. '
+                             'Applied every step regardless of which attribute is active -- a '
+                             'general realism prior, not attribute-specific. Input is upsampled to '
+                             '1024x1024 (the resolution D was trained at) rather than loading D at '
+                             'a smaller size via strict=False, to keep the loaded weights an exact '
+                             'match with no partial-load risk; this adds one extra discriminator '
+                             'forward+backward pass per step, non-trivial compute when enabled. '
+                             'Pass 0 (default) to fully disable -- skips loading the discriminator '
+                             'entirely. Start small (~0.01-0.05, similar order to '
+                             '--clip_prompt_weight) and watch it does not suppress '
+                             '--counter_attr_weight\'s gradient; this is a prior toward realism, '
+                             'not toward any particular attribute value, so an overly large weight '
+                             'will fight the edit itself, not just the artifact.')
     parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
                         help='Compare the edited image against the source RECONSTRUCTION '
                              'G(latent) instead of the real photo in id_loss, the directional '
@@ -1900,6 +1929,19 @@ if __name__ == '__main__':
         p.requires_grad_(False)
     print('** StyleGAN2 model initialization success !')
 
+    discriminator = None
+    if args.disc_realism_weight > 0:
+        # Same checkpoint file as G, loaded from its "d" key -- adversarially
+        # trained against THIS G's own artifact distribution, which is what
+        # makes it a faithful realism signal (see --disc_realism_weight help).
+        discriminator = Discriminator(size=1024, channel_multiplier=2)
+        discriminator.load_state_dict(ckpt['d'])
+        discriminator.cuda().eval()
+        for p in discriminator.parameters():
+            p.requires_grad_(False)
+        print(f'** Frozen StyleGAN2 discriminator (realism regularizer, '
+              f'weight={args.disc_realism_weight}) initialization success !')
+
     id_criterion = IDLoss(crop=True).cuda()
     id_criterion.eval()
     for p in id_criterion.parameters():
@@ -2150,6 +2192,19 @@ if __name__ == '__main__':
                                  embed_res=args.controlnet_embed_res,
                                  input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             new_face_tensors = F.interpolate(new_face_tensors, (args.img_size, args.img_size))
+
+            # ── Realism regularizer (frozen StyleGAN2 discriminator) ─────────
+            # Every other loss here measures a specific proxy (classifier score,
+            # feature distance, W+ displacement, diffusion noise residual), none
+            # asks "does this look like a real photo" -- see --disc_realism_weight
+            # help for the visual-audit evidence motivating this. Upsampled to
+            # 1024 (D's native training resolution) rather than loading D at
+            # img_size via strict=False, so the loaded weights match exactly.
+            disc_realism_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            if discriminator is not None:
+                _disc_input = F.interpolate(new_face_tensors, (1024, 1024),
+                                            mode='bilinear', align_corners=False)
+                disc_realism_loss = F.softplus(-discriminator(_disc_input)).mean()
 
             # ── Face-parser locality loss (local attributes only) ────────────
             # Outside the attribute's allowed facial region, the edited image
@@ -2617,7 +2672,8 @@ if __name__ == '__main__':
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
-                args.controlnet_reg_weight * loss_control_reg
+                args.controlnet_reg_weight * loss_control_reg +\
+                args.disc_realism_weight * disc_realism_loss
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -2756,6 +2812,7 @@ if __name__ == '__main__':
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
                 'loss_hair_gray':     hair_gray_loss,
+                'loss_disc_realism':  disc_realism_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
