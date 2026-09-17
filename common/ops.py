@@ -1,15 +1,5 @@
-from PIL import Image
 import torch
 import torch.distributed as dist
-
-def tensor2im(var):
-	# var shape: (3, H, W)
-	var = var.cpu().detach().transpose(0, 2).transpose(0, 1).numpy()
-	var = ((var + 1) / 2)
-	var[var < 0] = 0
-	var[var > 1] = 1
-	var = var * 255
-	return Image.fromarray(var.astype('uint8'))
 
 
 class AverageMeter(object):
@@ -29,12 +19,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-
-def normalize(input, mean, std):
-    mean = torch.Tensor(mean).to(input.device)
-    std = torch.Tensor(std).to(input.device)
-    return input.sub(mean[None, :, None, None]).div(std[None, :, None, None])
 
 
 def reduce_tensor(tensor, world_size=None):
