@@ -20,6 +20,7 @@ from tqdm import tqdm
 from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
+from common.region_stat_loss import directional_region_saturation_loss
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
@@ -364,6 +365,7 @@ def _mechanism_report(args):
         ('age_dds', args.age_diffusion_weight), ('clip_prompt', args.clip_prompt_weight),
         ('local_region', args.local_region_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
+        ('hair_color_add', args.hair_color_add_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
         ('disc_realism', args.disc_realism_weight),
     ]
@@ -935,6 +937,49 @@ if __name__ == '__main__':
                              'this, a source with only mild saturation to begin with could '
                              'satisfy the loss while remaining visibly colored, since the '
                              'relative ratio alone never asks for MORE than proportional change.')
+    parser.add_argument('--hair_color_add_loss_weight', type=float, default=0.0,
+                        help='Mirror of --hair_gray_loss_weight for the ADD direction (src '
+                             'already old -> de-aging edit, target Young=1): pushes the hair '
+                             'region toward MORE saturation (natural color) instead of less. '
+                             'Added because a failure-vs-success audit on Young add found '
+                             'Gray_Hair present in the SOURCE the single strongest correlate of '
+                             'SUCCESS (0.25 success vs 0.04 fail) -- the model\'s only reliable '
+                             'lever for "look younger" was hair darkening it stumbled into as a '
+                             'side effect of skin smoothing, never asked for directly, unlike '
+                             'the removal direction which has both this loss and an explicit '
+                             '"gray or white hair" DDS prompt cue (--age_add_hair_prompt_cue is '
+                             'that cue\'s mirror). Uses the SAME underlying mechanism as '
+                             '--hair_gray_loss_weight (see common/region_stat_loss.py) with the '
+                             'direction flipped -- not a separate ad hoc formula. Pass 0 '
+                             '(default) to disable -- shares the FaceParser instance with '
+                             '--hair_gray_loss_weight / --local_region_loss_weight.')
+    parser.add_argument('--hair_color_add_floor', type=float, default=0.18,
+                        help='Under --hair_color_add_loss_weight: minimum required edited-hair '
+                             'saturation, as a floor under the --hair_gray_relative_ratio-scaled '
+                             'source-relative target (that ratio is reused for both directions). '
+                             'UNTUNED -- pick a starting value from a visual audit of source hair '
+                             'saturation on a handful of Young-add samples before trusting this '
+                             'default; it was chosen as a plausible floor, not measured.')
+    parser.add_argument('--age_add_hair_prompt_cue', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Add an explicit "naturally colored hair, no gray or white" cue to '
+                             'the Young ADD-direction DDS prompt, mirroring the removal '
+                             'direction\'s existing "gray or white hair" cue (see '
+                             'diffusion_guidance.build_edit_prompts). Grounded in the same '
+                             'failure-audit finding as --hair_color_add_loss_weight -- the two '
+                             'are meant to be used together (pixel loss + text prompt), matching '
+                             'how the removal direction already uses both. Off by default so it '
+                             'never silently changes an existing run\'s DDS gradient.')
+    parser.add_argument('--gender_rm_prompt_cue', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Add explicit texture-removal cues (smooth skin, no facial hair, '
+                             'thin eyebrows) to the Male REMOVAL-direction ("female person") DDS '
+                             'prompt. EXPERIMENTAL, unlike the two flags above: Male-rm\'s '
+                             'weakness showed no code-level asymmetry when checked -- the plain '
+                             'prompt was already symmetric between add/rm before this flag '
+                             'existed -- so this tests the hypothesis that an explicit '
+                             'removal-direction cue helps the same way it did for age, not a '
+                             'confirmed fix grounded in a found bug. Off by default.')
     parser.add_argument('--disc_realism_weight', type=float, default=0.0,
                         help='Frozen StyleGAN2-FFHQ discriminator (loaded from the same '
                              '--stygan2_weights checkpoint\'s "d" key, alongside "g_ema") as a '
@@ -2000,7 +2045,8 @@ if __name__ == '__main__':
               f'{judge_balancer.num_slots} slots)')
 
     face_parser = None
-    if args.local_region_loss_weight > 0 or args.dds_face_mask or args.hair_gray_loss_weight > 0:
+    if args.local_region_loss_weight > 0 or args.dds_face_mask \
+            or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -2015,6 +2061,10 @@ if __name__ == '__main__':
                 print(f'** Hair-graying loss enabled (weight={args.hair_gray_loss_weight}, '
                       f'target={args.hair_gray_relative_ratio}x source sat, capped at '
                       f'{args.hair_gray_abs_cap}) for age(39) removal edits')
+            if args.hair_color_add_loss_weight > 0:
+                print(f'** Hair-color (add-direction) loss enabled (weight='
+                      f'{args.hair_color_add_loss_weight}, floor={args.hair_color_add_floor}) '
+                      f'for age(39) add edits -- mirror of --hair_gray_loss_weight')
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
             print(f'[WARN] Face parser unavailable ({exc}); locality/hair-gray/DDS-mask '
@@ -2259,6 +2309,7 @@ if __name__ == '__main__':
             #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            hair_color_add_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
             # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
             # Hoisted out of the face-parser branch below so the identity /
@@ -2338,9 +2389,9 @@ if __name__ == '__main__':
                 # saturated could satisfy the loss while remaining visibly
                 # colored, since relative_ratio alone never asks for MORE than
                 # proportional change.
+                _is_attr_age = torch.tensor([a == 39 for a in _mid_abs], device=latent.device)
                 if args.hair_gray_loss_weight > 0:
-                    _is_age_rm = torch.tensor([a == 39 for a in _mid_abs],
-                                              device=latent.device) & _is_removal
+                    _is_age_rm = _is_attr_age & _is_removal
                     if _is_age_rm.any():
                         with torch.no_grad():
                             src_hair_mask = face_parser.get_region_mask(
@@ -2354,19 +2405,41 @@ if __name__ == '__main__':
                         # would be dominated by a handful of misclassified pixels.
                         _min_px = 0.01 * src_hair_mask.numel()
                         if src_hair_mask.sum() > _min_px and edit_hair_mask.sum() > _min_px:
-                            def _region_sat(img_pm1, mask):
-                                img01 = img_pm1 * 0.5 + 0.5                   # [-1,1] -> [0,1]
-                                mx = img01.max(dim=1, keepdim=True).values
-                                mn = img01.min(dim=1, keepdim=True).values
-                                sat = (mx - mn) / mx.clamp(min=1e-4)          # (N,1,H,W)
-                                return (sat * mask).sum() / mask.sum().clamp(min=1e-4)
+                            hair_gray_loss = directional_region_saturation_loss(
+                                src_recon[_is_age_rm], new_face_tensors[_is_age_rm],
+                                src_hair_mask, edit_hair_mask,
+                                push=-1, relative_ratio=args.hair_gray_relative_ratio,
+                                bound=args.hair_gray_abs_cap,
+                            )
 
-                            with torch.no_grad():
-                                src_sat = _region_sat(src_recon[_is_age_rm], src_hair_mask)
-                            edit_sat = _region_sat(new_face_tensors[_is_age_rm], edit_hair_mask)
-                            target = (src_sat * args.hair_gray_relative_ratio).clamp(
-                                max=args.hair_gray_abs_cap)
-                            hair_gray_loss = F.relu(edit_sat - target)
+                # ── Hair-coloring (age/39 ADD direction only) ────────────────
+                # Mirror of the block above -- see --hair_color_add_loss_weight
+                # help for the failure-audit evidence motivating it (Gray_Hair
+                # in the SOURCE was the strongest correlate of a SUCCESSFUL
+                # de-aging edit, meaning the model's only reliable "look
+                # younger" lever was an incidental hair-darkening side effect
+                # it was never asked to produce directly). Same
+                # directional_region_saturation_loss call, push=+1 instead of
+                # -1, so the target moves toward MORE saturation instead of
+                # less.
+                if args.hair_color_add_loss_weight > 0:
+                    _is_age_add = _is_attr_age & ~_is_removal
+                    if _is_age_add.any():
+                        with torch.no_grad():
+                            src_hair_mask_add = face_parser.get_region_mask(
+                                src_recon[_is_age_add], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                            edit_hair_mask_add = face_parser.get_region_mask(
+                                new_face_tensors[_is_age_add], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                        _min_px_add = 0.01 * src_hair_mask_add.numel()
+                        if src_hair_mask_add.sum() > _min_px_add and edit_hair_mask_add.sum() > _min_px_add:
+                            hair_color_add_loss = directional_region_saturation_loss(
+                                src_recon[_is_age_add], new_face_tensors[_is_age_add],
+                                src_hair_mask_add, edit_hair_mask_add,
+                                push=+1, relative_ratio=args.hair_gray_relative_ratio,
+                                bound=args.hair_color_add_floor,
+                            )
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -2657,6 +2730,7 @@ if __name__ == '__main__':
                         attr_abs_idx=mid_abs_idx[non_age_mask],
                         target_values=soft_target[non_age_mask].detach(),
                         face_mask=_dds_mask(_face_non_age[non_age_mask], mid_abs_idx[non_age_mask]),
+                        gender_rm_texture_cue=args.gender_rm_prompt_cue,
                     )
                     diffusion_loss = diffusion_loss + _loss
                     diffusion_logs.update(_logs)
@@ -2679,6 +2753,7 @@ if __name__ == '__main__':
                         face_mask=_dds_mask(_face_age[is_age], mid_abs_idx[is_age]),
                         gender_prob=(src_probs[is_age, gender_local_idx].detach()
                                     if gender_local_idx is not None else None),
+                        young_add_hair_cue=args.age_add_hair_prompt_cue,
                     )
                     age_diffusion_loss = age_diffusion_loss + _loss
                     diffusion_logs.update({f'age_{k}': v for k, v in _logs.items()})
@@ -2696,6 +2771,7 @@ if __name__ == '__main__':
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
+                args.hair_color_add_loss_weight * hair_color_add_loss +\
                 args.controlnet_reg_weight * loss_control_reg +\
                 args.disc_realism_weight * disc_realism_loss
 
@@ -2836,6 +2912,7 @@ if __name__ == '__main__':
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
                 'loss_hair_gray':     hair_gray_loss,
+                'loss_hair_color_add': hair_color_add_loss,
                 'loss_disc_realism':  disc_realism_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),

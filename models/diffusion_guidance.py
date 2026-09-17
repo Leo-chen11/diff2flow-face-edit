@@ -5,12 +5,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None):
+def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None,
+                       young_add_hair_cue=False, gender_rm_texture_cue=False):
     """Build the per-sample DDS target-prompt strings.
 
     gender_prob: optional (B,) tensor, the source image's Male probability
     from the frozen attribute teacher (same one soft_target/src_attr use).
     Only attr 39 (age) reads it -- see the branch below for why.
+
+    young_add_hair_cue: mirrors the age-removal (elderly) branch's existing
+    "gray or white hair" cue onto the age-ADD (young) branch, which never
+    mentioned hair color -- see --age_add_hair_prompt_cue's help in
+    train_sdflow.py for the failure-audit finding this responds to. Off by
+    default so existing runs get byte-identical prompts unless opted in.
+
+    gender_rm_texture_cue: adds explicit texture-removal wording (smooth
+    skin, no facial hair, thin eyebrows) to the Male-removal ("female
+    person") branch. EXPERIMENTAL -- see --gender_rm_prompt_cue's help for
+    why this one is a hypothesis, not a confirmed fix. Off by default.
     """
     prompts = []
     gender_prob_list = (
@@ -27,11 +39,22 @@ def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None):
                 "a realistic face photo of a person without eyeglasses"
             )
         elif attr == 20:
-            prompts.append(
-                "a realistic face photo of a male person"
-                if enabled else
-                "a realistic face photo of a female person"
-            )
+            if enabled:
+                prompts.append("a realistic face photo of a male person")
+            elif gender_rm_texture_cue:
+                # EXPERIMENTAL (see --gender_rm_prompt_cue help): Male-rm has
+                # no known code-level asymmetry the way age did -- this
+                # branch was already symmetric before this flag existed.
+                # This tests whether giving the removal direction the same
+                # kind of explicit descriptive cue that fixed age's gap
+                # helps here too, without assuming it will.
+                prompts.append(
+                    "a realistic face photo of a female person with smooth "
+                    "skin, a softly rounded jawline, no visible facial hair "
+                    "or beard shadow, and thin, softly arched eyebrows"
+                )
+            else:
+                prompts.append("a realistic face photo of a female person")
         elif attr == 31:
             prompts.append(
                 "a realistic face photo of a smiling person"
@@ -79,13 +102,34 @@ def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None):
             # model failed to learn.
             male_like = gender_prob_list is not None and gender_prob_list[i] >= 0.5
             if enabled:
-                prompts.append(
-                    "a realistic face photo of a young man with a full, firm "
-                    "jawline, high round cheeks, and smooth, unlined skin"
-                    if male_like else
-                    "a realistic face photo of a young woman with a full, firm "
-                    "jawline, high round cheeks, and smooth, unlined skin"
-                )
+                if young_add_hair_cue:
+                    # Mirrors the elderly branch's explicit "gray or white
+                    # hair" cue below. Without this, the young branch never
+                    # mentioned hair at all -- see --age_add_hair_prompt_cue
+                    # help in train_sdflow.py for the failure-audit finding
+                    # (Gray_Hair in the SOURCE was the strongest correlate
+                    # of a successful de-aging edit, i.e. the model's only
+                    # reliable "look younger" lever was a hair-color change
+                    # it was never asked to make on this direction).
+                    prompts.append(
+                        "a realistic face photo of a young man with a full, "
+                        "firm jawline, high round cheeks, smooth unlined "
+                        "skin, and full, naturally colored hair with no "
+                        "gray or white strands"
+                        if male_like else
+                        "a realistic face photo of a young woman with a "
+                        "full, firm jawline, high round cheeks, smooth "
+                        "unlined skin, and full, naturally colored hair "
+                        "with no gray or white strands"
+                    )
+                else:
+                    prompts.append(
+                        "a realistic face photo of a young man with a full, firm "
+                        "jawline, high round cheeks, and smooth, unlined skin"
+                        if male_like else
+                        "a realistic face photo of a young woman with a full, firm "
+                        "jawline, high round cheeks, and smooth, unlined skin"
+                    )
             else:
                 prompts.append(
                     "a realistic face photo of an elderly man with gray or white "
@@ -213,12 +257,15 @@ class FrozenDiffusionDDSGuidance(nn.Module):
         return latents * self.latent_scale
 
     def forward(self, src_images, edit_images, attr_abs_idx, target_values, source_prompt=None,
-                timestep_min=None, timestep_max=None, face_mask=None, gender_prob=None):
+                timestep_min=None, timestep_max=None, face_mask=None, gender_prob=None,
+                young_add_hair_cue=False, gender_rm_texture_cue=False):
         device = edit_images.device
         B = edit_images.shape[0]
         source_prompt = source_prompt or "a realistic face photo of a person"
         src_prompts = [source_prompt] * B
-        edit_prompts = build_edit_prompts(attr_abs_idx, target_values, gender_prob=gender_prob)
+        edit_prompts = build_edit_prompts(attr_abs_idx, target_values, gender_prob=gender_prob,
+                                          young_add_hair_cue=young_add_hair_cue,
+                                          gender_rm_texture_cue=gender_rm_texture_cue)
 
         src_text = self._encode_text(src_prompts, device)
         edit_text = self._encode_text(edit_prompts, device)
