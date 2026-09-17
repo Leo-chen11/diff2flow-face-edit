@@ -93,22 +93,35 @@ def _histogram(values):
 
 
 def _make_judge_pair(src, edited, attr_name, src_celeba, edit_celeba, edit_clip,
-                     direction, group_label, size=256):
+                     direction, group_label, cond_src, size=256):
     """src|edited pair captioned with BOTH judges' verdicts on the edit.
 
     Each judge's edited score is coloured by whether THAT judge called this
     edit a success, so a row where one is green and the other red is exactly
     the disagreement the aggregate table counts.
+
+    cond_src is the conditioner's own reading of the source -- the number
+    that actually DECIDES which way the edit goes (see the INSTRUCTION
+    section of the report). It is flagged orange when it disagrees with the
+    judge's reading, because then the model was told to edit the opposite
+    way from the direction this sample was filed under, and the "failure"
+    is the instruction, not the edit.
     """
     ok = (lambda s: s < 0.5) if direction == 'rm' else (lambda s: s >= 0.5)
-    header_h = 52
+    header_h = 68
     a = to_pil(F.interpolate(src.unsqueeze(0), (size, size))[0])
     b = to_pil(F.interpolate(edited.unsqueeze(0), (size, size))[0])
     canvas = Image.new('RGB', (size * 2, size + header_h), (20, 20, 20))
     canvas.paste(a, (0, header_h)); canvas.paste(b, (size, header_h))
     d = ImageDraw.Draw(canvas)
     green, red, grey = (80, 220, 80), (240, 90, 90), (170, 170, 170)
+    orange = (245, 170, 60)
+    mismatched = (cond_src >= 0.5) != (src_celeba >= 0.5)
     d.text((4, 6), f'src {attr_name}={src_celeba:.2f}  ({group_label})', fill=grey)
+    d.text((size + 4, 6),
+           f'cond={cond_src:.2f} -> told to {"REMOVE" if cond_src >= 0.5 else "ADD"}'
+           + ('  MISMATCH' if mismatched else ''),
+           fill=orange if mismatched else grey)
     d.text((4, 22), 'CelebA:', fill=grey)
     d.text((4, 38), 'CLIP:', fill=grey)
     d.text((size + 4, 22), f'edited {attr_name}={edit_celeba:.2f}',
@@ -118,7 +131,7 @@ def _make_judge_pair(src, edited, attr_name, src_celeba, edit_celeba, edit_clip,
     return canvas
 
 
-def _report_group(name, celeba_scores, clip_scores, direction):
+def _report_group(name, celeba_scores, clip_scores, direction, cond_scores=None):
     n = len(celeba_scores)
     if n == 0:
         print(f'  {name}: (no samples)')
@@ -134,6 +147,24 @@ def _report_group(name, celeba_scores, clip_scores, direction):
     print(f'    mean edited score   CelebA={mean_celeba:.3f}   CLIP={mean_clip:.3f}')
     print(f'    fail rate           CelebA={celeba_fail:.1%}   CLIP={clip_fail:.1%}   '
          f'judges disagree on pass/fail: {disagree:.1%}')
+    if cond_scores is not None:
+        # Was the model even told to edit this way? The edit direction comes
+        # from the conditioner's own reading of the source, not from the
+        # judge that scores it, so the two can point opposite ways.
+        want_has = direction == 'rm'
+        mism = [i for i in range(n) if (cond_scores[i] >= 0.5) != want_has]
+        if mism:
+            mism_fail = sum(1 for i in mism if not success(celeba_scores[i])) / len(mism)
+            agree_idx = [i for i in range(n) if i not in set(mism)]
+            agree_fail = (sum(1 for i in agree_idx if not success(celeba_scores[i]))
+                          / len(agree_idx)) if agree_idx else float('nan')
+            print(f'    INSTRUCTION         {len(mism)}/{n} ({len(mism)/n:.1%}) were told the '
+                  f'OPPOSITE direction by the conditioner')
+            print(f'      CelebA fail rate  told-correctly={agree_fail:.1%} (n={len(agree_idx)})'
+                  f'   told-backwards={mism_fail:.1%} (n={len(mism)})')
+        else:
+            print(f'    INSTRUCTION         0/{n} mismatched -- every sample was told '
+                  f'to {"REMOVE" if want_has else "ADD"}')
     hist = _histogram(celeba_scores)
     hist_str = '  '.join(f'{_bin_label(i)}={c}' for i, c in enumerate(hist))
     print(f'    CelebA score distribution: {hist_str}')
@@ -173,8 +204,9 @@ def main(args):
     loader = data.DataLoader(dataset, shuffle=False, batch_size=args.batch,
                              num_workers=4, drop_last=False)
 
-    groups = {0: {'celeba': [], 'clip': []}, 1: {'celeba': [], 'clip': []}}
-    all_celeba, all_clip = [], []
+    groups = {0: {'celeba': [], 'clip': [], 'cond': []},
+              1: {'celeba': [], 'clip': [], 'cond': []}}
+    all_celeba, all_clip, all_cond = [], [], []
     # --dump_dir: three montages, each capped at --dump_max, so the aggregate
     # numbers above can be checked against what the images actually show.
     #   fail1/fail0  -- CelebA-judged failures inside each group
@@ -206,18 +238,28 @@ def main(args):
         edit_target_celeba = edit_celeba[:, args.attr]
         edit_target_clip = clip_judge.scores(edited_256)[:, 0]
         group_val = src_celeba[:, args.group_attr]        # grouping read on the SOURCE
+        # The number that actually decides which way edit_single_attribute
+        # moves this sample (it flips attr_cond, not the judge's score).
+        cond_target = attr_cond[:, local_idx]
 
         for b in range(img.size(0)):
             if n_seen >= args.max_samples:
                 break
             s = src_target[b].item()
+            c = cond_target[b].item()
             if not is_clear(s):
                 continue
+            # --gate_on judge reproduces dump_attr_failures.py and
+            # evaluate_sdflow.py's direction split (both bucket by the JUDGE's
+            # source score). --gate_on cond instead keeps only the samples the
+            # model was actually instructed to edit this way, which is the
+            # number that measures the edit rather than the label disagreement.
+            gate = s if args.gate_on == 'judge' else c
             if args.direction == 'add':
-                if s >= 0.5:
+                if gate >= 0.5:
                     continue
             else:
-                if s < 0.5:
+                if gate < 0.5:
                     continue
             n_seen += 1
             ec = edit_target_celeba[b].item()
@@ -225,8 +267,10 @@ def main(args):
             g = 1 if group_val[b].item() >= 0.5 else 0
             groups[g]['celeba'].append(ec)
             groups[g]['clip'].append(ek)
+            groups[g]['cond'].append(c)
             all_celeba.append(ec)
             all_clip.append(ek)
+            all_cond.append(c)
 
             if args.dump_dir:
                 ok = (lambda v: v < 0.5) if args.direction == 'rm' else (lambda v: v >= 0.5)
@@ -241,14 +285,17 @@ def main(args):
                     dumps[bucket].append(_make_judge_pair(
                         src_face[b].detach().cpu(), edited[b].detach().cpu(),
                         attr_name, s, ec, ek, args.direction,
-                        f'{group_name}={g}'))
+                        f'{group_name}={g}', c))
 
-    print(f'=== Overall ({n_seen} samples, direction={args.direction}) ===')
-    _report_group('all', all_celeba, all_clip, args.direction)
+    print(f'=== Overall ({n_seen} samples, direction={args.direction}, '
+          f'gate_on={args.gate_on}) ===')
+    _report_group('all', all_celeba, all_clip, args.direction, all_cond)
     print()
     print(f'=== Split by source {group_name} ===')
-    _report_group(f'{group_name}=0', groups[0]['celeba'], groups[0]['clip'], args.direction)
-    _report_group(f'{group_name}=1', groups[1]['celeba'], groups[1]['clip'], args.direction)
+    _report_group(f'{group_name}=0', groups[0]['celeba'], groups[0]['clip'],
+                  args.direction, groups[0]['cond'])
+    _report_group(f'{group_name}=1', groups[1]['celeba'], groups[1]['clip'],
+                  args.direction, groups[1]['cond'])
     print()
     if args.dump_dir:
         os.makedirs(args.dump_dir, exist_ok=True)
@@ -286,6 +333,18 @@ if __name__ == '__main__':
                    help='Global CelebA attribute index to split the report by, read on the '
                         'SOURCE image via the CelebA judge. Default 20 (Male).')
     p.add_argument('--max_samples', type=int, default=400)
+    p.add_argument('--gate_on', default='judge', choices=['judge', 'cond'],
+                   help='Which source reading decides that a sample belongs to this '
+                        'direction. "judge" (default) reproduces dump_attr_failures.py and '
+                        'evaluate_sdflow.py, which both bucket add/rm by the JUDGE\'s source '
+                        'score -- while the edit direction itself is set by the conditioner '
+                        '(edit_single_attribute flips attr_cond). When those two disagree the '
+                        'sample is filed under one direction and edited the other way, and '
+                        'gets scored as a failure for following the instruction it was given. '
+                        '"cond" gates on the conditioner instead, so the pool only holds '
+                        'samples the model was actually told to edit this way -- that fail '
+                        'rate measures the EDIT, the difference between the two measures the '
+                        'label disagreement.')
     p.add_argument('--dump_dir', default=None,
                    help='If set, also save montages: each group\'s CelebA-judged failures, '
                         'and the samples the two judges score on opposite sides. Off by '
