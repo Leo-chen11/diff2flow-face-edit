@@ -65,6 +65,7 @@ from evaluation.evaluate_sdflow import (
 # move is the goal, not a leak. _make_judge_pair below colours each judge's
 # score by whether THAT judge called it a success instead.
 from scripts.dump_attr_failures import save_montage, to_pil
+from models.clip_prompt_loss import FrozenCLIPPromptLoss
 from models.dataset import SDFlowDataset
 from models.flows.constant import CELEBA_ATTRIBUTES
 
@@ -131,7 +132,8 @@ def _make_judge_pair(src, edited, attr_name, src_celeba, edit_celeba, edit_clip,
     return canvas
 
 
-def _report_group(name, celeba_scores, clip_scores, direction, cond_scores=None):
+def _report_group(name, celeba_scores, clip_scores, direction, cond_scores=None,
+                  train_clip_losses=None, train_clip_mode=None):
     n = len(celeba_scores)
     if n == 0:
         print(f'  {name}: (no samples)')
@@ -165,6 +167,22 @@ def _report_group(name, celeba_scores, clip_scores, direction, cond_scores=None)
         else:
             print(f'    INSTRUCTION         0/{n} mismatched -- every sample was told '
                   f'to {"REMOVE" if want_has else "ADD"}')
+    if train_clip_losses is not None:
+        # The TRAINING CLIP loss (models/clip_prompt_loss.py), not the eval
+        # judge. Measured on the edits CelebA confirms are real, it answers a
+        # different question from any judge: for an edit that genuinely
+        # happened, how much reward did the training signal give it? A group
+        # that scores worse here is a group the training loss under-rewards,
+        # which is a training problem, not a measurement one.
+        ok_idx = [i for i in range(n) if success(celeba_scores[i])]
+        mean_all = sum(train_clip_losses) / n
+        mean_ok = (sum(train_clip_losses[i] for i in ok_idx) / len(ok_idx)) if ok_idx else float('nan')
+        extra = ''
+        if train_clip_mode == 'directional':
+            # directional loss is 1 - cos, so cos reads straight off it
+            extra = f'   (cos: all={1 - mean_all:+.3f}  CelebA-success={1 - mean_ok:+.3f})'
+        print(f'    TRAIN CLIP loss     all={mean_all:.3f}   '
+              f'on CelebA-successes={mean_ok:.3f} (n={len(ok_idx)}){extra}')
     hist = _histogram(celeba_scores)
     hist_str = '  '.join(f'{_bin_label(i)}={c}' for i, c in enumerate(hist))
     print(f'    CelebA score distribution: {hist_str}')
@@ -188,6 +206,20 @@ def main(args):
     celeba_judge = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, 'cuda')
     clip_judge = CLIPAttributeJudge([args.attr], args.clip_judge_model, 'cuda',
                                     calibration=parse_clip_calibration(args.clip_calibration))
+    train_clip = None
+    if args.score_train_clip:
+        train_clip = FrozenCLIPPromptLoss(
+            clip_model=args.clip_prompt_model,
+            temperature=args.clip_prompt_temperature,
+            mode=args.clip_prompt_mode,
+            num_augs=args.clip_prompt_num_augs,
+            aug_min_scale=args.clip_prompt_aug_min_scale,
+        ).cuda().eval()
+        print(f'[TrainLoss] scoring the same edits with the TRAINING CLIP loss '
+              f'({args.clip_prompt_model}, mode={args.clip_prompt_mode}, '
+              f'num_augs={args.clip_prompt_num_augs}) -- these settings must match the '
+              f'training run for the numbers to mean anything.')
+
     print(f'[Judge] {attr_name}: CelebAAttrClassifierJudge (grouping + primary) '
          f'and CLIP {args.clip_judge_model} (cross-check) on the same edited images')
     print(f'auditing {attr_name}  direction={args.direction}  grouped by {group_name}\n')
@@ -204,9 +236,9 @@ def main(args):
     loader = data.DataLoader(dataset, shuffle=False, batch_size=args.batch,
                              num_workers=4, drop_last=False)
 
-    groups = {0: {'celeba': [], 'clip': [], 'cond': []},
-              1: {'celeba': [], 'clip': [], 'cond': []}}
-    all_celeba, all_clip, all_cond = [], [], []
+    groups = {0: {'celeba': [], 'clip': [], 'cond': [], 'tclip': []},
+              1: {'celeba': [], 'clip': [], 'cond': [], 'tclip': []}}
+    all_celeba, all_clip, all_cond, all_tclip = [], [], [], []
     # --dump_dir: three montages, each capped at --dump_max, so the aggregate
     # numbers above can be checked against what the images actually show.
     #   fail1/fail0  -- CelebA-judged failures inside each group
@@ -242,6 +274,19 @@ def main(args):
         # moves this sample (it flips attr_cond, not the judge's score).
         cond_target = attr_cond[:, local_idx]
 
+        train_clip_batch = None
+        if train_clip is not None:
+            # Same target edit_single_attribute computed, so the training loss
+            # is asked about exactly the edit that was performed.
+            tv = (cond_target * (1.0 - args.edit_scale)
+                  + (1.0 - cond_target) * args.edit_scale)
+            abs_idx = torch.full((img.size(0),), args.attr,
+                                 device=img.device, dtype=torch.long)
+            train_clip_batch, _ = train_clip(
+                images=edited, attr_abs_idx=abs_idx, target_values=tv.detach(),
+                reduction='none', src_images=src_face,
+            )
+
         for b in range(img.size(0)):
             if n_seen >= args.max_samples:
                 break
@@ -268,9 +313,13 @@ def main(args):
             groups[g]['celeba'].append(ec)
             groups[g]['clip'].append(ek)
             groups[g]['cond'].append(c)
+            if train_clip_batch is not None:
+                groups[g]['tclip'].append(train_clip_batch[b].item())
             all_celeba.append(ec)
             all_clip.append(ek)
             all_cond.append(c)
+            if train_clip_batch is not None:
+                all_tclip.append(train_clip_batch[b].item())
 
             if args.dump_dir:
                 ok = (lambda v: v < 0.5) if args.direction == 'rm' else (lambda v: v >= 0.5)
@@ -289,13 +338,16 @@ def main(args):
 
     print(f'=== Overall ({n_seen} samples, direction={args.direction}, '
           f'gate_on={args.gate_on}) ===')
-    _report_group('all', all_celeba, all_clip, args.direction, all_cond)
+    _report_group('all', all_celeba, all_clip, args.direction, all_cond,
+                  all_tclip or None, args.clip_prompt_mode)
     print()
     print(f'=== Split by source {group_name} ===')
     _report_group(f'{group_name}=0', groups[0]['celeba'], groups[0]['clip'],
-                  args.direction, groups[0]['cond'])
+                  args.direction, groups[0]['cond'],
+                  groups[0]['tclip'] or None, args.clip_prompt_mode)
     _report_group(f'{group_name}=1', groups[1]['celeba'], groups[1]['clip'],
-                  args.direction, groups[1]['cond'])
+                  args.direction, groups[1]['cond'],
+                  groups[1]['tclip'] or None, args.clip_prompt_mode)
     print()
     if args.dump_dir:
         os.makedirs(args.dump_dir, exist_ok=True)
@@ -351,6 +403,22 @@ if __name__ == '__main__':
                         'default -- the aggregate numbers alone need no image decoding.')
     p.add_argument('--dump_max', type=int, default=16,
                    help='Max pairs per montage saved under --dump_dir.')
+    p.add_argument('--score_train_clip', action=argparse.BooleanOptionalAction, default=False,
+                   help='Also score every edit with the TRAINING CLIP loss '
+                        '(models/clip_prompt_loss.py), not the eval judge. Answers whether '
+                        'the training signal itself under-rewards one group: its age prompt '
+                        'is a single gender-neutral pair describing only fine skin texture '
+                        '("wrinkles, aged skin texture, nasolabial folds"), with no hair-colour '
+                        'cue and no male/female branch -- unlike the DDS prompt in '
+                        'diffusion_guidance.py, which was given both precisely because an audit '
+                        'found aging failures skewed Male. The flags below must match the '
+                        'training run or the number is meaningless.')
+    p.add_argument('--clip_prompt_model', default='ViT-B/32')
+    p.add_argument('--clip_prompt_mode', default='directional',
+                   choices=['absolute', 'directional'])
+    p.add_argument('--clip_prompt_num_augs', type=int, default=4)
+    p.add_argument('--clip_prompt_aug_min_scale', type=float, default=0.75)
+    p.add_argument('--clip_prompt_temperature', type=float, default=1.0)
     p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None)
 
     p.add_argument('--index_file',   default='./data/ffhq.txt')
