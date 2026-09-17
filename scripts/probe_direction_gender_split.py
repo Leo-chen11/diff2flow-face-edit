@@ -51,11 +51,20 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.utils import data
 
+from PIL import Image, ImageDraw
+
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CLIPAttributeJudge, CelebAAttrClassifierJudge,
     _latest_step, apply_run_config, edit_single_attribute, is_clear, load_models,
     parse_clip_calibration, resolve_controlnet_disable_attrs,
 )
+# to_pil / save_montage are reused as-is. dump_attr_failures.make_pair is NOT:
+# its `watch` row colours any |edit-src| > 0.15 orange as "leakage", which is
+# the right semantics for a bystander attribute but the wrong ones here --
+# the second judge is scoring the SAME attribute being edited, where a large
+# move is the goal, not a leak. _make_judge_pair below colours each judge's
+# score by whether THAT judge called it a success instead.
+from scripts.dump_attr_failures import save_montage, to_pil
 from models.dataset import SDFlowDataset
 from models.flows.constant import CELEBA_ATTRIBUTES
 
@@ -81,6 +90,32 @@ def _histogram(values):
                 counts[i] += 1
                 break
     return counts
+
+
+def _make_judge_pair(src, edited, attr_name, src_celeba, edit_celeba, edit_clip,
+                     direction, group_label, size=256):
+    """src|edited pair captioned with BOTH judges' verdicts on the edit.
+
+    Each judge's edited score is coloured by whether THAT judge called this
+    edit a success, so a row where one is green and the other red is exactly
+    the disagreement the aggregate table counts.
+    """
+    ok = (lambda s: s < 0.5) if direction == 'rm' else (lambda s: s >= 0.5)
+    header_h = 52
+    a = to_pil(F.interpolate(src.unsqueeze(0), (size, size))[0])
+    b = to_pil(F.interpolate(edited.unsqueeze(0), (size, size))[0])
+    canvas = Image.new('RGB', (size * 2, size + header_h), (20, 20, 20))
+    canvas.paste(a, (0, header_h)); canvas.paste(b, (size, header_h))
+    d = ImageDraw.Draw(canvas)
+    green, red, grey = (80, 220, 80), (240, 90, 90), (170, 170, 170)
+    d.text((4, 6), f'src {attr_name}={src_celeba:.2f}  ({group_label})', fill=grey)
+    d.text((4, 22), 'CelebA:', fill=grey)
+    d.text((4, 38), 'CLIP:', fill=grey)
+    d.text((size + 4, 22), f'edited {attr_name}={edit_celeba:.2f}',
+           fill=green if ok(edit_celeba) else red)
+    d.text((size + 4, 38), f'edited {attr_name}={edit_clip:.2f}',
+           fill=green if ok(edit_clip) else red)
+    return canvas
 
 
 def _report_group(name, celeba_scores, clip_scores, direction):
@@ -140,6 +175,13 @@ def main(args):
 
     groups = {0: {'celeba': [], 'clip': []}, 1: {'celeba': [], 'clip': []}}
     all_celeba, all_clip = [], []
+    # --dump_dir: three montages, each capped at --dump_max, so the aggregate
+    # numbers above can be checked against what the images actually show.
+    #   fail1/fail0  -- CelebA-judged failures inside each group
+    #   disagree     -- the samples the two judges score on opposite sides,
+    #                   which is the whole point of the cross-check: eyeball
+    #                   these to decide WHICH judge is misreading them.
+    dumps = {'fail1': [], 'fail0': [], 'disagree': []}
     n_seen = 0
     for img, latent, pred in loader:
         if n_seen >= args.max_samples:
@@ -186,6 +228,21 @@ def main(args):
             all_celeba.append(ec)
             all_clip.append(ek)
 
+            if args.dump_dir:
+                ok = (lambda v: v < 0.5) if args.direction == 'rm' else (lambda v: v >= 0.5)
+                buckets = []
+                if not ok(ec):
+                    buckets.append('fail1' if g == 1 else 'fail0')
+                if ok(ec) != ok(ek):
+                    buckets.append('disagree')
+                for bucket in buckets:
+                    if len(dumps[bucket]) >= args.dump_max:
+                        continue
+                    dumps[bucket].append(_make_judge_pair(
+                        src_face[b].detach().cpu(), edited[b].detach().cpu(),
+                        attr_name, s, ec, ek, args.direction,
+                        f'{group_name}={g}'))
+
     print(f'=== Overall ({n_seen} samples, direction={args.direction}) ===')
     _report_group('all', all_celeba, all_clip, args.direction)
     print()
@@ -193,6 +250,21 @@ def main(args):
     _report_group(f'{group_name}=0', groups[0]['celeba'], groups[0]['clip'], args.direction)
     _report_group(f'{group_name}=1', groups[1]['celeba'], groups[1]['clip'], args.direction)
     print()
+    if args.dump_dir:
+        os.makedirs(args.dump_dir, exist_ok=True)
+        tag = f'{attr_name}_{args.direction}'
+        print(f'=== Montages -> {args.dump_dir} ===')
+        for bucket, label in [
+            ('fail1', f'{group_name}1_CELEBA_FAILURES'),
+            ('fail0', f'{group_name}0_CELEBA_FAILURES'),
+            ('disagree', 'JUDGES_DISAGREE'),
+        ]:
+            save_montage(dumps[bucket], os.path.join(args.dump_dir, f'{tag}_{label}.png'),
+                         cols=2)
+        print(f'  In {tag}_JUDGES_DISAGREE.png each row shows both judges\' verdicts on the '
+              f'SAME edit (green = that judge called it a success). Whichever colour '
+              f'disagrees with your own eyes is the judge that is misreading these.')
+        print()
     print('How to read this:')
     print('  - If the weak group\'s CelebA distribution clusters in the near-miss bin')
     print('    ([0.35,0.50) for rm) rather than the far bin ([0.00,0.20)), the edit is')
@@ -214,6 +286,12 @@ if __name__ == '__main__':
                    help='Global CelebA attribute index to split the report by, read on the '
                         'SOURCE image via the CelebA judge. Default 20 (Male).')
     p.add_argument('--max_samples', type=int, default=400)
+    p.add_argument('--dump_dir', default=None,
+                   help='If set, also save montages: each group\'s CelebA-judged failures, '
+                        'and the samples the two judges score on opposite sides. Off by '
+                        'default -- the aggregate numbers alone need no image decoding.')
+    p.add_argument('--dump_max', type=int, default=16,
+                   help='Max pairs per montage saved under --dump_dir.')
     p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None)
 
     p.add_argument('--index_file',   default='./data/ffhq.txt')
