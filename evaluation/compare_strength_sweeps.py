@@ -7,9 +7,10 @@ Example:
         --run Ours=./output/compare/v20/metrics_summary.csv \
         --output_dir ./output/compare/original_vs_v20
 
-Inputs are the metrics_summary.csv files produced by:
-  - evaluation/eval_original_sdflow_strength_sweep.py
-  - evaluation/eval_strength_sweep.py
+Inputs are the metrics_summary.csv files produced by
+evaluation/eval_strength_sweep.py -- point --baseline and --run at two
+different --output_dir runs of it (e.g. an original-SDFlow checkpoint and a
+newer one).
 """
 
 import argparse
