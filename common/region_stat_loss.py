@@ -67,3 +67,41 @@ def directional_region_saturation_loss(src_img, edit_img, src_mask, edit_mask,
         return torch.relu(edit_sat - target)
     target = (src_sat + (1.0 - src_sat) * relative_ratio).clamp(min=bound)
     return torch.relu(target - edit_sat)
+
+
+def region_area_fraction(prob):
+    """Mask-weighted area of a region as a fraction of the frame.
+
+    prob MUST come from a differentiable source -- FaceParser.region_prob,
+    not FaceParser.get_region_mask. The latter is @torch.no_grad() and
+    argmax'd, so a loss on the value returned here would have exactly zero
+    gradient and would silently do nothing.
+    """
+    return prob.sum() / prob.numel()
+
+
+def directional_region_area_loss(src_prob, edit_prob, push, relative_change, bound):
+    """One-sided hinge on how much of the frame a region covers, relative to
+    the source's own coverage.
+
+    push=+1: the edited region must cover at least (1 + relative_change) x
+        the source's area, capped above by `bound`.
+    push=-1: at most (1 - relative_change) x, floored below by `bound`.
+
+    The target is MULTIPLICATIVE here, unlike
+    directional_region_saturation_loss's "move a fraction of the way toward
+    the extreme". Saturation is a [0,1] quantity where 1.0 is a meaningful
+    ceiling, so moving partway toward it makes sense. An area fraction is
+    also in [0,1] but a face's hair only ever covers roughly 0.05-0.30 of the
+    frame -- moving "halfway to 1.0" would demand hair over half the image.
+    Scaling the source's own coverage keeps the ask proportionate to how much
+    hair the person started with, and `bound` stops it running away.
+    """
+    with torch.no_grad():
+        src_a = region_area_fraction(src_prob)
+    edit_a = region_area_fraction(edit_prob)
+    if push > 0:
+        target = (src_a * (1.0 + relative_change)).clamp(max=bound)
+        return torch.relu(target - edit_a)
+    target = (src_a * (1.0 - relative_change)).clamp(min=bound)
+    return torch.relu(edit_a - target)

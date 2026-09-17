@@ -20,7 +20,8 @@ from tqdm import tqdm
 from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
-from common.region_stat_loss import directional_region_saturation_loss
+from common.region_stat_loss import (directional_region_area_loss,
+                                     directional_region_saturation_loss)
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
@@ -366,6 +367,7 @@ def _mechanism_report(args):
         ('local_region', args.local_region_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_color_add', args.hair_color_add_loss_weight),
+        ('hair_extent', args.hair_extent_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
         ('disc_realism', args.disc_realism_weight),
     ]
@@ -970,6 +972,52 @@ if __name__ == '__main__':
                              'are meant to be used together (pixel loss + text prompt), matching '
                              'how the removal direction already uses both. Off by default so it '
                              'never silently changes an existing run\'s DDS gradient.')
+    parser.add_argument('--hair_extent_loss_weight', type=float, default=0.0,
+                        help='Gender(20), BOTH directions: push the HAIR region\'s AREA up for '
+                             'removal edits (feminize -> more hair) and down for add edits '
+                             '(masculinize -> less hair). Same module as '
+                             '--hair_gray_loss_weight (common/region_stat_loss.py), different '
+                             'statistic: coverage instead of colour. Motivated by a visual audit '
+                             'of Male-rm at edit_scale 0.6, where the faces softened but the hair '
+                             'stayed male-typical and short, leaving the edit ambiguous enough '
+                             'that the two judges landed on opposite sides of it (CelebA 56% '
+                             'fail, CLIP 11% fail, disagreeing on 49% of samples). Hair is the '
+                             'cheapest place to buy that decisiveness: IDLoss.extract_features '
+                             'crops to the central 188/256 of the frame, so the top ~14% and the '
+                             'outer margins -- where most of the hair silhouette lives -- are '
+                             'outside what the identity loss can even see. Requires a '
+                             'DIFFERENTIABLE region occupancy, so it uses FaceParser.region_prob '
+                             '(softmax), NOT get_region_mask (argmax, no_grad) -- a loss on an '
+                             'argmax\'d mask would have zero gradient. That costs a backward pass '
+                             'through BiSeNet on the steps it fires. Pass 0 (default) to disable.')
+    parser.add_argument('--hair_extent_relative_change', type=float, default=0.35,
+                        help='Under --hair_extent_loss_weight: the edited hair region must cover '
+                             'at least (1 + this) x the source\'s own coverage on feminizing '
+                             'edits, or at most (1 - this) x on masculinizing ones. Relative to '
+                             'each sample\'s own starting hair, so someone already long-haired is '
+                             'not asked for the same absolute change as someone shaved.')
+    parser.add_argument('--hair_extent_max_frac', type=float, default=0.35,
+                        help='Ceiling on the grow-hair target, as a fraction of the frame. Stops '
+                             'the relative target from demanding unbounded hair on a source that '
+                             'already has a lot.')
+    parser.add_argument('--hair_extent_min_frac', type=float, default=0.02,
+                        help='Floor on the shrink-hair target, as a fraction of the frame.')
+    parser.add_argument('--gender_dds_fine_layer_start', type=int, default=-1,
+                        help='Fine-layer cutoff for the GENDER(20) DDS pass specifically, exactly '
+                             'mirroring --age_dds_fine_layer_start. <0 (default) falls back to the '
+                             'shared --dds_fine_layer_start (7), which blocks the diffusion '
+                             'teacher\'s gradient from W+ layers 7-17. Age had that block lifted '
+                             'to 12 because those layers "carry wrinkles/skin texture/gray hair, '
+                             'so the diffusion teacher could not teach real aging texture" (see '
+                             '--age_dds_fine_layer_start). The same layers carry lip shape, brow '
+                             'density, skin smoothness and eye detail -- the feminine facial '
+                             'features a Male-rm edit needs -- and gender was never given the same '
+                             'lift. Note this also decides whether --gender_rm_prompt_cue can do '
+                             'anything: that cue describes fine facial detail, so with the '
+                             'gradient blocked at 7 the prompt has no path to the layers that '
+                             'would render it. Set 12 to match age. Costs one extra generator '
+                             'forward per DDS step when it differs from the shared cutoff, since '
+                             'gender then needs its own pass.')
     parser.add_argument('--gender_rm_prompt_cue', action=argparse.BooleanOptionalAction,
                         default=False,
                         help='Add explicit texture-removal cues (smooth skin, no facial hair, '
@@ -2046,7 +2094,8 @@ if __name__ == '__main__':
 
     face_parser = None
     if args.local_region_loss_weight > 0 or args.dds_face_mask \
-            or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0:
+            or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0 \
+            or args.hair_extent_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -2061,6 +2110,12 @@ if __name__ == '__main__':
                 print(f'** Hair-graying loss enabled (weight={args.hair_gray_loss_weight}, '
                       f'target={args.hair_gray_relative_ratio}x source sat, capped at '
                       f'{args.hair_gray_abs_cap}) for age(39) removal edits')
+            if args.hair_extent_loss_weight > 0:
+                print(f'** Hair-EXTENT loss enabled (weight={args.hair_extent_loss_weight}, '
+                      f'+/-{args.hair_extent_relative_change:.0%} of source coverage, '
+                      f'capped [{args.hair_extent_min_frac}, {args.hair_extent_max_frac}]) '
+                      f'for gender(20) edits -- uses the DIFFERENTIABLE FaceParser.region_prob, '
+                      f'so it adds a BiSeNet backward pass on the steps it fires')
             if args.hair_color_add_loss_weight > 0:
                 print(f'** Hair-color (add-direction) loss enabled (weight='
                       f'{args.hair_color_add_loss_weight}, floor={args.hair_color_add_floor}) '
@@ -2310,6 +2365,7 @@ if __name__ == '__main__':
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_color_add_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
             # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
             # Hoisted out of the face-parser branch below so the identity /
@@ -2440,6 +2496,36 @@ if __name__ == '__main__':
                                 push=+1, relative_ratio=args.hair_gray_relative_ratio,
                                 bound=args.hair_color_add_floor,
                             )
+
+                # ── Hair EXTENT (gender/20, both directions) ─────────────
+                # See --hair_extent_loss_weight for the audit this responds
+                # to. Unlike the two blocks above this one optimises the
+                # SIZE of the region, so it cannot use face_parser's
+                # argmax'd, no_grad mask -- that would give it exactly zero
+                # gradient. region_prob is the differentiable softmax
+                # version; the cost is a BiSeNet backward pass here.
+                if args.hair_extent_loss_weight > 0:
+                    _is_gender = torch.tensor([a == 20 for a in _mid_abs],
+                                              device=latent.device)
+                    _terms_extent = []
+                    for _sel, _push, _bound in (
+                        (_is_gender & _is_removal, +1, args.hair_extent_max_frac),
+                        (_is_gender & ~_is_removal, -1, args.hair_extent_min_frac),
+                    ):
+                        if not _sel.any():
+                            continue
+                        with torch.no_grad():
+                            _src_prob = face_parser.region_prob(
+                                src_recon[_sel], HAIR_REGION_CLASS)
+                        _edit_prob = face_parser.region_prob(
+                            new_face_tensors[_sel], HAIR_REGION_CLASS)
+                        _terms_extent.append(directional_region_area_loss(
+                            _src_prob, _edit_prob, push=_push,
+                            relative_change=args.hair_extent_relative_change,
+                            bound=_bound,
+                        ))
+                    if _terms_extent:
+                        hair_extent_loss = torch.stack(_terms_extent).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -2717,23 +2803,43 @@ if __name__ == '__main__':
                 # Non-age samples (glasses, gender): standard cutoff and timestep range
                 non_age_mask = ~is_age
                 if non_age_fires:
-                    _face_non_age = _dds_face(args.dds_fine_layer_start)
+                    # Gender may ask for its own fine-layer cutoff
+                    # (--gender_dds_fine_layer_start), exactly as age does. A
+                    # different cutoff means a different detach point, so it
+                    # needs its own generator pass -- hence the split. When the
+                    # flag is left at its default this collapses back to the
+                    # single call it has always been, at the same cost.
+                    _gender_fine = (args.gender_dds_fine_layer_start
+                                    if args.gender_dds_fine_layer_start >= 0
+                                    else args.dds_fine_layer_start)
+                    if _gender_fine == args.dds_fine_layer_start:
+                        _non_age_groups = [(non_age_mask, args.dds_fine_layer_start)]
+                    else:
+                        _is_gender_dds = mid_abs_idx == 20
+                        _non_age_groups = [
+                            (non_age_mask & ~_is_gender_dds, args.dds_fine_layer_start),
+                            (non_age_mask & _is_gender_dds, _gender_fine),
+                        ]
                     # DDS subtracts the source branch's noise residual as a bias
                     # correction; that cancellation is only valid when src and
                     # edit differ ONLY by the edit. Passing the real photo makes
                     # the residual difference also contain the inversion gap,
                     # leaving an uncancelled "fix the reconstruction" component
                     # in the gradient. See --losses_vs_recon.
-                    _loss, _logs = diffusion_guidance(
-                        src_images=loss_ref_img[non_age_mask],
-                        edit_images=_face_non_age[non_age_mask],
-                        attr_abs_idx=mid_abs_idx[non_age_mask],
-                        target_values=soft_target[non_age_mask].detach(),
-                        face_mask=_dds_mask(_face_non_age[non_age_mask], mid_abs_idx[non_age_mask]),
-                        gender_rm_texture_cue=args.gender_rm_prompt_cue,
-                    )
-                    diffusion_loss = diffusion_loss + _loss
-                    diffusion_logs.update(_logs)
+                    for _grp_mask, _grp_fine in _non_age_groups:
+                        if not _grp_mask.any():
+                            continue
+                        _face_non_age = _dds_face(_grp_fine)
+                        _loss, _logs = diffusion_guidance(
+                            src_images=loss_ref_img[_grp_mask],
+                            edit_images=_face_non_age[_grp_mask],
+                            attr_abs_idx=mid_abs_idx[_grp_mask],
+                            target_values=soft_target[_grp_mask].detach(),
+                            face_mask=_dds_mask(_face_non_age[_grp_mask], mid_abs_idx[_grp_mask]),
+                            gender_rm_texture_cue=args.gender_rm_prompt_cue,
+                        )
+                        diffusion_loss = diffusion_loss + _loss
+                        diffusion_logs.update(_logs)
 
                 # Age samples: coarse timestep range, own interval, own fine-layer
                 # cutoff (may reach fine layers), accumulated into age_diffusion_loss
@@ -2772,6 +2878,7 @@ if __name__ == '__main__':
                 args.local_region_loss_weight * local_region_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
                 args.hair_color_add_loss_weight * hair_color_add_loss +\
+                args.hair_extent_loss_weight * hair_extent_loss +\
                 args.controlnet_reg_weight * loss_control_reg +\
                 args.disc_realism_weight * disc_realism_loss
 
@@ -2913,6 +3020,7 @@ if __name__ == '__main__':
                 'loss_local_region':  local_region_loss,
                 'loss_hair_gray':     hair_gray_loss,
                 'loss_hair_color_add': hair_color_add_loss,
+                'loss_hair_extent':   hair_extent_loss,
                 'loss_disc_realism':  disc_realism_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
