@@ -26,7 +26,7 @@ from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
 from models.control_encoder import clip_skips, skips_norm_per_sample, skips_reg_per_sample
-from models.direction_bank import AttributeDirectionBank
+from models.direction_bank import AttributeDirectionBank, _inverse_softplus
 from models.layer_mask import AttributeLayerMask
 from models.stylegan2.model import Generator, Discriminator
     
@@ -71,11 +71,6 @@ class LearnableAttributeScales(nn.Module):
     def current_scales(self):
         with torch.no_grad():
             return torch.exp(self.attr_log_scales).clamp(self.min_scale, self.max_scale)
-
-
-def _inverse_softplus(x):
-    x = x.clamp(min=1e-6)
-    return torch.log(torch.expm1(x))
 
 
 class LearnableRegLossWeights(nn.Module):

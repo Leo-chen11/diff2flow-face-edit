@@ -56,6 +56,7 @@ from models.attribute_estimator import AttributeClassifier
 from models.dataset import SDFlowDataset
 from models.editor import SDFlow
 from models.stylegan2.model import Generator
+from evaluation._shared import attr_name_map, generate_faces
 
 
 def parse_strengths(value):
@@ -68,26 +69,11 @@ def mean_or_zero(values):
     return sum(values) / len(values) if values else 0.0
 
 
-def attr_name_map(indices, names):
-    if names and len(names) != len(indices):
-        raise ValueError('--attribute_names must have the same length as --attribute_index.')
-    if names:
-        return {int(idx): name for idx, name in zip(indices, names)}
-    return {int(idx): f'attr_{idx}' for idx in indices}
-
-
 def tensor_to_float_list(x):
     return [float(v) for v in x.detach().cpu().view(-1)]
 
 
 @torch.no_grad()
-def generate_faces(generator, latents, img_size):
-    faces = generator([latents], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-    if faces.size(-1) != img_size:
-        faces = F.interpolate(faces, (img_size, img_size), mode='bilinear', align_corners=False)
-    return faces
-
-
 @torch.no_grad()
 def evaluate_batch(args, transformer, generator, attr_teacher, id_model,
                    images, latents, source_preds, attr_global_idx, attr_local_idx, strengths,

@@ -55,24 +55,10 @@ from models.attribute_estimator import AttributeClassifier
 from models.dataset import SDFlowDataset
 from models.editor import SDFlow
 from models.stylegan2.model import Generator
-
-
-def attr_name_map(indices, names):
-    if names and len(names) != len(indices):
-        raise ValueError('--attribute_names must have the same length as --attribute_index.')
-    if names:
-        return {int(idx): name for idx, name in zip(indices, names)}
-    return {int(idx): f'attr_{idx}' for idx in indices}
+from evaluation._shared import attr_name_map, generate_faces
 
 
 @torch.no_grad()
-def generate_faces(generator, latents, img_size):
-    faces = generator([latents], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-    if faces.size(-1) != img_size:
-        faces = F.interpolate(faces, (img_size, img_size), mode='bilinear', align_corners=False)
-    return faces
-
-
 @torch.no_grad()
 def classifier_prob(attr_teacher, faces, attr_global_idx):
     logits, _ = attr_teacher(F.interpolate(faces, (256, 256), mode='bilinear', align_corners=False))

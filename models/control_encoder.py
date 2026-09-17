@@ -178,7 +178,27 @@ def is_legacy_state_dict(state):
     return any(k.startswith('attr_heads.') for k in state)
 
 
-class LegacySingleResControlEncoder(nn.Module):
+class _PerDirectionSlots:
+    """Maps (attribute, direction) onto a slot index.
+
+    Shared by both encoders below, which had kept byte-identical copies of
+    this method -- to the point that the copy in the legacy class still
+    named AttributeControlEncoder in its error message. With
+    --controlnet_per_direction each attribute owns two slots (add and rm)
+    instead of one, so 'add glasses' and 'remove glasses' stop sharing a
+    single set of injection weights. Adds no parameters and no state, so it
+    does not affect either class's state_dict.
+    """
+
+    def slot_index(self, attr_idx, is_rm=None):
+        if not self.per_direction:
+            return attr_idx
+        if is_rm is None:
+            raise ValueError(f'per_direction {type(self).__name__} needs is_rm per sample')
+        return attr_idx * 2 + is_rm.long()
+
+
+class LegacySingleResControlEncoder(_PerDirectionSlots, nn.Module):
     """The original single-resolution encoder, kept verbatim so checkpoints
     trained before multi-resolution injection stay loadable.
 
@@ -237,13 +257,6 @@ class LegacySingleResControlEncoder(nn.Module):
         self.res_channels = {self.out_res: self.out_channels}
         self.out_res_list = [self.out_res]
 
-    def slot_index(self, attr_idx, is_rm=None):
-        if not self.per_direction:
-            return attr_idx
-        if is_rm is None:
-            raise ValueError('per_direction AttributeControlEncoder needs is_rm per sample')
-        return attr_idx * 2 + is_rm.long()
-
     def _build_head(self, channels, num_upsamples):
         layers = []
         for _ in range(num_upsamples):
@@ -285,7 +298,7 @@ class LegacySingleResControlEncoder(nn.Module):
         return {self.out_res: out * gain.view(-1, 1, 1, 1)}
 
 
-class AttributeControlEncoder(nn.Module):
+class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
     """Predicts additive feature-map corrections at one or more StyleGAN2
     resolutions, from the attribute being edited and (optionally) the source
     latent.
@@ -487,13 +500,6 @@ class AttributeControlEncoder(nn.Module):
         init_gain = max(float(init_gain), 1e-4)
         raw = math.log(math.expm1(init_gain))
         self.log_gain = nn.Parameter(torch.full((self.num_slots, len(self.out_res)), raw))
-
-    def slot_index(self, attr_idx, is_rm=None):
-        if not self.per_direction:
-            return attr_idx
-        if is_rm is None:
-            raise ValueError('per_direction AttributeControlEncoder needs is_rm per sample')
-        return attr_idx * 2 + is_rm.long()
 
     def forward(self, attr_delta, attr_idx, is_rm=None, latent=None):
         """
