@@ -199,13 +199,15 @@ def main(args):
 
     judge = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, 'cuda') \
         if args.celeba_attr_judge_weights else None
+    # Built whenever available, not just for --dump_dir: the skin_hf AGGREGATE
+    # (base vs projected vs random_ctrl, averaged over all samples) is the
+    # number this whole probe exists to answer, and it needs to be printed
+    # even on runs that skip the montage.
     face_parser = None
-    if args.dump_dir:
-        try:
-            face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-        except (FileNotFoundError, RuntimeError) as exc:
-            print(f'[WARN] --dump_dir requested but face parser unavailable ({exc}); '
-                 f'montage will skip the skin_hf column.')
+    try:
+        face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f'[WARN] face parser unavailable ({exc}); skin_hf column/summary will be skipped.')
 
     print(f'auditing {attr_name} direction={args.direction} scale={args.edit_scale}')
     print(f'removing top {args.num_directions} identity-damaging direction(s) per sample, '
@@ -227,6 +229,7 @@ def main(args):
 
     base_ids, proj_ids, ctrl_ids = [], [], []
     base_scores, proj_scores, ctrl_scores = [], [], []
+    base_hfs, proj_hfs, ctrl_hfs = [], [], []
     rows = []
     seen = 0
     for img, latent, pred in loader:
@@ -271,17 +274,20 @@ def main(args):
             base_scores.append(bs); proj_scores.append(ps); ctrl_scores.append(cs)
             line += (f'\n       {attr_name}  base={bs:.2f}  projected={ps:.2f} '
                     f'({ps-bs:+.2f})  random_ctrl={cs:.2f} ({cs-bs:+.2f})')
+
+        hf_vals = None
+        if face_parser is not None:
+            src_hf = skin_hf_energy(src_recon, face_parser, args.blur_sigma_hf).item()
+            base_hf = skin_hf_energy(base_img, face_parser, args.blur_sigma_hf).item()
+            proj_hf = skin_hf_energy(proj_img, face_parser, args.blur_sigma_hf).item()
+            ctrl_hf = skin_hf_energy(ctrl_img, face_parser, args.blur_sigma_hf).item()
+            base_hfs.append(base_hf); proj_hfs.append(proj_hf); ctrl_hfs.append(ctrl_hf)
+            hf_vals = [src_hf, base_hf, proj_hf, ctrl_hf]
+            line += (f'\n       skin_hf  base={base_hf:.5f}  projected={proj_hf:.5f} '
+                    f'({proj_hf-base_hf:+.5f})  random_ctrl={ctrl_hf:.5f} ({ctrl_hf-base_hf:+.5f})')
         print(line)
 
         if args.dump_dir and len(rows) < args.dump_max:
-            hf_vals = None
-            if face_parser is not None:
-                hf_vals = [
-                    skin_hf_energy(src_recon, face_parser, args.blur_sigma_hf).item(),
-                    skin_hf_energy(base_img, face_parser, args.blur_sigma_hf).item(),
-                    skin_hf_energy(proj_img, face_parser, args.blur_sigma_hf).item(),
-                    skin_hf_energy(ctrl_img, face_parser, args.blur_sigma_hf).item(),
-                ]
             rows.append(_make_row(
                 imgs=[src_recon, base_img, proj_img, ctrl_img],
                 labels=['source', 'base (unprojected)', 'projected (identity-derived)',
@@ -305,6 +311,14 @@ def main(args):
         print(f'  {attr_name} score      base={mean(base_scores):.3f}  '
              f'projected={mean(proj_scores):.3f} ({mean(proj_scores)-mean(base_scores):+.3f})  '
              f'random_ctrl={mean(ctrl_scores):.3f} ({mean(ctrl_scores)-mean(base_scores):+.3f})')
+    if base_hfs:
+        print(f'  skin_hf (skin)    base={mean(base_hfs):.5f}  '
+             f'projected={mean(proj_hfs):.5f} ({mean(proj_hfs)-mean(base_hfs):+.5f})  '
+             f'random_ctrl={mean(ctrl_hfs):.5f} ({mean(ctrl_hfs)-mean(base_hfs):+.5f})')
+        print('  -> projected HIGHER than base = genuinely more skin detail (real win).')
+        print('     projected LOWER/flat than base = same skin-smoothing shortcut the noise')
+        print('     probe found, just reached through a different mechanism -- accuracy/ID')
+        print('     gain here would not be one to build on; go back to reg_loss_fine instead.')
     print()
     print('How to read this:')
     print('  - ID recovered by "projected" should be >= what "random_ctrl" recovers, by a')
