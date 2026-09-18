@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,6 +40,8 @@ class AttributeDirectionBank(nn.Module):
         use_attr_lora=False,
         attr_lora_rank=4,
         signed_magnitude_input=False,
+        magnitude_latent_cond=False,
+        gate_usage_ema_decay=0.98,
     ):
         super().__init__()
         self.num_attrs = int(num_attrs)
@@ -150,6 +154,44 @@ class AttributeDirectionBank(nn.Module):
             self.attr_lora_B = nn.Parameter(torch.zeros(self.num_attrs, self.num_layers, rank))
             print(f"[DirectionBank] per-attribute LoRA adapter enabled (rank={rank})")
 
+        # Per-face magnitude conditioning. Without this, magnitude_net's ONLY
+        # input is attr_delta -- so every face gets the identical step size for
+        # a given (attribute, direction), and the whole dir_delta path is
+        # face-independent by construction. The only per-face term left is the
+        # K-slot gate, which measurably collapses to a constant (see the
+        # gate_usage_ema comment below: entropy pinned at log(K) with ~1e-7
+        # variance for 40k steps).
+        #
+        # A residual-ablation scale sweep is what makes this load-bearing: with
+        # the flow residual forced to 0, a single GLOBAL scale from 0.90 to 1.20
+        # recovers five of six add/rm directions back to (Male add: past) the
+        # full model's accuracy. So magnitude, not direction, is the binding
+        # constraint -- and a global scale is the wrong instrument for it,
+        # because it overshoots the easy faces (spending identity for accuracy
+        # already won) while still undershooting the hard ones. That trades
+        # along the Acc/ID frontier instead of moving it. Conditioning the
+        # magnitude on the source face is what lets the two move together.
+        #
+        # Added into magnitude_net's hidden pre-activation rather than
+        # concatenated onto its input, so magnitude_net[0] keeps its shape and
+        # existing checkpoints still load. LayerNorm first because w's large DC
+        # component (the StyleGAN W mean) would otherwise dominate the signal
+        # and make this learn a constant offset instead of a per-face one. The
+        # projection is zero-initialized, so this is a strict no-op until
+        # trained -- same convention as attr_lora_B above and the ControlNet
+        # injection heads.
+        self.magnitude_latent_cond = bool(magnitude_latent_cond)
+        if self.magnitude_latent_cond:
+            hidden_dim = self.magnitude_net[0].out_features   # 64
+            self.mag_w_cond = nn.Sequential(
+                nn.LayerNorm(self.latent_dim),
+                nn.Linear(self.latent_dim, hidden_dim),
+            )
+            with torch.no_grad():
+                self.mag_w_cond[-1].weight.zero_()
+                self.mag_w_cond[-1].bias.zero_()
+            print("[DirectionBank] per-face magnitude conditioning enabled")
+
         # gate_net: learns per-sample mixture weights over K directions (only when K>1)
         if self.num_k > 1:
             self.gate_net = nn.Sequential(
@@ -163,6 +205,36 @@ class AttributeDirectionBank(nn.Module):
                 self.gate_net[-1].bias.zero_()
         else:
             self.gate_net = None
+
+        # gate_usage_ema: (num_attrs, num_k) running average of how much each
+        # K-slot actually gets used, per attribute -- feeds both gate_load_balance_loss()
+        # and the per-attribute entropy wandb logs. WHY AN EMA INSTEAD OF THE RAW
+        # PER-STEP BATCH MEAN: nothing in this project's loss previously supervised
+        # gate_net's routing AT ALL -- it only ever got gradient indirectly through
+        # the final guided_delta, with no signal rewarding correct (demographic-
+        # appropriate) OR even diverse routing. Measured on a real trained checkpoint
+        # (eyeglasses, K=12 from --K 4 x --substyle_k 3): the gate collapsed within
+        # the first few thousand steps onto ~2 of the 12 slots for 81% of samples,
+        # regardless of the source face's actual gender/age -- including almost NEVER
+        # routing female_young samples to the female_young-conditioned slots that
+        # --extreme_min_conf specifically cleaned up, which is why that direction-bank
+        # fix alone did not move the eyeglasses-add failure rate. A single training
+        # step's batch (e.g. --batch 4) spread over K=12 slots is far too noisy to
+        # regularize directly -- an EMA smooths that out across many steps, matching
+        # the pattern this project already uses for --balance_ema_decay.
+        # persistent=False: this is a training-time running stat, not part of the
+        # frozen/learned state a checkpoint needs to reproduce inference -- excluding
+        # it from state_dict avoids key-mismatch noise when eval scripts load_state_dict
+        # with strict=False anyway.
+        if self.num_k > 1:
+            self.register_buffer(
+                "gate_usage_ema",
+                torch.full((self.num_attrs, self.num_k), 1.0 / self.num_k),
+                persistent=False,
+            )
+        else:
+            self.gate_usage_ema = None
+        self.gate_usage_ema_decay = float(gate_usage_ema_decay)
 
         # residual_scale: (num_attrs,) — learned, not hand-tuned. per_attr_residual_scale
         # (or the scalar residual_scale) only sets the *initial* value; gradient descent
@@ -256,7 +328,13 @@ class AttributeDirectionBank(nn.Module):
         # forces them equal. The sign of the edit still comes from attr_delta
         # below either way, so this only affects how far each side travels.
         mag_input = attr_delta if self.signed_magnitude_input else attr_delta.abs()
-        mag_hidden = torch.tanh(self.magnitude_net[0](mag_input))          # (B, 64)
+        mag_pre = self.magnitude_net[0](mag_input)                         # (B, 64)
+        if self.magnitude_latent_cond and latent is not None:
+            # Same pooling as _gate_weights, so both per-face paths read the
+            # source latent identically.
+            w_pooled = latent.mean(dim=1).to(device=device, dtype=dtype)   # (B, 512)
+            mag_pre = mag_pre + self.mag_w_cond(w_pooled)
+        mag_hidden = torch.tanh(mag_pre)                                   # (B, 64)
         mag_logits = self.magnitude_net[2](mag_hidden)                     # (B, A*L)
         mag_logits = mag_logits.view(B, self.num_attrs, self.num_layers)
 
@@ -283,6 +361,67 @@ class AttributeDirectionBank(nn.Module):
         # ── Gate mixture ──────────────────────────────────────────────────
         alpha = self._gate_weights(latent, B, device, dtype)          # (B, A, K)
         self._last_alpha = alpha                                        # expose for selection loss
+
+        # Update the per-attribute gate usage EMA from THIS batch's active
+        # attribute(s) only -- alpha for an attribute other than the one(s)
+        # actually being edited this step never receives gradient (its
+        # signed_magnitudes are masked to exactly 0 below, see forward()'s
+        # docstring on gate_usage_ema), so folding it into the EMA would
+        # just average in untrained noise.
+        #
+        # gate_usage_ema itself is updated under no_grad -- it is a plain
+        # buffer (requires_grad=False), used ONLY for the dir_gate_entropy_per_attr
+        # LOG (a smoothed, low-variance number to look at, not a value gradients
+        # ever need to flow through). self._last_gate_diversity_loss below is a
+        # SEPARATE, genuinely differentiable quantity computed from this same
+        # step's live `alpha` (no detach) -- that is the one train_sdflow.py's
+        # --dir_gate_diversity_weight actually optimizes. An earlier version of
+        # this method computed the trained loss FROM gate_usage_ema directly,
+        # which silently contributed ZERO gradient (the buffer has no grad_fn),
+        # making --dir_gate_diversity_weight a complete no-op -- confirmed by
+        # training a real run with it that showed no change in gate collapse
+        # behavior traceable to this loss. Fixed here; the EMA is for display only.
+        if self.num_k > 1 and attr_idx is not None:
+            attr_idx_long = attr_idx.view(-1).long()
+            div_losses = []
+            sharp_losses = []
+            max_entropy = math.log(self.num_k)
+            for a in attr_idx_long.unique():
+                m = attr_idx_long == a
+                sample_alpha = alpha[m, a, :]             # (n, K) -- LIVE, per-sample
+                batch_mean = sample_alpha.mean(dim=0)      # (K,)
+                if self.training:
+                    with torch.no_grad():
+                        self.gate_usage_ema[a].mul_(self.gate_usage_ema_decay).add_(
+                            batch_mean.detach(), alpha=1.0 - self.gate_usage_ema_decay
+                        )
+                p = batch_mean.clamp(min=1e-8)
+                p = p / p.sum()
+                marginal_entropy = -(p * p.log()).sum()
+                div_losses.append((max_entropy - marginal_entropy) / max_entropy)
+
+                # Conditional entropy (per-sample sharpness): the marginal
+                # term above only requires the BATCH AVERAGE alpha to stay
+                # spread across K -- satisfied just as well by every sample
+                # independently converging to an identical near-uniform
+                # mixture as by samples genuinely routing to different
+                # slots. Confirmed on a real trained checkpoint (Young,
+                # K=12): dir_gate_entropy_ema/attr_39 sat pinned at exactly
+                # log(K) with ~1e-7 variance for 40k steps -- gate_net had
+                # collapsed to a constant output, not a face-dependent one.
+                # This term pushes each SAMPLE toward a confident,
+                # low-entropy choice, which the marginal term alone cannot
+                # enforce.
+                sp = sample_alpha.clamp(min=1e-8)
+                sp = sp / sp.sum(dim=-1, keepdim=True)
+                cond_entropy = -(sp * sp.log()).sum(dim=-1).mean()
+                sharp_losses.append(cond_entropy / max_entropy)
+            self._last_gate_diversity_loss = torch.stack(div_losses).mean()
+            self._last_gate_sharpness_loss = torch.stack(sharp_losses).mean()
+        else:
+            self._last_gate_diversity_loss = torch.zeros([], device=device, dtype=dtype)
+            self._last_gate_sharpness_loss = torch.zeros([], device=device, dtype=dtype)
+
         # mix_dirs: weighted sum of K direction vectors per attribute
         mix_dirs = (alpha.unsqueeze(-1).unsqueeze(-1)                  # (B, A, K, 1, 1)
                     * dirs.unsqueeze(0)).sum(dim=2)                    # (B, A, 18, 512)
@@ -363,13 +502,24 @@ class AttributeDirectionBank(nn.Module):
         # ── Logging ───────────────────────────────────────────────────────
         with torch.no_grad():
             flow_norm = flow_delta.reshape(B, -1).norm(dim=1).mean()
-            dir_norm = dir_delta.reshape(B, -1).norm(dim=1).mean()
+            dir_per_sample = dir_delta.reshape(B, -1).norm(dim=1)          # (B,)
+            dir_norm = dir_per_sample.mean()
+            # Coefficient of variation of the per-sample edit magnitude. This
+            # is the direct check that --magnitude_latent_cond is doing
+            # something: with it off (and the K-gate collapsed) every sample
+            # sharing an attribute gets an identical magnitude, so this sits at
+            # ~0. It should become and stay clearly positive once per-face
+            # conditioning trains. Batches mixing attributes inflate it for a
+            # reason unrelated to per-face adaptivity, so read it on
+            # --attribute_sampling cycle runs.
+            dir_cv = dir_per_sample.std(unbiased=False) / dir_norm.clamp(min=1e-8)
             residual_norm = residual.reshape(B, -1).norm(dim=1).mean()
             guided_pre_clip_norm = guided_delta_pre_clip.reshape(B, -1).norm(dim=1).mean()
             guided_norm = guided_delta.reshape(B, -1).norm(dim=1).mean()
             logs = {
                 "dir_bank_flow_delta_norm": flow_norm.detach(),
                 "dir_bank_dir_delta_norm": dir_norm.detach(),
+                "dir_bank_dir_delta_norm_cv": dir_cv.detach(),
                 "dir_bank_residual_norm": residual_norm.detach(),
                 "dir_bank_guided_delta_norm_pre_clip": guided_pre_clip_norm.detach(),
                 "dir_bank_guided_delta_norm": guided_norm.detach(),
@@ -379,40 +529,82 @@ class AttributeDirectionBank(nn.Module):
                 "dir_bank_global_delta_max_norm": active_global_delta_max_norm.detach(),
             }
             if self.num_k > 1:
+                # Raw current-step entropy, kept for backward compat -- averages
+                # over EVERY attribute row including ones not active this step
+                # (their alpha is untrained noise, see gate_usage_ema comment
+                # above), so this number is noisier and less meaningful than the
+                # per-attribute EMA entropy below. Prefer dir_gate_entropy_per_attr.
                 entropy = -(alpha * (alpha + 1e-8).log()).sum(dim=-1).mean()
                 logs["dir_gate_entropy"] = entropy.detach()
+                # Per-attribute entropy computed from the EMA usage vector, not
+                # this step's raw alpha -- see gate_usage_ema for why. Keyed by
+                # LOCAL attribute row index; train_sdflow.py maps this to the
+                # actual CelebA attribute id for wandb.
+                p = self.gate_usage_ema.clamp(min=1e-8)
+                p = p / p.sum(dim=-1, keepdim=True)
+                ema_entropy = -(p * p.log()).sum(dim=-1)   # (num_attrs,)
+                logs["dir_gate_entropy_per_attr"] = ema_entropy.detach()
             self.last_logs = logs
 
         return guided_delta
 
-    def orthogonality_loss(self):
-        """Cross-attribute orthogonality, averaged over all K combinations."""
-        dirs = self.direction_units   # (A, K, 18, 512)
-        loss = torch.zeros([], device=dirs.device, dtype=dirs.dtype)
-        count = 0
-        for i in range(self.num_attrs):
-            for j in range(i + 1, self.num_attrs):
-                for ki in range(self.num_k):
-                    for kj in range(self.num_k):
-                        loss = loss + F.cosine_similarity(
-                            dirs[i, ki], dirs[j, kj], dim=-1
-                        ).abs().mean()
-                        count += 1
-        return loss / max(count, 1)
 
-    def diversity_loss(self):
-        """Intra-attribute diversity: penalize high cosine similarity among the K
-        directions belonging to the same attribute."""
+    def gate_load_balance_loss(self):
+        """Batch-level load-balancing loss for the K-mixture gate (Shazeer-style
+        importance loss). Returns the value computed in the MOST RECENT
+        forward() call (self._last_gate_diversity_loss) -- see that computation
+        for why it must be built from THIS step's live `alpha`, not from
+        gate_usage_ema (a plain buffer with no gradient; using it directly here
+        was an earlier bug that made --dir_gate_diversity_weight a silent
+        no-op). Call this AFTER calling direction_bank(...) in the same step.
+
+        Returns, per attribute active in the last forward() call, how far that
+        attribute's per-batch usage distribution sits from uniform (0 =
+        perfectly uniform, 1 = fully collapsed onto one slot), averaged over
+        whichever attribute(s) were active -- safe to add into the loss every
+        step regardless of --attribute_sampling mode.
+
+        WHAT THIS DOES NOT DO: this has no notion of which slot is "correct"
+        for a given face (that would need a demographic label fed in as a
+        target) -- it only discourages the gate from collapsing onto a
+        minority of slots. Necessary, not sufficient, for the geometry a
+        stratum-level fix like --extreme_min_conf produces to actually get
+        used by the model.
+        """
         if self.num_k <= 1:
             return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
-        dirs = self.direction_units   # (A, K, 18, 512)
-        loss = torch.zeros([], device=dirs.device, dtype=dirs.dtype)
-        count = 0
-        for i in range(self.num_attrs):
-            for ki in range(self.num_k):
-                for kj in range(ki + 1, self.num_k):
-                    loss = loss + F.cosine_similarity(
-                        dirs[i, ki], dirs[i, kj], dim=-1
-                    ).abs().mean()
-                    count += 1
-        return loss / max(count, 1)
+        loss = getattr(self, '_last_gate_diversity_loss', None)
+        if loss is None:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        return loss
+
+    def gate_sharpness_loss(self):
+        """Per-sample conditional-entropy loss for the K-mixture gate.
+
+        gate_load_balance_loss() above only constrains the BATCH-AVERAGE
+        usage distribution to stay spread across K slots -- a constraint
+        every sample independently outputting an identical near-uniform
+        alpha satisfies exactly as well as genuine per-sample routing does.
+        Confirmed as the actual failure mode on a real trained checkpoint:
+        Young's dir_gate_entropy_ema sat pinned at exactly log(K) (K=12)
+        with ~1e-7 variance across 40k steps -- gate_net had collapsed to a
+        constant, face-independent output despite gate_load_balance_loss
+        being active the whole run.
+
+        This loss instead penalizes each SAMPLE's own conditional entropy
+        directly. Minimizing it pushes every
+        sample toward a confident, low-entropy choice among the K
+        directions; used together with gate_load_balance_loss (which still
+        stops that choice from collapsing onto the same one or two slots
+        for everyone), the pair is the standard cond-entropy / marginal-
+        entropy pairing for mixture-of-experts load balancing.
+
+        Returns the value computed in the MOST RECENT forward() call, same
+        call-after-forward contract as gate_load_balance_loss().
+        """
+        if self.num_k <= 1:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        loss = getattr(self, '_last_gate_sharpness_loss', None)
+        if loss is None:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        return loss

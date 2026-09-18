@@ -536,9 +536,18 @@ class Generator(nn.Module):
             if out.shape[-1] == embed_res and return_f:
                 # get high residual features from generator
                 return out,None
-            if out.shape[-1] == embed_res and skips is not None:
-                out = out + skips
-            
+            # skips as a dict {resolution: tensor} injects at EVERY named
+            # resolution, not just embed_res. A bare tensor keeps the original
+            # single-point behaviour (added at embed_res) so old checkpoints
+            # and call sites still work unchanged.
+            if skips is not None:
+                if isinstance(skips, dict):
+                    _s = skips.get(out.shape[-1])
+                    if _s is not None:
+                        out = out + _s
+                elif out.shape[-1] == embed_res:
+                    out = out + skips
+
             out = conv2(out, latent[:, i + 1], noise=noise2)
             skip = to_rgb(out, latent[:, i + 2], skip)
 

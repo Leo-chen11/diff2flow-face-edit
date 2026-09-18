@@ -20,15 +20,40 @@ from tqdm import tqdm
 from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
+from common.region_stat_loss import (directional_region_area_loss,
+                                     directional_region_saturation_loss)
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
-from models.direction_bank import AttributeDirectionBank
+from models.control_encoder import clip_skips, skips_norm_per_sample, skips_reg_per_sample
+from models.direction_bank import AttributeDirectionBank, _inverse_softplus
 from models.layer_mask import AttributeLayerMask
-from models.stylegan2.model import Generator
+from models.stylegan2.model import Generator, Discriminator
     
+
+def parse_reg_fine_weight_min_override(spec):
+    """Parse '--reg_fine_weight_min_override 39:0.02,20:0.05' into
+    {39: 0.02, 20: 0.05} (GLOBAL attribute indices, matching --attribute_index
+    entries -- converted to local indices where LearnableRegLossWeights is
+    built). Same 'attr:value[,attr:value...]' convention as
+    evaluate_sdflow.parse_clip_calibration. Returns {} for None/empty."""
+    if not spec:
+        return {}
+    out = {}
+    for chunk in spec.split(','):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(':')
+        if len(parts) != 2:
+            raise ValueError(
+                f"--reg_fine_weight_min_override entry {chunk!r} must be 'attr_idx:min_value'")
+        idx, val = parts
+        out[int(idx)] = float(val)
+    return out
+
 
 class LearnableAttributeScales(nn.Module):
     """Per-attribute learnable training edit scales.
@@ -72,11 +97,6 @@ class LearnableAttributeScales(nn.Module):
             return torch.exp(self.attr_log_scales).clamp(self.min_scale, self.max_scale)
 
 
-def _inverse_softplus(x):
-    x = x.clamp(min=1e-6)
-    return torch.log(torch.expm1(x))
-
-
 class LearnableRegLossWeights(nn.Module):
     """Per-attribute learnable weights for the global/coarse/fine W+ regularization
     loss groups, replacing the fixed 2.0/1.0/reg_fine_weight constants that used to be
@@ -89,7 +109,7 @@ class LearnableRegLossWeights(nn.Module):
     """
 
     def __init__(self, n_edit_attrs, init_global=2.0, init_coarse=1.0, init_fine=0.5,
-                 min_weight=0.1):
+                 min_weight=0.1, fine_min_overrides=None):
         super().__init__()
         self.n_edit_attrs = int(n_edit_attrs)
         # Floor on every learned weight. Every main training loss pushes these
@@ -104,14 +124,34 @@ class LearnableRegLossWeights(nn.Module):
         init = init.unsqueeze(0).repeat(self.n_edit_attrs, 1)   # (n_edit_attrs, 3)
         self.log_weights_raw = nn.Parameter(_inverse_softplus(init))
 
+        # Per-(attribute, group) floor, defaulting everywhere to min_weight --
+        # a plain scalar clamp reproduces exactly what this class did before
+        # fine_min_overrides existed. fine_min_overrides (dict: LOCAL attr
+        # index -> float) lets ONE group (fine, W+ layers 4-17) sit lower than
+        # the shared floor for specific attributes, without loosening
+        # global/coarse (which guard structure/identity) or any other
+        # attribute's floor. See --reg_fine_weight_min_override's help text
+        # for why fine specifically needed this: probe_noise_texture.py and
+        # probe_identity_orthogonal.py both confirmed aging(39) systematically
+        # SMOOTHS skin instead of synthesizing wrinkle texture, and
+        # inspect_reg_fine_weight.py confirmed this weight sits exactly at
+        # the shared floor for every attribute -- still actively discouraging
+        # the fine-layer movement --age_dds_fine_layer_start unlocks DDS
+        # gradient into specifically to make wrinkles.
+        min_floor = torch.full((self.n_edit_attrs, 3), self.min_weight)
+        if fine_min_overrides:
+            for local_idx, floor in fine_min_overrides.items():
+                min_floor[local_idx, 2] = float(floor)
+        self.register_buffer('min_floor', min_floor)
+
     def weights_for(self, attr_local_idx):
         """attr_local_idx: LongTensor [B] -> (B, 3) tensor of [global, coarse, fine] weights."""
-        weights = F.softplus(self.log_weights_raw).clamp(min=self.min_weight)
+        weights = torch.maximum(F.softplus(self.log_weights_raw), self.min_floor)
         return weights[attr_local_idx]
 
     def current_weights(self):
         with torch.no_grad():
-            return F.softplus(self.log_weights_raw).clamp(min=self.min_weight)
+            return torch.maximum(F.softplus(self.log_weights_raw), self.min_floor)
 
 
 class CrossAttributeLossBalancer:
@@ -301,9 +341,111 @@ LOCAL_REGION_CLASSES = {
     15: [2, 3, 4, 5, 6],
 }
 
-# BiSeNet 'skin' class, used by --color_shift_loss_weight to measure whether
-# an edit shifted the overall skin tone rather than changing texture/geometry.
-SKIN_CLASS = [1]
+# BiSeNet hair class, used by --hair_gray_loss_weight (see that flag's help).
+HAIR_REGION_CLASS = [17]
+
+
+# Startup mechanism report. 144 CLI flags is far more surface than any single
+# run uses (a typical command sets ~19), and the ones left at their defaults
+# are invisible -- which has repeatedly cost whole training runs: --id_loss_hinge,
+# --signed_magnitude_input, --use_attr_lora, --dir_gate_reg_weight and
+# --target_loss were each silently inactive across runs that were launched
+# specifically to test them, and the mistake only surfaced days later when the
+# logs did not match the hypothesis. Printing every switchable mechanism with
+# its resolved state turns that class of error into something visible in the
+# first ten lines of stdout.
+#
+# Each entry is (label, value, note-when-notable). The note fires only for
+# states worth a second look, so a correct run stays quiet and an unintended
+# one does not.
+def _mechanism_report(args):
+    def onoff(v):
+        return 'ON ' if v else 'off'
+
+    edit = [
+        ('direction_bank', args.direction_bank_path or 'DISABLED',
+         None if args.direction_bank_path else 'no bank -- raw flow delta only'),
+        ('  magnitude_latent_cond', onoff(args.magnitude_latent_cond),
+         None if args.magnitude_latent_cond else 'magnitude identical for every face'),
+        ('  signed_magnitude_input', onoff(args.signed_magnitude_input),
+         None if args.signed_magnitude_input else 'add/rm forced to the same magnitude'),
+        ('  attr_lora', f'{onoff(args.use_attr_lora)} rank={args.attr_lora_rank}'
+         if args.use_attr_lora else 'off', None),
+        ('  dir_gate_reg', f'w={args.dir_gate_reg_weight:g}',
+         None if args.dir_gate_reg_weight > 0 else 'K-slot gate unsupervised'),
+        ('  residual_scale', f'{args.direction_residual_scale:g} (learned from here)', None),
+        ('velocity_field', args.velocity_field, None),
+    ]
+
+    inject = [
+        ('controlnet', onoff(args.use_controlnet_injection), None),
+    ]
+    if args.use_controlnet_injection:
+        inject += [
+            ('  resolutions', str(args.controlnet_res or [args.controlnet_embed_res]), None),
+            ('  per_direction', onoff(args.controlnet_per_direction), None),
+            ('  latent_cond', onoff(args.controlnet_latent_cond), None),
+            ('  warmup_steps', f'{args.controlnet_warmup_steps}',
+             'injection is exactly 0 until this step' if args.controlnet_warmup_steps else None),
+            ('  disable_attrs', str(getattr(args, 'controlnet_disable_attrs', None) or 'none'), None),
+        ]
+
+    realism = [
+        ('disc_realism', onoff(args.disc_realism_weight > 0), None),
+    ]
+    if args.disc_realism_weight > 0:
+        realism += [
+            ('  weight', f'{args.disc_realism_weight:g}', None),
+            ('  attrs', str(args.disc_realism_attrs or 'all'), None),
+        ]
+
+    losses = [
+        ('kd', args.kd_loss_weight), ('nll', args.nll_loss_weight),
+        ('reg', args.reg_loss_weight), ('id', args.id_loss_weight),
+        ('counter_attr', args.counter_attr_weight), ('lag_reg', args.lag_reg_weight),
+        ('dir_gate_reg', args.dir_gate_reg_weight),
+        ('diffusion_dds', args.diffusion_guidance_weight),
+        ('age_dds', args.age_diffusion_weight), ('clip_prompt', args.clip_prompt_weight),
+        ('local_region', args.local_region_loss_weight),
+        ('hair_gray', args.hair_gray_loss_weight),
+        ('hair_color_add', args.hair_color_add_loss_weight),
+        ('hair_extent', args.hair_extent_loss_weight),
+        ('controlnet_reg', args.controlnet_reg_weight),
+        ('disc_realism', args.disc_realism_weight),
+    ]
+
+    shape = [
+        ('id_loss', f'hinge@{args.id_hinge_threshold:g}' if args.id_loss_hinge else 'continuous (1-cos)',
+         None if args.id_loss_hinge else 'keeps pulling even when identity is already preserved'),
+        ('target_loss', args.target_loss,
+         None if args.target_loss == 'hinge' else 'mse keeps pulling samples already past the boundary'),
+    ]
+
+    w = 34
+    print('\n' + '=' * 62)
+    print('ACTIVE MECHANISMS')
+    print('=' * 62)
+    for title, rows in (('W+ EDITING PATH', edit), ('GENERATOR INJECTION', inject),
+                        ('REALISM PRIOR', realism), ('LOSS SHAPE', shape)):
+        print(f'-- {title}')
+        for label, val, note in rows:
+            line = f'   {label:<{w}} {val}'
+            print(f'{line}   <- {note}' if note else line)
+    print('-- LOSS WEIGHTS (0 = term contributes nothing)')
+    active = [f'{n}={v:g}' for n, v in losses if v and v > 0]
+    zeroed = [n for n, v in losses if not v or v <= 0]
+    print('   active: ' + ', '.join(active))
+    if zeroed:
+        print('   zero:   ' + ', '.join(zeroed))
+    if args.resume_dir:
+        print('-- RESUME')
+        print(f'   {"from":<{w}} {args.resume_dir} @ step {args.resume_step}')
+        for label, flag, warn in (('direction_bank', args.resume_direction_bank,
+                                   'magnitude_net will be RE-INITIALISED'),
+                                  ('optimizer', args.resume_optimizer,
+                                   'fresh momentum + LR schedule restarts')):
+            print(f'   {"  " + label:<{w}} {onoff(flag)}' + ('' if flag else f'   <- {warn}'))
+    print('=' * 62 + '\n')
 
 
 def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
@@ -764,18 +906,20 @@ if __name__ == '__main__':
                              'between teacher and CLIP accuracy without it).')
     parser.add_argument('--teacher_aug_noise', type=float, default=0.02,
                         help='Std of the shared gaussian noise in --teacher_aug.')
-    parser.add_argument('--local_region_loss_weight', type=float, default=0.0,
+    parser.add_argument('--local_region_loss_weight', type=float, default=0.5,
                         help='Weight for the face-parser locality loss on LOCAL attributes '
                              '(currently eyeglasses, see LOCAL_REGION_CLASSES): outside the '
                              'allowed region, the edited image must match the source '
                              'reconstruction pixel-wise. Directly attacks the ~55-60%% real '
                              'eyeglasses accuracy ceiling by forcing the edit budget into '
                              'the eye region instead of a diffuse whole-face "glasses-ness". '
-                             '0 disables (default). Suggested when enabling: 0.5.')
+                             'DEFAULT changed from 0.0 (off) to 0.5 (the previously-suggested '
+                             'value) -- eyeglasses structure was found incomplete/imperfect '
+                             'without it. Pass 0 to fully disable.')
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
                         help='BiSeNet weights for --local_region_loss_weight and '
                              '--dds_face_mask.')
-    parser.add_argument('--dds_face_mask', action='store_true',
+    parser.add_argument('--dds_face_mask', action=argparse.BooleanOptionalAction, default=True,
                         help='Restrict the DDS diffusion-guidance gradient (models/'
                              'diffusion_guidance.py) to the region the edit is allowed to touch, '
                              'instead of the whole latent. Unmasked, DDS asks the frozen '
@@ -788,9 +932,10 @@ if __name__ == '__main__':
                              '"receding hairline" prompt cue is not cut by this. Loads a '
                              'FaceParser the same way --local_region_loss_weight does (shared '
                              'instance if both are set). 0 risk to identity/leakage, upside '
-                             'only if DDS was actually spending gradient off-face; off by '
-                             'default because it changes DDS numerics for existing --resume_dir '
-                             'runs.')
+                             'only if DDS was actually spending gradient off-face. DEFAULT '
+                             'changed from off to on -- pass --no-dds_face_mask to resume an '
+                             'existing --resume_dir run unmasked (matching the DDS numerics it '
+                             'was trained with) instead of introducing the mask mid-run.')
     parser.add_argument('--local_region_add_blur', type=float, default=15,
                         help='Mask dilation (gaussian blur sigma) for ADDITION-direction '
                              'local edits. The source face has no glasses pixels for '
@@ -799,25 +944,185 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
-    parser.add_argument('--color_shift_loss_weight', type=float, default=0.0,
-                        help='Penalize the mean-RGB shift of the BiSeNet skin region between '
-                             'source and edited face, for --color_shift_attrs samples. '
-                             'A visual audit (scripts/dump_attr_failures.py, attr 39 direction '
-                             'rm) found the model satisfies the aging edit largely via a '
-                             'uniform red/orange skin-tone shift rather than genuine structural '
-                             'aging (wrinkles, gray hair) -- confirmed across every fix tried so '
-                             'far (direction changes, scale changes, directional CLIP loss all '
-                             'left the color-cast unchanged). Unlike those, this acts directly '
-                             'on the generated image pixels: it does not touch the direction '
-                             'vector or edit magnitude, it makes the color-shift shortcut itself '
-                             'costly, so satisfying the attribute loss has to come from '
-                             'elsewhere. Genuine structural aging is a texture/geometry change, '
-                             'not a uniform tone shift, so it is barely affected. 0 disables '
-                             '(default). Suggested when enabling: 0.5-2.0.')
-    parser.add_argument('--color_shift_attrs', nargs='*', type=int, default=[39],
-                        help='Attribute indices the color-shift regularizer applies to. '
-                             'Default is age (39) only, since that is the attribute the visual '
-                             'audit found relying on the color-shift shortcut.')
+    parser.add_argument('--hair_gray_loss_weight', type=float, default=0.0,
+                        help='Age(39) REMOVAL-direction only (src already Young -> aging edit): '
+                             'push the HAIR region (BiSeNet class 17, see HAIR_REGION_CLASS) '
+                             'toward lower saturation, i.e. graying, instead of relying only on '
+                             'the DDS text prompt (diffusion_guidance.py already asks for '
+                             '"gray or white hair"). dump_attr_failures.py failure-vs-success '
+                             'audit on Young rm found Brown_Hair present in 38%% of judge-failed '
+                             'samples vs 12%% of successes -- the single strongest correlate of a '
+                             'failed aging edit, despite that DDS prompt cue already existing, so '
+                             'the text prompt alone is not reliably winning against '
+                             'higher-frequency wrinkle texture for gradient budget. This is NOT '
+                             'the removed --color_shift_loss_weight mistake repeated: that one '
+                             'measured mean RGB over the WHOLE FACE, which structurally cannot '
+                             'see a spatially local change (it averages to ~0) -- hair graying IS '
+                             'a global property of one region, so a mean-based measure is the '
+                             'right instrument here. Target is RELATIVE to each sample\'s OWN '
+                             'source hair saturation (see --hair_gray_relative_ratio), not one '
+                             'hardcoded color -- works uniformly whether the source hair is '
+                             'black, brown, blonde, red, or already partly gray, instead of '
+                             'assuming a single numerical definition of "old hair". Hinge-style '
+                             '(only penalizes ABOVE the target), so already-gray hair costs '
+                             'nothing. Pass 0 (default) to fully disable -- builds a FaceParser '
+                             'the same way --local_region_loss_weight does (shared instance if '
+                             'any of the three is set).')
+    parser.add_argument('--hair_gray_relative_ratio', type=float, default=0.5,
+                        help='Under --hair_gray_loss_weight: the edited hair region\'s mean '
+                             'saturation must drop to at most this fraction of the SAME sample\'s '
+                             'source hair saturation (measured on src_recon). Scales the required '
+                             'change to each source\'s own starting color instead of a fixed '
+                             'absolute target -- vivid dyed hair and dark brown hair both need '
+                             'real desaturation but by different absolute amounts, while hair '
+                             'that already reads as gray needs almost none.')
+    parser.add_argument('--hair_gray_abs_cap', type=float, default=0.25,
+                        help='Absolute ceiling on the --hair_gray_relative_ratio target. Without '
+                             'this, a source with only mild saturation to begin with could '
+                             'satisfy the loss while remaining visibly colored, since the '
+                             'relative ratio alone never asks for MORE than proportional change.')
+    parser.add_argument('--hair_color_add_loss_weight', type=float, default=0.0,
+                        help='Mirror of --hair_gray_loss_weight for the ADD direction (src '
+                             'already old -> de-aging edit, target Young=1): pushes the hair '
+                             'region toward MORE saturation (natural color) instead of less. '
+                             'Added because a failure-vs-success audit on Young add found '
+                             'Gray_Hair present in the SOURCE the single strongest correlate of '
+                             'SUCCESS (0.25 success vs 0.04 fail) -- the model\'s only reliable '
+                             'lever for "look younger" was hair darkening it stumbled into as a '
+                             'side effect of skin smoothing, never asked for directly, unlike '
+                             'the removal direction which has both this loss and an explicit '
+                             '"gray or white hair" DDS prompt cue (--age_add_hair_prompt_cue is '
+                             'that cue\'s mirror). Uses the SAME underlying mechanism as '
+                             '--hair_gray_loss_weight (see common/region_stat_loss.py) with the '
+                             'direction flipped -- not a separate ad hoc formula. Pass 0 '
+                             '(default) to disable -- shares the FaceParser instance with '
+                             '--hair_gray_loss_weight / --local_region_loss_weight.')
+    parser.add_argument('--hair_color_add_floor', type=float, default=0.18,
+                        help='Under --hair_color_add_loss_weight: minimum required edited-hair '
+                             'saturation, as a floor under the --hair_gray_relative_ratio-scaled '
+                             'source-relative target (that ratio is reused for both directions). '
+                             'UNTUNED -- pick a starting value from a visual audit of source hair '
+                             'saturation on a handful of Young-add samples before trusting this '
+                             'default; it was chosen as a plausible floor, not measured.')
+    parser.add_argument('--age_add_hair_prompt_cue', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Add an explicit "naturally colored hair, no gray or white" cue to '
+                             'the Young ADD-direction DDS prompt, mirroring the removal '
+                             'direction\'s existing "gray or white hair" cue (see '
+                             'diffusion_guidance.build_edit_prompts). Grounded in the same '
+                             'failure-audit finding as --hair_color_add_loss_weight -- the two '
+                             'are meant to be used together (pixel loss + text prompt), matching '
+                             'how the removal direction already uses both. Off by default so it '
+                             'never silently changes an existing run\'s DDS gradient.')
+    parser.add_argument('--hair_extent_loss_weight', type=float, default=0.0,
+                        help='Gender(20), BOTH directions: push the HAIR region\'s AREA up for '
+                             'removal edits (feminize -> more hair) and down for add edits '
+                             '(masculinize -> less hair). Same module as '
+                             '--hair_gray_loss_weight (common/region_stat_loss.py), different '
+                             'statistic: coverage instead of colour. Motivated by a visual audit '
+                             'of Male-rm at edit_scale 0.6, where the faces softened but the hair '
+                             'stayed male-typical and short, leaving the edit ambiguous enough '
+                             'that the two judges landed on opposite sides of it (CelebA 56% '
+                             'fail, CLIP 11% fail, disagreeing on 49% of samples). Hair is the '
+                             'cheapest place to buy that decisiveness: IDLoss.extract_features '
+                             'crops to the central 188/256 of the frame, so the top ~14% and the '
+                             'outer margins -- where most of the hair silhouette lives -- are '
+                             'outside what the identity loss can even see. Requires a '
+                             'DIFFERENTIABLE region occupancy, so it uses FaceParser.region_prob '
+                             '(softmax), NOT get_region_mask (argmax, no_grad) -- a loss on an '
+                             'argmax\'d mask would have zero gradient. That costs a backward pass '
+                             'through BiSeNet on the steps it fires. Pass 0 (default) to disable.')
+    parser.add_argument('--hair_extent_relative_change', type=float, default=0.35,
+                        help='Under --hair_extent_loss_weight: the edited hair region must cover '
+                             'at least (1 + this) x the source\'s own coverage on feminizing '
+                             'edits, or at most (1 - this) x on masculinizing ones. Relative to '
+                             'each sample\'s own starting hair, so someone already long-haired is '
+                             'not asked for the same absolute change as someone shaved.')
+    parser.add_argument('--hair_extent_max_frac', type=float, default=0.35,
+                        help='Ceiling on the grow-hair target, as a fraction of the frame. Stops '
+                             'the relative target from demanding unbounded hair on a source that '
+                             'already has a lot.')
+    parser.add_argument('--hair_extent_min_frac', type=float, default=0.02,
+                        help='Floor on the shrink-hair target, as a fraction of the frame.')
+    parser.add_argument('--gender_dds_fine_layer_start', type=int, default=-1,
+                        help='Fine-layer cutoff for the GENDER(20) DDS pass specifically, exactly '
+                             'mirroring --age_dds_fine_layer_start. <0 (default) falls back to the '
+                             'shared --dds_fine_layer_start (7), which blocks the diffusion '
+                             'teacher\'s gradient from W+ layers 7-17. Age had that block lifted '
+                             'to 12 because those layers "carry wrinkles/skin texture/gray hair, '
+                             'so the diffusion teacher could not teach real aging texture" (see '
+                             '--age_dds_fine_layer_start). The same layers carry lip shape, brow '
+                             'density, skin smoothness and eye detail -- the feminine facial '
+                             'features a Male-rm edit needs -- and gender was never given the same '
+                             'lift. Note this also decides whether --gender_rm_prompt_cue can do '
+                             'anything: that cue describes fine facial detail, so with the '
+                             'gradient blocked at 7 the prompt has no path to the layers that '
+                             'would render it. Set 12 to match age. Costs one extra generator '
+                             'forward per DDS step when it differs from the shared cutoff, since '
+                             'gender then needs its own pass.')
+    parser.add_argument('--gender_rm_prompt_cue', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Add explicit texture-removal cues (smooth skin, no facial hair, '
+                             'thin eyebrows) to the Male REMOVAL-direction ("female person") DDS '
+                             'prompt. EXPERIMENTAL, unlike the two flags above: Male-rm\'s '
+                             'weakness showed no code-level asymmetry when checked -- the plain '
+                             'prompt was already symmetric between add/rm before this flag '
+                             'existed -- so this tests the hypothesis that an explicit '
+                             'removal-direction cue helps the same way it did for age, not a '
+                             'confirmed fix grounded in a found bug. Off by default.')
+    parser.add_argument('--disc_realism_weight', type=float, default=0.0,
+                        help='Frozen StyleGAN2-FFHQ discriminator (loaded from the same '
+                             '--stygan2_weights checkpoint\'s "d" key, alongside "g_ema") as a '
+                             'realism regularizer: non-saturating softplus(-D(edited_face)).mean(). '
+                             'Nothing else in this loss set asks "does this look like a real photo" '
+                             '-- counter_attr/id/reg/DDS all measure a specific proxy (a '
+                             'classifier score, a feature-space distance, a W+ displacement, a '
+                             'frozen diffusion model\'s noise residual), and each has independently '
+                             'been shown to be satisfiable by an unrealistic shortcut: v14\'s aging '
+                             'edits added thin, scratchy fake wrinkle lines; v17\'s (after the fix '
+                             'that motivated that finding) show blotchy, mottled skin discoloration '
+                             'instead -- same underlying gap in a different shape, confirmed by '
+                             'visual audit (scripts/dump_attr_failures.py) across two otherwise '
+                             'unrelated architecture/loss configurations. The discriminator was '
+                             'adversarially trained specifically to catch exactly this class of '
+                             'artifact against real FFHQ photos, which no other term here does. '
+                             'Applies to every attribute by default; pass --disc_realism_attrs to '
+                             'restrict it to specific ones (e.g. the Young/39 samples the visual '
+                             'audit above actually found the artifact on) for a clean single-variable '
+                             'test that does not also touch attributes with no evidence of this '
+                             'problem. Input is upsampled to '
+                             '1024x1024 (the resolution D was trained at) rather than loading D at '
+                             'a smaller size via strict=False, to keep the loaded weights an exact '
+                             'match with no partial-load risk; this adds one extra discriminator '
+                             'forward+backward pass per step, non-trivial compute when enabled. '
+                             'Pass 0 (default) to fully disable -- skips loading the discriminator '
+                             'entirely. Start small (~0.01-0.05, similar order to '
+                             '--clip_prompt_weight) and watch it does not suppress '
+                             '--counter_attr_weight\'s gradient; this is a prior toward realism, '
+                             'not toward any particular attribute value, so an overly large weight '
+                             'will fight the edit itself, not just the artifact.')
+    parser.add_argument('--disc_realism_attrs', nargs='*', type=int, default=None,
+                        help='Absolute CelebA attribute ids to apply --disc_realism_weight to '
+                             '(e.g. "39" for Young only). Default (unset) applies to every '
+                             'attribute\'s steps. Has no effect when --disc_realism_weight is 0 '
+                             '(the discriminator is not even loaded in that case).')
+    parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
+                        help='Compare the edited image against the source RECONSTRUCTION '
+                             'G(latent) instead of the real photo in id_loss, the directional '
+                             'CLIP loss, and the DDS diffusion guidance. The real photo differs '
+                             'from any generated image by (inversion gap) + (edit); referencing '
+                             'it charges the fixed e4e/StyleGAN reconstruction error to the edit, '
+                             'which the flow cannot remove without spending W+ budget on '
+                             'reconstruction instead of the attribute. Concretely: id_loss then '
+                             'optimizes a different quantity than evaluate_sdflow.py reports '
+                             '(it measures edited-vs-reconstruction), the directional CLIP delta '
+                             'carries a constant inversion offset that pulls it off the pos/neg '
+                             'text axis, and the DDS source-branch subtraction no longer cancels '
+                             'cleanly. The locality and color-shift losses already compare '
+                             'against G(latent) for exactly this reason -- this makes the other '
+                             'three consistent with them. Costs one extra frozen G forward per '
+                             'step (no_grad) when no face-parser loss already needed it. Pass '
+                             '--no-losses_vs_recon to restore the old real-photo references.')
 
     # ── Cross-attribute loss balancing ──────────────────────────────────────
     parser.add_argument('--balance_attr_losses', action=argparse.BooleanOptionalAction, default=False,
@@ -830,18 +1135,21 @@ if __name__ == '__main__':
                         help='How aggressively weights move toward equalizing relative progress each update.')
     parser.add_argument('--balance_min_weight', type=float, default=0.25)
     parser.add_argument('--balance_max_weight', type=float, default=4.0)
-    parser.add_argument('--orth_loss_weight', type=float, default=0.005)
-    parser.add_argument('--gate_smooth_weight', type=float, default=0.003)
-    parser.add_argument('--gate_sparse_weight', type=float, default=0.01,
-                        help='L_sparse = mean|g_a|, from the method doc but never wired '
-                             'into the loss until now. gate_smooth only pulls adjacent '
-                             'layers toward each other -- it has no gradient pushing any '
-                             'layer toward 0, so the gate has no incentive to ever close a '
-                             'layer. scripts/inspect_gate.py confirmed this on a trained '
-                             'checkpoint: every layer stayed in 0.79-0.99 regardless of '
-                             'attribute or ODE time (degenerated to an always-open, '
-                             'attribute-agnostic constant). Method doc suggested 0.01, '
-                             'try 0.003 if edits become too weak.')
+    parser.add_argument('--lag_reg_weight', type=float, default=1.0,
+                        help='Overall scale on the LAG-DOF velocity field\'s three internal '
+                             'regularizers (orth, gate_smooth, gate_sparse -- only active when '
+                             '--velocity_field is lag/lag_dof), combined at fixed 0.005:0.003:0.01 '
+                             'relative weights (their old individual defaults, kept as constants '
+                             'here since no run in this project has ever set them to anything else '
+                             '-- 1.0 here reproduces that default exactly; scale all three together '
+                             'by raising or lowering this one number). gate_sparse (L_sparse = '
+                             'mean|g_a|) is in the method doc but was never wired into the loss '
+                             'until it was added here: gate_smooth alone only pulls adjacent layers '
+                             'toward each other, with no gradient ever pushing a layer toward 0, so '
+                             'the gate had no incentive to close a layer at all -- '
+                             'scripts/inspect_gate.py confirmed this on a trained checkpoint, every '
+                             'layer stuck at 0.79-0.99 regardless of attribute or ODE time '
+                             '(degenerated to an always-open, attribute-agnostic constant).')
     parser.add_argument('--reg_global_weight_init', type=float, default=2.0,
                         help='Initial global-layer reg_loss weight, per attribute; then learned '
                              '(see LearnableRegLossWeights). Has no effect after the first step.')
@@ -854,6 +1162,27 @@ if __name__ == '__main__':
                              'push these weights down and nothing pushes them up, so without '
                              'a floor they collapse to ~0 at full meta lr (v7: fine/attr_39 '
                              'hit 5e-6, freeing fine layers -> texture/color artifacts).')
+    parser.add_argument('--reg_fine_weight_min_override', type=str, default=None,
+                        help='Optional per-attribute override of the FINE-layer reg-loss floor '
+                             'only, as "attr_idx:min_value[,attr_idx:min_value...]" GLOBAL '
+                             'attribute indices (e.g. "39:0.02"). --reg_weight_min stays the '
+                             'floor for global/coarse and for every attribute not listed here. '
+                             'Off by default -- identical behavior to before this flag existed. '
+                             'scripts/inspect_reg_fine_weight.py found every attribute\'s learned '
+                             'fine weight sitting exactly at --reg_weight_min (never above it, '
+                             'because nothing in the loss ever pushes it up); '
+                             'scripts/probe_noise_texture.py and '
+                             'scripts/probe_identity_orthogonal.py both found aging(39) edits '
+                             'systematically SMOOTH skin instead of adding wrinkle texture. '
+                             'reg_loss_fine penalizes ANY movement in W+ layers 4-17 uniformly, '
+                             'unable to tell "movement that synthesizes a wrinkle" from '
+                             '"movement that is just drift" -- and directly opposes what '
+                             '--age_dds_fine_layer_start unlocks DDS gradient into those same '
+                             'layers to do. Lowering just this floor, just for age, gives the '
+                             'fine layers more room to earn real texture from the DDS/prompt-cue '
+                             'signal without loosening the global/coarse regularization that '
+                             'guards structure and identity, and without touching any other '
+                             'attribute\'s floor.')
     parser.add_argument('--direction_bank_path', default=None, type=str,
                         help='Path to precomputed Attribute Direction Bank (.pth).')
     # Independent-judge eval evidence: with the old 0.05 init the residual (the
@@ -861,6 +1190,29 @@ if __name__ == '__main__':
     # run, so Eyeglasses/Young hit a dataset-mean-direction ceiling (~60% real
     # accuracy). Start higher so the flow's personalization is actually in play.
     parser.add_argument('--direction_residual_scale', type=float, default=0.15)
+    parser.add_argument('--glasses_residual_scale', type=float, default=0.35,
+                        help='Separate INITIAL residual_scale for eyeglasses (attr 15) at TRAINING '
+                             'time, same mechanism as --age_residual_scale. scripts/'
+                             'validate_direction_bank.py measures the eyeglasses direction ALONE '
+                             '(no residual, no ControlNet, no local_region_loss) reaching only '
+                             '~12%% AccCLIP even at 1.5x its natural magnitude -- markedly weaker '
+                             'than gender or age\'s response curve at the same alphas. This is '
+                             'architectural, not a calibration bug: eyeglasses is a discrete, '
+                             'multi-modal, spatially-precise structure (thin/thick frames, '
+                             'rimless, sunglasses, all at slightly different positions), and a '
+                             'single per-stratum mean-difference direction averages those styles '
+                             'together, which for a high-frequency local structure washes out '
+                             'detail rather than reinforcing it (unlike age/gender, which are '
+                             'smoother, closer to single-axis semantic shifts that a linear '
+                             'direction represents well). DEFAULT 0.35 (more than double the '
+                             'shared 0.15) hands the trainable flow residual more of the budget '
+                             'for glasses specifically, instead of leaning on a frozen direction '
+                             'that is confirmed too weak to carry the edit alone -- the flow, '
+                             'local_region_loss, ControlNet (if enabled) and '
+                             '--clip_prompt_glasses_weight do the real work; the direction only '
+                             'needs to point roughly the right way. Still just an INIT value, '
+                             'learned further via gradient descent from there. <0 falls back to '
+                             '--direction_residual_scale (old behavior).')
     parser.add_argument('--age_residual_scale', type=float, default=-1.0,
                         help='Separate INITIAL residual_scale for age (attr 39) at TRAINING time. '
                              '<0 (default) falls back to the shared --direction_residual_scale, i.e. '
@@ -876,9 +1228,54 @@ if __name__ == '__main__':
                              'output, instead of the frozen (~95% of the edit) direction dominating '
                              'regardless of what the residual learns. residual_scale is still learned '
                              'via gradient descent from this starting point, not fixed.')
+    parser.add_argument('--male_residual_scale', type=float, default=-1.0,
+                        help='Separate INITIAL residual_scale for gender (attr 20) at TRAINING '
+                             'time, same mechanism as --age_residual_scale/--glasses_residual_scale. '
+                             '<0 (default) falls back to the shared --direction_residual_scale. '
+                             'Independent-judge eval on a trained checkpoint found gender the most '
+                             'expensive of the three attributes per unit of accuracy: highest LPIPS '
+                             '(~2x eyeglasses/age at every tested scale), fastest-declining ID_ind '
+                             'across the scale sweep, and the highest LeakCLIP -- while its AccCLIP '
+                             'was already strong. Unlike eyeglasses/age, gender was never given its '
+                             'own reduced budget, so it shares the same residual_scale as every other '
+                             'attribute despite already having a well-calibrated (LDA + cross-attr-'
+                             'decorrelated) frozen direction to lean on instead. LOWERING this (e.g. '
+                             '0.05-0.10, below the shared default 0.15) hands gender LESS of the edit '
+                             'budget from the freely-learned, less-constrained flow residual and MORE '
+                             'from the frozen direction, trading a bit of headroom on AccCLIP (already '
+                             'comfortably ahead of eyeglasses/age) for less collateral pixel change and '
+                             'identity drift. residual_scale is still learned via gradient descent from '
+                             'this starting point, not fixed.')
     parser.add_argument('--direction_freeze', '--direction-freeze',
                         action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--direction_orth_weight', type=float, default=0.0)
+    parser.add_argument('--dir_gate_reg_weight', type=float, default=0.0,
+                        help='Weight on the K-mixture gate\'s combined load-balancing loss: '
+                             'gate_load_balance_loss() (marginal/batch-average entropy across K, '
+                             'active whenever the bank has num_k>1) PLUS gate_sharpness_loss() '
+                             '(per-sample conditional entropy). Merges what were --dir_gate_'
+                             'diversity_weight and --dir_gate_sharpness_weight into one knob -- '
+                             'every run in this project has always set them equal (both 0.1), so '
+                             'nothing is lost by summing them with a single weight; if a future '
+                             'run needs them decoupled again, reintroduce a second flag then. '
+                             'WHY BOTH TERMS TOGETHER MATTER: nothing else supervises gate routing '
+                             '(it otherwise only gets indirect gradient through guided_delta). The '
+                             'marginal term alone let a real checkpoint collapse onto ~2 of 12 slots '
+                             'for 81%% of samples (Eyeglasses, K=12) while still reporting spread '
+                             'usage on average, and a separate run pinned dir_gate_entropy_ema at '
+                             'exactly log(K) with ~1e-7 variance for 40k steps -- every sample '
+                             'outputting an identical near-uniform alpha satisfies "spread on '
+                             'average" just as well as real per-sample routing does. The two terms '
+                             'are the standard marginal-entropy / conditional-entropy '
+                             'mixture-of-experts pairing: marginal keeps usage spread across all K '
+                             'slots, conditional pushes each sample toward a sharp, confident choice '
+                             'among them; using either alone risks the collapse mode the other one '
+                             'exists to prevent. 0 (default) disables both; try 0.1 to start. No '
+                             'effect when num_k<=1 (K=1, no substyle_k).')
+    parser.add_argument('--gate_usage_ema_decay', type=float, default=0.98,
+                        help='EMA decay for AttributeDirectionBank.gate_usage_ema (per-attribute, '
+                             'per-K-slot usage, used by --dir_gate_reg_weight and the '
+                             'dir_gate_entropy_per_attr wandb logs). Higher = smoother/slower to '
+                             'react; matches the convention of --balance_ema_decay.')
     parser.add_argument('--direction_k', type=int, default=1,
                         help='Number of mixture directions per attribute in the Direction Bank.')
     parser.add_argument('--direction_guided_delta_max_norm', type=float, default=0.0,
@@ -908,6 +1305,23 @@ if __name__ == '__main__':
                              "moves the compensation inside the model so edit_scale stays at 1.0. "
                              "Parameter shapes are unchanged, so an existing checkpoint can be "
                              "fine-tuned with --resume_dir rather than retrained from scratch.")
+    parser.add_argument('--magnitude_latent_cond', action='store_true',
+                        help="Condition the edit magnitude on the SOURCE FACE. Without this, "
+                             "magnitude_net's only input is attr_delta, so every face gets the "
+                             "identical step size for a given (attribute, direction) -- the whole "
+                             "dir_delta path is face-independent by construction, and the one "
+                             "per-face term that remains (the K-slot gate) measurably collapses to "
+                             "a constant. A residual-ablation scale sweep is what makes this "
+                             "load-bearing: with the flow residual forced to 0, one GLOBAL scale "
+                             "from 0.90 to 1.20 recovers five of six add/rm directions back to (Male "
+                             "add: past) the full model's accuracy, so magnitude is the binding "
+                             "constraint. But a global scale overshoots easy faces -- spending "
+                             "identity on accuracy already won -- while still undershooting hard "
+                             "ones, which trades along the Acc/ID frontier instead of moving it. "
+                             "Zero-initialized projection, so this is a strict no-op at step 0 and "
+                             "magnitude_net keeps its shape: safe to enable on an existing "
+                             "checkpoint via --resume_dir. Watch dir_bank_dir_delta_norm_cv to "
+                             "confirm it actually trains away from face-independence.")
     parser.add_argument('--use_controlnet_injection', action='store_true',
                         help='ControlNet-style additive injection into an INTERMEDIATE StyleGAN2 '
                              'feature map (models/stylegan2/model.py Generator\'s dormant `skips` '
@@ -918,14 +1332,34 @@ if __name__ == '__main__':
                              '--direction_bank_path. See models/control_encoder.py module '
                              'docstring for the motivation.')
     parser.add_argument('--controlnet_embed_res', type=int, default=64,
-                        help='Must match Generator.forward()\'s embed_res (default 64) -- the '
-                             'feature-map resolution the injection targets.')
+                        help='Single-resolution injection target; must match '
+                             'Generator.forward()\'s embed_res (default 64). Superseded by '
+                             '--controlnet_res when that is given.')
+    parser.add_argument('--controlnet_res', nargs='*', type=int, default=None,
+                        help='Inject at SEVERAL StyleGAN2 feature-map resolutions instead of '
+                             'only --controlnet_embed_res, e.g. --controlnet_res 64 128. '
+                             'WHY: StyleGAN2 puts mid-level STRUCTURE around 64x64 and fine '
+                             'TEXTURE at 128-512. The two worst edits in eval are the two that '
+                             'must SYNTHESIZE what the source lacks -- Eyeglasses add (58.0%%, '
+                             'needs a frame) and Young rm (58.8%%, needs wrinkles) -- while '
+                             'every edit that only removes or displaces existing structure '
+                             'scores 72-96%%. A frame is mid-level structure so 64x64 can carry '
+                             'it, which is why injection measured load-bearing for eyeglasses '
+                             '(AccCeleb add 93%%->12%% with it off) and useless for age (~70.7%% '
+                             'either way): wrinkles live in a band a 64x64 injection never '
+                             'reaches. Channel width per resolution is forced to the '
+                             'generator\'s own (512 at 64, 256 at 128, 128 at 256) so the add '
+                             'broadcasts; --controlnet_channels is then ignored. Costs '
+                             'activation memory that grows with the finest band, so start at '
+                             '64 128 and add 256 only if the fine-texture edits still lag. '
+                             'CHANGES MODEL SHAPE -- needs a fresh run, cannot --resume_dir '
+                             'into a single-resolution checkpoint.')
     parser.add_argument('--controlnet_channels', type=int, default=512,
                         help='Must match StyleGAN2\'s channel count at --controlnet_embed_res '
                              '(512 for the default channel_multiplier=2 at 64x64).')
     parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
                         help='Hidden width of the shared trunk in AttributeControlEncoder.')
-    parser.add_argument('--controlnet_reg_weight', type=float, default=0.001,
+    parser.add_argument('--controlnet_reg_weight', type=float, default=0.01,
                         help='L2 penalty weight on the per-sample norm of control_skips (the '
                              'AttributeControlEncoder output actually added into the StyleGAN2 '
                              'feature map). Unlike the W+ guided_delta, control_skips has NO loss '
@@ -935,7 +1369,12 @@ if __name__ == '__main__':
                              'Over long fine-tunes this let the injected signal grow large enough '
                              'to visibly corrupt images (LPIPS blew up, AccCeleb collapsed, while '
                              'ID stayed misleadingly high) with no warning in any other loss curve. '
-                             'Set 0 to disable (not recommended once this is enabled).')
+                             'DEFAULT raised from 0.001 to 0.01: eval found ControlNet injection '
+                             'earns its keep on eyeglasses but gives gender/age no measured '
+                             'accuracy benefit while adding a sparkle artifact -- the stronger '
+                             'penalty lets training itself shrink the injection toward zero for '
+                             'attributes that do not need it, rather than a hard eval-time '
+                             '--controlnet_disable_attrs override. Set 0 to disable.')
     parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
                         help='Hard per-sample cap on control_skips norm (like guided_delta_max_norm '
                              'for the W+ path). 0 disables the cap; only the L2 penalty above still '
@@ -960,6 +1399,20 @@ if __name__ == '__main__':
                              '-- run scripts/measure_feature_norm.py rather than guessing.')
     parser.add_argument('--controlnet_lr_mult', type=float, default=1.0,
                         help='LR multiplier for control_encoder only (own Adam param group).')
+    parser.add_argument('--controlnet_latent_cond', action='store_true',
+                        help='Condition the injected feature map on the SOURCE LATENT, not just '
+                             'on attr_delta. WITHOUT this, AttributeControlEncoder.forward() sees '
+                             'only a (B, num_attrs) vector that is effectively identical for every '
+                             'sample editing the same attribute in the same direction -- so it '
+                             'adds ONE fixed, face-agnostic 512x64x64 pattern to a generator '
+                             'feature map that differs for every identity, pose and framing. For '
+                             'eyeglasses that means the perturbation lands at fixed spatial '
+                             'coordinates instead of on THIS face\'s eyes: enough glasses-like '
+                             'texture for a detector to fire, never a correctly placed frame. The '
+                             'real ControlNet is conditioned on a spatial input for exactly this '
+                             'reason. RECOMMENDED for new runs. Off by default because it changes '
+                             'the module\'s parameter shapes -- a checkpoint trained without it '
+                             'cannot be loaded into a model built with it, or vice versa.')
     parser.add_argument('--controlnet_per_direction',
                         action=argparse.BooleanOptionalAction, default=False,
                         help="Give add and rm their own decoder head and their own learnable gain "
@@ -1041,8 +1494,17 @@ if __name__ == '__main__':
                         help='Load direction_bank checkpoint state. Keep false when changing bank path/safety settings.')
 
     # ── Frozen pretrained diffusion guidance ───────────────────────────────
-    parser.add_argument('--use_diffusion_guidance', action='store_true',
-                        help='Use a frozen Stable Diffusion model as auxiliary DDS semantic guidance.')
+    parser.add_argument('--use_diffusion_guidance', action=argparse.BooleanOptionalAction, default=True,
+                        help='Use a frozen Stable Diffusion model as auxiliary DDS semantic '
+                             'guidance. DEFAULT changed from off to on -- this is what lets '
+                             '--age_dds_fine_layer_start/--age_diffusion_weight/'
+                             '--age_diffusion_interval (below) do anything; without it those are '
+                             'silently no-ops. COST: downloads/loads --diffusion_model_id (a few '
+                             'GB from HuggingFace on first run) and adds a forward/backward pass '
+                             'through it every --diffusion_guidance_interval steps -- meaningfully '
+                             'more VRAM and time per step. Pass --no-use_diffusion_guidance to '
+                             'restore the old default if you don\'t have network access to '
+                             'HuggingFace or want the old resource footprint.')
     parser.add_argument('--diffusion_model_id', default='SG161222/Realistic_Vision_V5.1_noVAE', type=str,
                         help='HuggingFace model id or local path for the frozen diffusion model.')
     parser.add_argument('--diffusion_vae_model_id', default='stabilityai/sd-vae-ft-mse', type=str,
@@ -1062,9 +1524,15 @@ if __name__ == '__main__':
 
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='Gradient accumulation steps. Effective batch = batch * grad_accum_steps.')
-    parser.add_argument('--residual_max_norm', type=float, default=None,
+    parser.add_argument('--residual_max_norm', type=float, default=10.0,
                         help='Hard clip per-sample residual norm in Direction Bank forward(). '
-                             'Prevents residual explosion from large DDS gradients. Suggested: 10.0.')
+                             'Prevents residual explosion from large DDS gradients. DEFAULT '
+                             'changed from None (off) to 10.0 (the previously-suggested value). '
+                             'There is no CLI value that means "off" any more (the consuming code '
+                             'in AttributeDirectionBank checks `is not None`, and a negative norm '
+                             'would flip the residual\'s sign rather than disable clipping) -- pass '
+                             'a very large value (e.g. 1e6) to make the clip effectively a no-op, '
+                             'or edit this default back to None to fully restore the old behavior.')
     parser.add_argument('--dds_fine_layer_start', type=int, default=7,
                         help='W+ layer index from which DDS gradients are blocked (fine layers). '
                              'Set 0 to disable masking.')
@@ -1072,61 +1540,83 @@ if __name__ == '__main__':
                         help='Min timestep for age-specific DDS pass (coarse structure).')
     parser.add_argument('--age_diffusion_timestep_max', type=int, default=900,
                         help='Max timestep for age-specific DDS pass.')
-    parser.add_argument('--age_diffusion_interval', type=int, default=16,
+    parser.add_argument('--age_diffusion_interval', type=int, default=8,
                         help='Run age DDS guidance every N steps (independent of --diffusion_guidance_interval). '
-                             'NOTE: default 16 is LESS frequent than non-age (8), i.e. the hardest '
-                             'attribute currently gets the least diffusion supervision. Lower it '
-                             '(e.g. 4-8) to give aging more of the diffusion teacher.')
-    parser.add_argument('--age_diffusion_weight', type=float, default=-1.0,
-                        help='Separate loss weight for the AGE DDS pass. <0 (default) falls back to '
-                             'the shared --diffusion_guidance_weight (0.01), i.e. age currently gets '
-                             'the same tiny weight as glasses/gender. Set higher (e.g. 0.05-0.2) to '
-                             'give the diffusion teacher real pull on aging without touching the '
-                             'other attributes.')
-    parser.add_argument('--age_dds_fine_layer_start', type=int, default=-1,
-                        help='Fine-layer cutoff for the AGE DDS pass specifically. <0 (default) reuses '
-                             '--dds_fine_layer_start (7), which blocks DDS gradients from the fine W+ '
-                             'layers (7-17) -- exactly the layers that carry wrinkles / skin texture / '
-                             'gray hair, so the diffusion teacher currently CANNOT teach real aging '
-                             'texture and the model falls back on the coarse/global color-shift '
-                             'shortcut. Set to 18 to let age DDS reach all layers (teach true aging '
-                             'texture), or a higher value like 12-14 for a middle ground.')
+                             'DEFAULT lowered from 16 to 8 (matching non-age) -- 16 was LESS '
+                             'frequent than non-age despite age being the hardest attribute, i.e. '
+                             'the hardest attribute was getting the least diffusion supervision.')
+    parser.add_argument('--age_diffusion_weight', type=float, default=0.1,
+                        help='Separate loss weight for the AGE DDS pass. DEFAULT changed from -1 '
+                             '(fall back to the shared --diffusion_guidance_weight, 0.01, same tiny '
+                             'weight as glasses/gender) to 0.1 -- gives the diffusion teacher real '
+                             'pull on aging without touching the other attributes. Pass a negative '
+                             'value to restore the old fall-back-to-shared-weight behavior.')
+    parser.add_argument('--age_dds_fine_layer_start', type=int, default=12,
+                        help='Fine-layer cutoff for the AGE DDS pass specifically. DEFAULT changed '
+                             'from -1 (fall back to the shared --dds_fine_layer_start, 7, which '
+                             'blocks DDS gradients from the fine W+ layers 7-17 -- exactly the '
+                             'layers that carry wrinkles/skin texture/gray hair, so the diffusion '
+                             'teacher could not teach real aging texture and the model fell back on '
+                             'the coarse/global color-shift shortcut) to 12: the documented '
+                             'middle-ground value, letting the teacher reach most texture layers. '
+                             'Set to 18 for fully unblocked (higher risk), or a negative value to '
+                             'restore the old fall-back-to-7 behavior.')
 
     # ── Frozen CLIP semantic target loss ───────────────────────────────
-    parser.add_argument('--use_clip_prompt_loss', action='store_true',
-                        help='Enable frozen CLIP prompt loss for semantic direction supervision.')
+    parser.add_argument('--use_clip_prompt_loss', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable frozen CLIP prompt loss for semantic direction supervision. '
+                             'DEFAULT changed from off to on -- required for --clip_prompt_mode/'
+                             '--clip_prompt_glasses_weight/--clip_prompt_age_weight (below) to have '
+                             'any effect; without it those are silently no-ops. Pass '
+                             '--no-use_clip_prompt_loss to restore the old default.')
     parser.add_argument('--clip_prompt_model', type=str, default='ViT-B/32',
                         help='OpenAI CLIP model name.')
     parser.add_argument('--clip_prompt_weight', type=float, default=0.03,
                         help='Weight for CLIP prompt loss. Suggested range: 0.02–0.05.')
     parser.add_argument('--clip_prompt_temperature', type=float, default=1.0,
                         help='Temperature for softplus sharpness in CLIP loss (absolute mode only).')
-    parser.add_argument('--clip_prompt_mode', default='absolute', choices=['absolute', 'directional'],
-                        help="'absolute' (default) pulls the edited image toward the target "
-                             "prompt regardless of the source. A visual audit (attr 39, "
-                             "direction rm) found this lets the model reach a high CLIP "
-                             "'looks old' score via a red/orange color shift instead of real "
-                             "structural aging -- a shortcut, not the intended edit. "
-                             "'directional' (StyleGAN-NADA style) instead rewards moving the "
-                             "image, from ITS OWN source, along the same CLIP-space axis that "
-                             "separates the pos/neg prompts -- closing off shortcuts that shift "
-                             "every image the same way regardless of content. Costs one extra "
-                             "CLIP image encode per step (source image).")
+    parser.add_argument('--clip_prompt_mode', default='directional', choices=['absolute', 'directional'],
+                        help="'absolute' pulls the edited image toward the target prompt "
+                             "regardless of the source. A visual audit (attr 39, direction rm) "
+                             "found this lets the model reach a high CLIP 'looks old' score via a "
+                             "red/orange color shift instead of real structural aging -- a "
+                             "shortcut, not the intended edit, and the actual source of the "
+                             "age color-cast artifact. 'directional' (StyleGAN-NADA style, now "
+                             "DEFAULT, was 'absolute') instead rewards moving the image, from ITS "
+                             "OWN source, along the same CLIP-space axis that separates the pos/"
+                             "neg prompts -- closing off shortcuts that shift every image the same "
+                             "way regardless of content. Costs one extra CLIP image encode per "
+                             "step (source image). Pass 'absolute' to restore the old default.")
     parser.add_argument('--clip_prompt_interval', type=int, default=1,
                         help='Compute CLIP loss every N steps (1 = every step).')
+    parser.add_argument('--clip_prompt_num_augs', type=int, default=4,
+                        help='Number of random crop/flip views the CLIP prompt loss averages '
+                             'its score over, per image. 1 = the old single fixed full-frame '
+                             'view, which the generator can attack with spatially-fixed '
+                             'high-frequency patterns that raise the CLIP score with no semantic '
+                             'change -- the CLIP-side twin of the r34 teacher-fooling --teacher_aug '
+                             'already defends against. Averaging over views forces a pattern to '
+                             'survive translation/scale/flip to keep scoring. Costs this many CLIP '
+                             'image encodes per step (doubled in directional mode); lower it to 2 '
+                             'if step time matters, 1 to restore the old behavior.')
+    parser.add_argument('--clip_prompt_aug_min_scale', type=float, default=0.75,
+                        help='Smallest random crop side, as a fraction of the image, for '
+                             '--clip_prompt_num_augs. Too small and the crop can miss the '
+                             'attribute entirely (e.g. crop out the eyes on a glasses edit).')
     parser.add_argument('--clip_prompt_age_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for age (attr 39) in CLIP loss.')
     parser.add_argument('--clip_prompt_gender_weight', type=float, default=1.0,
                         help='Per-sample weight multiplier for gender (attr 20) in CLIP loss.')
-    parser.add_argument('--clip_prompt_glasses_weight', type=float, default=1.0,
+    parser.add_argument('--clip_prompt_glasses_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for eyeglasses (attr 15) in CLIP '
                              'loss. Eyeglasses-add is the biggest independent-judge gap (r34 '
                              'teacher ~91%% but CLIP judge ~44%%, i.e. teacher-fooling) AND '
-                             'the attribute that historically got the LEAST semantic help '
+                             'was historically the attribute that got the LEAST semantic help '
                              '(age has a 3x CLIP weight and its own diffusion guidance; '
-                             'glasses had neither). Try 3.0-5.0 to force real, CLIP-visible '
-                             'glasses instead of a decision-boundary trick the frozen r34 '
-                             'classifier alone rewards.')
+                             'glasses had neither). DEFAULT raised from 1.0 to 3.0 to force '
+                             'real, CLIP-visible glasses instead of a decision-boundary trick '
+                             'the frozen r34 classifier alone rewards. Try up to 5.0 if '
+                             'eyeglasses structure is still incomplete.')
     parser.add_argument('--balance_clip_prompt_loss', action=argparse.BooleanOptionalAction, default=False,
                         help='Replace the fixed --clip_prompt_{age,gender,glasses}_weight constants '
                              'with a CrossAttributeLossBalancer tracking CLIP loss progress per '
@@ -1219,7 +1709,12 @@ if __name__ == '__main__':
     with open(os.path.join(save_root, 'config.json'), 'w') as _f:
         json.dump(vars(args), _f, indent=2, default=str)
     print(f'** run config saved to {os.path.join(save_root, "config.json")}')
+    _mechanism_report(args)
     attribute_index = torch.tensor(args.attribute_index,dtype=int)
+    # Local column of src_probs/target_probs (both ordered by attribute_index)
+    # that holds the source image's Male probability, for the age DDS
+    # prompt's gender-conditioned wording. None when 20 isn't being trained.
+    gender_local_idx = args.attribute_index.index(20) if 20 in args.attribute_index else None
     base_condition_dim = args.id_cond_dim + len(args.attribute_index)
     condition_dim = base_condition_dim
     prior = cnf(
@@ -1303,12 +1798,24 @@ if __name__ == '__main__':
     else:
         layer_mask = None
     attr_scales = LearnableAttributeScales(len(args.attribute_index)).cuda()
+    reg_fine_min_overrides_global = parse_reg_fine_weight_min_override(
+        args.reg_fine_weight_min_override)
+    reg_fine_min_overrides = {}
+    for attr, floor in reg_fine_min_overrides_global.items():
+        if attr not in args.attribute_index:
+            raise ValueError(f'--reg_fine_weight_min_override lists attr {attr}, which is not '
+                             f'in --attribute_index {args.attribute_index}.')
+        reg_fine_min_overrides[args.attribute_index.index(attr)] = floor
+    if reg_fine_min_overrides:
+        print(f'** per-attribute fine reg-loss floor override: '
+             f'{reg_fine_min_overrides_global} (global attr idx -> min_value)')
     reg_loss_weights = LearnableRegLossWeights(
         len(args.attribute_index),
         init_global=args.reg_global_weight_init,
         init_coarse=args.reg_coarse_weight_init,
         init_fine=args.reg_fine_weight,
         min_weight=args.reg_weight_min,
+        fine_min_overrides=reg_fine_min_overrides,
     ).cuda()
     loss_balancer = None
     if args.balance_attr_losses:
@@ -1358,13 +1865,18 @@ if __name__ == '__main__':
         if _bank_num_k != args.direction_k:
             print(f'** Direction Bank: --direction_k={args.direction_k} ignored, '
                   f'using num_k={_bank_num_k} from {args.direction_bank_path}')
-        # No per-attribute direction_scale/layer_scale/delta_max_norm, and no
-        # per-attribute residual_scale init either: every attribute starts from
-        # the same residual_scale value and learns its own from there via
-        # gradient descent (see AttributeDirectionBank.residual_scale_raw). The
-        # only magnitude safety net set here in advance is guided_delta_max_norm.
+        # No per-attribute direction_scale/layer_scale/delta_max_norm. Age,
+        # glasses, and gender DO get their own residual_scale INIT
+        # (--age_residual_scale, --glasses_residual_scale,
+        # --male_residual_scale) -- every other attribute still starts from
+        # the same shared --direction_residual_scale. All of them keep
+        # learning their own value from that starting point via gradient
+        # descent (see AttributeDirectionBank.residual_scale_raw); the only
+        # magnitude safety net fixed in advance is guided_delta_max_norm.
         _per_attr_residual_scale = [
             args.age_residual_scale if (idx == 39 and args.age_residual_scale >= 0)
+            else args.glasses_residual_scale if (idx == 15 and args.glasses_residual_scale >= 0)
+            else args.male_residual_scale if (idx == 20 and args.male_residual_scale >= 0)
             else args.direction_residual_scale
             for idx in args.attribute_index
         ]
@@ -1386,6 +1898,8 @@ if __name__ == '__main__':
             use_attr_lora=args.use_attr_lora,
             attr_lora_rank=args.attr_lora_rank,
             signed_magnitude_input=args.signed_magnitude_input,
+            magnitude_latent_cond=args.magnitude_latent_cond,
+            gate_usage_ema_decay=args.gate_usage_ema_decay,
         ).cuda()
         if args.freeze_direction_bank_nets:
             for p in direction_bank.parameters():
@@ -1407,20 +1921,57 @@ if __name__ == '__main__':
             raise ValueError('--use_controlnet_injection requires --direction_bank_path '
                               '(and --velocity_field != original) -- attr_delta, needed to '
                               'condition the control encoder, is only computed on that branch.')
-        from models.control_encoder import AttributeControlEncoder
-        control_encoder = AttributeControlEncoder(
-            num_attrs=len(args.attribute_index),
-            out_channels=args.controlnet_channels,
-            out_res=args.controlnet_embed_res,
-            hidden_dim=args.controlnet_hidden_dim,
-            init_gain=args.controlnet_init_gain,
-            per_direction=args.controlnet_per_direction,
-        ).cuda()
+        from models.control_encoder import (AttributeControlEncoder,
+                                            LegacySingleResControlEncoder,
+                                            is_legacy_state_dict)
+        _cn_res = args.controlnet_res or [args.controlnet_embed_res]
+        # When resuming, the checkpoint decides the architecture -- otherwise a
+        # run resumed from a pre-multi-resolution checkpoint would build the new
+        # module, fail to match a single key, and silently start its control
+        # encoder from scratch while every other module carried on. That looks
+        # like "the injection stopped working after resuming" and is invisible
+        # except in one non-strict-load line.
+        _legacy_resume = False
+        if args.resume_dir is not None and args.resume_step is not None:
+            _ce_path = os.path.join(resolve_resume_save_dir(args.resume_dir),
+                                    'control_encoder-{}'.format(str(int(args.resume_step)).zfill(7)))
+            if os.path.exists(_ce_path):
+                _legacy_resume = is_legacy_state_dict(torch.load(_ce_path, map_location='cpu'))
+        if _legacy_resume:
+            if args.controlnet_res and len(_cn_res) > 1:
+                raise ValueError(
+                    f'--controlnet_res {_cn_res} cannot be applied to a resumed run: the '
+                    f'checkpoint at {_ce_path} was trained with single-resolution injection, '
+                    f'and adding resolutions changes the module shape. Train multi-resolution '
+                    f'from scratch (drop --resume_dir/--resume_step), or drop --controlnet_res '
+                    f'to continue this run at {args.controlnet_embed_res} only.')
+            print(f'[Resume] control_encoder checkpoint predates multi-resolution injection; '
+                  f'building the single-resolution architecture at {args.controlnet_embed_res}.')
+            control_encoder = LegacySingleResControlEncoder(
+                num_attrs=len(args.attribute_index),
+                out_channels=args.controlnet_channels,
+                out_res=args.controlnet_embed_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=args.controlnet_init_gain,
+                per_direction=args.controlnet_per_direction,
+                latent_cond=args.controlnet_latent_cond,
+            ).cuda()
+        else:
+            control_encoder = AttributeControlEncoder(
+                num_attrs=len(args.attribute_index),
+                out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
+                out_res=_cn_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=args.controlnet_init_gain,
+                per_direction=args.controlnet_per_direction,
+                latent_cond=args.controlnet_latent_cond,
+            ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
-        print(f'** ControlNet-style feature injection enabled: embed_res='
-              f'{args.controlnet_embed_res}, channels={args.controlnet_channels}, '
-              f'init_gain={args.controlnet_init_gain} (= control_skip_norm once active)'
+        _cn_chans = ', '.join(f'{r}:{c}ch' for r, c in control_encoder.res_channels.items())
+        print(f'** ControlNet-style feature injection enabled at {len(_cn_res)} '
+              f'resolution(s) [{_cn_chans}], '
+              f'init_gain={args.controlnet_init_gain} (= per-band control_skip_norm once active)'
               + (f'; held off until step {_warm} so the W+ path matures first'
                  if _warm > 0 else '; active from step 0'))
 
@@ -1500,6 +2051,15 @@ if __name__ == '__main__':
             load_module_checkpoint(reg_loss_weights, resume_save_dir, 'reg_loss_weights', start_step, strict=False)
         except FileNotFoundError:
             print('[Resume] reg_loss_weights checkpoint not found; using default init weights.')
+        if reg_fine_min_overrides:
+            # A resumed checkpoint saved AFTER this feature existed carries its own
+            # min_floor buffer, which the strict=False load above just loaded verbatim --
+            # silently reverting this run's --reg_fine_weight_min_override if the value
+            # differs (e.g. tightening/loosening it partway through a run). Re-apply so
+            # the CLI flag always wins over whatever a resumed checkpoint happened to save.
+            with torch.no_grad():
+                for local_idx, floor in reg_fine_min_overrides.items():
+                    reg_loss_weights.min_floor[local_idx, 2] = float(floor)
         if direction_bank is not None and args.resume_direction_bank:
             load_module_checkpoint(direction_bank, resume_save_dir, 'direction_bank', start_step, strict=False)
         elif direction_bank is not None:
@@ -1558,6 +2118,19 @@ if __name__ == '__main__':
         p.requires_grad_(False)
     print('** StyleGAN2 model initialization success !')
 
+    discriminator = None
+    if args.disc_realism_weight > 0:
+        # Same checkpoint file as G, loaded from its "d" key -- adversarially
+        # trained against THIS G's own artifact distribution, which is what
+        # makes it a faithful realism signal (see --disc_realism_weight help).
+        discriminator = Discriminator(size=1024, channel_multiplier=2)
+        discriminator.load_state_dict(ckpt['d'])
+        discriminator.cuda().eval()
+        for p in discriminator.parameters():
+            p.requires_grad_(False)
+        print(f'** Frozen StyleGAN2 discriminator (realism regularizer, '
+              f'weight={args.disc_realism_weight}) initialization success !')
+
     id_criterion = IDLoss(crop=True).cuda()
     id_criterion.eval()
     for p in id_criterion.parameters():
@@ -1604,7 +2177,9 @@ if __name__ == '__main__':
               f'{judge_balancer.num_slots} slots)')
 
     face_parser = None
-    if args.local_region_loss_weight > 0 or args.color_shift_loss_weight > 0 or args.dds_face_mask:
+    if args.local_region_loss_weight > 0 or args.dds_face_mask \
+            or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0 \
+            or args.hair_extent_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -1612,39 +2187,68 @@ if __name__ == '__main__':
                 local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
                 print(f'** Face-parser locality loss enabled (weight='
                       f'{args.local_region_loss_weight}) for local attrs {local_attrs}')
-            if args.color_shift_loss_weight > 0:
-                print(f'** Color-shift regularizer enabled (weight='
-                      f'{args.color_shift_loss_weight}) for attrs {args.color_shift_attrs}')
             if args.dds_face_mask:
                 print('** DDS face mask enabled: diffusion-guidance gradient restricted to '
                       'the region each attribute is allowed to touch.')
+            if args.hair_gray_loss_weight > 0:
+                print(f'** Hair-graying loss enabled (weight={args.hair_gray_loss_weight}, '
+                      f'target={args.hair_gray_relative_ratio}x source sat, capped at '
+                      f'{args.hair_gray_abs_cap}) for age(39) removal edits')
+            if args.hair_extent_loss_weight > 0:
+                print(f'** Hair-EXTENT loss enabled (weight={args.hair_extent_loss_weight}, '
+                      f'+/-{args.hair_extent_relative_change:.0%} of source coverage, '
+                      f'capped [{args.hair_extent_min_frac}, {args.hair_extent_max_frac}]) '
+                      f'for gender(20) edits -- uses the DIFFERENTIABLE FaceParser.region_prob, '
+                      f'so it adds a BiSeNet backward pass on the steps it fires')
+            if args.hair_color_add_loss_weight > 0:
+                print(f'** Hair-color (add-direction) loss enabled (weight='
+                      f'{args.hair_color_add_loss_weight}, floor={args.hair_color_add_floor}) '
+                      f'for age(39) add edits -- mirror of --hair_gray_loss_weight')
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
-            print(f'[WARN] Face parser unavailable ({exc}); locality/color-shift/DDS-mask '
+            print(f'[WARN] Face parser unavailable ({exc}); locality/hair-gray/DDS-mask '
                   f'disabled.')
 
     diffusion_guidance = None
     if args.use_diffusion_guidance:
-        from models.diffusion_guidance import FrozenDiffusionDDSGuidance
-        diffusion_guidance = FrozenDiffusionDDSGuidance(
-            model_id=args.diffusion_model_id,
-            vae_model_id=args.diffusion_vae_model_id or None,
-            image_size=args.diffusion_image_size,
-            timestep_min=args.diffusion_timestep_min,
-            timestep_max=args.diffusion_timestep_max,
-            guidance_scale=args.diffusion_guidance_scale,
-            fp16=args.diffusion_fp16,
-        ).cuda()
-        print(f'** Frozen diffusion DDS guidance enabled: {args.diffusion_model_id}  '
-              f'weight={args.diffusion_guidance_weight}  interval={args.diffusion_guidance_interval}')
+        try:
+            from models.diffusion_guidance import FrozenDiffusionDDSGuidance
+            diffusion_guidance = FrozenDiffusionDDSGuidance(
+                model_id=args.diffusion_model_id,
+                vae_model_id=args.diffusion_vae_model_id or None,
+                image_size=args.diffusion_image_size,
+                timestep_min=args.diffusion_timestep_min,
+                timestep_max=args.diffusion_timestep_max,
+                guidance_scale=args.diffusion_guidance_scale,
+                fp16=args.diffusion_fp16,
+            ).cuda()
+            print(f'** Frozen diffusion DDS guidance enabled: {args.diffusion_model_id}  '
+                  f'weight={args.diffusion_guidance_weight}  interval={args.diffusion_guidance_interval}')
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                f'--use_diffusion_guidance is on by default but failed to load '
+                f'{args.diffusion_model_id} ({exc}). This needs the `diffusers` package plus '
+                f'either network access to HuggingFace or a local cache of the model. Pass '
+                f'--no-use_diffusion_guidance to train without it (age gets less diffusion '
+                f'supervision but everything else is unaffected).'
+            ) from exc
 
     clip_prompt_loss_fn = None
     if args.use_clip_prompt_loss:
-        from models.clip_prompt_loss import FrozenCLIPPromptLoss
+        try:
+            from models.clip_prompt_loss import FrozenCLIPPromptLoss
+        except ImportError as exc:
+            raise RuntimeError(
+                f'--use_clip_prompt_loss is on by default but failed to import ({exc}). Install '
+                f'OpenAI CLIP (pip install git+https://github.com/openai/CLIP.git) or pass '
+                f'--no-use_clip_prompt_loss to train without it.'
+            ) from exc
         clip_prompt_loss_fn = FrozenCLIPPromptLoss(
             clip_model=args.clip_prompt_model,
             temperature=args.clip_prompt_temperature,
             mode=args.clip_prompt_mode,
+            num_augs=args.clip_prompt_num_augs,
+            aug_min_scale=args.clip_prompt_aug_min_scale,
         ).cuda().eval()
         for p in clip_prompt_loss_fn.parameters():
             p.requires_grad_(False)
@@ -1735,6 +2339,7 @@ if __name__ == '__main__':
 
             control_skips = None
             control_skip_norm = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            control_band_logs = {}
             loss_control_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
             controlnet_active = (control_encoder is not None
                                  and n_iter >= args.controlnet_warmup_steps)
@@ -1746,7 +2351,8 @@ if __name__ == '__main__':
                 # direction_bank branch above; control_encoder requires
                 # direction_bank to be enabled (checked at arg-parse time).
                 control_skips = control_encoder(attr_delta, mid_idx,
-                                                is_rm=(src_attr_flow > 0.5))
+                                                is_rm=(src_attr_flow > 0.5),
+                                                latent=latent)
 
                 # control_skips has no OTHER loss term constraining its
                 # magnitude -- it's only shaped indirectly through downstream
@@ -1757,17 +2363,61 @@ if __name__ == '__main__':
                 # corruption didn't destroy ArcFace's coarse face embedding).
                 # An explicit L2 penalty plus optional hard cap closes that
                 # gap, mirroring guided_delta_max_norm on the W+ path.
-                skip_norm_per_sample = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
-                loss_control_reg = skip_norm_per_sample.pow(2).mean()
-                if args.controlnet_max_norm > 0:
-                    clip = (args.controlnet_max_norm / skip_norm_per_sample.clamp(min=1e-8)).clamp(max=1.0)
-                    control_skips = control_skips * clip.view(-1, 1, 1, 1)
+                skip_norm_per_sample = skips_norm_per_sample(control_skips)
+                # Mean squared norm PER BAND, not the total: summing would make
+                # this penalty grow with the number of injected resolutions, so
+                # adding a band would itself push every gain down. See
+                # skips_reg_per_sample. Identical to the old value when there is
+                # one band, so --controlnet_reg_weight keeps its calibration.
+                loss_control_reg = skips_reg_per_sample(control_skips).mean()
+                control_skips = clip_skips(control_skips, args.controlnet_max_norm)
                 control_skip_norm = skip_norm_per_sample.mean().detach()
+                # Per-band norms too: with several resolutions the combined
+                # number above hides which band the model actually leans on,
+                # and that is the whole question this change exists to answer.
+                with torch.no_grad():
+                    for _r, _t in control_skips.items():
+                        control_band_logs[f'control_skip_norm_r{_r}'] = (
+                            _t.reshape(_t.shape[0], -1).norm(dim=1).mean().detach())
+                    # Spatial-gate coverage per band (see AttributeControlEncoder
+                    # heads' +1-channel comment): starts ~0.98 (near-full-coverage
+                    # init) everywhere. A local attribute (eyeglasses) should drift
+                    # down over training as local_region_loss's gradient teaches it
+                    # to close outside the allowed region; a global attribute
+                    # (Male/Young), which local_region_loss never touches, has no
+                    # reason to move and should stay near its init.
+                    for _r, _g in getattr(control_encoder, 'last_gate_mean', {}).items():
+                        control_band_logs[f'control_gate_mean_r{_r}'] = _g
 
             new_face_tensors = G([new_latents], skips=control_skips,
                                  embed_res=args.controlnet_embed_res,
                                  input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             new_face_tensors = F.interpolate(new_face_tensors, (args.img_size, args.img_size))
+
+            # ── Realism regularizer (frozen StyleGAN2 discriminator) ─────────
+            # Every other loss here measures a specific proxy (classifier score,
+            # feature distance, W+ displacement, diffusion noise residual), none
+            # asks "does this look like a real photo" -- see --disc_realism_weight
+            # help for the visual-audit evidence motivating this. Upsampled to
+            # 1024 (D's native training resolution) rather than loading D at
+            # img_size via strict=False, so the loaded weights match exactly.
+            #
+            # --disc_realism_attrs restricts which samples feed the discriminator
+            # this step, same masking pattern as the hair-graying/local-region
+            # losses below: map this step's LOCAL mid_idx to absolute CelebA ids,
+            # then select. None (default) = no restriction, every sample counts.
+            disc_realism_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            if discriminator is not None:
+                _disc_sel = new_face_tensors
+                if args.disc_realism_attrs is not None:
+                    _mid_abs_r = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
+                    _realism_mask = torch.tensor(
+                        [a in args.disc_realism_attrs for a in _mid_abs_r], device=latent.device)
+                    _disc_sel = new_face_tensors[_realism_mask]
+                if _disc_sel.shape[0] > 0:
+                    _disc_input = F.interpolate(_disc_sel, (1024, 1024),
+                                                mode='bilinear', align_corners=False)
+                    disc_realism_loss = F.softplus(-discriminator(_disc_input)).mean()
 
             # ── Face-parser locality loss (local attributes only) ────────────
             # Outside the attribute's allowed facial region, the edited image
@@ -1797,71 +2447,169 @@ if __name__ == '__main__':
             #     (--local_region_add_blur) as a geometric prior for where a
             #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
-            # ── Color-shift regularizer (--color_shift_loss_weight) ──────────
-            # A visual audit (scripts/dump_attr_failures.py, attr 39 direction
-            # rm) found the model satisfies the aging edit largely by shifting
-            # the whole face's skin tone toward red/orange, not by drawing
-            # genuine texture/geometry aging (wrinkles, gray hair) -- and this
-            # was unchanged by every fix tried so far that operates on the
-            # direction vector or edit magnitude (direction swaps, scale
-            # sweeps, residual overrides, directional CLIP loss). This
-            # regularizer instead acts directly on the generated pixels: it
-            # penalizes the change in mean skin-region RGB between source and
-            # edited face, making the color-shift shortcut itself costly so
-            # the attribute loss has to be satisfied some other way. Genuine
-            # aging is a texture/geometry change, not a uniform tone shift,
-            # so it should be largely unaffected by this penalty.
-            color_shift_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            hair_color_add_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+
+            # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
+            # Hoisted out of the face-parser branch below so the identity /
+            # CLIP / DDS losses can use it as their reference too (see
+            # --losses_vs_recon). Computed at most once per step and reused.
+            #
+            # WHY THIS MATTERS: `img` is the REAL photo; `new_face_tensors` is
+            # G(latent + delta). The difference between them is (inversion gap)
+            # + (edit). Any loss that compares the edited image against `img`
+            # therefore charges the e4e/StyleGAN inversion error to the edit --
+            # error the flow did not cause and cannot usefully remove, since
+            # fixing it would mean spending W+ budget on reconstruction rather
+            # than on the attribute. The locality loss below already
+            # deliberately compares against src_recon for exactly this
+            # reason; --losses_vs_recon extends the same principle to the other
+            # three losses that were still referencing `img`.
+            src_recon = None
+            if (args.losses_vs_recon
+                    or face_parser is not None):
+                with torch.no_grad():
+                    src_recon = G([latent], input_is_latent=True,
+                                  randomize_noise=False)[0].clamp(-1, 1)
+                    src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
+            # Reference image for id_loss / directional CLIP / DDS.
+            loss_ref_img = src_recon if (args.losses_vs_recon and src_recon is not None) else img
+
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
+                _is_removal = src_attr_flow > 0.5
                 _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
                                          device=latent.device)
-                _is_color = torch.tensor([a in args.color_shift_attrs for a in _mid_abs],
-                                         device=latent.device)
-                if _is_local.any() or _is_color.any():
-                    with torch.no_grad():
-                        src_recon = G([latent], input_is_latent=True,
-                                      randomize_noise=False)[0].clamp(-1, 1)
-                        src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
-
-                    if _is_local.any():
-                        _is_removal = src_attr_flow > 0.5
-                        _terms = []
-                        for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
-                            _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
-                                                     device=latent.device)
-                            for _dir_sel, _sigma in [
-                                (_attr_sel & _is_removal, 5),
-                                (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
-                            ]:
-                                if not _dir_sel.any():
-                                    continue
-                                with torch.no_grad():
-                                    region = face_parser.get_region_mask(
-                                        src_recon[_dir_sel],
-                                        LOCAL_REGION_CLASSES[_abs_idx],
-                                        blur_sigma=_sigma,
-                                    )
-                                outside = (1.0 - region)
-                                diff_sq = (new_face_tensors[_dir_sel] - src_recon[_dir_sel]).pow(2)
-                                _terms.append(
-                                    (diff_sq * outside).sum()
-                                    / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
+                if _is_local.any():
+                    _terms = []
+                    for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
+                        _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
+                                                 device=latent.device)
+                        for _dir_sel, _sigma in [
+                            (_attr_sel & _is_removal, 5),
+                            (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
+                        ]:
+                            if not _dir_sel.any():
+                                continue
+                            with torch.no_grad():
+                                region = face_parser.get_region_mask(
+                                    src_recon[_dir_sel],
+                                    LOCAL_REGION_CLASSES[_abs_idx],
+                                    blur_sigma=_sigma,
                                 )
-                        if _terms:
-                            local_region_loss = torch.stack(_terms).mean()
+                            outside = (1.0 - region)
+                            diff_sq = (new_face_tensors[_dir_sel] - src_recon[_dir_sel]).pow(2)
+                            _terms.append(
+                                (diff_sq * outside).sum()
+                                / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
+                            )
+                    if _terms:
+                        local_region_loss = torch.stack(_terms).mean()
 
-                    if _is_color.any():
+                # ── Hair-graying (age/39 removal direction only) ────────────
+                # See --hair_gray_loss_weight help for the failure-audit evidence
+                # motivating this. Only touches samples where THIS step's edited
+                # attribute is age AND the edit direction is removal (src already
+                # Young -> aging).
+                #
+                # Target is RELATIVE to each sample's OWN source saturation, not
+                # a fixed absolute constant -- a single hardcoded target (e.g.
+                # "saturation must drop below 0.15") implicitly assumes one
+                # numerical definition of "gray" that does not fit every source
+                # hair color/lighting condition equally: a person who starts
+                # with vivid dyed-red hair and one who starts with dark brown
+                # both need real desaturation, but by different absolute
+                # amounts, while someone whose hair is already close to gray
+                # needs almost none. Scaling the target off src_recon's own
+                # measured saturation generalizes across any starting hair
+                # color instead of encoding an assumption about what "old hair"
+                # numerically looks like. The abs cap is a floor under that
+                # scaling: without it, a sample that starts only mildly
+                # saturated could satisfy the loss while remaining visibly
+                # colored, since relative_ratio alone never asks for MORE than
+                # proportional change.
+                _is_attr_age = torch.tensor([a == 39 for a in _mid_abs], device=latent.device)
+                if args.hair_gray_loss_weight > 0:
+                    _is_age_rm = _is_attr_age & _is_removal
+                    if _is_age_rm.any():
                         with torch.no_grad():
-                            skin_mask = face_parser.get_region_mask(
-                                src_recon[_is_color], SKIN_CLASS, blur_sigma=5,
-                            )   # (N, 1, H, W)
-                        _src_c = src_recon[_is_color]
-                        _edit_c = new_face_tensors[_is_color]
-                        _pixel_count = skin_mask.sum(dim=(2, 3)).clamp(min=1e-6)   # (N, 1)
-                        mean_src = (_src_c * skin_mask).sum(dim=(2, 3)) / _pixel_count    # (N, 3)
-                        mean_edit = (_edit_c * skin_mask).sum(dim=(2, 3)) / _pixel_count  # (N, 3)
-                        color_shift_loss = (mean_edit - mean_src).pow(2).sum(dim=1).mean()
+                            src_hair_mask = face_parser.get_region_mask(
+                                src_recon[_is_age_rm], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                            edit_hair_mask = face_parser.get_region_mask(
+                                new_face_tensors[_is_age_rm], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                        # Skip samples where BiSeNet found ~no hair pixels in
+                        # EITHER pass (bald, hat, hair out of frame) -- the mean
+                        # would be dominated by a handful of misclassified pixels.
+                        _min_px = 0.01 * src_hair_mask.numel()
+                        if src_hair_mask.sum() > _min_px and edit_hair_mask.sum() > _min_px:
+                            hair_gray_loss = directional_region_saturation_loss(
+                                src_recon[_is_age_rm], new_face_tensors[_is_age_rm],
+                                src_hair_mask, edit_hair_mask,
+                                push=-1, relative_ratio=args.hair_gray_relative_ratio,
+                                bound=args.hair_gray_abs_cap,
+                            )
+
+                # ── Hair-coloring (age/39 ADD direction only) ────────────────
+                # Mirror of the block above -- see --hair_color_add_loss_weight
+                # help for the failure-audit evidence motivating it (Gray_Hair
+                # in the SOURCE was the strongest correlate of a SUCCESSFUL
+                # de-aging edit, meaning the model's only reliable "look
+                # younger" lever was an incidental hair-darkening side effect
+                # it was never asked to produce directly). Same
+                # directional_region_saturation_loss call, push=+1 instead of
+                # -1, so the target moves toward MORE saturation instead of
+                # less.
+                if args.hair_color_add_loss_weight > 0:
+                    _is_age_add = _is_attr_age & ~_is_removal
+                    if _is_age_add.any():
+                        with torch.no_grad():
+                            src_hair_mask_add = face_parser.get_region_mask(
+                                src_recon[_is_age_add], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                            edit_hair_mask_add = face_parser.get_region_mask(
+                                new_face_tensors[_is_age_add], HAIR_REGION_CLASS, blur_sigma=3,
+                            )
+                        _min_px_add = 0.01 * src_hair_mask_add.numel()
+                        if src_hair_mask_add.sum() > _min_px_add and edit_hair_mask_add.sum() > _min_px_add:
+                            hair_color_add_loss = directional_region_saturation_loss(
+                                src_recon[_is_age_add], new_face_tensors[_is_age_add],
+                                src_hair_mask_add, edit_hair_mask_add,
+                                push=+1, relative_ratio=args.hair_gray_relative_ratio,
+                                bound=args.hair_color_add_floor,
+                            )
+
+                # ── Hair EXTENT (gender/20, both directions) ─────────────
+                # See --hair_extent_loss_weight for the audit this responds
+                # to. Unlike the two blocks above this one optimises the
+                # SIZE of the region, so it cannot use face_parser's
+                # argmax'd, no_grad mask -- that would give it exactly zero
+                # gradient. region_prob is the differentiable softmax
+                # version; the cost is a BiSeNet backward pass here.
+                if args.hair_extent_loss_weight > 0:
+                    _is_gender = torch.tensor([a == 20 for a in _mid_abs],
+                                              device=latent.device)
+                    _terms_extent = []
+                    for _sel, _push, _bound in (
+                        (_is_gender & _is_removal, +1, args.hair_extent_max_frac),
+                        (_is_gender & ~_is_removal, -1, args.hair_extent_min_frac),
+                    ):
+                        if not _sel.any():
+                            continue
+                        with torch.no_grad():
+                            _src_prob = face_parser.region_prob(
+                                src_recon[_sel], HAIR_REGION_CLASS)
+                        _edit_prob = face_parser.region_prob(
+                            new_face_tensors[_sel], HAIR_REGION_CLASS)
+                        _terms_extent.append(directional_region_area_loss(
+                            _src_prob, _edit_prob, push=_push,
+                            relative_change=args.hair_extent_relative_change,
+                            bound=_bound,
+                        ))
+                    if _terms_extent:
+                        hair_extent_loss = torch.stack(_terms_extent).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -1877,7 +2625,12 @@ if __name__ == '__main__':
             # is at or above --id_hinge_threshold, so the model can spend its full
             # editing budget above that floor instead of a continuous pull fighting
             # counter_attr_loss even when identity is already well preserved.
-            id_src_feat = F.normalize(id_criterion.extract_features(img), dim=1).detach()
+            # Reference is the source RECONSTRUCTION by default (--losses_vs_recon),
+            # not the real photo: otherwise the fixed inversion gap sits inside
+            # id_loss as a constant penalty the edit cannot remove, and training
+            # optimizes a different quantity than evaluate_sdflow.py reports
+            # (which measures edited-vs-reconstruction identity).
+            id_src_feat = F.normalize(id_criterion.extract_features(loss_ref_img), dim=1).detach()
             id_edit_feat = F.normalize(id_criterion.extract_features(new_face_tensors), dim=1)
             id_cos_sim = F.cosine_similarity(id_edit_feat, id_src_feat, dim=1)
             if args.id_loss_hinge:
@@ -1985,7 +2738,17 @@ if __name__ == '__main__':
                     attr_abs_idx=_clip_abs_idx,
                     target_values=soft_target_for_loss,
                     reduction='none',
-                    src_images=img if args.clip_prompt_mode == 'directional' else None,
+                    # Directional CLIP measures cos(clip(edit) - clip(src), text_delta).
+                    # The source MUST be the reconstruction, not the real photo:
+                    # with the real photo, every img_delta carries the same
+                    # inversion-gap offset in CLIP space on top of the actual
+                    # edit direction, which drags the cosine toward that offset
+                    # and away from the pos/neg text axis the loss is supposed
+                    # to align to. That is very likely why this file's own notes
+                    # record "directional CLIP loss left the color-cast
+                    # unchanged" -- the directional signal was diluted, so it
+                    # never got a fair test.
+                    src_images=loss_ref_img if args.clip_prompt_mode == 'directional' else None,
                 )   # clip_loss_each: (B,)
                 if clip_loss_balancer is not None:
                     # Auto-balanced: tracks THIS loss's own per-attribute progress
@@ -2022,15 +2785,45 @@ if __name__ == '__main__':
                 lag_orth = lag_dof_losses['orth']
                 lag_gate_smooth = lag_dof_losses['gate_smooth']
                 lag_gate_sparse = lag_dof_losses['gate_sparse']
+            # Fixed relative weights are the three terms' pre-merge individual
+            # defaults (0.005 / 0.003 / 0.01) -- see --lag_reg_weight help.
+            # Individual terms above are kept (and still logged below) purely
+            # for diagnostics; only this combined value is trained on.
+            lag_reg_loss = 0.005 * lag_orth + 0.003 * lag_gate_smooth + 0.01 * lag_gate_sparse
 
             id_warmup_steps = 1500
             id_weight = args.id_loss_weight * min(1.0, n_iter / max(1, id_warmup_steps))
             if direction_bank is not None:
-                dir_orth_loss = direction_bank.orthogonality_loss()
                 dir_logs = direction_bank.last_logs if direction_bank_applied else {}
+                # gate_load_balance_loss() returns a value computed INSIDE the
+                # most recent direction_bank(...) forward call (see
+                # _last_gate_diversity_loss in direction_bank.py) -- only valid
+                # to read/backward through when that forward call actually
+                # happened THIS step (direction_bank_applied). Reading it on a
+                # step where direction_bank wasn't called would reuse a stale
+                # tensor from a previous step whose autograd graph has already
+                # been freed by that step's own .backward().
+                dir_gate_diversity_loss = (
+                    direction_bank.gate_load_balance_loss()
+                    if (args.dir_gate_reg_weight > 0 and direction_bank_applied)
+                    else _zero.clone()
+                )
+                # Same stale-tensor caveat as dir_gate_diversity_loss above --
+                # gate_sharpness_loss() also reads a value computed inside
+                # THIS step's direction_bank(...) forward call.
+                dir_gate_sharpness_loss = (
+                    direction_bank.gate_sharpness_loss()
+                    if (args.dir_gate_reg_weight > 0 and direction_bank_applied)
+                    else _zero.clone()
+                )
             else:
-                dir_orth_loss = _zero.clone()
                 dir_logs = {}
+                dir_gate_diversity_loss = _zero.clone()
+                dir_gate_sharpness_loss = _zero.clone()
+            # Marginal + conditional entropy, the standard mixture-of-experts
+            # load-balancing pair -- see --dir_gate_reg_weight help for why
+            # both terms are needed together.
+            dir_gate_reg_loss = dir_gate_diversity_loss + dir_gate_sharpness_loss
 
             diffusion_loss = _zero.clone()       # non-age DDS (glasses/gender)
             age_diffusion_loss = _zero.clone()   # age DDS, separately weighted
@@ -2094,16 +2887,43 @@ if __name__ == '__main__':
                 # Non-age samples (glasses, gender): standard cutoff and timestep range
                 non_age_mask = ~is_age
                 if non_age_fires:
-                    _face_non_age = _dds_face(args.dds_fine_layer_start)
-                    _loss, _logs = diffusion_guidance(
-                        src_images=img[non_age_mask],
-                        edit_images=_face_non_age[non_age_mask],
-                        attr_abs_idx=mid_abs_idx[non_age_mask],
-                        target_values=soft_target[non_age_mask].detach(),
-                        face_mask=_dds_mask(_face_non_age[non_age_mask], mid_abs_idx[non_age_mask]),
-                    )
-                    diffusion_loss = diffusion_loss + _loss
-                    diffusion_logs.update(_logs)
+                    # Gender may ask for its own fine-layer cutoff
+                    # (--gender_dds_fine_layer_start), exactly as age does. A
+                    # different cutoff means a different detach point, so it
+                    # needs its own generator pass -- hence the split. When the
+                    # flag is left at its default this collapses back to the
+                    # single call it has always been, at the same cost.
+                    _gender_fine = (args.gender_dds_fine_layer_start
+                                    if args.gender_dds_fine_layer_start >= 0
+                                    else args.dds_fine_layer_start)
+                    if _gender_fine == args.dds_fine_layer_start:
+                        _non_age_groups = [(non_age_mask, args.dds_fine_layer_start)]
+                    else:
+                        _is_gender_dds = mid_abs_idx == 20
+                        _non_age_groups = [
+                            (non_age_mask & ~_is_gender_dds, args.dds_fine_layer_start),
+                            (non_age_mask & _is_gender_dds, _gender_fine),
+                        ]
+                    # DDS subtracts the source branch's noise residual as a bias
+                    # correction; that cancellation is only valid when src and
+                    # edit differ ONLY by the edit. Passing the real photo makes
+                    # the residual difference also contain the inversion gap,
+                    # leaving an uncancelled "fix the reconstruction" component
+                    # in the gradient. See --losses_vs_recon.
+                    for _grp_mask, _grp_fine in _non_age_groups:
+                        if not _grp_mask.any():
+                            continue
+                        _face_non_age = _dds_face(_grp_fine)
+                        _loss, _logs = diffusion_guidance(
+                            src_images=loss_ref_img[_grp_mask],
+                            edit_images=_face_non_age[_grp_mask],
+                            attr_abs_idx=mid_abs_idx[_grp_mask],
+                            target_values=soft_target[_grp_mask].detach(),
+                            face_mask=_dds_mask(_face_non_age[_grp_mask], mid_abs_idx[_grp_mask]),
+                            gender_rm_texture_cue=args.gender_rm_prompt_cue,
+                        )
+                        diffusion_loss = diffusion_loss + _loss
+                        diffusion_logs.update(_logs)
 
                 # Age samples: coarse timestep range, own interval, own fine-layer
                 # cutoff (may reach fine layers), accumulated into age_diffusion_loss
@@ -2114,13 +2934,16 @@ if __name__ == '__main__':
                                        else args.dds_fine_layer_start)
                     _face_age = _dds_face(_age_fine_start)
                     _loss, _logs = diffusion_guidance(
-                        src_images=img[is_age],
+                        src_images=loss_ref_img[is_age],
                         edit_images=_face_age[is_age],
                         attr_abs_idx=mid_abs_idx[is_age],
                         target_values=soft_target[is_age].detach(),
                         timestep_min=args.age_diffusion_timestep_min,
                         timestep_max=args.age_diffusion_timestep_max,
                         face_mask=_dds_mask(_face_age[is_age], mid_abs_idx[is_age]),
+                        gender_prob=(src_probs[is_age, gender_local_idx].detach()
+                                    if gender_local_idx is not None else None),
+                        young_add_hair_cue=args.age_add_hair_prompt_cue,
                     )
                     age_diffusion_loss = age_diffusion_loss + _loss
                     diffusion_logs.update({f'age_{k}': v for k, v in _logs.items()})
@@ -2130,17 +2953,18 @@ if __name__ == '__main__':
                 args.reg_loss_weight * reg_loss +\
                 id_weight * id_loss +\
                 args.counter_attr_weight * counter_attr_loss +\
-                args.orth_loss_weight * lag_orth +\
-                args.gate_smooth_weight * lag_gate_smooth +\
-                args.gate_sparse_weight * lag_gate_sparse +\
-                args.direction_orth_weight * dir_orth_loss +\
+                args.lag_reg_weight * lag_reg_loss +\
+                args.dir_gate_reg_weight * dir_gate_reg_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
                 (args.age_diffusion_weight if args.age_diffusion_weight >= 0
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
-                args.color_shift_loss_weight * color_shift_loss +\
-                args.controlnet_reg_weight * loss_control_reg
+                args.hair_gray_loss_weight * hair_gray_loss +\
+                args.hair_color_add_loss_weight * hair_color_add_loss +\
+                args.hair_extent_loss_weight * hair_extent_loss +\
+                args.controlnet_reg_weight * loss_control_reg +\
+                args.disc_realism_weight * disc_realism_loss
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -2260,7 +3084,6 @@ if __name__ == '__main__':
                 'final_delta_max_norm': torch.tensor(args.final_delta_max_norm),
                 'control_skip_norm': control_skip_norm,
                 'loss_control_reg': loss_control_reg.detach(),
-                'dir_orth': dir_orth_loss,
                 'dir_bank_flow_delta_norm': dir_logs.get('dir_bank_flow_delta_norm', _zero.detach().clone()),
                 'dir_bank_dir_delta_norm': dir_logs.get('dir_bank_dir_delta_norm', _zero.detach().clone()),
                 'dir_bank_residual_norm': dir_logs.get('dir_bank_residual_norm', _zero.detach().clone()),
@@ -2271,11 +3094,18 @@ if __name__ == '__main__':
                 'dir_bank_active_delta_max_norm': dir_logs.get('dir_bank_active_delta_max_norm', _zero.detach().clone()),
                 'dir_bank_global_delta_max_norm': dir_logs.get('dir_bank_global_delta_max_norm', _zero.detach().clone()),
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
+                'dir_gate_diversity_loss': dir_gate_diversity_loss,
+                'dir_gate_sharpness_loss': dir_gate_sharpness_loss,
+                'dir_gate_reg_loss': dir_gate_reg_loss,
+                'lag_reg_loss': lag_reg_loss,
                 'loss_diffusion_dds': diffusion_loss,
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
-                'loss_color_shift':   color_shift_loss,
+                'loss_hair_gray':     hair_gray_loss,
+                'loss_hair_color_add': hair_color_add_loss,
+                'loss_hair_extent':   hair_extent_loss,
+                'loss_disc_realism':  disc_realism_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
@@ -2286,6 +3116,7 @@ if __name__ == '__main__':
                 'clip_prompt_gender_fraction': clip_logs.get('clip_prompt_gender_fraction', latent.new_tensor(0.0)),
                 'clip_prompt_glasses_fraction': clip_logs.get('clip_prompt_glasses_fraction', latent.new_tensor(0.0)),
             }
+            _log_dict.update(control_band_logs)
             current_attr_scales = attr_scales.current_scales()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'attr_scale/attr_{_attr_abs_idx}'] = current_attr_scales[_i]
@@ -2293,6 +3124,10 @@ if __name__ == '__main__':
                 current_residual_scales = direction_bank.current_residual_scale().detach()
                 for _i, _attr_abs_idx in enumerate(args.attribute_index):
                     _log_dict[f'residual_scale/attr_{_attr_abs_idx}'] = current_residual_scales[_i]
+                _gate_entropy_per_attr = dir_logs.get('dir_gate_entropy_per_attr')
+                if _gate_entropy_per_attr is not None:
+                    for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                        _log_dict[f'dir_gate_entropy_ema/attr_{_attr_abs_idx}'] = _gate_entropy_per_attr[_i]
             current_reg_weights = reg_loss_weights.current_weights()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'reg_weight_global/attr_{_attr_abs_idx}'] = current_reg_weights[_i, 0]
