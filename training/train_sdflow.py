@@ -33,6 +33,28 @@ from models.layer_mask import AttributeLayerMask
 from models.stylegan2.model import Generator, Discriminator
     
 
+def parse_reg_fine_weight_min_override(spec):
+    """Parse '--reg_fine_weight_min_override 39:0.02,20:0.05' into
+    {39: 0.02, 20: 0.05} (GLOBAL attribute indices, matching --attribute_index
+    entries -- converted to local indices where LearnableRegLossWeights is
+    built). Same 'attr:value[,attr:value...]' convention as
+    evaluate_sdflow.parse_clip_calibration. Returns {} for None/empty."""
+    if not spec:
+        return {}
+    out = {}
+    for chunk in spec.split(','):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(':')
+        if len(parts) != 2:
+            raise ValueError(
+                f"--reg_fine_weight_min_override entry {chunk!r} must be 'attr_idx:min_value'")
+        idx, val = parts
+        out[int(idx)] = float(val)
+    return out
+
+
 class LearnableAttributeScales(nn.Module):
     """Per-attribute learnable training edit scales.
 
@@ -87,7 +109,7 @@ class LearnableRegLossWeights(nn.Module):
     """
 
     def __init__(self, n_edit_attrs, init_global=2.0, init_coarse=1.0, init_fine=0.5,
-                 min_weight=0.1):
+                 min_weight=0.1, fine_min_overrides=None):
         super().__init__()
         self.n_edit_attrs = int(n_edit_attrs)
         # Floor on every learned weight. Every main training loss pushes these
@@ -102,14 +124,34 @@ class LearnableRegLossWeights(nn.Module):
         init = init.unsqueeze(0).repeat(self.n_edit_attrs, 1)   # (n_edit_attrs, 3)
         self.log_weights_raw = nn.Parameter(_inverse_softplus(init))
 
+        # Per-(attribute, group) floor, defaulting everywhere to min_weight --
+        # a plain scalar clamp reproduces exactly what this class did before
+        # fine_min_overrides existed. fine_min_overrides (dict: LOCAL attr
+        # index -> float) lets ONE group (fine, W+ layers 4-17) sit lower than
+        # the shared floor for specific attributes, without loosening
+        # global/coarse (which guard structure/identity) or any other
+        # attribute's floor. See --reg_fine_weight_min_override's help text
+        # for why fine specifically needed this: probe_noise_texture.py and
+        # probe_identity_orthogonal.py both confirmed aging(39) systematically
+        # SMOOTHS skin instead of synthesizing wrinkle texture, and
+        # inspect_reg_fine_weight.py confirmed this weight sits exactly at
+        # the shared floor for every attribute -- still actively discouraging
+        # the fine-layer movement --age_dds_fine_layer_start unlocks DDS
+        # gradient into specifically to make wrinkles.
+        min_floor = torch.full((self.n_edit_attrs, 3), self.min_weight)
+        if fine_min_overrides:
+            for local_idx, floor in fine_min_overrides.items():
+                min_floor[local_idx, 2] = float(floor)
+        self.register_buffer('min_floor', min_floor)
+
     def weights_for(self, attr_local_idx):
         """attr_local_idx: LongTensor [B] -> (B, 3) tensor of [global, coarse, fine] weights."""
-        weights = F.softplus(self.log_weights_raw).clamp(min=self.min_weight)
+        weights = torch.maximum(F.softplus(self.log_weights_raw), self.min_floor)
         return weights[attr_local_idx]
 
     def current_weights(self):
         with torch.no_grad():
-            return F.softplus(self.log_weights_raw).clamp(min=self.min_weight)
+            return torch.maximum(F.softplus(self.log_weights_raw), self.min_floor)
 
 
 class CrossAttributeLossBalancer:
@@ -1120,6 +1162,27 @@ if __name__ == '__main__':
                              'push these weights down and nothing pushes them up, so without '
                              'a floor they collapse to ~0 at full meta lr (v7: fine/attr_39 '
                              'hit 5e-6, freeing fine layers -> texture/color artifacts).')
+    parser.add_argument('--reg_fine_weight_min_override', type=str, default=None,
+                        help='Optional per-attribute override of the FINE-layer reg-loss floor '
+                             'only, as "attr_idx:min_value[,attr_idx:min_value...]" GLOBAL '
+                             'attribute indices (e.g. "39:0.02"). --reg_weight_min stays the '
+                             'floor for global/coarse and for every attribute not listed here. '
+                             'Off by default -- identical behavior to before this flag existed. '
+                             'scripts/inspect_reg_fine_weight.py found every attribute\'s learned '
+                             'fine weight sitting exactly at --reg_weight_min (never above it, '
+                             'because nothing in the loss ever pushes it up); '
+                             'scripts/probe_noise_texture.py and '
+                             'scripts/probe_identity_orthogonal.py both found aging(39) edits '
+                             'systematically SMOOTH skin instead of adding wrinkle texture. '
+                             'reg_loss_fine penalizes ANY movement in W+ layers 4-17 uniformly, '
+                             'unable to tell "movement that synthesizes a wrinkle" from '
+                             '"movement that is just drift" -- and directly opposes what '
+                             '--age_dds_fine_layer_start unlocks DDS gradient into those same '
+                             'layers to do. Lowering just this floor, just for age, gives the '
+                             'fine layers more room to earn real texture from the DDS/prompt-cue '
+                             'signal without loosening the global/coarse regularization that '
+                             'guards structure and identity, and without touching any other '
+                             'attribute\'s floor.')
     parser.add_argument('--direction_bank_path', default=None, type=str,
                         help='Path to precomputed Attribute Direction Bank (.pth).')
     # Independent-judge eval evidence: with the old 0.05 init the residual (the
@@ -1735,12 +1798,24 @@ if __name__ == '__main__':
     else:
         layer_mask = None
     attr_scales = LearnableAttributeScales(len(args.attribute_index)).cuda()
+    reg_fine_min_overrides_global = parse_reg_fine_weight_min_override(
+        args.reg_fine_weight_min_override)
+    reg_fine_min_overrides = {}
+    for attr, floor in reg_fine_min_overrides_global.items():
+        if attr not in args.attribute_index:
+            raise ValueError(f'--reg_fine_weight_min_override lists attr {attr}, which is not '
+                             f'in --attribute_index {args.attribute_index}.')
+        reg_fine_min_overrides[args.attribute_index.index(attr)] = floor
+    if reg_fine_min_overrides:
+        print(f'** per-attribute fine reg-loss floor override: '
+             f'{reg_fine_min_overrides_global} (global attr idx -> min_value)')
     reg_loss_weights = LearnableRegLossWeights(
         len(args.attribute_index),
         init_global=args.reg_global_weight_init,
         init_coarse=args.reg_coarse_weight_init,
         init_fine=args.reg_fine_weight,
         min_weight=args.reg_weight_min,
+        fine_min_overrides=reg_fine_min_overrides,
     ).cuda()
     loss_balancer = None
     if args.balance_attr_losses:
@@ -1976,6 +2051,15 @@ if __name__ == '__main__':
             load_module_checkpoint(reg_loss_weights, resume_save_dir, 'reg_loss_weights', start_step, strict=False)
         except FileNotFoundError:
             print('[Resume] reg_loss_weights checkpoint not found; using default init weights.')
+        if reg_fine_min_overrides:
+            # A resumed checkpoint saved AFTER this feature existed carries its own
+            # min_floor buffer, which the strict=False load above just loaded verbatim --
+            # silently reverting this run's --reg_fine_weight_min_override if the value
+            # differs (e.g. tightening/loosening it partway through a run). Re-apply so
+            # the CLI flag always wins over whatever a resumed checkpoint happened to save.
+            with torch.no_grad():
+                for local_idx, floor in reg_fine_min_overrides.items():
+                    reg_loss_weights.min_floor[local_idx, 2] = float(floor)
         if direction_bank is not None and args.resume_direction_bank:
             load_module_checkpoint(direction_bank, resume_save_dir, 'direction_bank', start_step, strict=False)
         elif direction_bank is not None:
