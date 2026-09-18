@@ -57,12 +57,20 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.utils import data
+from PIL import Image, ImageDraw
 
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CelebAAttrClassifierJudge, _latest_step, apply_run_config,
     is_clear, load_models,
 )
+from common.face_parser import FaceParser
 from models.dataset import SDFlowDataset
+from scripts.dump_attr_failures import save_montage, to_pil
+# Reused rather than recomputed: same high-frequency-in-skin metric the
+# noise probe used to find that aging smooths skin instead of texturing
+# it. Whatever explains the accuracy gain here, this ties it back to that
+# same axis instead of introducing a second, unrelated realism proxy.
+from scripts.probe_noise_texture import SKIN_CLASS, skin_hf_energy
 
 
 def compute_guided_delta(prior, direction_bank, latent, attr_cond, id_cond,
@@ -156,6 +164,30 @@ def random_control_delta(guided_delta, removed_units, seed):
     return delta
 
 
+def _make_row(imgs, labels, cos_vals, score_vals, hf_vals, attr_name, size=256):
+    """src | base | projected | random_ctrl, one row.
+
+    hf_vals may be None (no --face_parser_weights given, montage saved but
+    the skin-texture line skipped) -- everything else about this probe
+    still works without it.
+    """
+    n = len(imgs)
+    header_h = 20 + 14 * (2 if hf_vals is None else 3)
+    canvas = Image.new('RGB', (size * n, size + header_h), (20, 20, 20))
+    d = ImageDraw.Draw(canvas)
+    for i, (img, label) in enumerate(zip(imgs, labels)):
+        x = i * size
+        canvas.paste(to_pil(F.interpolate(img, (size, size))[0]), (x, header_h))
+        d.text((x + 4, 4), label, fill=(200, 200, 120))
+        if cos_vals[i] is not None:
+            d.text((x + 4, 18), f'ID={cos_vals[i]:.3f}', fill=(170, 170, 170))
+        if score_vals[i] is not None:
+            d.text((x + 4, 32), f'{attr_name}={score_vals[i]:.2f}', fill=(170, 170, 170))
+        if hf_vals is not None:
+            d.text((x + 4, 46), f'skin_hf={hf_vals[i]:.4f}', fill=(170, 170, 170))
+    return canvas
+
+
 @torch.no_grad()
 def main(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
@@ -167,6 +199,13 @@ def main(args):
 
     judge = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, 'cuda') \
         if args.celeba_attr_judge_weights else None
+    face_parser = None
+    if args.dump_dir:
+        try:
+            face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --dump_dir requested but face parser unavailable ({exc}); '
+                 f'montage will skip the skin_hf column.')
 
     print(f'auditing {attr_name} direction={args.direction} scale={args.edit_scale}')
     print(f'removing top {args.num_directions} identity-damaging direction(s) per sample, '
@@ -188,6 +227,7 @@ def main(args):
 
     base_ids, proj_ids, ctrl_ids = [], [], []
     base_scores, proj_scores, ctrl_scores = [], [], []
+    rows = []
     seen = 0
     for img, latent, pred in loader:
         if seen >= args.num_samples:
@@ -223,6 +263,7 @@ def main(args):
         line = (f'  #{seen:<2} ID  base={base_cos.item():.4f}  '
                f'projected={proj_cos.item():.4f} ({proj_cos.item()-base_cos.item():+.4f})  '
                f'random_ctrl={ctrl_cos.item():.4f} ({ctrl_cos.item()-base_cos.item():+.4f})')
+        bs = ps = cs = None
         if judge is not None:
             bs = judge.scores(F.interpolate(base_img, (256, 256)))[0, args.attr].item()
             ps = judge.scores(F.interpolate(proj_img, (256, 256)))[0, args.attr].item()
@@ -231,6 +272,25 @@ def main(args):
             line += (f'\n       {attr_name}  base={bs:.2f}  projected={ps:.2f} '
                     f'({ps-bs:+.2f})  random_ctrl={cs:.2f} ({cs-bs:+.2f})')
         print(line)
+
+        if args.dump_dir and len(rows) < args.dump_max:
+            hf_vals = None
+            if face_parser is not None:
+                hf_vals = [
+                    skin_hf_energy(src_recon, face_parser, args.blur_sigma_hf).item(),
+                    skin_hf_energy(base_img, face_parser, args.blur_sigma_hf).item(),
+                    skin_hf_energy(proj_img, face_parser, args.blur_sigma_hf).item(),
+                    skin_hf_energy(ctrl_img, face_parser, args.blur_sigma_hf).item(),
+                ]
+            rows.append(_make_row(
+                imgs=[src_recon, base_img, proj_img, ctrl_img],
+                labels=['source', 'base (unprojected)', 'projected (identity-derived)',
+                       'random_ctrl (matched norm)'],
+                cos_vals=[None, base_cos.item(), proj_cos.item(), ctrl_cos.item()],
+                score_vals=[None, bs, ps, cs],
+                hf_vals=hf_vals,
+                attr_name=attr_name,
+            ))
 
     if not base_ids:
         raise SystemExit('no samples matched that attribute/direction.')
@@ -256,6 +316,20 @@ def main(args):
     print('    edit and its identity cost are not separable in W+ -- the subspaces overlap too')
     print('    much for a rank-K cut to help, and the fix has to be elsewhere (magnitude/')
     print('    calibration, not direction).')
+    if args.dump_dir:
+        os.makedirs(args.dump_dir, exist_ok=True)
+        tag = f'{attr_name}_{args.direction}'
+        path = os.path.join(args.dump_dir, f'{tag}_identity_orthogonal.png')
+        save_montage(rows, path, cols=1)
+        print()
+        print(f'=== Montage -> {path} ===')
+        print('  The numbers above cannot tell "genuinely more real aging" apart from "an')
+        print('  even more aggressive version of the skin-smoothing shortcut this project\'s')
+        print('  own noise probe (probe_noise_texture.py) already found" -- both would show')
+        print('  as higher accuracy AND higher ID here. skin_hf on each panel is the same')
+        print('  metric that probe used: if "projected" reads LOWER than "base" there, the')
+        print('  accuracy gain came with LESS skin detail, not more -- look at that column')
+        print('  first, then judge the wrinkles by eye the way the earlier audits did.')
 
 
 if __name__ == '__main__':
@@ -272,6 +346,16 @@ if __name__ == '__main__':
     p.add_argument('--celeba_attr_judge_weights', default=None,
                    help='Optional but recommended -- without it only ID cosine is reported, '
                         'not whether the attribute edit itself survived the projection.')
+    p.add_argument('--dump_dir', default=None,
+                   help='If set, save a montage: source | base | projected | random_ctrl per '
+                        'sample, each captioned with ID/attribute score and (if '
+                        '--face_parser_weights resolves) skin high-frequency energy. Off by '
+                        'default -- the numbers alone cost nothing extra to print.')
+    p.add_argument('--dump_max', type=int, default=12)
+    p.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth')
+    p.add_argument('--blur_sigma_hf', type=float, default=2.0,
+                   help='Same meaning as probe_noise_texture.py: Gaussian sigma whose removed '
+                        'detail counts as high frequency, for the skin_hf column.')
     p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None)
 
     p.add_argument('--index_file',   default='./data/ffhq.txt')
