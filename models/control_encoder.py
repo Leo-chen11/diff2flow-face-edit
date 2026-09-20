@@ -331,11 +331,32 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
     judge_celeb_acc/attr_15_rm drifted down over the same steps -- the harder
     add task pulling shared capacity away from rm. Splitting removes the
     shared capacity these two are competing for.
+
+    region_cond (default off, opt-in via --controlnet_region_cond) feeds a
+    per-pixel region prior (e.g. a BiSeNet skin mask for age) into the
+    upsampling ladder as an extra input channel at every stage, concatenated
+    before each ConvTranspose2d. This is the DC-ControlNet-style fix for the
+    gap region_gate_concentration_loss (common/region_stat_loss.py) only
+    approximates after the fact: without it, the decoder never SEES where a
+    region is, so it either paints uniformly (a global attribute's gate stays
+    at its wide-open init, per that loss's own docstring) or has to be told
+    after the fact where to gate. With region_cond, the network is shown the
+    region as it decodes, the way the original ControlNet paper's own
+    conditions (edges, depth, pose) are all spatially-dense maps fed directly
+    into the network -- not something the network has to be supervised into
+    discovering. The new input channel's weight is zero-initialized, so at
+    step 0 it contributes nothing and the module is otherwise identical to
+    region_cond=False; from there it must LEARN to read the channel.
+    Changes every stage's input channel count, so a checkpoint saved with
+    region_cond=False cannot --resume_dir into a run with this flag set (same
+    class of incompatibility as --controlnet_per_direction changing the
+    per-slot layout -- see that flag's help).
     """
 
     def __init__(self, num_attrs, out_channels=None, out_res=(64,), seed_res=4,
                  hidden_dim=256, init_gain=1.0, per_direction=False,
-                 latent_cond=False, latent_dim=512, channel_multiplier=2):
+                 latent_cond=False, latent_dim=512, channel_multiplier=2,
+                 region_cond=False):
         """
         out_res: resolution(s) to inject at. An int is accepted for the
             single-resolution behaviour this module started with; a list or
@@ -384,6 +405,7 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         self.per_direction = bool(per_direction)
         self.latent_cond = bool(latent_cond)
         self.latent_dim = int(latent_dim)
+        self.region_cond = bool(region_cond)
         self.num_slots = self.num_attrs * 2 if self.per_direction else self.num_attrs
 
         if isinstance(out_res, int):
@@ -440,20 +462,41 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         # ── shared upsampling ladder, seed_res -> max_res ──────────────────
         # One stage per doubling, each narrowing to the generator's own width
         # at that resolution so the tap points below need no extra projection.
+        # With region_cond, each stage takes one EXTRA input channel: the
+        # region prior, resized to that stage's input resolution and
+        # concatenated in forward() before the ConvTranspose2d runs -- so the
+        # decoder sees WHERE the region is at every step of decoding, not
+        # only as a post-hoc penalty on its output (see class docstring).
         self.stage_res = []
         stages = []
         r = self.seed_res
         c_in = self.seed_channels
         while r < self.max_res:
             c_out = chan[r * 2]
+            stage_in = c_in + (1 if self.region_cond else 0)
             stages.append(nn.Sequential(
-                nn.ConvTranspose2d(c_in, c_out, kernel_size=4, stride=2, padding=1),
+                nn.ConvTranspose2d(stage_in, c_out, kernel_size=4, stride=2, padding=1),
                 nn.LeakyReLU(0.2, inplace=True),
             ))
             r *= 2
             c_in = c_out
             self.stage_res.append(r)
         self.stages = nn.ModuleList(stages)
+        if self.region_cond:
+            # Zero-init the region channel's weight slice: at step 0 this
+            # input contributes nothing and the stack matches region_cond's
+            # behavior with an all-zero region map, giving training a stable
+            # starting point to learn to read the channel FROM, rather than
+            # starting with a random-weighted extra input fighting the rest
+            # of the stack from step 0 (same convention as attr_lora_B and
+            # mag_w_cond in direction_bank.py).
+            with torch.no_grad():
+                for stage in self.stages:
+                    # ConvTranspose2d.weight is (in_channels, out_channels,
+                    # kH, kW) -- the OPPOSITE layout from Conv2d -- so the
+                    # newly-appended input channel (index stage_in - 1) is
+                    # sliced on dim 0, not dim 1.
+                    stage[0].weight[-1:, :, :, :].zero_()
 
         # ── per-slot output conv at each injected resolution ───────────────
         # Slot layout is attr-major when per_direction: slot 2a is attribute
@@ -501,7 +544,7 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         raw = math.log(math.expm1(init_gain))
         self.log_gain = nn.Parameter(torch.full((self.num_slots, len(self.out_res)), raw))
 
-    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None):
+    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None):
         """
         attr_delta: (B, num_attrs) -- same tensor passed to AttributeDirectionBank.
         attr_idx:   (B,) long -- which attribute is being edited, per sample.
@@ -515,6 +558,15 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
                     depend on THIS face rather than being one fixed pattern
                     shared by every sample (see __init__ docstring). Ignored
                     when latent_cond=False.
+        region_mask: (B, 1, H, W) in [0, 1], any spatial size -- REQUIRED when
+                    region_cond=True (see class docstring), resized to each
+                    stage's resolution before being concatenated as an extra
+                    input channel. A caller with nothing meaningful to
+                    condition on for a given sample (no defined region for
+                    that attribute) should pass an all-ones mask for it, not
+                    omit the tensor -- region_cond changes the conv shape
+                    unconditionally, so every sample needs a value here once
+                    it is on. Ignored when region_cond=False.
 
         Returns: {resolution: (B, C_res, res, res)}, to pass as StyleGAN2
                  Generator's `skips=` argument.
@@ -558,9 +610,21 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         # training step that produced it, same lifetime as last_gate_mean.
         self.last_gate_mean = {}
         self.last_gate = {}
+        if self.region_cond and region_mask is None:
+            raise ValueError(
+                'AttributeControlEncoder(region_cond=True) needs region_mask; '
+                'pass region_mask=<(B,1,H,W) tensor in [0,1]> (all-ones where no '
+                'region is defined for a sample\'s attribute).')
         wanted = set(self.out_res)
         skips = {}
         for stage, res in zip(self.stages, self.stage_res):
+            if self.region_cond:
+                # Resized to feat's CURRENT (pre-stage) resolution -- this
+                # stage doubles it, so the concatenated map matches feat's
+                # spatial size going in, not the resolution it produces.
+                r_mask = F.interpolate(region_mask.to(device=device, dtype=dtype),
+                                       feat.shape[-2:], mode='bilinear', align_corners=False)
+                feat = torch.cat([feat, r_mask], dim=1)
             feat = stage(feat)
             if res in wanted:
                 skips[res] = self._tap(feat, res, slot_idx, gains, B, device, dtype)

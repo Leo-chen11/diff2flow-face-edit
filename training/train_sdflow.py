@@ -1464,6 +1464,29 @@ if __name__ == '__main__':
                              "AttributeDirectionBank and never fixed here. Off by default: changes "
                              "control_encoder's parameter shapes, so a checkpoint saved with the "
                              "old (shared) layout cannot --resume_dir into a run with this flag set.")
+    parser.add_argument('--controlnet_region_cond',
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="Feed a per-pixel region prior into AttributeControlEncoder's "
+                             "upsampling ladder as an extra input channel at every stage (see that "
+                             "class's region_cond docstring in models/control_encoder.py), instead "
+                             "of only supervising the existing spatial gate after the fact via "
+                             "--age_gate_region_loss_weight. Currently only age(39) has a defined "
+                             "region (BiSeNet skin, AGE_TEXTURE_REGION_CLASS); other attributes get "
+                             "an all-ones (uninformative) mask, unchanged from having no region prior "
+                             "at all. This is the closer match to how the published ControlNet "
+                             "conditions (edges, depth, pose) work -- fed into the network as it "
+                             "decodes, not supervised into being discovered -- and to DC-ControlNet's "
+                             "(ICCV 2025) per-element region-aware decoupling. "
+                             "Requires --use_controlnet_injection. Off by default: CHANGES EVERY "
+                             "STAGE'S INPUT CHANNEL COUNT, so --resume_dir into a checkpoint saved "
+                             "with this flag at a different setting will raise a shape-mismatch error "
+                             "loading control_encoder (same class of incompatibility as "
+                             "--controlnet_per_direction -- see that flag's help). Train a new "
+                             "control_encoder from scratch to turn this on: drop --resume_dir/"
+                             "--resume_step entirely, or resume everything else from a checkpoint "
+                             "and delete just its control_encoder-* files first so load_module_"
+                             "checkpoint's FileNotFoundError path takes over (control_encoder starts "
+                             "from zero-init, same as a run that never had ControlNet before).")
     parser.add_argument('--target_loss', default='mse', choices=['mse', 'hinge'],
                         help="Shape of the target-attribute loss. 'mse' squares the distance to "
                              "soft_target, which keeps pulling on samples that already crossed the "
@@ -1982,6 +2005,14 @@ if __name__ == '__main__':
                     f'and adding resolutions changes the module shape. Train multi-resolution '
                     f'from scratch (drop --resume_dir/--resume_step), or drop --controlnet_res '
                     f'to continue this run at {args.controlnet_embed_res} only.')
+            if args.controlnet_region_cond:
+                raise ValueError(
+                    f'--controlnet_region_cond cannot be applied to a resumed run: the '
+                    f'checkpoint at {_ce_path} predates multi-resolution injection and would '
+                    f'build LegacySingleResControlEncoder, which does not implement region_cond. '
+                    f'Train from scratch (drop --resume_dir/--resume_step), or delete '
+                    f'control_encoder-* under {resolve_resume_save_dir(args.resume_dir)} so this '
+                    f'run builds a fresh AttributeControlEncoder instead of loading the legacy one.')
             print(f'[Resume] control_encoder checkpoint predates multi-resolution injection; '
                   f'building the single-resolution architecture at {args.controlnet_embed_res}.')
             control_encoder = LegacySingleResControlEncoder(
@@ -2002,6 +2033,7 @@ if __name__ == '__main__':
                 init_gain=args.controlnet_init_gain,
                 per_direction=args.controlnet_per_direction,
                 latent_cond=args.controlnet_latent_cond,
+                region_cond=args.controlnet_region_cond,
             ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
@@ -2216,10 +2248,17 @@ if __name__ == '__main__':
     face_parser = None
     if args.local_region_loss_weight > 0 or args.dds_face_mask \
             or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0 \
-            or args.hair_extent_loss_weight > 0:
+            or args.hair_extent_loss_weight > 0 or args.age_gate_region_loss_weight > 0 \
+            or args.controlnet_region_cond:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            if args.controlnet_region_cond:
+                print('** ControlNet region conditioning enabled: age(39) edits feed a BiSeNet '
+                      'skin-region prior into AttributeControlEncoder\'s upsampling ladder.')
+            if args.age_gate_region_loss_weight > 0:
+                print(f'** ControlNet gate-region loss enabled (weight='
+                      f'{args.age_gate_region_loss_weight}) for age(39) edits')
             if args.local_region_loss_weight > 0:
                 local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
                 print(f'** Face-parser locality loss enabled (weight='
@@ -2374,6 +2413,26 @@ if __name__ == '__main__':
             safe_delta = guided_delta
             new_latents = latent + safe_delta
 
+            # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
+            # Hoisted here (rather than right before the face-parser losses
+            # that used to be its only consumer) so it exists BEFORE
+            # control_encoder runs too: --controlnet_region_cond needs a
+            # region prior computed from the UNEDITED source, the same
+            # locality argument --local_region_loss_weight relies on below --
+            # using `img`, the real photo, would charge e4e/StyleGAN's own
+            # inversion error to the region mask. Computed at most once per
+            # step and reused by every consumer (--losses_vs_recon, the
+            # face-parser losses, region conditioning).
+            src_recon = None
+            if (args.losses_vs_recon or face_parser is not None
+                    or args.controlnet_region_cond):
+                with torch.no_grad():
+                    src_recon = G([latent], input_is_latent=True,
+                                  randomize_noise=False)[0].clamp(-1, 1)
+                    src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
+            # Reference image for id_loss / directional CLIP / DDS.
+            loss_ref_img = src_recon if (args.losses_vs_recon and src_recon is not None) else img
+
             control_skips = None
             control_skip_norm = torch.zeros([], device=latent.device, dtype=latent.dtype)
             control_band_logs = {}
@@ -2387,9 +2446,30 @@ if __name__ == '__main__':
                 # this project. attr_delta is only defined on the
                 # direction_bank branch above; control_encoder requires
                 # direction_bank to be enabled (checked at arg-parse time).
+                #
+                # region_mask: only built when --controlnet_region_cond is on
+                # (AttributeControlEncoder.forward raises if region_cond=True
+                # and this is None; ignored otherwise). All-ones by default --
+                # age(39) is the only attribute with a defined texture region
+                # right now (AGE_TEXTURE_REGION_CLASS), everything else gets
+                # an uninformative constant mask, same as having no region
+                # prior at all.
+                region_mask = None
+                if args.controlnet_region_cond:
+                    region_mask = torch.ones(latent.size(0), 1, args.img_size, args.img_size,
+                                             device=latent.device, dtype=latent.dtype)
+                    if face_parser is not None:
+                        _mid_abs_rc = [args.attribute_index[int(j)]
+                                      for j in mid_idx.detach().cpu().tolist()]
+                        _is_age_rc = torch.tensor([a == 39 for a in _mid_abs_rc],
+                                                  device=latent.device)
+                        if _is_age_rc.any():
+                            with torch.no_grad():
+                                region_mask[_is_age_rc] = face_parser.get_region_mask(
+                                    src_recon[_is_age_rc], AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
                 control_skips = control_encoder(attr_delta, mid_idx,
                                                 is_rm=(src_attr_flow > 0.5),
-                                                latent=latent)
+                                                latent=latent, region_mask=region_mask)
 
                 # control_skips has no OTHER loss term constraining its
                 # magnitude -- it's only shaped indirectly through downstream
@@ -2489,30 +2569,9 @@ if __name__ == '__main__':
             hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             gate_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
-            # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
-            # Hoisted out of the face-parser branch below so the identity /
-            # CLIP / DDS losses can use it as their reference too (see
-            # --losses_vs_recon). Computed at most once per step and reused.
-            #
-            # WHY THIS MATTERS: `img` is the REAL photo; `new_face_tensors` is
-            # G(latent + delta). The difference between them is (inversion gap)
-            # + (edit). Any loss that compares the edited image against `img`
-            # therefore charges the e4e/StyleGAN inversion error to the edit --
-            # error the flow did not cause and cannot usefully remove, since
-            # fixing it would mean spending W+ budget on reconstruction rather
-            # than on the attribute. The locality loss below already
-            # deliberately compares against src_recon for exactly this
-            # reason; --losses_vs_recon extends the same principle to the other
-            # three losses that were still referencing `img`.
-            src_recon = None
-            if (args.losses_vs_recon
-                    or face_parser is not None):
-                with torch.no_grad():
-                    src_recon = G([latent], input_is_latent=True,
-                                  randomize_noise=False)[0].clamp(-1, 1)
-                    src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
-            # Reference image for id_loss / directional CLIP / DDS.
-            loss_ref_img = src_recon if (args.losses_vs_recon and src_recon is not None) else img
+            # src_recon / loss_ref_img: computed earlier now, right before the
+            # controlnet_active block above (region conditioning needs it
+            # before control_encoder runs) -- reused here unchanged.
 
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
