@@ -20,8 +20,31 @@ parameterized by direction instead of hardcoded to one. push=-1
 reproduces the original hair_gray_loss formula exactly; push=+1 is its
 mirror for the add direction. Both are hinge losses (only penalize the
 wrong side), so a sample that already satisfies the target costs nothing.
+
+region_gate_concentration_loss() addresses a different, later-discovered
+gap: models/control_encoder.py's AttributeControlEncoder already predicts
+a per-pixel spatial gate for its injected feature-map content, but that
+gate only ever gets a training signal for LOCAL attributes, through
+--local_region_loss_weight's pixel-difference penalty (see that flag and
+LOCAL_REGION_CLASSES in train_sdflow.py). AttributeControlEncoder's own
+docstring says as much: the gate is "bias-initialized wide open ... so a
+global attribute (Male/Young), which local_region_loss never touches, has
+no gradient pushing its gate anywhere and stays effectively
+full-coverage." A gate with no spatial preference is exactly the failure
+mode the published ControlNet literature documents for this class of
+mechanism -- conditioning built for spatially-dense, pixel-aligned inputs
+(edges, depth, pose) generalizes poorly to a diffuse, non-spatial
+condition like "is this face old", because nothing in the architecture
+tells it WHERE in the frame that condition should manifest (DC-ControlNet,
+ICCV 2025, addresses the same gap for multi-element scene composition by
+decoupling a global condition into per-element, region-aware control).
+This loss is the minimal version of that fix for age: reward the gate for
+concentrating inside a texture-relevant face region (skin, where wrinkles/
+skin-texture aging actually lives) instead of leaving it a flat, spatially
+uninformed multiplier.
 """
 import torch
+import torch.nn.functional as F
 
 
 def region_mean_saturation(img_pm1, mask):
@@ -105,3 +128,35 @@ def directional_region_area_loss(src_prob, edit_prob, push, relative_change, bou
         return torch.relu(target - edit_a)
     target = (src_a * (1.0 - relative_change)).clamp(min=bound)
     return torch.relu(edit_a - target)
+
+
+def region_gate_concentration_loss(gate, region_mask, margin=0.15):
+    """One-sided hinge pulling a ControlNet-style spatial gate to concentrate
+    inside `region_mask`, instead of leaving it spatially flat.
+
+    gate: (B,1,H,W) in [0,1] -- AttributeControlEncoder._tap's per-pixel gate
+        (see models/control_encoder.py's AttributeControlEncoder.last_gate),
+        taken WITH gradient, not the detached last_gate_mean used for logging.
+    region_mask: (B,1,h,w) in [0,1], any spatial size -- resized to match
+        `gate` if needed. Pass a FaceParser.get_region_mask() (no_grad,
+        argmax'd) output, not region_prob(): the region here is a fixed
+        reference the gate is scored against, the same role src_sat/src_a
+        play above, not the quantity being optimised.
+
+    Hinge on the GAP between the gate's mean value inside the region and its
+    mean value outside: pays nothing once inside already exceeds outside by
+    `margin`, so a gate that already concentrates in the right place is not
+    pushed to full binary open/closed -- it only has to prefer the region,
+    not consume it. Mirrors directional_region_saturation_loss/
+    directional_region_area_loss's convention of a one-sided penalty that a
+    satisfying sample pays nothing for.
+    """
+    if region_mask.shape[-2:] != gate.shape[-2:]:
+        region_mask = F.interpolate(region_mask, gate.shape[-2:],
+                                    mode='bilinear', align_corners=False)
+    inside = (gate * region_mask).sum(dim=(1, 2, 3)) \
+        / region_mask.sum(dim=(1, 2, 3)).clamp(min=1e-6)
+    outside_mask = 1.0 - region_mask
+    outside = (gate * outside_mask).sum(dim=(1, 2, 3)) \
+        / outside_mask.sum(dim=(1, 2, 3)).clamp(min=1e-6)
+    return torch.relu(margin - (inside - outside)).mean()

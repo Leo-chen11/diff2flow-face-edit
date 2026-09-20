@@ -21,7 +21,8 @@ from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
 from common.region_stat_loss import (directional_region_area_loss,
-                                     directional_region_saturation_loss)
+                                     directional_region_saturation_loss,
+                                     region_gate_concentration_loss)
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
@@ -344,6 +345,14 @@ LOCAL_REGION_CLASSES = {
 # BiSeNet hair class, used by --hair_gray_loss_weight (see that flag's help).
 HAIR_REGION_CLASS = [17]
 
+# BiSeNet skin class, used by --age_gate_region_loss_weight (see that flag's
+# help). Deliberately the SAME single class scripts/probe_noise_texture.py's
+# SKIN_CLASS uses for its skin_hf_energy diagnostic -- this loss targets the
+# gate at exactly the region that diagnostic already measures, so a change in
+# skin_hf between two checkpoints has a direct, named mechanism to attribute
+# it to instead of a fresh unexplained correlation.
+AGE_TEXTURE_REGION_CLASS = [1]
+
 
 # Startup mechanism report. 144 CLI flags is far more surface than any single
 # run uses (a typical command sets ~19), and the ones left at their defaults
@@ -410,6 +419,7 @@ def _mechanism_report(args):
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_color_add', args.hair_color_add_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
+        ('age_gate_region', args.age_gate_region_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
         ('disc_realism', args.disc_realism_weight),
     ]
@@ -1044,6 +1054,33 @@ if __name__ == '__main__':
                              'already has a lot.')
     parser.add_argument('--hair_extent_min_frac', type=float, default=0.02,
                         help='Floor on the shrink-hair target, as a fraction of the frame.')
+    parser.add_argument('--age_gate_region_loss_weight', type=float, default=0.0,
+                        help='Weight for region_gate_concentration_loss (common/region_stat_loss.py), '
+                             'which teaches AttributeControlEncoder\'s per-pixel spatial gate '
+                             '(models/control_encoder.py) to prefer the BiSeNet skin region for '
+                             'age(39) edits, both directions. Requires --use_controlnet_injection; '
+                             'a no-op otherwise (silently skipped, same as the hair_* losses when '
+                             'their prerequisite is missing). '
+                             'WHY: the gate already exists and already gets a real training signal '
+                             'for LOCAL attributes, through --local_region_loss_weight\'s pixel-'
+                             'difference penalty on eyeglasses -- but AttributeControlEncoder\'s own '
+                             'docstring says a GLOBAL attribute\'s gate "has no gradient pushing it '
+                             'anywhere and stays effectively full-coverage." A spatially flat gate is '
+                             'exactly the documented failure mode of ControlNet-style conditioning '
+                             'applied to a diffuse, non-spatial condition (the published ControlNet '
+                             'literature\'s own conditioning types -- edges, depth, pose, segmentation '
+                             '-- are all spatially-dense maps; DC-ControlNet, ICCV 2025, addresses the '
+                             'same gap for multi-element scene composition by decoupling a global '
+                             'condition into per-element, region-aware control). This gives age\'s '
+                             'gate the region-aware training signal it currently lacks, using BiSeNet '
+                             'skin (class 1, same region scripts/probe_noise_texture.py\'s skin_hf '
+                             'diagnostic already measures) as the texture-relevant prior. Off by '
+                             'default -- identical behavior to before this flag existed. Test this '
+                             'AFTER the age_dds_fine_layer_start / age_diffusion_weight experiments '
+                             'conclude, as its own single-variable line: it changes a different '
+                             'mechanism (WHERE injected content concentrates) than those change '
+                             '(HOW MUCH signal reaches the fine W+ layers), and stacking it with an '
+                             'in-flight experiment would make neither result attributable.')
     parser.add_argument('--gender_dds_fine_layer_start', type=int, default=-1,
                         help='Fine-layer cutoff for the GENDER(20) DDS pass specifically, exactly '
                              'mirroring --age_dds_fine_layer_start. <0 (default) falls back to the '
@@ -2450,6 +2487,7 @@ if __name__ == '__main__':
             hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_color_add_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            gate_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
             # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
             # Hoisted out of the face-parser branch below so the identity /
@@ -2610,6 +2648,30 @@ if __name__ == '__main__':
                         ))
                     if _terms_extent:
                         hair_extent_loss = torch.stack(_terms_extent).mean()
+
+                # ── ControlNet gate locality (age/39, both directions) ──────
+                # See --age_gate_region_loss_weight help / region_stat_loss.py's
+                # region_gate_concentration_loss docstring for the gap this
+                # closes: AttributeControlEncoder's spatial gate only ever gets
+                # a training signal for LOCAL attributes (--local_region_loss_
+                # weight touches eyeglasses only, via LOCAL_REGION_CLASSES);
+                # age's gate has nothing pushing it away from its wide-open
+                # init. Needs control_encoder.last_gate, which only exists
+                # when the injection actually ran this step.
+                if args.age_gate_region_loss_weight > 0 and controlnet_active \
+                        and getattr(control_encoder, 'last_gate', None):
+                    if _is_attr_age.any():
+                        with torch.no_grad():
+                            age_skin_mask = face_parser.get_region_mask(
+                                new_face_tensors[_is_attr_age], AGE_TEXTURE_REGION_CLASS,
+                                blur_sigma=3,
+                            )
+                        _gate_terms = []
+                        for _gate in control_encoder.last_gate.values():
+                            _gate_terms.append(region_gate_concentration_loss(
+                                _gate[_is_attr_age], age_skin_mask))
+                        if _gate_terms:
+                            gate_region_loss = torch.stack(_gate_terms).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -2963,6 +3025,7 @@ if __name__ == '__main__':
                 args.hair_gray_loss_weight * hair_gray_loss +\
                 args.hair_color_add_loss_weight * hair_color_add_loss +\
                 args.hair_extent_loss_weight * hair_extent_loss +\
+                args.age_gate_region_loss_weight * gate_region_loss +\
                 args.controlnet_reg_weight * loss_control_reg +\
                 args.disc_realism_weight * disc_realism_loss
 
@@ -3105,6 +3168,7 @@ if __name__ == '__main__':
                 'loss_hair_gray':     hair_gray_loss,
                 'loss_hair_color_add': hair_color_add_loss,
                 'loss_hair_extent':   hair_extent_loss,
+                'loss_gate_region':   gate_region_loss,
                 'loss_disc_realism':  disc_realism_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),

@@ -544,7 +544,20 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         # after a forward pass to watch a local attribute's gate close in on its
         # allowed region over training, and confirm a global attribute's gate
         # stays near its ~0.98 init.
+        #
+        # last_gate: {res: (B,1,res,res)} the same gate WITH gradient intact
+        # (last_gate_mean is detached, for cheap logging only). This is what
+        # a caller needs to put a spatial loss directly on the gate itself --
+        # see common/region_stat_loss.py's region_gate_concentration_loss,
+        # written for exactly this: local attributes get gate guidance for
+        # free through --local_region_loss_weight's pixel-difference penalty,
+        # but nothing analogous exists for a global attribute (age), so its
+        # gate has no gradient pushing it anywhere and stays at its
+        # full-coverage init indefinitely (see this class's own docstring).
+        # Overwritten every forward() call; safe to read only within the same
+        # training step that produced it, same lifetime as last_gate_mean.
         self.last_gate_mean = {}
+        self.last_gate = {}
         wanted = set(self.out_res)
         skips = {}
         for stage, res in zip(self.stages, self.stage_res):
@@ -573,6 +586,7 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         gate = torch.sigmoid(gate_logit)                     # (B, 1, res, res)
         with torch.no_grad():
             self.last_gate_mean[res] = gate.mean().detach()
+        self.last_gate[res] = gate
         out = out * gate
         out = F.normalize(out.reshape(B, -1), dim=1).view_as(out)
         return out * gains[slot_idx, r_i].view(-1, 1, 1, 1)
