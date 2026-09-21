@@ -67,6 +67,13 @@ from models.stylegan2.model import Generator
 ATTR_NAMES = {15: 'Eyeglasses', 20: 'Male', 24: 'No_Beard', 31: 'Smiling',
               33: 'Wavy_Hair', 39: 'Young'}
 
+# BiSeNet skin class -- MUST match training/train_sdflow.py's
+# AGE_TEXTURE_REGION_CLASS (and scripts/probe_noise_texture.py's SKIN_CLASS)
+# exactly: this is the region a --controlnet_region_cond checkpoint was
+# trained to read for age(39) edits, so evaluating it with a different
+# region definition would silently feed it something it never learned to use.
+AGE_TEXTURE_REGION_CLASS = [1]
+
 # Official CelebA list_attr_celeba.txt column order (0-indexed). Index 15 =
 # Eyeglasses, 20 = Male, 24 = No_Beard, 31 = Smiling, 33 = Wavy_Hair, 39 =
 # Young -- matches this project's attribute indices directly.
@@ -494,6 +501,7 @@ RUN_CONFIG_KEYS = [
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
+    'controlnet_region_cond',
 ]
 
 
@@ -814,6 +822,7 @@ def load_models(args):
                 init_gain=getattr(args, 'controlnet_init_gain', 1.0),
                 per_direction=getattr(args, 'controlnet_per_direction', False),
                 latent_cond=getattr(args, 'controlnet_latent_cond', False),
+                region_cond=getattr(args, 'controlnet_region_cond', False),
             ).to(device).eval()
         if _ce_state is not None:
             result = control_encoder.load_state_dict(_ce_state, strict=False)
@@ -934,24 +943,43 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                           attr_global_idx=None, bypass_glasses_direction_bank=False,
                           face_parser=None, composite_method='alpha', composite_blur_sigma=15,
                           control_encoder=None, controlnet_max_norm=0.0,
-                          controlnet_disable_attrs=None, controlnet_embed_res=64):
+                          controlnet_disable_attrs=None, controlnet_embed_res=64,
+                          composite=True):
     """
-    face_parser: if given, composite the edited face back onto the SOURCE
-    RECONSTRUCTION's background/hair (see composite_faces() above). A
-    long-running complaint in this project was that gender/age edits move
-    the background and hair far more than intended (the W+ edit is global,
-    not local to the face). Restricting the visible change to the BiSeNet
-    face region is a training-free way to cut that leakage for EVERY
-    attribute at once, instead of another attribute-specific loss tweak.
-    Composites against G(latent) (the source RECONSTRUCTION), not the raw
-    source photo, so the blend doesn't inherit the encoder's inversion gap
-    as a seam. A first attempt at plain alpha blending showed a visible
-    seam (boundary color/brightness mismatch); composite_method='poisson'
-    fixes that via gradient-domain blending instead of a wider feather.
+    face_parser: if given AND composite=True (the default), composite the
+    edited face back onto the SOURCE RECONSTRUCTION's background/hair (see
+    composite_faces() above). A long-running complaint in this project was
+    that gender/age edits move the background and hair far more than
+    intended (the W+ edit is global, not local to the face). Restricting the
+    visible change to the BiSeNet face region is a training-free way to cut
+    that leakage for EVERY attribute at once, instead of another
+    attribute-specific loss tweak. Composites against G(latent) (the source
+    RECONSTRUCTION), not the raw source photo, so the blend doesn't inherit
+    the encoder's inversion gap as a seam. A first attempt at plain alpha
+    blending showed a visible seam (boundary color/brightness mismatch);
+    composite_method='poisson' fixes that via gradient-domain blending
+    instead of a wider feather.
+
+    composite: set False to pass a face_parser WITHOUT compositing -- needed
+    when face_parser is only there to build a --controlnet_region_cond
+    region mask (see below) and the caller did not separately ask for
+    --composite_face_region. Defaults True so every existing caller (which
+    only ever passed face_parser when it wanted compositing) is unaffected.
     """
     B = img.size(0)
     device = img.device
     zero_pad = torch.zeros(B, 18, 1, device=device)
+
+    # Hoisted above the control_encoder call (rather than computed only for
+    # compositing at the end, as before): a --controlnet_region_cond encoder
+    # needs a region prior built from the UNEDITED source before it runs, for
+    # the same inversion-gap reason compositing already used src_recon for.
+    # Computed once, reused by both consumers.
+    src_recon = None
+    if face_parser is not None:
+        with torch.no_grad():
+            src_recon = G([latent], input_is_latent=True,
+                          randomize_noise=False)[0].clamp(-1, 1)
 
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
@@ -987,8 +1015,18 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         if control_encoder is not None and (
                 controlnet_disable_attrs is None
                 or attr_global_idx not in controlnet_disable_attrs):
+            region_mask = None
+            if getattr(control_encoder, 'region_cond', False):
+                # Same convention as training: all-ones (uninformative) for
+                # any attribute without a defined region, a real BiSeNet
+                # mask for age(39) when face_parser is available.
+                region_mask = torch.ones(B, 1, *img.shape[-2:], device=device, dtype=img.dtype)
+                if face_parser is not None and attr_global_idx == 39:
+                    with torch.no_grad():
+                        region_mask = face_parser.get_region_mask(
+                            src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
             control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
-                                            latent=latent)
+                                            latent=latent, region_mask=region_mask)
             control_skips = clip_skips(control_skips, controlnet_max_norm)
     else:
         new_latents = new_latents_raw
@@ -996,13 +1034,10 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     edited_face = G([new_latents], skips=control_skips, embed_res=controlnet_embed_res,
                     input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
 
-    if face_parser is not None:
-        with torch.no_grad():
-            src_recon = G([latent], input_is_latent=True,
-                          randomize_noise=False)[0].clamp(-1, 1)
-            edited_face = composite_faces(face_parser, src_recon, edited_face,
-                                          method=composite_method,
-                                          blur_sigma=composite_blur_sigma)
+    if composite and face_parser is not None:
+        edited_face = composite_faces(face_parser, src_recon, edited_face,
+                                      method=composite_method,
+                                      blur_sigma=composite_blur_sigma)
 
     return edited_face
 
@@ -1011,7 +1046,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
                          img, latent, attr_cond, id_cond,
                          attr_local_idxs, edit_scales, direction_bank,
                          attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0,
-                         controlnet_embed_res=64, controlnet_disable_attrs=None):
+                         controlnet_embed_res=64, controlnet_disable_attrs=None,
+                         face_parser=None):
     """Edit several attributes on the same face at once.
 
     Composes N independently-computed single-attribute guided deltas by
@@ -1037,6 +1073,12 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         itself is always used per attribute regardless.
     controlnet_disable_attrs: absolute attribute indices to skip ControlNet
         injection for, same semantics as edit_single_attribute.
+    face_parser: needed only for a --controlnet_region_cond control_encoder
+        to get a real region mask for age(39) edits within this composite
+        (see edit_single_attribute); every other attribute in the loop gets
+        the same all-ones fallback regardless. None (the default) is safe --
+        region_cond=True samples then fall back to all-ones for every
+        attribute, same as region_cond=False's behavior.
     """
     if isinstance(edit_scales, (int, float)):
         edit_scales = [edit_scales] * len(attr_local_idxs)
@@ -1045,6 +1087,13 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     B = img.size(0)
     device = img.device
     zero_pad = torch.zeros(B, 18, 1, device=device)
+
+    region_cond = getattr(control_encoder, 'region_cond', False) if control_encoder is not None else False
+    src_recon = None
+    if region_cond and face_parser is not None:
+        with torch.no_grad():
+            src_recon = G([latent], input_is_latent=True,
+                          randomize_noise=False)[0].clamp(-1, 1)
 
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
@@ -1068,8 +1117,15 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         use_controlnet_here = (control_encoder is not None and not (
             controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
         if use_controlnet_here:
+            region_mask = None
+            if region_cond:
+                region_mask = torch.ones(B, 1, *img.shape[-2:], device=device, dtype=img.dtype)
+                if face_parser is not None and this_global_idx == 39:
+                    with torch.no_grad():
+                        region_mask = face_parser.get_region_mask(
+                            src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
             skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
-                                   latent=latent)
+                                   latent=latent, region_mask=region_mask)
             skip = clip_skips(skip, controlnet_max_norm)
             combined_skips = add_skips(combined_skips, skip)
 
@@ -1134,17 +1190,23 @@ def evaluate(args):
     _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
 
     composite_face_parser = None
-    if args.composite_face_region:
+    if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
         from common.face_parser import FaceParser
         try:
             composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-            print('[Composite] Compositing edited face back onto source-reconstruction '
-                  'background/hair (common/face_parser.py FaceParser.composite) for ALL '
-                  'attributes -- reduces background/hair leakage from global W+ edits, '
-                  'training-free.')
+            if args.composite_face_region:
+                print('[Composite] Compositing edited face back onto source-reconstruction '
+                      'background/hair (common/face_parser.py FaceParser.composite) for ALL '
+                      'attributes -- reduces background/hair leakage from global W+ edits, '
+                      'training-free.')
+            if getattr(args, 'controlnet_region_cond', False):
+                print('[ControlNet] region_cond checkpoint: feeding a real BiSeNet skin mask '
+                      'for age(39) edits (all-ones fallback for every other attribute).')
         except (FileNotFoundError, RuntimeError) as exc:
-            print(f'[WARN] --composite_face_region requested but face parser unavailable '
-                  f'({exc}); compositing disabled.')
+            composite_face_parser = None
+            print(f'[WARN] face parser unavailable ({exc}); compositing disabled, and any '
+                  f'--controlnet_region_cond checkpoint will fall back to an all-ones region '
+                  f'mask for age(39) too -- numbers from it will not match what training saw.')
 
     if args.bypass_glasses_direction_bank:
         print('[WARN] --bypass_glasses_direction_bank is ON: Eyeglasses is evaluated '
@@ -1257,6 +1319,11 @@ def evaluate(args):
                     controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
                     controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
                     controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
+                    # composite_face_parser may now exist ONLY because
+                    # --controlnet_region_cond needs it for age's region mask
+                    # -- decoupled from whether compositing was actually
+                    # requested, so it doesn't silently turn on here too.
+                    composite=args.composite_face_region,
                 )
                 edited_256 = F.interpolate(edited_face, (256, 256))
 
@@ -1539,6 +1606,13 @@ if __name__ == '__main__':
                              'encoder\'s parameter shapes, so a mismatch is a hard checkpoint '
                              'load error rather than silently wrong numbers. Auto-restored from '
                              'config.json.')
+    parser.add_argument('--controlnet_region_cond', action='store_true',
+                        help='Must match training --controlnet_region_cond. Changes every stage\'s '
+                             'input channel count (same class of hard load error as '
+                             '--controlnet_latent_cond above), and edit_single_attribute/'
+                             'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
+                             'edits to get a real region mask instead of the all-ones fallback. '
+                             'Auto-restored from config.json.')
     parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
                         help='Must match training --controlnet_init_gain. Only sets the log_gain '
                              'init; the trained value comes from the checkpoint. Auto-restored '

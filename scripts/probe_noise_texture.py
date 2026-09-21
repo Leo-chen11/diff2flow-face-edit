@@ -174,6 +174,15 @@ def main(args):
                 control_encoder=control_encoder,
                 controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
                 controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
+                # face_parser is already built above (this script's own skin_hf
+                # measurement needs it unconditionally) -- pass it through so a
+                # --controlnet_region_cond checkpoint gets its real age region
+                # mask instead of silently falling back to all-ones, which
+                # would measure the wrong thing for exactly what this probe
+                # exists to check. composite=False: this script never wanted
+                # background compositing, only reusing face_parser for the
+                # region mask.
+                face_parser=face_parser, composite=False,
             )
             hfs.append(skin_hf_energy(edited, face_parser, args.blur_sigma_hf).item())
             if judge is not None:

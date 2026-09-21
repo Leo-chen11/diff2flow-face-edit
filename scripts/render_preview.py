@@ -74,17 +74,23 @@ def main(args):
         direction_bank, control_encoder = load_models(args)
 
     composite_face_parser = None
-    if args.composite_face_region:
+    if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
         from common.face_parser import FaceParser
         try:
             composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-            print('[Composite] Compositing edited face back onto source-reconstruction '
-                  'background/hair -- same mitigation as evaluate_sdflow.py '
-                  '--composite_face_region, applied here too since this script (not the eval '
-                  'loop) is what produced the artifact-heavy preview grids.')
+            if args.composite_face_region:
+                print('[Composite] Compositing edited face back onto source-reconstruction '
+                      'background/hair -- same mitigation as evaluate_sdflow.py '
+                      '--composite_face_region, applied here too since this script (not the eval '
+                      'loop) is what produced the artifact-heavy preview grids.')
+            if getattr(args, 'controlnet_region_cond', False):
+                print('[ControlNet] region_cond checkpoint: feeding a real BiSeNet skin mask '
+                      'for age(39) edits (all-ones fallback for every other attribute).')
         except (FileNotFoundError, RuntimeError) as exc:
-            print(f'[WARN] --composite_face_region requested but face parser unavailable '
-                  f'({exc}); compositing disabled.')
+            composite_face_parser = None
+            print(f'[WARN] face parser unavailable ({exc}); compositing disabled, and any '
+                  f'--controlnet_region_cond checkpoint will fall back to an all-ones region '
+                  f'mask for age(39) too -- output will not match what training saw.')
 
     img_transform = T.Compose([
         T.ToTensor(),
@@ -126,6 +132,10 @@ def main(args):
                 controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
                 controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
                 controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
+                # composite_face_parser may exist only because
+                # --controlnet_region_cond needed it for age's region mask --
+                # decoupled from whether compositing was actually requested.
+                composite=args.composite_face_region,
             )
             cells.append(F.interpolate(edited, (args.cell_size, args.cell_size)))
 
