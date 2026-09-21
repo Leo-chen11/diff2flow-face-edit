@@ -21,8 +21,10 @@ from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
 from common.region_stat_loss import (directional_region_area_loss,
+                                     directional_region_frequency_loss,
                                      directional_region_saturation_loss,
-                                     region_gate_concentration_loss)
+                                     region_gate_concentration_loss,
+                                     region_hf_energy)
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
@@ -345,12 +347,13 @@ LOCAL_REGION_CLASSES = {
 # BiSeNet hair class, used by --hair_gray_loss_weight (see that flag's help).
 HAIR_REGION_CLASS = [17]
 
-# BiSeNet skin class, used by --age_gate_region_loss_weight (see that flag's
-# help). Deliberately the SAME single class scripts/probe_noise_texture.py's
-# SKIN_CLASS uses for its skin_hf_energy diagnostic -- this loss targets the
-# gate at exactly the region that diagnostic already measures, so a change in
-# skin_hf between two checkpoints has a direct, named mechanism to attribute
-# it to instead of a fresh unexplained correlation.
+# BiSeNet skin class, used by --age_gate_region_loss_weight and
+# --age_skin_hf_loss_weight (see those flags' help). Deliberately the SAME
+# single class scripts/probe_noise_texture.py's SKIN_CLASS uses for its
+# skin_hf_energy diagnostic -- these losses target exactly the region that
+# diagnostic already measures, so a change in skin_hf between two checkpoints
+# has a direct, named mechanism to attribute it to instead of a fresh
+# unexplained correlation.
 AGE_TEXTURE_REGION_CLASS = [1]
 
 
@@ -420,6 +423,7 @@ def _mechanism_report(args):
         ('hair_color_add', args.hair_color_add_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
         ('age_gate_region', args.age_gate_region_loss_weight),
+        ('age_skin_hf', args.age_skin_hf_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
         ('disc_realism', args.disc_realism_weight),
     ]
@@ -1081,6 +1085,68 @@ if __name__ == '__main__':
                              'mechanism (WHERE injected content concentrates) than those change '
                              '(HOW MUCH signal reaches the fine W+ layers), and stacking it with an '
                              'in-flight experiment would make neither result attributable.')
+    parser.add_argument('--age_skin_hf_loss_weight', type=float, default=0.0,
+                        help='Weight for directional_region_frequency_loss '
+                             '(common/region_stat_loss.py): a one-sided hinge on the HIGH-'
+                             'FREQUENCY energy of the BiSeNet skin region for age(39) edits. '
+                             'Aging edits (removal direction) must not LOSE skin texture; '
+                             'de-aging edits (add direction) must not keep it. Both targets are '
+                             'relative to each sample\'s own source reconstruction, so a person '
+                             'who starts with visibly textured skin and one who starts smooth '
+                             'are not asked for the same absolute value. '
+                             'WHY: no other term in this loss set can see fine texture at all. '
+                             'The attribute teachers are 256px classifiers reading mostly low-'
+                             'frequency evidence, id_loss reads a deliberately texture-invariant '
+                             'ArcFace embedding, reg_loss counts W+ displacement, DDS scores a '
+                             'latent-space noise residual. So "darken, raise contrast, and SMOOTH '
+                             'the skin" satisfies every one of them at once, and that is what the '
+                             'model has repeatedly learned: three separate mechanism changes '
+                             '(--reg_fine_weight_min_override, --age_dds_fine_layer_start 18, '
+                             '--controlnet_region_cond) were each measured with '
+                             'scripts/probe_noise_texture.py and each one was spent on MORE '
+                             'smoothing, not more texture. This is the term that makes texture '
+                             'cost something. '
+                             'NOT a repeat of the removed --color_shift_loss_weight (see its note '
+                             'further down): that one averaged SIGNED mean RGB over the whole '
+                             'face, so a local change cancelled to ~0 and it structurally could '
+                             'not see what it was asked to see. This squares the residual before '
+                             'averaging, so local texture cannot cancel. '
+                             'ITS OWN LIMIT: mean energy is location-agnostic -- uniform grain '
+                             'satisfies it as well as a real fold does. --disc_realism_weight and '
+                             'the diffusion prior are what push back against unphotographic '
+                             'grain; this term only stops texture being destroyed. Verify any run '
+                             'using it VISUALLY (scripts/probe_noise_texture.py prints the same '
+                             'skin_hf number AND writes a montage), not by the metric alone. '
+                             'Needs FaceParser. Off by default (0) -- identical behavior to '
+                             'before this flag existed. Costs one extra separable blur per '
+                             'firing step; no BiSeNet backward pass (the mask is a fixed '
+                             'reference, like the hair_* losses, not an optimised quantity).')
+    parser.add_argument('--age_skin_hf_relative_change', type=float, default=0.15,
+                        help='Under --age_skin_hf_loss_weight: aging edits must reach at least '
+                             '(1 + this) x the source\'s own skin HF energy, de-aging edits at '
+                             'most (1 - this) x. Deliberately modest by default: the measured '
+                             'source-to-edit change in the runs that motivated this loss was '
+                             'roughly -0.00013 to -0.00034 against a source level of ~0.00074, '
+                             'i.e. the model was destroying 20-45% of the texture, so asking for '
+                             '+15% is asking it to stop and then gain a little -- not to invent '
+                             'an amount of detail no FFHQ face has. Raise it only after a run at '
+                             'this value has been checked visually.')
+    parser.add_argument('--age_skin_hf_max', type=float, default=0.0025,
+                        help='Ceiling on the aging-direction target, in absolute HF-energy units '
+                             '(the same units scripts/probe_noise_texture.py prints; a typical '
+                             'FFHQ reconstruction at 512 sits near 0.0007). Stops the relative '
+                             'target from demanding unbounded grain on a source that is already '
+                             'heavily textured.')
+    parser.add_argument('--age_skin_hf_min', type=float, default=0.0002,
+                        help='Floor on the de-aging-direction target, same units as '
+                             '--age_skin_hf_max. Stops the mirror direction from being rewarded '
+                             'for wiping skin to a flat plastic surface -- which is the exact '
+                             'failure this whole loss exists to prevent, and it would be '
+                             'self-defeating to let the add direction reintroduce it.')
+    parser.add_argument('--age_skin_hf_blur_sigma', type=float, default=2.0,
+                        help='Gaussian sigma whose removed detail counts as "high frequency". '
+                             'Must match scripts/probe_noise_texture.py --blur_sigma_hf (default '
+                             '2.0) for the training log and the probe to report the same number.')
     parser.add_argument('--gender_dds_fine_layer_start', type=int, default=-1,
                         help='Fine-layer cutoff for the GENDER(20) DDS pass specifically, exactly '
                              'mirroring --age_dds_fine_layer_start. <0 (default) falls back to the '
@@ -2249,7 +2315,7 @@ if __name__ == '__main__':
     if args.local_region_loss_weight > 0 or args.dds_face_mask \
             or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0 \
             or args.hair_extent_loss_weight > 0 or args.age_gate_region_loss_weight > 0 \
-            or args.controlnet_region_cond:
+            or args.age_skin_hf_loss_weight > 0 or args.controlnet_region_cond:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -2259,6 +2325,14 @@ if __name__ == '__main__':
             if args.age_gate_region_loss_weight > 0:
                 print(f'** ControlNet gate-region loss enabled (weight='
                       f'{args.age_gate_region_loss_weight}) for age(39) edits')
+            if args.age_skin_hf_loss_weight > 0:
+                print(f'** Skin HIGH-FREQUENCY loss enabled (weight='
+                      f'{args.age_skin_hf_loss_weight}, +/-{args.age_skin_hf_relative_change:.0%} '
+                      f'of source energy, bounds [{args.age_skin_hf_min}, {args.age_skin_hf_max}], '
+                      f'sigma={args.age_skin_hf_blur_sigma}) for age(39) edits -- watch '
+                      f'skin_hf_src_mean / skin_hf_edit_mean in the logs, and confirm VISUALLY '
+                      f'(scripts/probe_noise_texture.py): the metric cannot tell wrinkles from '
+                      f'uniform grain.')
             if args.local_region_loss_weight > 0:
                 local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
                 print(f'** Face-parser locality loss enabled (weight='
@@ -2576,6 +2650,9 @@ if __name__ == '__main__':
             hair_color_add_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             gate_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            skin_hf_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            skin_hf_src_mean = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            skin_hf_edit_mean = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
             # src_recon / loss_ref_img: computed earlier now, right before the
             # controlnet_active block above (region conditioning needs it
@@ -2739,6 +2816,64 @@ if __name__ == '__main__':
                                 _gate[_is_attr_age], age_skin_mask))
                         if _gate_terms:
                             gate_region_loss = torch.stack(_gate_terms).mean()
+
+                # ── Skin high-frequency texture (age/39, both directions) ───
+                # See --age_skin_hf_loss_weight help and
+                # region_stat_loss.directional_region_frequency_loss's docstring.
+                # This is the only term in the whole loss set that can see fine
+                # texture; everything else is satisfied by "darker, smoother,
+                # higher contrast", which is what the model kept learning.
+                #
+                # Both masks come from get_region_mask (no_grad, argmax'd): the
+                # skin REGION is a fixed reference here, as in the hair_* losses
+                # -- the optimised quantity is the ENERGY inside it, not its
+                # shape, so no BiSeNet backward pass is needed. blur_sigma=0 to
+                # match probe_noise_texture.py's skin_hf_energy exactly (it
+                # passes 0), so the number logged here and the number that probe
+                # prints are the same measurement rather than two close ones.
+                if args.age_skin_hf_loss_weight > 0 and _is_attr_age.any():
+                    _hf_terms, _hf_src, _hf_edit = [], [], []
+                    for _sel, _push, _bound in (
+                        # removal = src is Young -> edit ages the face: DEMAND
+                        # texture. add = src is Old -> edit de-ages: demand its
+                        # removal, floored so it cannot go plastic.
+                        (_is_attr_age & _is_removal, +1, args.age_skin_hf_max),
+                        (_is_attr_age & ~_is_removal, -1, args.age_skin_hf_min),
+                    ):
+                        if not _sel.any():
+                            continue
+                        with torch.no_grad():
+                            _src_skin = face_parser.get_region_mask(
+                                src_recon[_sel], AGE_TEXTURE_REGION_CLASS, blur_sigma=0)
+                            _edit_skin = face_parser.get_region_mask(
+                                new_face_tensors[_sel], AGE_TEXTURE_REGION_CLASS, blur_sigma=0)
+                        # Same guard as the hair_* losses: if BiSeNet found
+                        # essentially no skin in either pass (heavy occlusion,
+                        # extreme crop), the mean would be decided by a handful
+                        # of misclassified pixels.
+                        _min_px_skin = 0.01 * _src_skin.numel()
+                        if _src_skin.sum() <= _min_px_skin or _edit_skin.sum() <= _min_px_skin:
+                            continue
+                        _hf_terms.append(directional_region_frequency_loss(
+                            src_recon[_sel], new_face_tensors[_sel],
+                            _src_skin, _edit_skin, push=_push,
+                            relative_change=args.age_skin_hf_relative_change,
+                            bound=_bound, sigma=args.age_skin_hf_blur_sigma,
+                        ))
+                        # Logged unconditionally (even for samples whose hinge
+                        # is already satisfied and contributes 0), because the
+                        # loss value alone cannot distinguish "texture is fine"
+                        # from "this direction had no samples this step".
+                        with torch.no_grad():
+                            _hf_src.append(region_hf_energy(
+                                src_recon[_sel], _src_skin, args.age_skin_hf_blur_sigma))
+                            _hf_edit.append(region_hf_energy(
+                                new_face_tensors[_sel], _edit_skin,
+                                args.age_skin_hf_blur_sigma))
+                    if _hf_terms:
+                        skin_hf_loss = torch.stack(_hf_terms).mean()
+                        skin_hf_src_mean = torch.stack(_hf_src).mean()
+                        skin_hf_edit_mean = torch.stack(_hf_edit).mean()
             reg_loss_global = (new_latents[:, :2, :] - latent[:, :2, :]).pow(2).mean(dim=(1, 2))
             reg_loss_coarse = (new_latents[:, 2:4, :] - latent[:, 2:4, :]).pow(2).mean(dim=(1, 2))
             reg_loss_fine = (new_latents[:, 4:, :] - latent[:, 4:, :]).pow(2).mean(dim=(1, 2))
@@ -3093,6 +3228,7 @@ if __name__ == '__main__':
                 args.hair_color_add_loss_weight * hair_color_add_loss +\
                 args.hair_extent_loss_weight * hair_extent_loss +\
                 args.age_gate_region_loss_weight * gate_region_loss +\
+                args.age_skin_hf_loss_weight * skin_hf_loss +\
                 args.controlnet_reg_weight * loss_control_reg +\
                 args.disc_realism_weight * disc_realism_loss
 
@@ -3236,6 +3372,13 @@ if __name__ == '__main__':
                 'loss_hair_color_add': hair_color_add_loss,
                 'loss_hair_extent':   hair_extent_loss,
                 'loss_gate_region':   gate_region_loss,
+                'loss_skin_hf':       skin_hf_loss,
+                # The two diagnostics --age_skin_hf_loss_weight is actually
+                # judged by. loss_skin_hf going to 0 only says the hinge is
+                # satisfied; skin_hf_edit_mean rising above skin_hf_src_mean is
+                # what says the model stopped trading texture for score.
+                'skin_hf_src_mean':   skin_hf_src_mean,
+                'skin_hf_edit_mean':  skin_hf_edit_mean,
                 'loss_disc_realism':  disc_realism_loss,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),

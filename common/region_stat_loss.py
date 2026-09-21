@@ -42,6 +42,19 @@ This loss is the minimal version of that fix for age: reward the gate for
 concentrating inside a texture-relevant face region (skin, where wrinkles/
 skin-texture aging actually lives) instead of leaving it a flat, spatially
 uninformed multiplier.
+
+directional_region_frequency_loss() closes the gap that the gate loss
+above, by itself, turned out not to close. Conditioning the injection on
+the skin region made the edit more localised -- and the model spent that
+localisation on smoothing the skin more precisely, not on adding texture
+to it (measured: skin HF energy fell further than in the runs without it).
+The same thing happened when the fine-layer reg floor was lowered and when
+the DDS fine-layer block was lifted. Three different mechanisms, three
+times the same outcome, because every existing loss in this project is
+blind to fine texture and "smoother, darker, higher contrast" is the
+cheapest way to satisfy all of them at once. This term measures the one
+quantity none of the others can see and is one-sided like the rest, so a
+sample that already keeps its texture pays nothing.
 """
 import torch
 import torch.nn.functional as F
@@ -128,6 +141,112 @@ def directional_region_area_loss(src_prob, edit_prob, push, relative_change, bou
         return torch.relu(target - edit_a)
     target = (src_a * (1.0 - relative_change)).clamp(min=bound)
     return torch.relu(edit_a - target)
+
+
+def _gaussian_blur(x, sigma):
+    """Separable Gaussian blur, DIFFERENTIABLE.
+
+    Deliberately the same kernel construction as
+    scripts/probe_noise_texture.py's _gaussian_blur, so the quantity this
+    file's loss optimises and the quantity that probe reports are the same
+    number, not two similar-looking definitions that drift apart. The one
+    difference is that this one is not wrapped in @torch.no_grad() -- a
+    blur inside a loss has to carry gradient back to the image.
+    """
+    ks = int(sigma * 6) | 1                      # odd kernel
+    coords = torch.arange(ks, device=x.device, dtype=x.dtype) - ks // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = (g / g.sum()).view(1, 1, 1, -1)
+    c = x.shape[1]
+    x = F.conv2d(x, g.expand(c, 1, 1, ks), padding=(0, ks // 2), groups=c)
+    x = F.conv2d(x, g.transpose(-1, -2).expand(c, 1, ks, 1), padding=(ks // 2, 0), groups=c)
+    return x
+
+
+def region_hf_energy(img_pm1, mask, sigma=2.0):
+    """Mask-weighted mean squared high-frequency residual.
+
+    img - blur(img) keeps exactly what a Gaussian removes: pores, creases,
+    fine shading. Restricted to `mask` (in practice BiSeNet skin) because
+    hair carries far more high-frequency energy than any wrinkle and would
+    swamp the measurement.
+
+    Matches scripts/probe_noise_texture.py's skin_hf_energy formula, including
+    its denominator convention (mask pixel count x channel count), so a value
+    logged from training is directly comparable to one the probe prints.
+
+    Returns a single scalar over the whole batch, matching
+    region_mean_saturation's convention above.
+    """
+    hf = img_pm1 - _gaussian_blur(img_pm1, sigma)
+    denom = (mask.sum() * img_pm1.shape[1]).clamp(min=1.0)
+    return ((hf ** 2) * mask).sum() / denom
+
+
+def directional_region_frequency_loss(src_img, edit_img, src_mask, edit_mask,
+                                      push, relative_change, bound, sigma=2.0):
+    """One-sided hinge on a region's HIGH-FREQUENCY energy, relative to its
+    own source value.
+
+    WHY THIS EXISTS. Every loss in this project measures the edit through
+    something that is blind to fine texture: the attribute teachers are
+    classifiers reading mostly low-frequency evidence (a 256px r34/CelebA
+    head is happy to call a darkened, higher-contrast face "old"), id_loss
+    reads an ArcFace embedding that is trained to be texture-invariant on
+    purpose, reg_loss counts W+ displacement, DDS scores a latent-space
+    noise residual. None of them can tell a face that grew wrinkles from a
+    face that was darkened and SMOOTHED. Three separate mechanism changes
+    (lowering the fine reg floor, unblocking DDS above layer 12, and
+    conditioning ControlNet on the skin region) were each measured, and
+    each one was spent on MORE smoothing rather than more texture --
+    scripts/probe_noise_texture.py reported skin HF energy going the wrong
+    way in all three. That is not three coincidences; it is what happens
+    when nothing in the objective pays for texture. This is the term that
+    pays for it.
+
+    push=+1 (aging direction, age REMOVAL edits): the edited skin must carry
+        at least (1 + relative_change) x the source's own HF energy, capped
+        ABOVE by `bound`.
+    push=-1 (de-aging direction, age ADD edits): at most
+        (1 - relative_change) x, floored BELOW by `bound`.
+
+    The target is MULTIPLICATIVE, following directional_region_area_loss
+    rather than directional_region_saturation_loss: HF energy is a small
+    positive quantity with no meaningful ceiling (~7e-4 on a typical FFHQ
+    reconstruction at 512), so "move a fraction of the way toward 1.0" would
+    be meaningless, while scaling the source's own measured value keeps the
+    ask proportionate to how much texture the person started with. `bound`
+    stops it running away on either side.
+
+    src energy is detached: it is the fixed reference the edit is scored
+    against, the same role src_sat/src_a play above.
+
+    TWO KNOWN LIMITS, stated here rather than discovered later:
+
+    1. This is NOT the removed --color_shift_loss_weight (see its note in
+       training/train_sdflow.py) repeated. That one failed structurally: it
+       averaged SIGNED mean RGB over the whole face, so a local change
+       cancelled to ~0 and the loss could never see it. Here the residual is
+       SQUARED before averaging, so every pixel's contribution is
+       non-negative and local texture cannot cancel against other local
+       texture.
+    2. Mean energy is location-agnostic. It says how much fine detail the
+       skin carries, not whether that detail is arranged as plausible
+       wrinkles -- uniform grain over the whole cheek satisfies it as well
+       as a nasolabial fold does. The discriminator (--disc_realism_weight)
+       and the diffusion prior (--age_diffusion_weight) are what push
+       against added grain that does not look like a photograph; this term
+       is only the one that stops texture being DESTROYED. Any run using it
+       has to be checked visually, not just by the number going up.
+    """
+    with torch.no_grad():
+        src_e = region_hf_energy(src_img, src_mask, sigma)
+    edit_e = region_hf_energy(edit_img, edit_mask, sigma)
+    if push > 0:
+        target = (src_e * (1.0 + relative_change)).clamp(max=bound)
+        return torch.relu(target - edit_e)
+    target = (src_e * (1.0 - relative_change)).clamp(min=bound)
+    return torch.relu(edit_e - target)
 
 
 def region_gate_concentration_loss(gate, region_mask, margin=0.15):
