@@ -221,6 +221,21 @@ def directional_region_frequency_loss(src_img, edit_img, src_mask, edit_mask,
     src energy is detached: it is the fixed reference the edit is scored
     against, the same role src_sat/src_a play above.
 
+    THE RETURNED VALUE IS NORMALISED by the target, so it is a RELATIVE
+    shortfall (1.0 = the edited skin carries no texture at all; 0 = the
+    hinge is satisfied) rather than a raw energy difference. The two
+    directional losses above return their raw quantity because saturation
+    and area fraction are both O(0.1-1) -- weights near 0.05-0.1 work for
+    them. HF energy is O(1e-3), so a raw return here would need a loss
+    weight around 100 to matter at all, and that weight would then be
+    wrong the moment --img_size or --age_skin_hf_blur_sigma changed, since
+    the absolute energy scales with both. Normalising makes
+    --age_skin_hf_loss_weight live on the same 0.05-0.5 scale as every
+    other auxiliary weight in this project and keeps it meaningful across
+    resolutions. The raw, probe-comparable numbers are still available:
+    training/train_sdflow.py logs region_hf_energy() directly as
+    skin_hf_src_mean / skin_hf_edit_mean.
+
     TWO KNOWN LIMITS, stated here rather than discovered later:
 
     1. This is NOT the removed --color_shift_loss_weight (see its note in
@@ -244,9 +259,9 @@ def directional_region_frequency_loss(src_img, edit_img, src_mask, edit_mask,
     edit_e = region_hf_energy(edit_img, edit_mask, sigma)
     if push > 0:
         target = (src_e * (1.0 + relative_change)).clamp(max=bound)
-        return torch.relu(target - edit_e)
+        return torch.relu(target - edit_e) / target.clamp(min=1e-8)
     target = (src_e * (1.0 - relative_change)).clamp(min=bound)
-    return torch.relu(edit_e - target)
+    return torch.relu(edit_e - target) / target.clamp(min=1e-8)
 
 
 def region_gate_concentration_loss(gate, region_mask, margin=0.15):
