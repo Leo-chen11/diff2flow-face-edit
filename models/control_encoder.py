@@ -654,3 +654,28 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         out = out * gate
         out = F.normalize(out.reshape(B, -1), dim=1).view_as(out)
         return out * gains[slot_idx, r_i].view(-1, 1, 1, 1)
+
+    def region_channel_weight_norm(self):
+        """{stage_res: scalar} L2 norm of each stage's region-channel weight
+        slice (the one zero-initialized in __init__ when region_cond=True).
+
+        The only direct signal that the network is actually LEARNING to read
+        the region input: region_cond changes the network's INPUT, not its
+        supervised output the way region_gate_concentration_loss's gate does,
+        so there is nothing else in the existing logs (last_gate_mean
+        included) that moves in response to this specific mechanism. Starts
+        at exactly 0.0 every stage by construction; a run where these stay at
+        0.0 for many thousands of steps means the region channel is being
+        ignored, not just slow to help -- gradient is reaching it (it is not
+        detached), so a truly stuck 0.0 points at the region signal being
+        too weak or too uncorrelated with the losses actually driving
+        training to be worth the network's attention, not at a wiring bug.
+        Returns {} when region_cond=False (nothing to report).
+        """
+        if not self.region_cond:
+            return {}
+        with torch.no_grad():
+            return {
+                res: stage[0].weight[-1:, :, :, :].norm().item()
+                for stage, res in zip(self.stages, self.stage_res)
+            }

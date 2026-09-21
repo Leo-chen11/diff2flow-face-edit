@@ -2505,6 +2505,14 @@ if __name__ == '__main__':
                     # reason to move and should stay near its init.
                     for _r, _g in getattr(control_encoder, 'last_gate_mean', {}).items():
                         control_band_logs[f'control_gate_mean_r{_r}'] = _g
+                    # --controlnet_region_cond only: the region channel's own
+                    # weight norm, the direct "is this being learned at all"
+                    # signal for that mechanism (see
+                    # region_channel_weight_norm's own docstring -- nothing
+                    # else in these logs reacts to it, unlike the gate above).
+                    if hasattr(control_encoder, 'region_channel_weight_norm'):
+                        for _r, _w in control_encoder.region_channel_weight_norm().items():
+                            control_band_logs[f'control_region_ch_norm_r{_r}'] = torch.tensor(_w)
 
             new_face_tensors = G([new_latents], skips=control_skips,
                                  embed_res=args.controlnet_embed_res,
