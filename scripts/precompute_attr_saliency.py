@@ -40,6 +40,11 @@ Usage:
     python -m scripts.precompute_attr_saliency --preview \
         --attrs 15 20 39 --num_faces 8 --out_dir ./saliency_probe
 
+    # 1b. a NUMBER instead of an eyeball judgment on a handful of thumbnails
+    # -- see run_correlate()'s docstring for what it measures and why.
+    python -m scripts.precompute_attr_saliency --correlate \
+        --attrs 15 20 39 --num_samples 200
+
     # 2. only if the maps look right -- dump the whole index
     python -m scripts.precompute_attr_saliency --dump \
         --attrs 15 20 39 --out ./data/ffhq_attr_saliency.pth
@@ -264,6 +269,112 @@ def run_dump(args, teacher, tap):
     print('  resolution -- same role the BiSeNet mask plays today.')
 
 
+def run_correlate(args, teacher, tap):
+    """A NUMBER, not an eyeball call on 8 thumbnails.
+
+    --preview's montage puts the decision on "does this look right", and at
+    an 8x8-16x16 CAM stretched over a compressed preview image, that call
+    runs out of resolution fast -- exactly what happened comparing layer3
+    vs layer4 for Male here: "less identical to Young than before, but not
+    clearly jaw/brow either" is not a call an eyeball should be making on a
+    handful of samples. This measures the same question --preview asks,
+    over MANY samples, as a single number: for each pair of attributes, the
+    mean cosine similarity between their CAMs, flattened to a vector.
+
+    TWO variants, because they answer slightly different questions:
+
+      cos_abs    -- similarity of |cam|: do the two attributes' evidence
+                    (for OR against, either sign) sit in the same PLACE,
+                    regardless of which way it points. This is the more
+                    direct test for "does this channel carry attribute-
+                    specific location information at all" -- the question
+                    that decides whether --region_saliency_path's all-ones
+                    replacement is worth it.
+      cos_signed -- similarity of the raw signed cam: do they also agree in
+                    DIRECTION at each location (both "for", or one "for"
+                    where the other is "against"). Stricter; a low
+                    cos_abs with a very different cos_signed is itself
+                    informative (same rough area, opposite reading).
+
+    A KNOWN-LOCAL attribute in --attrs (Eyeglasses/15, if included) is the
+    reference point, not just another row: it is the one attribute this
+    project already trusts has a real, tight region
+    (LOCAL_REGION_CLASSES[15]), so its similarity to Male/Young is the
+    empirical floor for "clearly different". If Eyeglasses-vs-Male comes
+    back just as high as Male-vs-Young, that is reason to distrust the
+    METRIC (e.g. a shared background/lighting bias dominating over actual
+    face-region signal) rather than concluding every attribute collapses
+    to one map.
+
+    Read: high similarity (rule of thumb >0.6) means the two attributes'
+    CAMs are close enough to carry little separating information -- treat
+    as NOT differentiated. Low (<0.3) is a real difference. In between is
+    genuinely ambiguous and probably needs the same caution as a
+    borderline --preview call, not a false sense of precision from having
+    a decimal point.
+    """
+    _dataset, loader = build_loader(args, batch_size=args.batch)
+    K = len(args.attrs)
+    sum_abs = torch.zeros(K, K, dtype=torch.float64)
+    sum_signed = torch.zeros(K, K, dtype=torch.float64)
+    n = 0
+    for img, _latent, _pred in loader:
+        if n >= args.num_samples:
+            break
+        img = img.cuda()
+        x = F.interpolate(img, (TEACHER_RES, TEACHER_RES), mode='bilinear',
+                          align_corners=False)
+        cam = signed_gradcam(teacher, tap, x, args.attrs)      # (B, K, h, w)
+        B = cam.size(0)
+        flat = cam.reshape(B, K, -1)
+        flat_abs = flat.abs()
+        unit = flat / flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        unit_abs = flat_abs / flat_abs.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        # (B, K, K) pairwise cosine similarity, per sample, then summed --
+        # averaged over samples at the end, not per-batch, so the last
+        # (possibly smaller) batch is weighted correctly.
+        sum_signed += torch.einsum('bik,bjk->bij', unit, unit).sum(dim=0).double().cpu()
+        sum_abs += torch.einsum('bik,bjk->bij', unit_abs, unit_abs).sum(dim=0).double().cpu()
+        n += B
+        if n % (args.batch * 20) < args.batch:
+            print(f'  {min(n, args.num_samples)}/{args.num_samples}')
+
+    mean_abs = sum_abs / n
+    mean_signed = sum_signed / n
+    names = [ATTR_NAMES.get(a, f'attr{a}') for a in args.attrs]
+
+    def _print_matrix(title, mat):
+        print(f'\n{title}')
+        header = ' ' * 14 + ''.join(f'{nm:>12}' for nm in names)
+        print(header)
+        for i, nm in enumerate(names):
+            row = f'{nm:>14}' + ''.join(f'{mat[i, j].item():>12.3f}' for j in range(K))
+            print(row)
+
+    print(f'\n=== over {n} samples, tap={args.tap} ===')
+    _print_matrix('cosine similarity of |cam| (location overlap, sign-agnostic):', mean_abs)
+    _print_matrix('cosine similarity of signed cam (location + direction agreement):', mean_signed)
+
+    print('\nHOW TO READ THIS')
+    print('  >0.6  : essentially the same map -- treat as NOT differentiated.')
+    print('  <0.3  : a real spatial difference.')
+    print('  between: ambiguous -- do not treat a decimal point as more')
+    print('  certainty than an eyeball call would give you here.')
+    if 15 in args.attrs and len(args.attrs) > 1:
+        i15 = args.attrs.index(15)
+        others = [(a, mean_abs[i15, args.attrs.index(a)].item())
+                 for a in args.attrs if a != 15]
+        print(f'\n  Eyeglasses(15) is a KNOWN-LOCAL attribute (LOCAL_REGION_CLASSES '
+              f'already trusts it) -- its row is the reference point, not just another '
+              f'attribute:')
+        for a, sim in others:
+            print(f'    Eyeglasses vs {ATTR_NAMES.get(a, a)}: {sim:.3f}')
+        print(f'  These should read LOW (this is a known-good case with a real, tight '
+              f'region). If they do NOT, distrust the metric itself before concluding '
+              f'anything about the other attributes -- something else (shared '
+              f'background/lighting bias, a broken tap) is probably dominating it.')
+
+
 # ── small montage helpers (kept local; scripts/dump_attr_failures.py's are
 # shaped around its src/edit pair layout, not a variable-width row) ────────
 
@@ -311,13 +422,19 @@ if __name__ == '__main__':
                            'the cheap check on whether the premise holds.')
     mode.add_argument('--dump', action='store_true',
                       help='Compute maps for the whole index and save them.')
+    mode.add_argument('--correlate', action='store_true',
+                      help='Print a pairwise similarity NUMBER between attributes\' '
+                           'CAMs over many samples, instead of an eyeball call on a '
+                           'handful of --preview thumbnails. See run_correlate()\'s '
+                           'docstring. Also read-only, also cheap (no training).')
 
     p.add_argument('--attrs', nargs='*', type=int, default=[15, 20, 39],
                    help='Absolute CelebA indices. Any of the 40 works -- the '
                         'point of this script is that nothing is hand-specified '
                         'per attribute, so 13 (Chubby) or 26 (Pale_Skin) are '
                         'legitimate things to look at even though this project '
-                        'does not edit them.')
+                        'does not edit them. --correlate: include 15 (Eyeglasses) '
+                        'if you want the known-local reference row.')
     p.add_argument('--tap', default='layer3',
                    help='Which ResNet stage to read activations from. layer3 is '
                         '16x16 at 256 input, layer4 is 8x8 (see _resolve_tap).')
@@ -326,7 +443,8 @@ if __name__ == '__main__':
     p.add_argument('--out_dir', default='./saliency_probe', help='--preview only.')
     p.add_argument('--out', default='./data/ffhq_attr_saliency.pth',
                    help='--dump only.')
-    p.add_argument('--batch', type=int, default=8, help='--dump only.')
+    p.add_argument('--num_samples', type=int, default=200, help='--correlate only.')
+    p.add_argument('--batch', type=int, default=8, help='--dump / --correlate.')
     p.add_argument('--workers', type=int, default=2)
 
     p.add_argument('--attr_backbone', default='r34',
@@ -350,5 +468,7 @@ if __name__ == '__main__':
           f'tap={args.tap} attrs={args.attrs}')
     if args.preview:
         run_preview(args, teacher, tap)
+    elif args.correlate:
+        run_correlate(args, teacher, tap)
     else:
         run_dump(args, teacher, tap)
