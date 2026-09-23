@@ -25,7 +25,7 @@ from common.region_stat_loss import (directional_region_area_loss,
                                      directional_region_saturation_loss,
                                      region_gate_concentration_loss,
                                      region_hf_energy)
-from models.dataset import SDFlowDataset
+from models.dataset import IndexedDataset, SDFlowDataset
 from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
@@ -1558,6 +1558,35 @@ if __name__ == '__main__':
                              "and delete just its control_encoder-* files first so load_module_"
                              "checkpoint's FileNotFoundError path takes over (control_encoder starts "
                              "from zero-init, same as a run that never had ControlNet before).")
+    parser.add_argument('--region_saliency_path', type=str, default=None,
+                        help="Path to a saliency index from scripts/precompute_attr_saliency.py "
+                             "--dump. Requires --controlnet_region_cond; no-op otherwise (with a "
+                             "warning). Replaces the all-ones fallback --controlnet_region_cond "
+                             "feeds every attribute WITHOUT a hand-specified region (currently "
+                             "everything except age(39), which keeps its BiSeNet mask regardless -- "
+                             "the two are not compared against each other here, only age's known "
+                             "gap is left alone) with a per-sample classifier-attribution map: "
+                             "relu(+cam) for the removal direction (erase where evidence FOR the "
+                             "attribute sits), relu(-cam) for add (build where evidence AGAINST it "
+                             "sits) -- see that script's SIGNED, NOT RECTIFIED note. "
+                             "WHY THE ALL-ONES FALLBACK IS WORTH REPLACING: a conv layer's weighted "
+                             "sum over an input channel that is the SAME CONSTANT at every spatial "
+                             "position collapses to a fixed per-output-channel bias -- mathematically, "
+                             "a uniform input cannot carry location information no matter what the "
+                             "conv learns, so an attribute stuck on all-ones (Male(20) foremost: "
+                             "BiSeNet's 19 classes have no jaw/brow/hairline to point at) gets a "
+                             "learnable offset from this channel, never a WHERE. "
+                             "Default (unset): identical behavior to before this flag existed. "
+                             "Samples whose file the index does not cover (a stale --dump, or an "
+                             "attribute the index was not run with --attrs on) silently keep the "
+                             "all-ones fallback for that sample -- checked per (sample, attribute), "
+                             "not gated globally, so a partial index degrades gracefully instead of "
+                             "erroring. CHANGES THE MEANING of an already-warm region_cond channel: "
+                             "resuming a run that trained on all-ones for an attribute into a run "
+                             "using this flag for that same attribute is a real distribution shift "
+                             "for that channel (see this flag's discussion in the session history), "
+                             "not a strict no-op -- treat a switch as a fresh experimental condition, "
+                             "not a free continuation.")
     parser.add_argument('--target_loss', default='mse', choices=['mse', 'hinge'],
                         help="Shape of the target-attribute loss. 'mse' squares the distance to "
                              "soft_target, which keeps pulling on samples that already crossed the "
@@ -1891,7 +1920,7 @@ if __name__ == '__main__':
             high_threshold=args.score_balance_high,
             seed=0,
         )
-        train_loader = data.DataLoader(train_dataset,
+        train_loader = data.DataLoader(IndexedDataset(train_dataset),
                                        batch_sampler=train_sampler,
                                        num_workers=args.num_workers,
                                        pin_memory=True)
@@ -1900,7 +1929,7 @@ if __name__ == '__main__':
         print(f'** score-balanced sampler enabled. low pools: {low_counts}, high pools: {high_counts}')
     else:
         train_sampler = None
-        train_loader = data.DataLoader(train_dataset,
+        train_loader = data.DataLoader(IndexedDataset(train_dataset),
                                        shuffle=True,
                                        batch_size=args.batch,
                                        num_workers=args.num_workers,
@@ -2364,6 +2393,33 @@ if __name__ == '__main__':
             print(f'[WARN] Face parser unavailable ({exc}); locality/hair-gray/DDS-mask '
                   f'disabled.')
 
+    # region_saliency: replaces --controlnet_region_cond's all-ones fallback
+    # (see the region_mask construction below) with a precomputed
+    # classifier-attribution map, for whichever attributes
+    # scripts/precompute_attr_saliency.py --dump was run on. See
+    # --region_saliency_path help for why the all-ones fallback is worth
+    # replacing at all -- a constant input channel is mathematically
+    # equivalent to a bias term, so a conv can never learn ANY location
+    # from it, only a fixed per-attribute offset.
+    region_saliency = None
+    if args.region_saliency_path:
+        if not args.controlnet_region_cond:
+            print('[WARN] --region_saliency_path set without --controlnet_region_cond -- '
+                  'ignored (region_mask is never built, so there is nothing to fill in).')
+        else:
+            _sal = torch.load(args.region_saliency_path, map_location='cpu')
+            region_saliency = {
+                'maps': _sal['maps'],                                    # (N, K, h, w) fp16, signed [-1,1]
+                'attr_to_col': {a: i for i, a in enumerate(_sal['attrs'])},
+                'file_to_row': {f: i for i, f in enumerate(_sal['files'])},
+            }
+            print(f'** Region saliency index loaded ({args.region_saliency_path}): '
+                  f'{region_saliency["maps"].shape[0]} images, attrs='
+                  f'{sorted(region_saliency["attr_to_col"])} -- replaces the all-ones '
+                  f'region_cond fallback for these attributes (age(39) keeps its BiSeNet '
+                  f'mask regardless, if --local_region_loss_weight-style face_parser is '
+                  f'active).')
+
     diffusion_guidance = None
     if args.use_diffusion_guidance:
         try:
@@ -2427,7 +2483,11 @@ if __name__ == '__main__':
             local_step = epoch*len(train_loader)+i
             n_iter = start_step + local_step
             
-            img,latent,pred = datas
+            # sample_idx: index into train_dataset (see IndexedDataset in
+            # models/dataset.py), not moved to cuda -- it's only used as a
+            # CPU-side key into train_dataset.image_list for
+            # --region_saliency_path lookups below, never in a tensor op.
+            img,latent,pred,sample_idx = datas
             img = img.cuda()
             latent = latent.cuda()
             pred = pred.cuda()
@@ -2537,15 +2597,53 @@ if __name__ == '__main__':
                 if args.controlnet_region_cond:
                     region_mask = torch.ones(latent.size(0), 1, args.img_size, args.img_size,
                                              device=latent.device, dtype=latent.dtype)
+                    _mid_abs_rc = [args.attribute_index[int(j)]
+                                  for j in mid_idx.detach().cpu().tolist()]
+                    _is_age_rc = None
                     if face_parser is not None:
-                        _mid_abs_rc = [args.attribute_index[int(j)]
-                                      for j in mid_idx.detach().cpu().tolist()]
                         _is_age_rc = torch.tensor([a == 39 for a in _mid_abs_rc],
                                                   device=latent.device)
                         if _is_age_rc.any():
                             with torch.no_grad():
                                 region_mask[_is_age_rc] = face_parser.get_region_mask(
                                     src_recon[_is_age_rc], AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
+                    # region_saliency: fills the all-ones default for attributes
+                    # WITHOUT a hand-specified region (age above is the only
+                    # exception, and is never overwritten here) with a per-sample
+                    # classifier-attribution map. See --region_saliency_path help.
+                    # A per-sample Python loop, not vectorized: mid_idx (and
+                    # therefore _mid_abs_rc / direction) varies PER SAMPLE, so
+                    # which attribute's column to read -- or whether this sample
+                    # has an entry at all -- cannot be expressed as one gather.
+                    # Batch sizes in this project are small (--batch 4-8), so the
+                    # CPU-GPU sync per sample is not a meaningful cost, and only
+                    # runs when --region_saliency_path is actually set.
+                    if region_saliency is not None:
+                        with torch.no_grad():
+                            _is_removal_rc = (src_attr_flow > 0.5).detach().cpu().tolist()
+                            for _b in range(latent.size(0)):
+                                _a = _mid_abs_rc[_b]
+                                if _is_age_rc is not None and bool(_is_age_rc[_b]):
+                                    continue   # age already set above -- never overridden
+                                _col = region_saliency['attr_to_col'].get(_a)
+                                if _col is None:
+                                    continue   # index was not dumped for this attribute
+                                _file = train_dataset.image_list[int(sample_idx[_b])]
+                                _row = region_saliency['file_to_row'].get(_file)
+                                if _row is None:
+                                    continue   # sample outside the dumped index (stale dump)
+                                _cam = region_saliency['maps'][_row, _col].to(
+                                    device=latent.device, dtype=latent.dtype)
+                                # push=+1 (removal): erase where evidence FOR the
+                                # attribute sits -> relu(+cam). push=-1 (add): build
+                                # where evidence AGAINST it sits -> relu(-cam). See
+                                # precompute_attr_saliency.py's SIGNED, NOT RECTIFIED
+                                # note for why the map keeps both signs.
+                                _signed = _cam if _is_removal_rc[_b] else -_cam
+                                _mask = F.relu(_signed)[None, None]
+                                region_mask[_b:_b + 1] = F.interpolate(
+                                    _mask, (args.img_size, args.img_size),
+                                    mode='bilinear', align_corners=False)
                 control_skips = control_encoder(attr_delta, mid_idx,
                                                 is_rm=(src_attr_flow > 0.5),
                                                 latent=latent, region_mask=region_mask)

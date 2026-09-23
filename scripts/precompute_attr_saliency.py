@@ -168,10 +168,19 @@ def build_loader(args, batch_size):
         T.ToTensor(), T.Resize((args.img_size, args.img_size)),
         T.Normalize(mean=0.5, std=0.5),
     ])
+    # train=True, matching training/train_sdflow.py's train_dataset -- NOT
+    # the train=False convention every other probe script in this project
+    # uses. SDFlowDataset splits on df['split'] == (not train): train=True
+    # and train=False are DISJOINT sets of images, not a superset/subset
+    # relationship. The whole point of --dump is to build an index that
+    # train_sdflow.py's training loop can look attributes up in DURING
+    # TRAINING, which iterates train_dataset (train=True) -- an index built
+    # from the eval split would silently cover none of the images training
+    # actually sees.
     dataset = SDFlowDataset(
         index_file=args.index_file, image_root=args.image_root,
         latents_file=args.latent_file, preds_file=args.preds_file,
-        train=False, transform=img_transform,
+        train=True, transform=img_transform,
     )
     loader = data.DataLoader(dataset, shuffle=False, batch_size=batch_size,
                              num_workers=args.workers, drop_last=False)
