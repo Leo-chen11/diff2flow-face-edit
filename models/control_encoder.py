@@ -655,6 +655,60 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         out = F.normalize(out.reshape(B, -1), dim=1).view_as(out)
         return out * gains[slot_idx, r_i].view(-1, 1, 1, 1)
 
+    def region_channel_weight_penalty(self):
+        """Mean squared norm of each stage's region-channel weight slice,
+        WITH GRADIENT -- for use directly in a loss. region_channel_weight_
+        norm() below is the same quantity but detached and logging-only (see
+        its own docstring); this is that convention's other half, the same
+        split as last_gate_mean (detached) / last_gate (live) in forward()'s
+        comments.
+
+        WHY THIS EXISTS. control_region_ch_norm_* (region_channel_weight_
+        norm's log) climbs monotonically for as long as this project has
+        measured it -- v23 through a v26/v27 fine-tune spanning 125k-157k
+        steps on top of that, no sign of saturating. Nothing constrains it.
+        For an attribute WITHOUT a real spatial region_mask (everything
+        except age(39) unless --region_saliency_path is set -- see that
+        flag), the input this weight reads is a CONSTANT (all-ones), so
+        growing this weight only grows a spatially-UNIFORM contribution to
+        the pre-normalize content vector -- see models/control_encoder.py's
+        region_cond class docstring and --region_saliency_path's help for
+        why a constant input can only ever encode a bias, never a location.
+        As that bias's share of the pre-normalize vector's energy grows, the
+        POST-normalize (unit-norm) injected pattern is pulled toward that
+        uniform direction regardless of what the rest of the stack computed
+        -- a mechanism-level account for the drift toward flat, grain-like
+        texture and background bleed observed after long region_cond
+        fine-tunes (scripts/probe_noise_texture.py visual audits, v26/v27).
+
+        Averaged over stages, not summed -- same reasoning as skips_reg_
+        per_sample above: summing would make the penalty grow with stage
+        count, so adding an injection resolution would itself increase
+        pressure to shrink the channel at every OTHER resolution too.
+
+        BLUNT INSTRUMENT, stated plainly: this weight is SHARED across every
+        attribute that uses region_cond, including age(39)'s real BiSeNet-
+        sourced signal. This penalty cannot distinguish "growing because it
+        usefully reads a real mask" from "growing because it is building a
+        uniform bias off a constant input" -- it holds back both. Age's own
+        region_cond use has not been unambiguously beneficial either (v23:
+        FID improved but skin_hf measurably worsened -- see that run's
+        analysis), so this is not confidently known to be sacrificing
+        something proven to work, but it is not free of that risk either.
+
+        Returns a 0-valued tensor (not {}) when region_cond=False, so a
+        caller can multiply by its loss weight unconditionally without an
+        extra branch, mirroring the *_loss zero-tensor pattern in
+        training/train_sdflow.py.
+        """
+        if not self.region_cond:
+            return self.log_gain.new_zeros([])
+        sq = torch.stack([
+            stage[0].weight[-1:, :, :, :].pow(2).sum()
+            for stage in self.stages
+        ])
+        return sq.mean()
+
     def region_channel_weight_norm(self):
         """{stage_res: scalar} L2 norm of each stage's region-channel weight
         slice (the one zero-initialized in __init__ when region_cond=True).

@@ -425,6 +425,7 @@ def _mechanism_report(args):
         ('age_gate_region', args.age_gate_region_loss_weight),
         ('age_skin_hf', args.age_skin_hf_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
+        ('controlnet_region_ch_reg', args.controlnet_region_ch_reg_weight),
         ('disc_realism', args.disc_realism_weight),
     ]
 
@@ -1487,6 +1488,43 @@ if __name__ == '__main__':
                         help='Hard per-sample cap on control_skips norm (like guided_delta_max_norm '
                              'for the W+ path). 0 disables the cap; only the L2 penalty above still '
                              'applies. Use this if the L2 penalty alone does not keep training stable.')
+    parser.add_argument('--controlnet_region_ch_reg_weight', type=float, default=0.0,
+                        help="L2 penalty on the region_mask input channel's OWN CONV WEIGHT (see "
+                             "AttributeControlEncoder.region_channel_weight_penalty in "
+                             "models/control_encoder.py), not on the injected content -- "
+                             "--controlnet_reg_weight above already covers that. Requires "
+                             "--controlnet_region_cond; no-op otherwise (the weight does not exist). "
+                             "WHY: control_region_ch_norm_* (this same weight's norm, logged) has "
+                             "climbed monotonically with no sign of saturating across every "
+                             "region_cond run measured so far -- v23 through a v26/v27 fine-tune "
+                             "spanning 125k-157k steps on top of that. For an attribute WITHOUT a "
+                             "real region_mask (everything except age(39) unless "
+                             "--region_saliency_path is set), the input this weight reads is a "
+                             "CONSTANT (all-ones) -- see --controlnet_region_cond's help for why a "
+                             "constant input can only ever encode a per-attribute BIAS, never a "
+                             "location. As this weight grows, that bias's share of the pre-"
+                             "normalize content vector's energy grows with it, pulling the "
+                             "POST-normalize (unit-norm) injected pattern toward a spatially "
+                             "UNIFORM direction regardless of what the rest of the stack computed "
+                             "-- a mechanism-level account for the drift toward flat, grain-like "
+                             "texture and background bleed a long region_cond fine-tune showed "
+                             "visually (scripts/probe_noise_texture.py audits, v26/v27), compounded "
+                             "by control_skip_norm_r64/128/256 (the actual injected magnitude, not "
+                             "just this weight) ALSO climbing steadily over the same run, still "
+                             "below --controlnet_max_norm's cap. "
+                             "BLUNT INSTRUMENT: this weight is SHARED across every attribute using "
+                             "region_cond, including age(39)'s real BiSeNet-sourced signal -- this "
+                             "penalty cannot tell 'growing because it usefully reads a real mask' "
+                             "apart from 'growing because it is building a uniform bias off a "
+                             "constant input', it holds back both. Age's own region_cond use has "
+                             "not been unambiguously beneficial either (v23: FID improved but "
+                             "skin_hf measurably worsened), so this is not confidently known to "
+                             "sacrifice something proven to work -- but that is not certain either. "
+                             "Off by default (0): identical behavior to before this flag existed. "
+                             "Start small (~0.001, similar order to --clip_prompt_weight) and watch "
+                             "control_region_ch_norm_* -- it should stop climbing, not collapse to "
+                             "0 (a truly stuck 0 is the same 'ignored, not helped' reading "
+                             "region_channel_weight_norm's docstring already gives that log).")
     parser.add_argument('--controlnet_warmup_steps', type=int, default=0,
                         help='Hold the injection off for this many steps so the W+ path (flow + '
                              'Direction Bank) learns to edit on its own first. Training both from '
@@ -2356,6 +2394,10 @@ if __name__ == '__main__':
             if args.controlnet_region_cond:
                 print('** ControlNet region conditioning enabled: age(39) edits feed a BiSeNet '
                       'skin-region prior into AttributeControlEncoder\'s upsampling ladder.')
+            if args.controlnet_region_ch_reg_weight > 0:
+                print(f'** Region-channel weight regularizer enabled (weight='
+                      f'{args.controlnet_region_ch_reg_weight}) -- watch control_region_ch_norm_* '
+                      f'stop climbing, not collapse to 0.')
             if args.age_gate_region_loss_weight > 0:
                 print(f'** ControlNet gate-region loss enabled (weight='
                       f'{args.age_gate_region_loss_weight}) for age(39) edits')
@@ -2576,6 +2618,7 @@ if __name__ == '__main__':
             control_skip_norm = torch.zeros([], device=latent.device, dtype=latent.dtype)
             control_band_logs = {}
             loss_control_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            loss_region_ch_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
             controlnet_active = (control_encoder is not None
                                  and n_iter >= args.controlnet_warmup_steps)
             if controlnet_active:
@@ -2664,6 +2707,16 @@ if __name__ == '__main__':
                 # skips_reg_per_sample. Identical to the old value when there is
                 # one band, so --controlnet_reg_weight keeps its calibration.
                 loss_control_reg = skips_reg_per_sample(control_skips).mean()
+                # Region-channel weight regularizer: penalizes the CONV
+                # WEIGHT that reads region_mask, not the injected content
+                # (loss_control_reg above already covers that). See
+                # AttributeControlEncoder.region_channel_weight_penalty's
+                # docstring for why this weight specifically needs its own
+                # penalty -- control_region_ch_norm_* has climbed
+                # monotonically for >100k steps across every region_cond run
+                # measured so far with nothing holding it back.
+                if args.controlnet_region_ch_reg_weight > 0 and args.controlnet_region_cond:
+                    loss_region_ch_reg = control_encoder.region_channel_weight_penalty()
                 control_skips = clip_skips(control_skips, args.controlnet_max_norm)
                 control_skip_norm = skip_norm_per_sample.mean().detach()
                 # Per-band norms too: with several resolutions the combined
@@ -3333,6 +3386,7 @@ if __name__ == '__main__':
                 args.age_gate_region_loss_weight * gate_region_loss +\
                 args.age_skin_hf_loss_weight * skin_hf_loss +\
                 args.controlnet_reg_weight * loss_control_reg +\
+                args.controlnet_region_ch_reg_weight * loss_region_ch_reg +\
                 args.disc_realism_weight * disc_realism_loss
 
             attr_scale_grad_norm = _zero.detach().clone()
@@ -3453,6 +3507,7 @@ if __name__ == '__main__':
                 'final_delta_max_norm': torch.tensor(args.final_delta_max_norm),
                 'control_skip_norm': control_skip_norm,
                 'loss_control_reg': loss_control_reg.detach(),
+                'loss_region_ch_reg': loss_region_ch_reg.detach(),
                 'dir_bank_flow_delta_norm': dir_logs.get('dir_bank_flow_delta_norm', _zero.detach().clone()),
                 'dir_bank_dir_delta_norm': dir_logs.get('dir_bank_dir_delta_norm', _zero.detach().clone()),
                 'dir_bank_residual_norm': dir_logs.get('dir_bank_residual_norm', _zero.detach().clone()),
