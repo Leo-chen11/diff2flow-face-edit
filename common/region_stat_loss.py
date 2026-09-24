@@ -264,6 +264,60 @@ def directional_region_frequency_loss(src_img, edit_img, src_mask, edit_mask,
     return torch.relu(edit_e - target) / target.clamp(min=1e-8)
 
 
+def dilate_mask(mask, radius):
+    """Morphological dilation of a (B,1,H,W) mask by `radius` pixels.
+
+    Separable max-pool (a (1,k) pass then a (k,1) pass) -- exact for a square
+    structuring element, and O(k) per pixel instead of O(k^2): a 2D max-pool
+    with k=97 over a 512x512 mask would cost ~2.5e9 comparisons per image,
+    the separable version ~5e7. Unlike FaceParser.get_region_mask's
+    blur_sigma (a Gaussian SOFTENING, which lowers values just inside the
+    boundary as much as it raises them just outside), this actually GROWS
+    the region, which is what a "leave room around the face" margin needs.
+    """
+    if radius <= 0:
+        return mask
+    k = 2 * int(radius) + 1
+    mask = F.max_pool2d(mask, kernel_size=(1, k), stride=1, padding=(0, int(radius)))
+    return F.max_pool2d(mask, kernel_size=(k, 1), stride=1, padding=(int(radius), 0))
+
+
+def outside_region_preservation_loss(edit_img, ref_img, allowed):
+    """Mean squared pixel change OUTSIDE `allowed`, normalized by the outside
+    area -- the same formula training/train_sdflow.py's local_region_loss
+    has always used for eyeglasses, factored out so it can be applied to
+    attributes that have no tight region of their own.
+
+    WHY THIS EXISTS. DC-ControlNet, the method --controlnet_region_cond
+    adapts, is a GENERATION method: it composes an image from layout and
+    content conditions and has no notion of "leave everything else as it
+    was", because generation never needs one. Editing does. The adaptation
+    brought over the input side (WHERE the network may act, via the region
+    channel) but not an output side (WHERE it must NOT act), and a v26->v27
+    comparison inside one run isolates exactly that gap: Eyeglasses, the
+    only attribute with an output-side constraint (local_region_loss),
+    stayed flat (LPIPS 0.116->0.128, ID_ind 0.808->0.807), while Male and
+    Young, sharing the same trunk, the same all-ones/BiSeNet region channel
+    and the same schedule, degraded sharply (Male LeakCLIP 0.038->0.133,
+    Young LPIPS 0.199->0.319) -- and Young did so despite HAVING a real
+    input-side region (BiSeNet skin), so input-side region information does
+    not substitute for an output-side constraint.
+
+    For a global attribute there is no tight region to protect, but there
+    is still a well-defined one to leave alone: everything that is not the
+    face or hair (background, clothing, hat). That is the region this loss
+    is meant to be called with for Male/Young -- see
+    --background_preserve_loss_weight.
+
+    allowed: (B,1,H,W) in [0,1], 1 = may change. ref_img should be the
+    source RECONSTRUCTION, not the real photo, for the same inversion-gap
+    reason local_region_loss uses it.
+    """
+    outside = 1.0 - allowed
+    diff_sq = (edit_img - ref_img).pow(2)
+    return (diff_sq * outside).sum() / (outside.sum() * diff_sq.shape[1]).clamp(min=1e-6)
+
+
 def region_gate_concentration_loss(gate, region_mask, margin=0.15):
     """One-sided hinge pulling a ControlNet-style spatial gate to concentrate
     inside `region_mask`, instead of leaving it spatially flat.

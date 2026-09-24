@@ -20,9 +20,12 @@ from tqdm import tqdm
 from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
-from common.region_stat_loss import (directional_region_area_loss,
+from common.face_parser import FACE_CLASSES
+from common.region_stat_loss import (dilate_mask,
+                                     directional_region_area_loss,
                                      directional_region_frequency_loss,
                                      directional_region_saturation_loss,
+                                     outside_region_preservation_loss,
                                      region_gate_concentration_loss,
                                      region_hf_energy)
 from models.dataset import IndexedDataset, SDFlowDataset
@@ -419,6 +422,7 @@ def _mechanism_report(args):
         ('diffusion_dds', args.diffusion_guidance_weight),
         ('age_dds', args.age_diffusion_weight), ('clip_prompt', args.clip_prompt_weight),
         ('local_region', args.local_region_loss_weight),
+        ('background_preserve', args.background_preserve_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_color_add', args.hair_color_add_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
@@ -871,6 +875,24 @@ if __name__ == '__main__':
     parser.add_argument("--batch", type=int, default=8, help="batch size")
     parser.add_argument("--num_workers", type=int, default=16, help="number of workers")
     parser.add_argument("--epochs", type=int, default=10, help="number of epochs")
+    parser.add_argument('--max_steps', type=int, default=None,
+                        help='Length of THIS run in iterations (the same unit as --resume_step '
+                             'and checkpoint step numbers), counted from --resume_step. When set: '
+                             'training stops after exactly this many iterations, a checkpoint is '
+                             'always written at the final step, and the cosine LR schedule spans '
+                             'exactly this run -- it starts at --lr and anneals to 1e-6 by the '
+                             'last step, overriding --epochs. '
+                             'WHY: without it, T_max = epochs * len(train_loader) (~10 epochs, '
+                             'well over 100k iterations), but every run in this project has been '
+                             'stopped by hand after 30-40k, i.e. still in the first stretch of the '
+                             'cosine, and every --resume_dir continuation rebuilt the scheduler '
+                             'from the top. The v23->v24->v26->v27 chain therefore trained at '
+                             'close to peak LR the entire time and was never annealed, so none of '
+                             'its checkpoints is a converged one. With this flag each run is a '
+                             'complete warm-restart cycle whose final checkpoint is at low LR. '
+                             'Pair with --resume_optimizer to keep Adam\'s moment estimates across '
+                             'the restart instead of re-estimating them from scratch. '
+                             'Default (unset): identical behavior to before this flag existed.')
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument('--meta_lr_mult', type=float, default=1.0,
                         help='LR multiplier for magnitude meta-params (attr_scales, '
@@ -959,6 +981,44 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
+    parser.add_argument('--background_preserve_loss_weight', type=float, default=0.0,
+                        help='Output-side preservation for attributes that have no tight region '
+                             'of their own (by default every edited attribute NOT in '
+                             'LOCAL_REGION_CLASSES -- Male(20) and Young(39) here): pixels outside '
+                             'the face+hair region (BiSeNet FACE_CLASSES: background, clothing and '
+                             'hat excluded) must match the source reconstruction. Same formula as '
+                             '--local_region_loss_weight, generalized from "outside the eye region" '
+                             'to "outside the face". See common/region_stat_loss.py\'s '
+                             'outside_region_preservation_loss docstring for the evidence. '
+                             'WHY: --controlnet_region_cond adapts DC-ControlNet, which is a '
+                             'GENERATION method and has no "leave the rest alone" constraint; the '
+                             'adaptation added input-side region information but nothing on the '
+                             'output side. Within one v26->v27 continuation, Eyeglasses (the only '
+                             'attribute with an output-side constraint) stayed flat while Male/Young '
+                             'degraded sharply in LPIPS/LeakCLIP/FID at matched accuracy -- and '
+                             'Young degraded despite having a real input-side region. '
+                             'The allowed region is the UNION of the face+hair masks of the source '
+                             'and of the edited image, then dilated by --background_preserve_dilate. '
+                             'The union is what keeps this from fighting --hair_extent_loss_weight: '
+                             'a Male-rm edit that grows hair turns background pixels into hair, '
+                             'and those are classified as hair in the EDITED image, so they are '
+                             'allowed. Known loophole, stated plainly: the model could escape the '
+                             'penalty by making background look like hair; --hair_extent_max_frac '
+                             'caps how much hair it can claim and --disc_realism_weight pushes back '
+                             'on unphotographic hair, but check a preview grid. '
+                             'Costs one extra BiSeNet forward (no backward) on the edited image per '
+                             'firing step. Off by default (0): identical behavior to before this '
+                             'flag existed.')
+    parser.add_argument('--background_preserve_attrs', nargs='*', type=int, default=None,
+                        help='Absolute attribute ids --background_preserve_loss_weight applies to. '
+                             'Default (unset): every attribute in --attribute_index that is NOT in '
+                             'LOCAL_REGION_CLASSES (those already have the stricter '
+                             '--local_region_loss_weight).')
+    parser.add_argument('--background_preserve_dilate', type=int, default=16,
+                        help='Dilation radius in pixels at --img_size for the allowed face+hair '
+                             'region (a true dilation via max-pool, not a blur). Leaves a margin so '
+                             'the loss does not fight legitimate changes right at the face '
+                             'boundary (jawline, hairline).')
     parser.add_argument('--hair_gray_loss_weight', type=float, default=0.0,
                         help='Age(39) REMOVAL-direction only (src already Young -> aging edit): '
                              'push the HAIR region (BiSeNet class 17, see HAIR_REGION_CLASS) '
@@ -2212,8 +2272,15 @@ if __name__ == '__main__':
               f'({args.controlnet_lr_mult}x base lr)')
 
     optimizer = optim.Adam(param_groups)
+    # --max_steps: the cosine spans exactly this run, so its last checkpoint
+    # is annealed. Otherwise the old behavior -- T_max over --epochs, which no
+    # run in this project has ever reached (see --max_steps help).
+    if args.max_steps is not None:
+        _sched_T = max(1, args.max_steps // args.grad_accum_steps)
+    else:
+        _sched_T = args.epochs * len(train_loader) // args.grad_accum_steps
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs * len(train_loader) // args.grad_accum_steps, eta_min=1e-6
+        optimizer, T_max=_sched_T, eta_min=1e-6
     )
 
     ema_pairs = []       # [(live_module, ema_module, save_name), ...]
@@ -2282,6 +2349,13 @@ if __name__ == '__main__':
                 raise FileNotFoundError(f'[Resume] missing optimizer checkpoint: {opt_path}')
             optimizer.load_state_dict(torch.load(opt_path, map_location='cpu'))
             print(f'[Resume] loaded optimizer from {opt_path}')
+            if args.max_steps is not None:
+                # load_state_dict also restored each group's saved 'lr' (the
+                # previous run's mid-cosine value). Under --max_steps this run
+                # is its own cycle starting at --lr, so put that back; the
+                # scheduler was built before this load and holds base_lrs.
+                for _g, _base in zip(optimizer.param_groups, scheduler.base_lrs):
+                    _g['lr'] = _base
         else:
             print('[Resume] optimizer state not loaded; using fresh optimizer for controlled fine-tuning.')
 
@@ -2387,10 +2461,19 @@ if __name__ == '__main__':
     if args.local_region_loss_weight > 0 or args.dds_face_mask \
             or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0 \
             or args.hair_extent_loss_weight > 0 or args.age_gate_region_loss_weight > 0 \
-            or args.age_skin_hf_loss_weight > 0 or args.controlnet_region_cond:
+            or args.age_skin_hf_loss_weight > 0 or args.controlnet_region_cond \
+            or args.background_preserve_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            if args.background_preserve_loss_weight > 0:
+                _bp = (args.background_preserve_attrs if args.background_preserve_attrs is not None
+                       else [a for a in args.attribute_index if a not in LOCAL_REGION_CLASSES])
+                print(f'** Background-preservation loss enabled (weight='
+                      f'{args.background_preserve_loss_weight}, dilate='
+                      f'{args.background_preserve_dilate}px) for attrs {_bp}: pixels outside '
+                      f'face+hair (union of source and edited masks) must match the source '
+                      f'reconstruction.')
             if args.controlnet_region_cond:
                 print('** ControlNet region conditioning enabled: age(39) edits feed a BiSeNet '
                       'skin-region prior into AttributeControlEncoder\'s upsampling ladder.')
@@ -2518,13 +2601,28 @@ if __name__ == '__main__':
         )
         print(f'** fixed preview indices: {fixed_preview_batch[-1]}')
 
-    for epoch in range(args.epochs):
+    # --max_steps overrides --epochs: enough epochs to cover it, and the loop
+    # below stops at exactly max_steps (inclusive, so n_iter reaches
+    # start_step + max_steps and that step is checkpointed).
+    if args.max_steps is not None:
+        _n_epochs = -(-(args.max_steps + 1) // len(train_loader))
+        print(f'** --max_steps {args.max_steps}: run ends at step {start_step + args.max_steps}; '
+              f'cosine LR {args.lr:g} -> 1e-6 over this run.')
+    else:
+        _n_epochs = args.epochs
+    _stop_training = False
+    for epoch in range(_n_epochs):
+        if _stop_training:
+            break
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         for i, datas in tqdm(enumerate(train_loader),total=len(train_loader)):
             local_step = epoch*len(train_loader)+i
             n_iter = start_step + local_step
-            
+            if args.max_steps is not None and local_step > args.max_steps:
+                _stop_training = True
+                break
+
             # sample_idx: index into train_dataset (see IndexedDataset in
             # models/dataset.py), not moved to cuda -- it's only used as a
             # CPU-side key into train_dataset.image_list for
@@ -2802,6 +2900,7 @@ if __name__ == '__main__':
             #     (--local_region_add_blur) as a geometric prior for where a
             #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            background_preserve_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_color_add_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
@@ -2844,6 +2943,34 @@ if __name__ == '__main__':
                             )
                     if _terms:
                         local_region_loss = torch.stack(_terms).mean()
+
+                # ── Background preservation (attributes with no tight region) ─
+                # See --background_preserve_loss_weight and common/region_stat_
+                # loss.py's outside_region_preservation_loss. The output-side
+                # half of the DC-ControlNet adaptation: region_cond says where
+                # the network MAY act; nothing said where it must NOT, except
+                # local_region_loss above, which only ever covered eyeglasses.
+                if args.background_preserve_loss_weight > 0:
+                    _bp_attrs = (set(args.background_preserve_attrs)
+                                 if args.background_preserve_attrs is not None
+                                 else {a for a in args.attribute_index
+                                       if a not in LOCAL_REGION_CLASSES})
+                    _bp_sel = torch.tensor([a in _bp_attrs for a in _mid_abs],
+                                           device=latent.device)
+                    if _bp_sel.any():
+                        with torch.no_grad():
+                            # Union of source and EDITED face+hair: a Male-rm
+                            # edit that grows hair turns background into hair,
+                            # and those pixels must stay allowed or this loss
+                            # fights --hair_extent_loss_weight directly.
+                            _src_face = face_parser.get_region_mask(
+                                src_recon[_bp_sel], FACE_CLASSES, blur_sigma=0)
+                            _edit_face = face_parser.get_region_mask(
+                                new_face_tensors[_bp_sel].detach(), FACE_CLASSES, blur_sigma=0)
+                            _allowed = dilate_mask(torch.maximum(_src_face, _edit_face),
+                                                   args.background_preserve_dilate)
+                        background_preserve_loss = outside_region_preservation_loss(
+                            new_face_tensors[_bp_sel], src_recon[_bp_sel], _allowed)
 
                 # ── Hair-graying (age/39 removal direction only) ────────────
                 # See --hair_gray_loss_weight help for the failure-audit evidence
@@ -3380,6 +3507,7 @@ if __name__ == '__main__':
                  else args.diffusion_guidance_weight) * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
+                args.background_preserve_loss_weight * background_preserve_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
                 args.hair_color_add_loss_weight * hair_color_add_loss +\
                 args.hair_extent_loss_weight * hair_extent_loss +\
@@ -3405,7 +3533,8 @@ if __name__ == '__main__':
                         update_ema(ema_module, live_module, args.ema_decay)
             
             
-            if n_iter % args.save_freq==0:
+            _final_step = args.max_steps is not None and local_step == args.max_steps
+            if n_iter % args.save_freq==0 or _final_step:
                 if fixed_preview_batch is not None:
                     test_img, test_latent, test_pred, _ = fixed_preview_batch
                 else:
@@ -3526,6 +3655,7 @@ if __name__ == '__main__':
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
+                'loss_background_preserve': background_preserve_loss,
                 'loss_hair_gray':     hair_gray_loss,
                 'loss_hair_color_add': hair_color_add_loss,
                 'loss_hair_extent':   hair_extent_loss,
