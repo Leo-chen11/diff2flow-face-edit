@@ -403,6 +403,10 @@ def _mechanism_report(args):
             ('  warmup_steps', f'{args.controlnet_warmup_steps}',
              'injection is exactly 0 until this step' if args.controlnet_warmup_steps else None),
             ('  disable_attrs', str(getattr(args, 'controlnet_disable_attrs', None) or 'none'), None),
+            ('  region_cond (layout)', onoff(args.controlnet_region_cond), None),
+            ('  content_cond (content)', args.content_bank_path or 'off',
+             ('no content loss -- the encoder has no reason to read the reference'
+              if args.content_bank_path and args.content_loss_weight <= 0 else None)),
         ]
 
     realism = [
@@ -431,6 +435,7 @@ def _mechanism_report(args):
         ('controlnet_reg', args.controlnet_reg_weight),
         ('controlnet_region_ch_reg', args.controlnet_region_ch_reg_weight),
         ('disc_realism', args.disc_realism_weight),
+        ('content', args.content_loss_weight),
     ]
 
     shape = [
@@ -628,14 +633,23 @@ def generate_test_image(flow_model:torch.nn.Module,
                         layer_mask=None,
                         direction_bank=None,
                         preview_scale=0.6,
-                        args=None):
+                        args=None,
+                        control_encoder=None,
+                        face_parser=None,
+                        content_ctx=None):
+    """control_encoder: pass it (once past --controlnet_warmup_steps) so the
+    preview shows the model's REAL output. Before this argument existed the
+    preview never ran the ControlNet injection at all: every wandb 'test'
+    image of a --use_controlnet_injection run showed the W+ edit alone, not
+    what training optimised or what evaluate_sdflow.py renders. Region mask
+    and content follow the same rules as training / edit_single_attribute."""
     batchsize = ori_img.shape[0]
     
     #ori_img = F.interpolate(ori_img,(1024,1024))
     #img_ori = torchvision.utils.make_grid(ori_img,nrow=1,normalize=True,value_range=(-1,1))
     #img_recon = stylegan2_model().clamp(-1,1)
-    img_recon_batch = stylegan2_model([origin_latent.squeeze(1)],input_is_latent=True,randomize_noise=False)[0].clamp(-1, 1)
-    img_recon_batch = F.interpolate(img_recon_batch, ori_img.shape[2:])
+    img_recon_full = stylegan2_model([origin_latent.squeeze(1)],input_is_latent=True,randomize_noise=False)[0].clamp(-1, 1)
+    img_recon_batch = F.interpolate(img_recon_full, ori_img.shape[2:])
     img_recon = torchvision.utils.make_grid(img_recon_batch,nrow=1,normalize=True,value_range=(-1,1))
 
     # images = [img,ori, img_recon]
@@ -666,8 +680,29 @@ def generate_test_image(flow_model:torch.nn.Module,
         else:
             new_latents = new_latents_raw
 
+        skips = None
+        if control_encoder is not None and direction_bank is not None:
+            _abs = args.attribute_index[i]
+            attr_idx = torch.full((batchsize,), i, device=origin_latent.device, dtype=torch.long)
+            attr_delta = new_attr_cond - test_attr_cond
+            region_mask = None
+            if getattr(control_encoder, 'region_cond', False):
+                region_mask = torch.ones(batchsize, 1, *img_recon_full.shape[-2:],
+                                         device=origin_latent.device, dtype=origin_latent.dtype)
+                if face_parser is not None and _abs == 39:
+                    region_mask = face_parser.get_region_mask(
+                        img_recon_full, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
+            content_bias = (content_ctx.bias(_abs, test_attr_cond, src > 0.5)
+                            if content_ctx is not None else None)
+            skips = control_encoder(attr_delta, attr_idx, is_rm=(src > 0.5),
+                                    latent=source_latent, region_mask=region_mask,
+                                    content_bias=content_bias)
+            skips = clip_skips(skips, args.controlnet_max_norm)
+
         #tmp = stylegan2_model(new_latents).clamp(-1,1)
-        tmp = stylegan2_model([new_latents],input_is_latent=True,randomize_noise=False)[0].clamp(-1, 1)
+        tmp = stylegan2_model([new_latents], skips=skips,
+                              embed_res=(args.controlnet_embed_res if args is not None else 64),
+                              input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         tmp = F.interpolate(tmp, ori_img.shape[2:])
         tmp = torchvision.utils.make_grid(tmp,nrow=1,normalize=True,value_range=(-1,1))
         images.append(tmp)
@@ -1767,6 +1802,40 @@ if __name__ == '__main__':
                              "for that channel (see this flag's discussion in the session history), "
                              "not a strict no-op -- treat a switch as a fresh experimental condition, "
                              "not a free continuation.")
+    parser.add_argument('--content_bank_path', type=str, default=None,
+                        help="CONTENT condition (the half of DC-ControlNet this project never "
+                             "built; see models/content_cond.py). Path to a reference bank from "
+                             "scripts/precompute_content_bank.py --dump. For each Young(39) edit, a "
+                             "random REAL face already in the target state (old for an aging edit, "
+                             "young for a rejuvenating one), of the SAME gender as the source and "
+                             "never the source itself, is described by VGG skin/hair texture "
+                             "statistics. ContentEncoder turns that into a bias on "
+                             "AttributeControlEncoder's trunk. Other attributes get no content. "
+                             "Requires --use_controlnet_injection (the non-legacy encoder). "
+                             "Resume-safe: control_encoder's own checkpoint is unchanged, and "
+                             "content_encoder starts zero-init (a no-op at step 0) when the resumed "
+                             "run has none. Default (unset): off, identical to before.")
+    parser.add_argument('--content_loss_weight', type=float, default=0.0,
+                        help="Weight of the content-matching loss: the edited skin/hair texture "
+                             "statistics must move toward the reference's, by the edit strength "
+                             "(target = src + clamp(train_scale,0,1) * (ref - src), smooth-L1 in "
+                             "z-scored stat space). WITHOUT THIS THE CONTENT INPUT IS IGNORED -- no "
+                             "other loss gets smaller when the output resembles another person, so "
+                             "the encoder has no reason to read it. Needs --content_bank_path. "
+                             "Watch loss_content fall and content_sensitivity rise above ~0.05 "
+                             "(below that the encoder is not using the reference).")
+    parser.add_argument('--content_cond_dropout', type=float, default=0.2,
+                        help="Probability a Young edit gets NO content (and no content loss) this "
+                             "step, so the model still edits sensibly without a reference -- same "
+                             "idea as --id_cond_dropout.")
+    parser.add_argument('--target_direction_from_cond', action='store_true', default=False,
+                        help="Pick the target-attribute loss's direction (add vs rm, i.e. which "
+                             "SOFT_TARGET_TABLE end it pulls toward) from the conditioner's source "
+                             "score -- the same score that set the FLOW's direction -- instead of "
+                             "the teacher's score on the real photo. When the two disagree (near "
+                             "0.5, logged as dir_disagree_frac) the default asks the output to move "
+                             "opposite to the edit the flow was told to make. Identical whenever "
+                             "they agree. Default off (old behaviour).")
     parser.add_argument('--target_loss', default='mse', choices=['mse', 'hinge'],
                         help="Shape of the target-attribute loss. 'mse' squares the distance to "
                              "soft_target, which keeps pulling on samples that already crossed the "
@@ -2353,6 +2422,47 @@ if __name__ == '__main__':
               + (f'; held off until step {_warm} so the W+ path matures first'
                  if _warm > 0 else '; active from step 0'))
 
+    # ── Content condition (--content_bank_path; models/content_cond.py) ──
+    # content_encoder is its own module with its own checkpoint
+    # (content_encoder-XXXXXXX) and its own optimizer param group, added AFTER
+    # any --resume_optimizer load (see _add_content_param_group below), so an
+    # optimizer saved without it still loads.
+    content_bank = None
+    content_encoder = None
+    content_tex = None
+    content_gen = torch.Generator().manual_seed(1234)
+    content_local_idx = None
+    if args.content_bank_path:
+        from models.content_cond import (ContentBank, ContentContext, ContentEncoder,
+                                         RegionTextureStats, content_match_loss)
+        from models.control_encoder import AttributeControlEncoder as _ACE
+        if not isinstance(control_encoder, _ACE):
+            raise ValueError('--content_bank_path needs --use_controlnet_injection with the '
+                             'multi-resolution AttributeControlEncoder (not the legacy '
+                             'single-resolution one).')
+        if 39 not in args.attribute_index:
+            raise ValueError('--content_bank_path is wired for Young(39) only; add 39 to '
+                             '--attribute_index.')
+        content_local_idx = args.attribute_index.index(39)
+        content_bank = ContentBank(args.content_bank_path, device='cuda')
+        _bcfg = content_bank.config
+        content_encoder = ContentEncoder(in_dim=content_bank.dim,
+                                         out_dim=control_encoder.fc[0].out_features).cuda()
+        trainable_params += list(content_encoder.parameters())
+        if args.content_loss_weight > 0:
+            content_tex = RegionTextureStats(res=int(_bcfg.get('res', 256)),
+                                             min_frac=float(_bcfg.get('min_frac', 0.01)),
+                                             erode=int(_bcfg.get('erode', 4))).cuda()
+            if content_tex.dim != content_bank.dim:
+                raise ValueError(f'content bank dim {content_bank.dim} != texture stats dim '
+                                 f'{content_tex.dim}; rebuild the bank with this code.')
+        print(f'** Content condition enabled for Young(39): bank {args.content_bank_path} '
+              f'[{content_bank.summary()}], stats at {_bcfg.get("res", 256)}px, '
+              f'loss weight {args.content_loss_weight:g}, dropout {args.content_cond_dropout:g}')
+        if args.content_loss_weight <= 0:
+            print('[WARN] --content_loss_weight is 0: nothing rewards the encoder for reading '
+                  'the reference, so content_encoder will most likely stay at its zero init.')
+
     # Magnitude-controlling meta-parameters (edit-strength center, direction-bank
     # residual trust, reg_loss layer-group weights). The old hardcoded 0.1x lr,
     # combined with the softplus/exp reparam shrinking gradients near small
@@ -2369,10 +2479,16 @@ if __name__ == '__main__':
     # branch independently of the W+ path it runs alongside.
     control_params = list(control_encoder.parameters()) if control_encoder is not None else []
     control_ids = {id(p) for p in control_params}
+    # content_encoder gets its own group later (_add_content_param_group); it
+    # must not also land in the base group (PyTorch rejects a parameter in two
+    # groups). It stays in trainable_params for grad clipping.
+    content_ids = ({id(p) for p in content_encoder.parameters()}
+                   if content_encoder is not None else set())
 
     param_groups = [
         {'params': [p for p in trainable_params
-                    if id(p) not in low_lr_ids and id(p) not in control_ids],
+                    if id(p) not in low_lr_ids and id(p) not in control_ids
+                    and id(p) not in content_ids],
          'lr': args.lr},
         {'params': low_lr_params, 'lr': args.lr * args.meta_lr_mult, 'weight_decay': 0.0},
     ]
@@ -2393,6 +2509,20 @@ if __name__ == '__main__':
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=_sched_T, eta_min=1e-6
     )
+
+    # content_encoder's param group is appended separately (and registered with
+    # the scheduler by hand) so --resume_optimizer works both from a checkpoint
+    # saved WITHOUT content (group added after loading) and from one saved WITH
+    # it (group added before loading, so the group counts match).
+    _content_group_added = False
+
+    def _add_content_param_group():
+        _lr_c = args.lr * args.controlnet_lr_mult
+        optimizer.add_param_group({'params': list(content_encoder.parameters()),
+                                   'lr': _lr_c, 'initial_lr': _lr_c})
+        scheduler.base_lrs.append(_lr_c)
+        if hasattr(scheduler, '_last_lr') and scheduler._last_lr is not None:
+            scheduler._last_lr = list(scheduler._last_lr) + [_lr_c]
 
     ema_pairs = []       # [(live_module, ema_module, save_name), ...]
     ema_modules_for_save = {}
@@ -2416,6 +2546,10 @@ if __name__ == '__main__':
             control_encoder_ema = make_ema_copy(control_encoder)
             ema_pairs.append((control_encoder, control_encoder_ema, 'control_encoder'))
             ema_modules_for_save['control_encoder'] = control_encoder_ema
+        if content_encoder is not None:
+            content_encoder_ema = make_ema_copy(content_encoder)
+            ema_pairs.append((content_encoder, content_encoder_ema, 'content_encoder'))
+            ema_modules_for_save['content_encoder'] = content_encoder_ema
         print(f'** EMA enabled (decay={args.ema_decay}); shadow weights saved to '
               f'save_models_ema/, point --ckpt_dir there at eval time to use them.')
 
@@ -2454,11 +2588,22 @@ if __name__ == '__main__':
                 load_module_checkpoint(control_encoder, resume_save_dir, 'control_encoder', start_step, strict=False)
             except FileNotFoundError:
                 print('[Resume] control_encoder checkpoint not found; starting from zero-init (no-op).')
+        if content_encoder is not None:
+            try:
+                load_module_checkpoint(content_encoder, resume_save_dir, 'content_encoder', start_step, strict=True)
+            except FileNotFoundError:
+                print('[Resume] content_encoder checkpoint not found; starting from zero-init '
+                      '(no-op at step 0 -- expected when adding content to an older run).')
         if args.resume_optimizer:
             opt_path = os.path.join(resume_save_dir, 'optimizer-{}'.format(str(start_step).zfill(7)))
             if not os.path.exists(opt_path):
                 raise FileNotFoundError(f'[Resume] missing optimizer checkpoint: {opt_path}')
-            optimizer.load_state_dict(torch.load(opt_path, map_location='cpu'))
+            _opt_state = torch.load(opt_path, map_location='cpu')
+            if (content_encoder is not None
+                    and len(_opt_state['param_groups']) == len(optimizer.param_groups) + 1):
+                _add_content_param_group()     # saved by a content run: add first
+                _content_group_added = True
+            optimizer.load_state_dict(_opt_state)
             print(f'[Resume] loaded optimizer from {opt_path}')
             if args.max_steps is not None:
                 # load_state_dict also restored each group's saved 'lr' (the
@@ -2483,6 +2628,10 @@ if __name__ == '__main__':
                     ema_module.load_state_dict(live_module.state_dict())
                     print(f'[Resume] {name}_ema checkpoint not found; re-synced EMA to resumed live weights.')
 
+    if content_encoder is not None and not _content_group_added:
+        _add_content_param_group()
+        _content_group_added = True
+
     log_modules = [prior, conditioner, attr_scales, reg_loss_weights, optimizer]
     if args.velocity_field == 'original':
         log_modules.insert(2, layer_mask)
@@ -2490,6 +2639,8 @@ if __name__ == '__main__':
         log_modules.insert(-1, direction_bank)
     if control_encoder is not None:
         log_modules.insert(-1, control_encoder)
+    if content_encoder is not None:
+        log_modules.insert(-1, content_encoder)
 
     # Best-checkpoint tracking. The metric is the AccCeleb monitor, smoothed --
     # the raw value scores one small batch and lands on 0/0.5/1, so selecting on
@@ -2573,7 +2724,7 @@ if __name__ == '__main__':
             or args.hair_gray_loss_weight > 0 or args.hair_color_add_loss_weight > 0 \
             or args.hair_extent_loss_weight > 0 or args.age_gate_region_loss_weight > 0 \
             or args.age_skin_hf_loss_weight > 0 or args.controlnet_region_cond \
-            or args.background_preserve_loss_weight > 0:
+            or args.background_preserve_loss_weight > 0 or args.content_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -2841,6 +2992,35 @@ if __name__ == '__main__':
             loss_region_ch_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
             controlnet_active = (control_encoder is not None
                                  and n_iter >= args.controlnet_warmup_steps)
+            # --content_bank_path state for this step (see models/content_cond.py).
+            # _content_present: which samples got a reference (Young edits not
+            # hit by --content_cond_dropout); the content loss below only runs
+            # on those.
+            content_bias = None
+            _content_present = None
+            _ref_z = None
+            _ref_valid = None
+            content_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            content_logs = {}
+            if controlnet_active and content_encoder is not None:
+                _is_content = mid_idx == content_local_idx
+                if _is_content.any():
+                    _keep = torch.rand(latent.size(0), device=latent.device) >= args.content_cond_dropout
+                    _content_present = _is_content & _keep
+                    # Same gender signal edit_single_attribute uses at eval
+                    # (the conditioner's Male score), so references are chosen
+                    # the same way in both.
+                    _male = ((attr_cond[:, gender_local_idx] >= 0.5).detach()
+                             if gender_local_idx is not None else None)
+                    # Young source (score > 0.5) -> rm edit -> OLD reference.
+                    _want_old = (src_attr_flow > 0.5).detach()
+                    _excl = [train_dataset.image_list[int(k)] for k in sample_idx]
+                    _rows = content_bank.sample(_want_old, _male, exclude_files=_excl,
+                                                generator=content_gen)
+                    _ref_stats, _ref_valid = content_bank.lookup(_rows, latent.device)
+                    _ref_z = content_bank.zscore(_ref_stats, _ref_valid)
+                    content_bias = content_encoder(_ref_z, _content_present.float())
+                    content_logs['content_present_frac'] = _content_present.float().sum() / _is_content.float().sum()
             if controlnet_active:
                 # ControlNet-style injection: an additive correction at an
                 # INTERMEDIATE StyleGAN2 feature map (embed_res, default
@@ -2909,7 +3089,36 @@ if __name__ == '__main__':
                                     mode='bilinear', align_corners=False)
                 control_skips = control_encoder(attr_delta, mid_idx,
                                                 is_rm=(src_attr_flow > 0.5),
-                                                latent=latent, region_mask=region_mask)
+                                                latent=latent, region_mask=region_mask,
+                                                content_bias=content_bias)
+
+                # content_sensitivity: does the encoder READ the reference?
+                # Same inputs, a different reference: relative change of the
+                # injected maps. ~0 means content is ignored (the zero-init
+                # layer never moved, or the loss is not pulling). No
+                # gradient; last_gate/last_gate_mean are restored because
+                # --age_gate_region_loss_weight reads the grad-carrying gate
+                # from the main forward call above.
+                if _content_present is not None and _content_present.any():
+                    with torch.no_grad():
+                        _saved_gate = control_encoder.last_gate
+                        _saved_gate_mean = control_encoder.last_gate_mean
+                        _rows_alt = content_bank.sample(_want_old, _male, exclude_files=_excl,
+                                                        generator=content_gen)
+                        _alt_stats, _alt_valid = content_bank.lookup(_rows_alt, latent.device)
+                        _alt_bias = content_encoder(content_bank.zscore(_alt_stats, _alt_valid),
+                                                    _content_present.float())
+                        _alt_skips = control_encoder(attr_delta, mid_idx,
+                                                     is_rm=(src_attr_flow > 0.5),
+                                                     latent=latent, region_mask=region_mask,
+                                                     content_bias=_alt_bias)
+                        control_encoder.last_gate = _saved_gate
+                        control_encoder.last_gate_mean = _saved_gate_mean
+                        _p = _content_present
+                        _num = sum((control_skips[_r][_p] - _alt_skips[_r][_p]).pow(2).sum()
+                                   for _r in control_skips)
+                        _den = sum(control_skips[_r][_p].pow(2).sum() for _r in control_skips)
+                        content_logs['content_sensitivity'] = (_num / _den.clamp(min=1e-12)).sqrt()
 
                 # control_skips has no OTHER loss term constraining its
                 # magnitude -- it's only shaped indirectly through downstream
@@ -3093,6 +3302,41 @@ if __name__ == '__main__':
                                                    args.background_preserve_dilate)
                         background_preserve_loss = outside_region_preservation_loss(
                             new_face_tensors[_bp_sel], src_recon[_bp_sel], _allowed)
+
+                # ── Content matching (--content_bank_path) ──────────────────
+                # Edited skin/hair texture statistics must move toward the
+                # reference's by the edit strength: target = src + s*(ref - src)
+                # with s = this sample's train_scale, clamped to [0, 1], so a
+                # weaker edit asks for a partial move, consistent with how the
+                # attribute target itself is interpolated (soft_flow_target).
+                # Masks come from each image's OWN parse (the edit may grow or
+                # shrink hair) and carry no gradient; the gradient reaches the
+                # generator through the edited pixels only.
+                if (content_tex is not None and _content_present is not None
+                        and _content_present.any()):
+                    _cs = _content_present
+                    _src_masks = content_tex.region_masks(face_parser, src_recon[_cs])
+                    _edit_masks = content_tex.region_masks(face_parser, new_face_tensors[_cs].detach())
+                    with torch.no_grad():
+                        _src_st, _src_va = content_tex.stats(src_recon[_cs], _src_masks)
+                        _src_z = content_bank.zscore(_src_st, _src_va)
+                    _edit_st, _edit_va = content_tex.stats(new_face_tensors[_cs], _edit_masks)
+                    _edit_z = content_bank.zscore(_edit_st, _edit_va)
+                    _s = train_scale[_cs].detach().clamp(0, 1).view(-1, 1).to(_src_z.dtype)
+                    _tgt_z = _src_z + _s * (_ref_z[_cs] - _src_z)
+                    _tgt_va = _src_va & _ref_valid[_cs]
+                    content_loss, _n_cmp = content_match_loss(
+                        _edit_z, _edit_va, _tgt_z, _tgt_va, content_bank.region_dim)
+                    # How far from the reference before vs after the edit
+                    # (mean |z| gap over compared regions). The edit should
+                    # close part of the gap: content_gap_edit < content_gap_src.
+                    if _n_cmp > 0:
+                        with torch.no_grad():
+                            _m = (_edit_va & _tgt_va).repeat_interleave(
+                                content_bank.region_dim, dim=1).to(_src_z.dtype)
+                            _den = _m.sum().clamp(min=1.0)
+                            content_logs['content_gap_src'] = ((_src_z - _ref_z[_cs]).abs() * _m).sum() / _den
+                            content_logs['content_gap_edit'] = ((_edit_z.detach() - _ref_z[_cs]).abs() * _m).sum() / _den
 
                 # ── Hair-graying (age/39 removal direction only) ────────────
                 # See --hair_gray_loss_weight help for the failure-audit evidence
@@ -3327,7 +3571,20 @@ if __name__ == '__main__':
             # sample the same way when it reads a weight out (clip-prompt loss,
             # below) and when it writes an accuracy back in (monitor block).
             edit_is_rm = (src_attr > 0.5).detach()
-            hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
+            # The FLOW was told which way to go by the conditioner
+            # (src_attr_flow, above); this loss picks its direction from the
+            # teacher's score on the real photo. Near 0.5 they can disagree,
+            # and then the flow is asked to go one way while this loss pulls
+            # the output the other: contradictory gradient on exactly the
+            # ambiguous samples. dir_disagree_frac measures how often.
+            # --target_direction_from_cond makes the loss follow the flow's
+            # direction (identical whenever the two agree).
+            dir_disagree = ((src_attr > 0.5) != (src_attr_flow > 0.5)).float()
+            if args.target_direction_from_cond:
+                hard_teacher_target = compute_soft_targets(src_attr_flow.detach(), mid_idx,
+                                                           args.attribute_index)
+            else:
+                hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
             soft_target = src_attr + train_scale * (hard_teacher_target - src_attr)
             soft_target_for_loss = soft_target.detach()
             target_probs[batch_indices, mid_idx] = soft_target_for_loss
@@ -3637,7 +3894,8 @@ if __name__ == '__main__':
                 args.age_skin_hf_loss_weight * skin_hf_loss +\
                 args.controlnet_reg_weight * loss_control_reg +\
                 args.controlnet_region_ch_reg_weight * loss_region_ch_reg +\
-                args.disc_realism_weight * disc_realism_loss
+                args.disc_realism_weight * disc_realism_loss +\
+                args.content_loss_weight * content_loss
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -3679,6 +3937,13 @@ if __name__ == '__main__':
                         test_mid_latent, layer_mask=layer_mask, direction_bank=direction_bank,
                         preview_scale=args.preview_scale,
                         args=args,
+                        control_encoder=(control_encoder
+                                         if control_encoder is not None
+                                         and n_iter >= args.controlnet_warmup_steps else None),
+                        face_parser=face_parser,
+                        content_ctx=(ContentContext(content_bank, content_encoder,
+                                                    gender_local_idx, seed=0)
+                                     if content_encoder is not None else None),
                     )
                     logger.save_image(grid_img,n_iter,'test')
                 logger.checkpoints(n_iter)
@@ -3790,6 +4055,8 @@ if __name__ == '__main__':
                 'skin_hf_src_mean':   skin_hf_src_mean,
                 'skin_hf_edit_mean':  skin_hf_edit_mean,
                 'loss_disc_realism':  disc_realism_loss,
+                'loss_content':       content_loss,
+                'dir_disagree_frac':  dir_disagree.mean(),
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
@@ -3801,17 +4068,22 @@ if __name__ == '__main__':
                 'clip_prompt_glasses_fraction': clip_logs.get('clip_prompt_glasses_fraction', latent.new_tensor(0.0)),
             }
             _log_dict.update(control_band_logs)
+            _log_dict.update(content_logs)
             # Sampler check, from the same dataset preds the sampler pools on:
             # with the sampler aligned, sampler_src_high_frac is exactly 0.5
             # on every step (half low, half high for the attribute being
             # edited); anything else means the batch was balanced for another
-            # attribute. sampler_src_male_frac on Young steps should sit at
-            # 0.5 under --age_gender_balance.
+            # attribute. sampler_src_male_frac_young is logged on Young steps
+            # only (averaging it over every step would mix in Glasses/Male
+            # batches) and should sit at 0.5 under --age_gender_balance.
             with torch.no_grad():
                 _edited_scores = attributes[batch_indices, mid_idx]
                 _log_dict['sampler_src_high_frac'] = (_edited_scores >= 0.5).float().mean()
-                if 20 in args.attribute_index:
-                    _log_dict['sampler_src_male_frac'] = (pred[:, 20] >= 0.5).float().mean()
+                if 20 in args.attribute_index and 39 in args.attribute_index:
+                    _young_steps = mid_idx == args.attribute_index.index(39)
+                    if _young_steps.any():
+                        _log_dict['sampler_src_male_frac_young'] = (
+                            pred[_young_steps, 20] >= 0.5).float().mean()
             current_attr_scales = attr_scales.current_scales()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'attr_scale/attr_{_attr_abs_idx}'] = current_attr_scales[_i]

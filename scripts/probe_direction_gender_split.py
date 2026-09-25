@@ -381,6 +381,8 @@ if __name__ == '__main__':
     p.add_argument('--attr', type=int, default=39, help='Global attribute index being edited.')
     p.add_argument('--direction', default='rm', choices=['add', 'rm'])
     p.add_argument('--edit_scale', type=float, default=1.0)
+    p.add_argument('--edit_target', default='mirror', choices=['mirror', 'train'],
+                   help='Same as evaluate_sdflow.py --edit_target.')
     p.add_argument('--group_attr', type=int, default=20,
                    help='Global CelebA attribute index to split the report by, read on the '
                         'SOURCE image via the CelebA judge. Default 20 (Male).')

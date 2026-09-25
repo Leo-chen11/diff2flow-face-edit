@@ -501,7 +501,7 @@ RUN_CONFIG_KEYS = [
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
-    'controlnet_region_cond',
+    'controlnet_region_cond', 'content_bank_path', 'region_saliency_path',
 ]
 
 
@@ -621,7 +621,91 @@ def _latest_step(checkpoint_dir, module_name='prior'):
 # Model loading
 # ---------------------------------------------------------------------------
 
+def _attach_region_parser(args, control_encoder, device):
+    """A --controlnet_region_cond encoder was trained with a BiSeNet skin mask
+    as its region input for EVERY age(39) edit. edit_single_attribute /
+    edit_multi_attribute only built that mask when the CALLER passed a
+    face_parser, and several scripts never do (probe_direction_gender_split,
+    calibrate_clip_thresh, inspect_zero_edit_magnitude, dump_multi_attr_edit).
+    Their age edits silently got the all-ones mask instead: a different input
+    from training, so a different edit from the one evaluate_sdflow.py scores.
+    Attaching the parser here gives every caller the training-time mask.
+
+    Stored with object.__setattr__ so it is NOT registered as a submodule of
+    control_encoder (it must stay out of its parameters() / state_dict())."""
+    if not getattr(control_encoder, 'region_cond', False):
+        return
+    if getattr(args, 'region_saliency_path', None):
+        print(f'[WARN] this run trained with --region_saliency_path '
+              f'({args.region_saliency_path}): non-age attributes saw per-sample saliency '
+              f'maps as their region input, but eval has no saliency lookup and feeds them '
+              f'the all-ones mask. Their numbers do NOT reflect what was trained.')
+    from common.face_parser import FaceParser
+    weights = getattr(args, 'face_parser_weights', None) or './data/parsing_bisenet.pth'
+    try:
+        parser = FaceParser(weights_path=weights).to(device).eval()
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f'[WARN] region_cond checkpoint but face parser unavailable ({exc}); age(39) '
+              f'edits fall back to an all-ones region mask, which training never used.')
+        return
+    object.__setattr__(control_encoder, 'region_parser', parser)
+
+
+def _attach_content_context(args, control_encoder, device):
+    """--content_bank_path runs (models/content_cond.py): load content_encoder
+    and attach a ContentContext to control_encoder as .content_ctx.
+    edit_single_attribute / edit_multi_attribute read it from there, so every
+    script that edits through them (render_preview, the probes, ...) gets the
+    same content as training with no change of its own.
+
+    Training gave content to Young(39) edits only; nothing changes for other
+    attributes. --disable_content_cond evaluates the same checkpoint with the
+    reference withheld (the ablation that shows what content adds)."""
+    bank_path = getattr(args, 'content_bank_path', None)
+    if not bank_path:
+        return
+    from models.control_encoder import AttributeControlEncoder
+    from models.content_cond import ContentBank, ContentContext, ContentEncoder
+    if not isinstance(control_encoder, AttributeControlEncoder):
+        print('[WARN] content_bank_path set but control_encoder is the legacy '
+              'single-resolution one; content ignored.')
+        return
+    ckpt = _ckpt_path(args.checkpoint_dir, 'content_encoder', args.step)
+    if not os.path.exists(ckpt):
+        print(f'[WARN] run was trained with --content_bank_path but {ckpt} is missing; '
+              f'evaluating WITHOUT content.')
+        return
+    if not os.path.exists(bank_path):
+        raise FileNotFoundError(
+            f'content bank {bank_path} (from config.json) not found. Pass --content_bank_path '
+            f'<path> to point at it, or --disable_content_cond to evaluate without content.')
+    bank = ContentBank(bank_path, device=device)
+    encoder = ContentEncoder(in_dim=bank.dim,
+                             out_dim=control_encoder.fc[0].out_features).to(device).eval()
+    _check_load(encoder.load_state_dict(load_network(ckpt), strict=False), 'content_encoder')
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+    male_local = args.attribute_index.index(20) if 20 in args.attribute_index else None
+    enabled = not getattr(args, 'disable_content_cond', False)
+    control_encoder.content_ctx = ContentContext(bank, encoder, male_local, seed=0,
+                                                 enabled=enabled)
+    print(f'Loading content ← {ckpt}  (bank {bank_path}: {bank.summary()})'
+          + ('' if enabled else '  [--disable_content_cond: reference WITHHELD]'))
+
+
+def _content_bias(control_encoder, attr_global_idx, attr_cond, is_rm):
+    ctx = getattr(control_encoder, 'content_ctx', None)
+    if ctx is None:
+        return None
+    return ctx.bias(attr_global_idx, attr_cond, is_rm)
+
+
 def load_models(args):
+    global _EDIT_TARGET_MODE
+    _EDIT_TARGET_MODE = getattr(args, 'edit_target', None) or 'mirror'
+    if _EDIT_TARGET_MODE != 'mirror':
+        print(f'[EditTarget] {_EDIT_TARGET_MODE}: edits aim at the training targets '
+              f'(0.2/0.8, Eyeglasses 0.1/0.9) -- not comparable with mirror-mode numbers.')
     device = 'cuda'
     attribute_index = torch.tensor(args.attribute_index, dtype=torch.long)
     num_attrs = len(args.attribute_index)
@@ -835,6 +919,8 @@ def load_models(args):
             print(f'Control encoder init (no trained weights at {ce_ckpt_path})')
         for p in control_encoder.parameters():
             p.requires_grad_(False)
+        _attach_region_parser(args, control_encoder, device)
+        _attach_content_context(args, control_encoder, device)
 
     # ── StyleGAN2 ─────────────────────────────────────────────────────────
     ckpt = torch.load(args.stygan2_weights, map_location='cpu')
@@ -863,6 +949,38 @@ def load_models(args):
 # ---------------------------------------------------------------------------
 # Editing
 # ---------------------------------------------------------------------------
+
+# Copy of training/train_sdflow.py SOFT_TARGET_TABLE (not imported: that module
+# pulls in the whole training stack). Keep the two in sync.
+TRAIN_SOFT_TARGET = {15: (0.10, 0.90), 20: (0.20, 0.80), 39: (0.20, 0.80)}
+TRAIN_SOFT_TARGET_DEFAULT = (0.20, 0.80)
+
+# --edit_target, set once by load_models() so every script that edits through
+# edit_single_attribute / edit_multi_attribute follows it without passing it.
+_EDIT_TARGET_MODE = 'mirror'
+
+
+def edited_attr_value(src, scale, attr_global_idx, mode=None):
+    """The attribute value the flow is asked to reach at edit strength `scale`.
+
+    'mirror' (default, what every eval so far used): src*(1-s) + (1-src)*s, so
+    s=1 lands on 1-src. 'train': src + s*(hard - src) with hard = 0.20/0.80
+    (0.10/0.90 for Eyeglasses), the exact rule training used (soft_flow_target
+    in train_sdflow.py).
+
+    Why it matters: the two agree for confident sources and disagree for
+    ambiguous ones. A source at 0.68 gets a delta of 0.36 under mirror@1.0 but
+    0.48 under train@1.0. Mirror therefore under-edits exactly the sources
+    that are hardest to flip, and asks for a smaller change than training
+    taught the model to make for that source. Numbers from the two modes are
+    not comparable: compare checkpoints under the same mode."""
+    mode = mode or _EDIT_TARGET_MODE
+    if mode == 'train' and attr_global_idx is not None:
+        low, high = TRAIN_SOFT_TARGET.get(int(attr_global_idx), TRAIN_SOFT_TARGET_DEFAULT)
+        hard = torch.where(src > 0.5, torch.full_like(src, low), torch.full_like(src, high))
+        return src + scale * (hard - src)
+    return src * (1.0 - scale) + (1.0 - src) * scale
+
 
 @torch.no_grad()
 def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
@@ -975,8 +1093,15 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     # needs a region prior built from the UNEDITED source before it runs, for
     # the same inversion-gap reason compositing already used src_recon for.
     # Computed once, reused by both consumers.
+    # region_parser: the caller's face_parser if given, else the one
+    # load_models() attached for a region_cond encoder (_attach_region_parser)
+    # -- used ONLY for the region mask; compositing still needs face_parser.
+    region_parser = face_parser if face_parser is not None else \
+        getattr(control_encoder, 'region_parser', None)
+    need_region = (region_parser is not None and attr_global_idx == 39
+                   and getattr(control_encoder, 'region_cond', False))
     src_recon = None
-    if face_parser is not None:
+    if face_parser is not None or need_region:
         with torch.no_grad():
             src_recon = G([latent], input_is_latent=True,
                           randomize_noise=False)[0].clamp(-1, 1)
@@ -986,7 +1111,7 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
 
     new_attr_cond = attr_cond.clone()
     src = attr_cond[:, attr_local_idx]
-    new_attr_cond[:, attr_local_idx] = src * (1.0 - edit_scale) + (1.0 - src) * edit_scale
+    new_attr_cond[:, attr_local_idx] = edited_attr_value(src, edit_scale, attr_global_idx)
     new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
     new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
@@ -1021,12 +1146,15 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                 # any attribute without a defined region, a real BiSeNet
                 # mask for age(39) when face_parser is available.
                 region_mask = torch.ones(B, 1, *img.shape[-2:], device=device, dtype=img.dtype)
-                if face_parser is not None and attr_global_idx == 39:
+                if need_region:
                     with torch.no_grad():
-                        region_mask = face_parser.get_region_mask(
+                        region_mask = region_parser.get_region_mask(
                             src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
             control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
-                                            latent=latent, region_mask=region_mask)
+                                            latent=latent, region_mask=region_mask,
+                                            content_bias=_content_bias(
+                                                control_encoder, attr_global_idx,
+                                                attr_cond, src > 0.5))
             control_skips = clip_skips(control_skips, controlnet_max_norm)
     else:
         new_latents = new_latents_raw
@@ -1089,6 +1217,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     zero_pad = torch.zeros(B, 18, 1, device=device)
 
     region_cond = getattr(control_encoder, 'region_cond', False) if control_encoder is not None else False
+    if face_parser is None and control_encoder is not None:
+        face_parser = getattr(control_encoder, 'region_parser', None)   # see _attach_region_parser
     src_recon = None
     if region_cond and face_parser is not None:
         with torch.no_grad():
@@ -1103,7 +1233,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     for i, (local_idx, scale) in enumerate(zip(attr_local_idxs, edit_scales)):
         new_attr_cond = attr_cond.clone()
         src = attr_cond[:, local_idx]
-        new_attr_cond[:, local_idx] = src * (1.0 - scale) + (1.0 - src) * scale
+        new_attr_cond[:, local_idx] = edited_attr_value(
+            src, scale, attr_global_idxs[i] if attr_global_idxs is not None else None)
         new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
         new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
@@ -1125,7 +1256,9 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
                         region_mask = face_parser.get_region_mask(
                             src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
             skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
-                                   latent=latent, region_mask=region_mask)
+                                   latent=latent, region_mask=region_mask,
+                                   content_bias=_content_bias(
+                                       control_encoder, this_global_idx, attr_cond, src > 0.5))
             skip = clip_skips(skip, controlnet_max_norm)
             combined_skips = add_skips(combined_skips, skip)
 
@@ -1613,6 +1746,21 @@ if __name__ == '__main__':
                              'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
                              'edits to get a real region mask instead of the all-ones fallback. '
                              'Auto-restored from config.json.')
+    parser.add_argument('--edit_target', default='mirror', choices=['mirror', 'train'],
+                        help="What value an edit of strength s asks the flow for. mirror "
+                             "(default, all previous evals): src*(1-s)+(1-src)*s. train: "
+                             "src+s*(target-src) with training's 0.2/0.8 targets (0.1/0.9 "
+                             "Eyeglasses), which stops ambiguous sources being under-edited "
+                             "relative to what training taught. See edited_attr_value(). Compare "
+                             "checkpoints under the SAME mode.")
+    parser.add_argument('--content_bank_path', type=str, default=None,
+                        help='Reference bank of a --content_bank_path training run '
+                             '(models/content_cond.py). Auto-restored from config.json; pass it only '
+                             'if the bank has moved.')
+    parser.add_argument('--disable_content_cond', action='store_true',
+                        help='Evaluate a content-trained checkpoint with the reference withheld '
+                             '(content bias = 0). Run once with and once without to see what the '
+                             'content condition itself contributes.')
     parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
                         help='Must match training --controlnet_init_gain. Only sets the log_gain '
                              'init; the trained value comes from the checkpoint. Auto-restored '

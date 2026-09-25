@@ -162,6 +162,8 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_dir', required=True)
     parser.add_argument('--step', type=int, default=None)
     parser.add_argument('--scale', type=float, default=1.25)
+    parser.add_argument('--edit_target', default='mirror', choices=['mirror', 'train'],
+                   help='Same as evaluate_sdflow.py --edit_target.')
     parser.add_argument('--num_faces', type=int, default=8)
     parser.add_argument('--cell_size', type=int, default=256)
     parser.add_argument('--out', default=None)

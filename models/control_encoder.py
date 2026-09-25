@@ -544,7 +544,8 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         raw = math.log(math.expm1(init_gain))
         self.log_gain = nn.Parameter(torch.full((self.num_slots, len(self.out_res)), raw))
 
-    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None):
+    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None,
+                content_bias=None):
         """
         attr_delta: (B, num_attrs) -- same tensor passed to AttributeDirectionBank.
         attr_idx:   (B,) long -- which attribute is being edited, per sample.
@@ -567,6 +568,13 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
                     omit the tensor -- region_cond changes the conv shape
                     unconditionally, so every sample needs a value here once
                     it is on. Ignored when region_cond=False.
+        content_bias: optional (B, hidden_dim), added to the trunk's first
+                    Linear BEFORE its ReLU -- the CONTENT half of DC-ControlNet
+                    (what the edited region should look like), produced by
+                    models/content_cond.py ContentEncoder. An additive input
+                    to an existing layer, not a wider layer, so this module's
+                    parameters and checkpoints are the same with or without
+                    it. None (or all-zero rows) is exactly the old behaviour.
 
         Returns: {resolution: (B, C_res, res, res)}, to pass as StyleGAN2
                  Generator's `skips=` argument.
@@ -581,7 +589,12 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
                     'pass latent=<W+ tensor>.')
             w = latent.mean(dim=1).to(device=device, dtype=dtype)   # (B, latent_dim)
             trunk_in = torch.cat([attr_delta, self.latent_proj(w)], dim=1)
-        hidden = self.fc(trunk_in)
+        if content_bias is None:
+            hidden = self.fc(trunk_in)
+        else:
+            # self.fc is Sequential(Linear, ReLU); same computation with the
+            # bias added in between.
+            hidden = F.relu(self.fc[0](trunk_in) + content_bias.to(dtype=trunk_in.dtype))
         feat = self.seed_proj(hidden).view(
             B, self.seed_channels, self.seed_res, self.seed_res)
 
