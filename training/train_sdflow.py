@@ -734,8 +734,33 @@ def _collect_dataset_attr_scores(dataset, attribute_index):
 
 
 class ScoreBalancedBatchSampler(data.Sampler):
+    """Per step: pick the attribute being edited, draw half the batch from its
+    low-score pool and half from its high-score pool, so add and rm edits of
+    that attribute are balanced.
+
+    align_global_step: the training loop decides which attribute a step edits
+    with n_iter % num_attrs, where n_iter = start_step + epoch *
+    len(train_loader) + i. This sampler used to use step % num_attrs with
+    `step` restarting at 0 every epoch. The two agree only when start_step
+    and steps_per_epoch are both multiples of num_attrs; every --resume_dir
+    continuation in the v23->v29 chain started at a step that is not
+    (55000, 85000, 125000 are all non-multiples of 3), so in those runs the
+    pools feeding each batch belonged to a DIFFERENT attribute than the one
+    being edited -- the balancing landed on the wrong attribute. With
+    align_global_step the sampler counts the same global step the loop does
+    (step_offset = start_step). Off by default only so older commands
+    reproduce; there is no reason to leave it off in a new run.
+
+    gender_scores / gender_balance_attrs: for the listed local attribute
+    indices, each of the low/high pools is split again by source gender
+    (gender score >= 0.5 -> male) and drawn half from each, so the edit is
+    not learned mostly on one gender. See --age_gender_balance.
+    """
+
     def __init__(self, attr_scores, batch_size, steps_per_epoch,
-                 low_threshold=0.35, high_threshold=0.65, seed=0):
+                 low_threshold=0.35, high_threshold=0.65, seed=0,
+                 align_global_step=False, step_offset=0,
+                 gender_scores=None, gender_balance_attrs=None):
         self.attr_scores = attr_scores.float().cpu()
         self.batch_size = int(batch_size)
         self.steps_per_epoch = int(steps_per_epoch)
@@ -744,6 +769,11 @@ class ScoreBalancedBatchSampler(data.Sampler):
         self.seed = int(seed)
         self.num_attrs = int(attr_scores.shape[1])
         self.epoch = 0
+        self.align_global_step = bool(align_global_step)
+        self.step_offset = int(step_offset)
+        self.gender_scores = (gender_scores.float().cpu()
+                              if gender_scores is not None else None)
+        self.gender_balance_attrs = set(gender_balance_attrs or [])
         self._build_pools()
 
     def _build_pools(self):
@@ -762,6 +792,26 @@ class ScoreBalancedBatchSampler(data.Sampler):
 
             self.low_pools.append(low.tolist())
             self.high_pools.append(high.tolist())
+
+        # Gender sub-pools, only for the attributes asked for. A side whose
+        # male or female half is empty keeps its unsplit pool rather than
+        # silently drawing from one gender only.
+        self.gender_pools = {}
+        if self.gender_scores is not None:
+            for attr_idx in self.gender_balance_attrs:
+                for side, pool in (('low', self.low_pools[attr_idx]),
+                                   ('high', self.high_pools[attr_idx])):
+                    male = [i for i in pool if self.gender_scores[i] >= 0.5]
+                    female = [i for i in pool if self.gender_scores[i] < 0.5]
+                    if male and female:
+                        self.gender_pools[(attr_idx, side)] = {'m': male, 'f': female}
+
+    def attr_for_step(self, step):
+        """Local attribute index the batch at within-epoch `step` is built
+        for. Must match the training loop's n_iter % num_attrs to be useful."""
+        if self.align_global_step:
+            return (self.step_offset + self.epoch * self.steps_per_epoch + step) % self.num_attrs
+        return step % self.num_attrs
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
@@ -799,9 +849,27 @@ class ScoreBalancedBatchSampler(data.Sampler):
 
         low_count = self.batch_size // 2
         high_count = self.batch_size - low_count
+        def take_side(attr_idx, side, count):
+            key = (attr_idx, side)
+            if key not in self.gender_pools:
+                return take(attr_idx, side, count)
+            # Alternate which gender gets the odd sample so odd counts
+            # (batch 4 -> 2 per side, fine; batch 6 -> 3) still balance out
+            # over steps instead of always favouring one gender.
+            parity = int(torch.randint(0, 2, (1,), generator=generator))
+            n_m = count // 2 + (count % 2) * parity
+            n_f = count - n_m
+            return take(attr_idx, side + '_m', n_m) + take(attr_idx, side + '_f', n_f)
+
+        for (attr_idx, side), halves in self.gender_pools.items():
+            for g, pool in halves.items():
+                order = torch.randperm(len(pool), generator=generator).tolist()
+                shuffled[(attr_idx, side + '_' + g)] = [pool[i] for i in order]
+                cursors[(attr_idx, side + '_' + g)] = 0
+
         for step in range(self.steps_per_epoch):
-            attr_idx = step % self.num_attrs
-            batch = take(attr_idx, 'low', low_count) + take(attr_idx, 'high', high_count)
+            attr_idx = self.attr_for_step(step)
+            batch = take_side(attr_idx, 'low', low_count) + take_side(attr_idx, 'high', high_count)
             perm = torch.randperm(len(batch), generator=generator).tolist()
             yield [batch[i] for i in perm]
 
@@ -924,6 +992,20 @@ if __name__ == '__main__':
     parser.add_argument('--disable_score_balanced_sampling', dest='score_balanced_sampling', action='store_false')
     parser.add_argument('--score_balance_low', type=float, default=0.35)
     parser.add_argument('--score_balance_high', type=float, default=0.65)
+    parser.add_argument('--align_sampler_global_step', action='store_true', default=False,
+                        help='Make ScoreBalancedBatchSampler pick each batch for the SAME '
+                             'attribute the training loop edits at that step (n_iter %% '
+                             'num_attrs, counted from --resume_step). Without it, any resume '
+                             'whose --resume_step (or steps/epoch) is not a multiple of the '
+                             'number of attributes balances the wrong attribute. Default off '
+                             'only so older commands reproduce; turn it on for new runs.')
+    parser.add_argument('--age_gender_balance', action='store_true', default=False,
+                        help='For the age attribute (39) only, split its low/high source '
+                             'pools again by source Male score (preds index 20, >=0.5 = male) '
+                             'and draw each side half male / half female, so aging is not '
+                             'learned mostly on one gender. Implies --align_sampler_global_step '
+                             '(balancing is meaningless if the batch goes to another attribute). '
+                             'Needs score-balanced cycle sampling. Default off.')
     parser.add_argument('--preview_scale', type=float, default=0.50)
     parser.add_argument('--preview_mode', default='fixed_balanced',
                         choices=['fixed_balanced', 'rolling'],
@@ -2008,8 +2090,24 @@ if __name__ == '__main__':
                                         train=False,
                                         transform=img_transform)
     
+    if args.age_gender_balance:
+        if not (args.score_balanced_sampling and args.attribute_sampling == 'cycle'):
+            raise ValueError('--age_gender_balance needs score-balanced cycle sampling '
+                             '(--attribute_sampling cycle, without --disable_score_balanced_sampling)')
+        if 39 not in [int(a) for a in args.attribute_index] or 20 not in [int(a) for a in args.attribute_index]:
+            raise ValueError('--age_gender_balance needs both 39 (Young) and 20 (Male) in --attribute_index')
+        args.align_sampler_global_step = True
+
     if args.score_balanced_sampling and args.attribute_sampling == 'cycle':
         train_attr_scores = _collect_dataset_attr_scores(train_dataset, args.attribute_index)
+        _gender_scores = None
+        _gender_attrs = None
+        if args.age_gender_balance:
+            _local = [int(a) for a in args.attribute_index]
+            _gender_scores = train_attr_scores[:, _local.index(20)]
+            _gender_attrs = [_local.index(39)]
+        # step_offset is filled in once start_step is known (after --resume_dir
+        # is parsed further down); the sampler is not iterated before that.
         train_sampler = ScoreBalancedBatchSampler(
             train_attr_scores,
             batch_size=args.batch,
@@ -2017,7 +2115,20 @@ if __name__ == '__main__':
             low_threshold=args.score_balance_low,
             high_threshold=args.score_balance_high,
             seed=0,
+            align_global_step=args.align_sampler_global_step,
+            gender_scores=_gender_scores,
+            gender_balance_attrs=_gender_attrs,
         )
+        if args.age_gender_balance:
+            _ai = _gender_attrs[0]
+            for _side in ('low', 'high'):
+                _gp = train_sampler.gender_pools.get((_ai, _side))
+                if _gp is None:
+                    print(f'** age_gender_balance: Young {_side} pool has no male or no female '
+                          f'sources; drawing it unsplit.')
+                else:
+                    print(f'** age_gender_balance: Young {_side} pool male={len(_gp["m"])} '
+                          f'female={len(_gp["f"])} -> drawn 50/50')
         train_loader = data.DataLoader(IndexedDataset(train_dataset),
                                        batch_sampler=train_sampler,
                                        num_workers=args.num_workers,
@@ -2610,6 +2721,17 @@ if __name__ == '__main__':
               f'cosine LR {args.lr:g} -> 1e-6 over this run.')
     else:
         _n_epochs = args.epochs
+    if train_sampler is not None:
+        train_sampler.step_offset = start_step
+        _misaligned = (start_step % len(args.attribute_index) != 0
+                       or len(train_loader) % len(args.attribute_index) != 0)
+        if train_sampler.align_global_step:
+            print(f'** sampler aligned to global step (offset {start_step}).')
+        elif _misaligned:
+            print(f'** WARNING: score-balanced sampler is NOT aligned with the edited attribute '
+                  f'(start_step {start_step}, {len(train_loader)} steps/epoch, '
+                  f'{len(args.attribute_index)} attrs): batches are balanced for a different '
+                  f'attribute than the one being edited. Pass --align_sampler_global_step.')
     _stop_training = False
     for epoch in range(_n_epochs):
         if _stop_training:
@@ -3679,6 +3801,17 @@ if __name__ == '__main__':
                 'clip_prompt_glasses_fraction': clip_logs.get('clip_prompt_glasses_fraction', latent.new_tensor(0.0)),
             }
             _log_dict.update(control_band_logs)
+            # Sampler check, from the same dataset preds the sampler pools on:
+            # with the sampler aligned, sampler_src_high_frac is exactly 0.5
+            # on every step (half low, half high for the attribute being
+            # edited); anything else means the batch was balanced for another
+            # attribute. sampler_src_male_frac on Young steps should sit at
+            # 0.5 under --age_gender_balance.
+            with torch.no_grad():
+                _edited_scores = attributes[batch_indices, mid_idx]
+                _log_dict['sampler_src_high_frac'] = (_edited_scores >= 0.5).float().mean()
+                if 20 in args.attribute_index:
+                    _log_dict['sampler_src_male_frac'] = (pred[:, 20] >= 0.5).float().mean()
             current_attr_scales = attr_scales.current_scales()
             for _i, _attr_abs_idx in enumerate(args.attribute_index):
                 _log_dict[f'attr_scale/attr_{_attr_abs_idx}'] = current_attr_scales[_i]
