@@ -7,15 +7,25 @@ Example:
         --run Ours=./output/compare/v20/metrics_summary.csv \
         --output_dir ./output/compare/original_vs_v20
 
-Inputs are the metrics_summary.csv files produced by:
-  - evaluation/eval_original_sdflow_strength_sweep.py
-  - evaluation/eval_strength_sweep.py
+Inputs are the metrics_summary.csv files produced by
+evaluation/eval_strength_sweep.py -- point --baseline and --run at two
+different --output_dir runs of it (e.g. an original-SDFlow checkpoint and a
+newer one).
 """
 
 import argparse
 import csv
 import os
+import sys
 from collections import defaultdict
+
+# Same preamble every other evaluation/ script carries: makes the project
+# root importable so this file can be run as `python evaluation/<name>.py`
+# and still resolve `evaluation._shared`.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, PROJECT_ROOT)
+
+from evaluation._shared import parse_named_path
 
 
 METRICS = [
@@ -43,19 +53,6 @@ HIGHER_IS_BETTER = {
     "balanced_score",
     "practical_score",
 }
-
-
-def parse_named_path(value):
-    if "=" not in value:
-        raise argparse.ArgumentTypeError("Expected NAME=path/to/metrics_summary.csv")
-    name, path = value.split("=", 1)
-    name = name.strip()
-    path = path.strip()
-    if not name:
-        raise argparse.ArgumentTypeError("Run name cannot be empty.")
-    if not os.path.exists(path):
-        raise argparse.ArgumentTypeError(f"File does not exist: {path}")
-    return name, path
 
 
 def read_csv(path, run_name):
