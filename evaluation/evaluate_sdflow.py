@@ -502,6 +502,7 @@ RUN_CONFIG_KEYS = [
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
     'controlnet_region_cond', 'content_bank_path', 'region_saliency_path',
+    'age_gate_by_strata',
 ]
 
 
@@ -806,6 +807,12 @@ def load_models(args):
                       f'stay calibrated.)')
         else:
             print(f'Direction bank init (no trained weights at {db_ckpt_path})')
+        if getattr(args, 'age_gate_by_strata', False):
+            _per = direction_bank.enable_strata_routing(
+                args.attribute_index.index(39), args.attribute_index.index(20),
+                args.attribute_index.index(15))
+            print(f'[Routing] age strata routing ON (trained with --age_gate_by_strata): '
+                  f'{_per} slot(s) per gender x glasses stratum.')
 
         if args.override_residual_scale is not None:
             # Diagnostic knob: the trained residual_scale is typically frozen
@@ -1126,7 +1133,8 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), attr_local_idx, device=device, dtype=torch.long)
         guided_delta = direction_bank(flow_delta, attr_delta,
-                                      attr_idx=batch_attr_idx, latent=latent)
+                                      attr_idx=batch_attr_idx, latent=latent,
+                                      route_scores=attr_cond)
         new_latents = latent + guided_delta
         # controlnet_disable_attrs: some attributes (e.g. eyeglasses) need the
         # ControlNet feature-map injection to synthesize structure the W+
@@ -1242,7 +1250,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
         guided_delta = direction_bank(flow_delta, attr_delta,
-                                      attr_idx=batch_attr_idx, latent=latent)
+                                      attr_idx=batch_attr_idx, latent=latent,
+                                      route_scores=attr_cond)
         combined_delta = combined_delta + guided_delta
         this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
         use_controlnet_here = (control_encoder is not None and not (

@@ -675,7 +675,8 @@ def generate_test_image(flow_model:torch.nn.Module,
             attr_idx = torch.full((batchsize,), i, device=origin_latent.device, dtype=torch.long)
             flow_delta = new_latents_raw - source_latent
             attr_delta = new_attr_cond - test_attr_cond
-            guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=source_latent)
+            guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=source_latent,
+                                          route_scores=test_attr_cond)
             new_latents = source_latent + guided_delta
         else:
             new_latents = new_latents_raw
@@ -1901,6 +1902,36 @@ if __name__ == '__main__':
                         help='Load optimizer state. Usually false for controlled stage fine-tuning.')
     parser.add_argument('--resume_direction_bank', action=argparse.BooleanOptionalAction, default=False,
                         help='Load direction_bank checkpoint state. Keep false when changing bank path/safety settings.')
+    parser.add_argument('--refresh_bank_directions', nargs='+', type=int, default=None,
+                        help="CelebA attribute ids (e.g. 39). With --resume_direction_bank: keep "
+                             "the resumed gate / magnitude / residual nets, but take THESE "
+                             "attributes' frozen direction_units from the CURRENT "
+                             "--direction_bank_path instead of the checkpoint (the checkpoint "
+                             "stores them as a buffer, so a plain resume silently keeps the OLD "
+                             "bank's directions). Other attributes keep the checkpoint's, so "
+                             "rebuilding the bank for age does not also swap glasses/male. For a "
+                             "rebuilt bank of the same K, e.g. --age_k 4 instead of the tiled "
+                             "--age_k 1. Default off.")
+    parser.add_argument('--age_gate_by_strata', action='store_true', default=False,
+                        help="Route each Young(39) edit to the bank slots of the SOURCE's own "
+                             "gender x glasses stratum (read from the conditioner's Male / "
+                             "Eyeglasses scores); the gate still picks among that stratum's "
+                             "sub-style slots. Without it nothing ties the gate's choice to "
+                             "the stratum a slot was fit on -- its sharpness / load-balance "
+                             "losses are met by any split of faces -- so a male face can age "
+                             "with a female direction. Needs a bank built with --age_k 4 (a "
+                             "--age_k 1 bank tiles one gender-averaged direction into every "
+                             "slot and is refused) and 15, 20, 39 in --attribute_index. Run "
+                             "scripts/probe_age_routing.py first. Default off.")
+    parser.add_argument('--cap_train_target', action='store_true', default=False,
+                        help="Cap the edit strength used to build the TARGETS at 1.0: target = "
+                             "src + min(train_scale, 1) * (hard - src), so it never passes the "
+                             "SOFT_TARGET_TABLE end (0.2/0.8, Eyeglasses 0.1/0.9). The learnable "
+                             "train_scale centre drifts above 1 (attr_scale/attr_39 reached 1.29 "
+                             "in v30), which puts Young targets below 0 / above 1: the flow is "
+                             "conditioned outside the conditioner's [0,1] range and the teacher "
+                             "MSE target becomes unreachable, so the loss never stops pushing. "
+                             "target_out_of_range_frac logs how often that happens. Default off.")
 
     # ── Frozen pretrained diffusion guidance ───────────────────────────────
     parser.add_argument('--use_diffusion_guidance', action=argparse.BooleanOptionalAction, default=True,
@@ -2348,6 +2379,14 @@ if __name__ == '__main__':
             if p.requires_grad and p is not direction_bank.residual_scale_raw
         ]
         print(f'** Direction Bank enabled: {args.direction_bank_path}')
+        if args.age_gate_by_strata:
+            if not all(a in args.attribute_index for a in (15, 20, 39)):
+                raise ValueError('--age_gate_by_strata needs 15, 20 and 39 in --attribute_index')
+            _per = direction_bank.enable_strata_routing(
+                args.attribute_index.index(39), args.attribute_index.index(20),
+                args.attribute_index.index(15))
+            print(f'** Age strata routing ON: each Young edit uses only the {_per} slot(s) of '
+                  f'its source\'s gender x glasses stratum.')
     else:
         direction_bank = None
     trainable_params += list(attr_scales.parameters())
@@ -2580,7 +2619,20 @@ if __name__ == '__main__':
                 for local_idx, floor in reg_fine_min_overrides.items():
                     reg_loss_weights.min_floor[local_idx, 2] = float(floor)
         if direction_bank is not None and args.resume_direction_bank:
+            _fresh_units = direction_bank.direction_units.detach().clone()
             load_module_checkpoint(direction_bank, resume_save_dir, 'direction_bank', start_step, strict=False)
+            if args.refresh_bank_directions:
+                for _a in args.refresh_bank_directions:
+                    if _a not in args.attribute_index:
+                        raise ValueError(f'--refresh_bank_directions {_a}: not in --attribute_index')
+                    _r = args.attribute_index.index(_a)
+                    with torch.no_grad():
+                        _cos = (F.normalize(direction_bank.direction_units[_r], dim=-1)
+                                * F.normalize(_fresh_units[_r], dim=-1)).sum(-1).mean().item()
+                        direction_bank.direction_units[_r].copy_(_fresh_units[_r])
+                    print(f'[Resume] attr {_a} direction_units refreshed from '
+                          f'{args.direction_bank_path} (mean cos to the checkpoint\'s old '
+                          f'units: {_cos:.3f}); other attributes keep the checkpoint\'s.')
         elif direction_bank is not None:
             print('[Resume] direction_bank checkpoint not loaded; using current bank path and safety controls.')
         if control_encoder is not None:
@@ -2938,8 +2990,12 @@ if __name__ == '__main__':
                 device=latent.device,
                 dtype=latent.dtype,
             )
+            # --cap_train_target: strength used for the TARGETS never exceeds
+            # 1, so a target never passes the SOFT_TARGET_TABLE end.
+            _s_tgt = train_scale.clamp(max=1.0) if args.cap_train_target else train_scale
             hard_flow_target = compute_soft_targets(src_attr_flow, mid_idx, args.attribute_index)
-            soft_flow_target = src_attr_flow + train_scale * (hard_flow_target - src_attr_flow)
+            soft_flow_target = src_attr_flow + _s_tgt * (hard_flow_target - src_attr_flow)
+            target_out_of_range = ((soft_flow_target < 0) | (soft_flow_target > 1)).float().mean().detach()
             new_attr_cond = attr_cond.detach().clone()
             new_attr_cond = new_attr_cond.scatter(1, mid_idx.view(-1, 1), soft_flow_target.view(-1, 1))
             new_cond = torch.cat([id_cond_train.detach(), new_attr_cond], dim=1)
@@ -2954,7 +3010,8 @@ if __name__ == '__main__':
             elif direction_bank is not None:
                 attr_delta = new_attr_cond - attr_cond.detach()
                 direction_bank_applied = True
-                guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=mid_idx, latent=latent)
+                guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=mid_idx, latent=latent,
+                                              route_scores=attr_cond.detach())
             else:
                 guided_delta = flow_delta
 
@@ -3585,7 +3642,7 @@ if __name__ == '__main__':
                                                            args.attribute_index)
             else:
                 hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
-            soft_target = src_attr + train_scale * (hard_teacher_target - src_attr)
+            soft_target = src_attr + _s_tgt * (hard_teacher_target - src_attr)
             soft_target_for_loss = soft_target.detach()
             target_probs[batch_indices, mid_idx] = soft_target_for_loss
             edited_probs = gen_probs[batch_indices, mid_idx]
@@ -4057,6 +4114,7 @@ if __name__ == '__main__':
                 'loss_disc_realism':  disc_realism_loss,
                 'loss_content':       content_loss,
                 'dir_disagree_frac':  dir_disagree.mean(),
+                'target_out_of_range_frac': target_out_of_range,
                 'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
                 'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
                 'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),

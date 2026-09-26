@@ -52,8 +52,25 @@ class AttributeDirectionBank(nn.Module):
         direction_units = torch.zeros(self.num_attrs, self.num_k, self.num_layers, self.latent_dim)
         layer_norms = torch.ones(self.num_attrs, self.num_k, self.num_layers)
 
+        # Bank-file metadata, kept for enable_strata_routing(): which slots
+        # hold which stratum is only knowable from how the bank was built
+        # (precompute_directions_stratified.py saves age_k / stratification).
+        self.bank_meta = {}
+        # {local attr: (gender_local, glasses_local, slots_per_stratum)} --
+        # see enable_strata_routing(). Plain attribute, not state: it is
+        # re-applied from the run config at train and eval time.
+        self._strata_routing = {}
+        self._warned_no_route_scores = False
+
         if bank_path is not None:
             bank = torch.load(bank_path, map_location="cpu")
+            self.bank_meta = {
+                "num_k": int(bank.get("num_k", bank["direction_units"].shape[1]
+                                      if bank["direction_units"].ndim == 4 else 1)),
+                "age_k": bank.get("age_k"),
+                "stratification": bank.get("stratification", {}),
+                "attribute_index": [int(x) for x in bank.get("attribute_index", [])],
+            }
             du = bank["direction_units"].float()
             ln = bank["layer_norms"].float()
 
@@ -306,17 +323,89 @@ class AttributeDirectionBank(nn.Module):
         """(num_attrs,) learned residual_scale values, always positive."""
         return F.softplus(self.residual_scale_raw)
 
-    def _gate_weights(self, latent, B, device, dtype):
-        """Return (B, num_attrs, K) softmax mixture weights."""
+    def _gate_weights(self, latent, B, device, dtype, slot_mask=None):
+        """Return (B, num_attrs, K) softmax mixture weights.
+
+        slot_mask: optional (B, num_attrs, K) bool, True = slot allowed. The
+        softmax runs over allowed slots only (see enable_strata_routing)."""
         if self.num_k == 1:
             return self.direction_units.new_ones(B, self.num_attrs, 1)
         if latent is not None and self.gate_net is not None:
             w = latent.mean(dim=1).to(device=device, dtype=dtype)        # (B, 512)
-            logits = self.gate_net(w)                                      # (B, A*K)
-            return F.softmax(logits.view(B, self.num_attrs, self.num_k), dim=-1)
-        return self.direction_units.new_ones(B, self.num_attrs, self.num_k) / self.num_k
+            logits = self.gate_net(w).view(B, self.num_attrs, self.num_k)  # (B, A, K)
+        else:
+            logits = torch.zeros(B, self.num_attrs, self.num_k, device=device, dtype=dtype)
+        if slot_mask is not None:
+            logits = logits.masked_fill(~slot_mask, float('-inf'))
+        return F.softmax(logits, dim=-1)
 
-    def forward(self, flow_delta, attr_delta, attr_idx=None, latent=None):
+    # Stratum label order written by precompute_directions_stratified.py for
+    # age(39) when --age_k > 1 (confident_strata_masks' hi/lo order on
+    # gender x glasses). Each stratum owns age_k/4 consecutive slots
+    # (--substyle_k sub-clusters).
+    AGE_STRATA = ("male_glasses", "male_noglasses", "female_glasses", "female_noglasses")
+
+    def enable_strata_routing(self, attr_local_idx, gender_local_idx, glasses_local_idx):
+        """Route age(39) edits by the SOURCE's stratum instead of letting the
+        gate choose freely among all K slots.
+
+        The bank's age slots were each fit on one gender x glasses stratum,
+        but nothing in training ties the gate's choice to that label: its two
+        losses (sharpness, load balance) are satisfied by ANY split of faces
+        into K groups -- pose, lighting, hair colour. A male face routed to a
+        female slot gets a female aging direction in full. With routing on,
+        the gate can only pick among the (age_k/4) sub-style slots of the
+        source's own stratum, read from the conditioner's Male / Eyeglasses
+        scores (route_scores in forward()); it still learns which sub-style.
+
+        Refuses a bank whose age slots are one tiled direction (--age_k 1):
+        every slot is the same gender-averaged vector there, so there is
+        nothing to route to. Rebuild with --age_k 4 first."""
+        strat = self.bank_meta.get("stratification", {})
+        labels = strat.get(39) or strat.get("39")
+        age_k = self.bank_meta.get("age_k")
+        if not labels or list(labels[:4]) != list(self.AGE_STRATA):
+            raise ValueError(
+                "age strata routing needs a bank built with --age_k 4 (or more): this bank's "
+                f"age stratification is {labels[:2] if labels else None}... (age_k={age_k}), "
+                "i.e. one gender-averaged direction tiled into every slot. Rebuild it with "
+                "scripts/precompute_directions_stratified.py --age_k 4 [--substyle_k 3].")
+        if self.bank_meta.get("num_k") != self.num_k:
+            raise ValueError(f"bank K={self.bank_meta.get('num_k')} was tiled/truncated to "
+                             f"K={self.num_k}; slot->stratum mapping would be wrong.")
+        age_k = int(age_k)
+        if age_k % 4 != 0:
+            raise ValueError(f"age_k={age_k} is not a multiple of the 4 strata.")
+        per = age_k // 4
+        self._strata_routing[int(attr_local_idx)] = (int(gender_local_idx),
+                                                     int(glasses_local_idx), per)
+        return per
+
+    def _routing_mask(self, route_scores, B, device):
+        """(B, A, K) bool slot mask for routed attributes, or None."""
+        if not self._strata_routing:
+            return None
+        if route_scores is None:
+            if not self._warned_no_route_scores:
+                print("[DirectionBank] strata routing is on but this caller passed no "
+                      "route_scores; falling back to the free gate for this call site.")
+                self._warned_no_route_scores = True
+            return None
+        mask = torch.ones(B, self.num_attrs, self.num_k, dtype=torch.bool, device=device)
+        slots = torch.arange(self.num_k, device=device)
+        for a, (g_i, gl_i, per) in self._strata_routing.items():
+            male = route_scores[:, g_i].to(device) >= 0.5
+            glasses = route_scores[:, gl_i].to(device) >= 0.5
+            # AGE_STRATA order: male_glasses=0, male_noglasses=1,
+            # female_glasses=2, female_noglasses=3
+            stratum = (1 - male.long()) * 2 + (1 - glasses.long())             # (B,)
+            lo = (stratum * per).view(B, 1)
+            mask[:, a, :] = (slots.view(1, -1) >= lo) & (slots.view(1, -1) < lo + per)
+        return mask
+
+    def forward(self, flow_delta, attr_delta, attr_idx=None, latent=None, route_scores=None):
+        """route_scores: optional (B, num_attrs) conditioner attribute scores
+        (local order). Only read when enable_strata_routing() is on."""
         B = flow_delta.size(0)
         device = flow_delta.device
         dtype = flow_delta.dtype
@@ -359,7 +448,8 @@ class AttributeDirectionBank(nn.Module):
         signed_magnitudes = magnitudes * attr_delta.unsqueeze(-1)    # (B, A, 18)
 
         # ── Gate mixture ──────────────────────────────────────────────────
-        alpha = self._gate_weights(latent, B, device, dtype)          # (B, A, K)
+        alpha = self._gate_weights(latent, B, device, dtype,
+                                   slot_mask=self._routing_mask(route_scores, B, device))  # (B, A, K)
         self._last_alpha = alpha                                        # expose for selection loss
 
         # Update the per-attribute gate usage EMA from THIS batch's active
@@ -395,10 +485,15 @@ class AttributeDirectionBank(nn.Module):
                         self.gate_usage_ema[a].mul_(self.gate_usage_ema_decay).add_(
                             batch_mean.detach(), alpha=1.0 - self.gate_usage_ema_decay
                         )
-                p = batch_mean.clamp(min=1e-8)
-                p = p / p.sum()
-                marginal_entropy = -(p * p.log()).sum()
-                div_losses.append((max_entropy - marginal_entropy) / max_entropy)
+                # A routed attribute's slot usage follows the stratum mix of
+                # the batch by construction; pushing it toward uniform over
+                # all K would fight the routing. Sharpness (within the
+                # allowed slots) still applies below.
+                if int(a) not in self._strata_routing:
+                    p = batch_mean.clamp(min=1e-8)
+                    p = p / p.sum()
+                    marginal_entropy = -(p * p.log()).sum()
+                    div_losses.append((max_entropy - marginal_entropy) / max_entropy)
 
                 # Conditional entropy (per-sample sharpness): the marginal
                 # term above only requires the BATCH AVERAGE alpha to stay
@@ -416,7 +511,8 @@ class AttributeDirectionBank(nn.Module):
                 sp = sp / sp.sum(dim=-1, keepdim=True)
                 cond_entropy = -(sp * sp.log()).sum(dim=-1).mean()
                 sharp_losses.append(cond_entropy / max_entropy)
-            self._last_gate_diversity_loss = torch.stack(div_losses).mean()
+            self._last_gate_diversity_loss = (torch.stack(div_losses).mean() if div_losses
+                                              else torch.zeros([], device=device, dtype=dtype))
             self._last_gate_sharpness_loss = torch.stack(sharp_losses).mean()
         else:
             self._last_gate_diversity_loss = torch.zeros([], device=device, dtype=dtype)
