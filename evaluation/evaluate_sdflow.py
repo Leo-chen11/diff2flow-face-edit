@@ -502,7 +502,7 @@ RUN_CONFIG_KEYS = [
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
     'controlnet_region_cond', 'content_bank_path', 'region_saliency_path',
-    'age_gate_by_strata',
+    'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers',
 ]
 
 
@@ -807,6 +807,14 @@ def load_models(args):
                       f'stay calibrated.)')
         else:
             print(f'Direction bank init (no trained weights at {db_ckpt_path})')
+        from models.direction_bank import parse_attr_spec
+        for _a, _c in parse_attr_spec(getattr(args, 'residual_scale_cap', None)).items():
+            direction_bank.set_residual_cap(args.attribute_index.index(_a), _c)
+            print(f'[RunConfig] residual_scale for attr {_a} capped at {_c:g} (as trained)')
+        for _a, (_lo, _hi) in parse_attr_spec(getattr(args, 'bank_dir_layers', None),
+                                              'range').items():
+            direction_bank.set_dir_layers(args.attribute_index.index(_a), _lo, _hi)
+            print(f'[RunConfig] direction edit for attr {_a} restricted to W+ layers {_lo}-{_hi}')
         if getattr(args, 'age_gate_by_strata', False):
             _per = direction_bank.enable_strata_routing(
                 args.attribute_index.index(39), args.attribute_index.index(20),

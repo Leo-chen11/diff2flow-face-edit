@@ -34,7 +34,7 @@ from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
 from models.control_encoder import clip_skips, skips_norm_per_sample, skips_reg_per_sample
-from models.direction_bank import AttributeDirectionBank, _inverse_softplus
+from models.direction_bank import AttributeDirectionBank, _inverse_softplus, parse_attr_spec
 from models.layer_mask import AttributeLayerMask
 from models.stylegan2.model import Generator, Discriminator
     
@@ -1912,6 +1912,32 @@ if __name__ == '__main__':
                              "rebuilding the bank for age does not also swap glasses/male. For a "
                              "rebuilt bank of the same K, e.g. --age_k 4 instead of the tiled "
                              "--age_k 1. Default off.")
+    parser.add_argument('--residual_scale_cap', type=str, default=None,
+                        help="Per-attribute upper bound on the direction bank's learned "
+                             "residual_scale, e.g. '39:0.05'. The residual is the part of the "
+                             "flow's edit OUTSIDE every data direction. For v30, removing it at "
+                             "eval (--override_residual_scale 0) made Young stop changing entirely, "
+                             "so the trained aging lived almost wholly in that free-form component "
+                             "(the 'fake' texture / lipstick look), not in the real-data age "
+                             "directions that look right when applied raw. Capping it forces the "
+                             "age edit onto the directions. Pair with --reset_bank_magnitude 39 "
+                             "when resuming. Restored at eval from config.json. Default off.")
+    parser.add_argument('--reset_bank_magnitude', nargs='+', type=int, default=None,
+                        help="CelebA ids whose direction-bank magnitude is reset to the bank's "
+                             "per-layer prior after --resume_direction_bank loads (softplus logits "
+                             "that training drove very negative have almost no gradient left, so "
+                             "a capped residual alone may leave the edit dead). Default off.")
+    parser.add_argument('--bank_dir_layers', type=str, default=None,
+                        help="Restrict an attribute's DIRECTION edit to a W+ layer range, e.g. "
+                             "'39:0-10' (inclusive; 0-2 = 4-8px, 3-6 = 16-32px structure, 7-10 = "
+                             "64-128px, 11-17 = 256-1024px). Pick it with "
+                             "scripts/probe_age_tradeoff.py. Restored at eval. Default off.")
+    parser.add_argument('--id_hinge_threshold_override', type=str, default=None,
+                        help="Per-attribute --id_hinge_threshold, e.g. '39:0.72'. Real aging lowers "
+                             "ArcFace similarity (the raw age direction reaches CLIP 85.8%% at "
+                             "ID_ind 0.63), so the shared 0.8 floor pushes the model to age by "
+                             "texture only. Use scripts/probe_age_tradeoff.py to choose it. "
+                             "Default off (every attribute uses --id_hinge_threshold).")
     parser.add_argument('--age_gate_by_strata', action='store_true', default=False,
                         help="Route each Young(39) edit to the bank slots of the SOURCE's own "
                              "gender x glasses stratum (read from the conditioner's Male / "
@@ -2387,6 +2413,12 @@ if __name__ == '__main__':
                 args.attribute_index.index(15))
             print(f'** Age strata routing ON: each Young edit uses only the {_per} slot(s) of '
                   f'its source\'s gender x glasses stratum.')
+        for _a, _c in parse_attr_spec(args.residual_scale_cap).items():
+            direction_bank.set_residual_cap(args.attribute_index.index(_a), _c)
+            print(f'** residual_scale for attr {_a} capped at {_c:g}')
+        for _a, (_lo, _hi) in parse_attr_spec(args.bank_dir_layers, 'range').items():
+            direction_bank.set_dir_layers(args.attribute_index.index(_a), _lo, _hi)
+            print(f'** direction edit for attr {_a} restricted to W+ layers {_lo}-{_hi}')
     else:
         direction_bank = None
     trainable_params += list(attr_scales.parameters())
@@ -2621,6 +2653,10 @@ if __name__ == '__main__':
         if direction_bank is not None and args.resume_direction_bank:
             _fresh_units = direction_bank.direction_units.detach().clone()
             load_module_checkpoint(direction_bank, resume_save_dir, 'direction_bank', start_step, strict=False)
+            for _a in (args.reset_bank_magnitude or []):
+                _before, _after = direction_bank.reset_magnitude(args.attribute_index.index(_a))
+                print(f'[Resume] attr {_a} direction magnitude reset to the bank prior '
+                      f'(mean per-layer magnitude {_before:.4f} -> {_after:.4f})')
             if args.refresh_bank_directions:
                 for _a in args.refresh_bank_directions:
                     if _a not in args.attribute_index:
@@ -2935,6 +2971,21 @@ if __name__ == '__main__':
                   f'(start_step {start_step}, {len(train_loader)} steps/epoch, '
                   f'{len(args.attribute_index)} attrs): batches are balanced for a different '
                   f'attribute than the one being edited. Pass --align_sampler_global_step.')
+    # --id_hinge_threshold_override: per-LOCAL-attribute hinge floor, indexed
+    # by mid_idx in the loop. None = the shared --id_hinge_threshold.
+    _id_thr_by_local = None
+    _id_over = parse_attr_spec(args.id_hinge_threshold_override)
+    if _id_over:
+        _id_thr_by_local = torch.full((len(args.attribute_index),), float(args.id_hinge_threshold))
+        for _a, _t in _id_over.items():
+            _id_thr_by_local[args.attribute_index.index(_a)] = float(_t)
+        print(f'** ID hinge floor per attribute: '
+              f'{dict(zip(args.attribute_index, _id_thr_by_local.tolist()))}')
+        if not args.id_loss_hinge:
+            print('[WARN] --id_hinge_threshold_override only applies with --id_loss_hinge')
+    if args.reset_bank_magnitude and not (args.resume_dir and args.resume_direction_bank):
+        print('[WARN] --reset_bank_magnitude does nothing without --resume_dir + '
+              '--resume_direction_bank (a fresh bank already starts at the prior).')
     _stop_training = False
     for epoch in range(_n_epochs):
         if _stop_training:
@@ -3604,7 +3655,11 @@ if __name__ == '__main__':
             id_edit_feat = F.normalize(id_criterion.extract_features(new_face_tensors), dim=1)
             id_cos_sim = F.cosine_similarity(id_edit_feat, id_src_feat, dim=1)
             if args.id_loss_hinge:
-                id_loss = F.relu(args.id_hinge_threshold - id_cos_sim).mean()
+                if _id_thr_by_local is not None:
+                    _thr = _id_thr_by_local.to(id_cos_sim.device)[mid_idx].to(id_cos_sim.dtype)
+                    id_loss = F.relu(_thr - id_cos_sim).mean()
+                else:
+                    id_loss = F.relu(args.id_hinge_threshold - id_cos_sim).mean()
             else:
                 id_loss = 1.0 - id_cos_sim.mean()
 

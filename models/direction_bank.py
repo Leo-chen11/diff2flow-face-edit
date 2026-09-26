@@ -10,6 +10,29 @@ def _inverse_softplus(x):
     return torch.log(torch.expm1(x))
 
 
+def parse_attr_spec(spec, kind=float):
+    """'39:0.05,20:0.1' -> {39: 0.05, 20: 0.1} (CelebA attribute ids).
+    kind='range': '39:0-10' -> {39: (0, 10)} (inclusive W+ layer range).
+    None / '' -> {}. Shared by train_sdflow.py and evaluate_sdflow.py so the
+    two parse run-config values identically."""
+    out = {}
+    if not spec:
+        return out
+    if isinstance(spec, (list, tuple)):
+        spec = ','.join(str(x) for x in spec)
+    for part in str(spec).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        attr, val = part.split(':', 1)
+        if kind == 'range':
+            lo, hi = val.split('-')
+            out[int(attr)] = (int(lo), int(hi))
+        else:
+            out[int(attr)] = kind(val)
+    return out
+
+
 class AttributeDirectionBank(nn.Module):
     """Dataset-level W+ attribute directions used to filter raw flow deltas.
 
@@ -134,6 +157,15 @@ class AttributeDirectionBank(nn.Module):
             prior_norms = layer_norms.mean(dim=1).clamp(min=1e-4)   # (num_attrs, 18)
             self.magnitude_net[-1].bias.copy_(_inverse_softplus(prior_norms.reshape(-1)))
             self.magnitude_net[-1].weight.mul_(0.01)
+        # Plain attribute, not a buffer (a new state_dict key would break
+        # strict eval loads of older checkpoints): the bank's own per-layer
+        # magnitude prior, for reset_magnitude().
+        self._prior_norms = prior_norms.detach().clone()
+        # {local attr: max residual_scale} and {local attr: (18,) 0/1 mask on
+        # the DIRECTION edit}; see set_residual_cap / set_dir_layers. Plain
+        # attributes re-applied from the run config at train and eval time.
+        self._residual_cap = {}
+        self._dir_layer_mask = {}
 
         # Optional per-attribute LoRA-style adapter on top of magnitude_net's
         # shared hidden representation. magnitude_net is ONE MLP shared across
@@ -320,8 +352,50 @@ class AttributeDirectionBank(nn.Module):
         self._last_alpha = None   # (B, num_attrs, K) — set each forward, used for selection loss
 
     def current_residual_scale(self):
-        """(num_attrs,) learned residual_scale values, always positive."""
-        return F.softplus(self.residual_scale_raw)
+        """(num_attrs,) learned residual_scale values, always positive, capped
+        per attribute by set_residual_cap()."""
+        s = F.softplus(self.residual_scale_raw)
+        if self._residual_cap:
+            cap = torch.full_like(s, float('inf'))
+            for a, c in self._residual_cap.items():
+                cap[a] = float(c)
+            s = torch.minimum(s, cap)
+        return s
+
+    def set_residual_cap(self, attr_local_idx, cap):
+        """Upper bound on one attribute's residual_scale. The residual is the
+        part of the flow's edit OUTSIDE every bank direction. An eval ablation
+        (--override_residual_scale 0) showed the trained age edit lives almost
+        entirely there: with it removed, Young stopped changing at all. The
+        real-data age directions, which look right when applied raw, were
+        barely used. Capping the residual forces the age edit back onto them."""
+        self._residual_cap[int(attr_local_idx)] = float(cap)
+
+    def set_dir_layers(self, attr_local_idx, lo, hi):
+        """Restrict one attribute's DIRECTION edit to W+ layers lo..hi
+        (inclusive). The residual is not masked (cap it separately)."""
+        m = torch.zeros(self.num_layers)
+        m[int(lo):int(hi) + 1] = 1.0
+        self._dir_layer_mask[int(attr_local_idx)] = m
+
+    def reset_magnitude(self, attr_local_idx):
+        """Put one attribute's per-layer magnitude back to the bank prior
+        (the dataset's old-vs-young displacement per layer), as at a fresh
+        init. Needed after resuming a checkpoint whose training shrank this
+        attribute's magnitude toward 0: magnitudes go through softplus, whose
+        slope is sigmoid(logit), so a very negative logit has almost no
+        gradient left to grow back even once the residual is capped."""
+        a = int(attr_local_idx)
+        L = self.num_layers
+        lin = self.magnitude_net[-1]
+        with torch.no_grad():
+            before = F.softplus(lin.bias[a * L:(a + 1) * L]).mean().item()
+            prior = self._prior_norms[a].to(lin.bias.device, lin.bias.dtype)
+            lin.bias[a * L:(a + 1) * L].copy_(_inverse_softplus(prior))
+            lin.weight[a * L:(a + 1) * L].mul_(0.01)
+            if self.use_attr_lora:
+                self.attr_lora_B[a].zero_()
+        return before, prior.mean().item()
 
     def _gate_weights(self, latent, B, device, dtype, slot_mask=None):
         """Return (B, num_attrs, K) softmax mixture weights.
@@ -446,6 +520,11 @@ class AttributeDirectionBank(nn.Module):
             magnitudes = magnitudes * mask.unsqueeze(-1)
 
         signed_magnitudes = magnitudes * attr_delta.unsqueeze(-1)    # (B, A, 18)
+        if self._dir_layer_mask:
+            lm = torch.ones(self.num_attrs, self.num_layers, device=device, dtype=dtype)
+            for a, m in self._dir_layer_mask.items():
+                lm[a] = m.to(device=device, dtype=dtype)
+            signed_magnitudes = signed_magnitudes * lm.unsqueeze(0)
 
         # ── Gate mixture ──────────────────────────────────────────────────
         alpha = self._gate_weights(latent, B, device, dtype,
