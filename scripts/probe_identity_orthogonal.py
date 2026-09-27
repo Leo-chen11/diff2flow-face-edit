@@ -65,8 +65,8 @@ from torch.utils import data
 from PIL import Image, ImageDraw
 
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, CelebAAttrClassifierJudge, _latest_step, apply_run_config,
-    is_clear, load_models,
+    ATTR_NAMES, CelebAAttrClassifierJudge, CLIPAttributeJudge, IndependentIDJudge,
+    _latest_step, apply_run_config, is_clear, load_models, parse_clip_calibration,
 )
 from common.face_parser import FaceParser
 from models.dataset import SDFlowDataset
@@ -208,6 +208,31 @@ def main(args):
     # (base vs projected vs random_ctrl, averaged over all samples) is the
     # number this whole probe exists to answer, and it needs to be printed
     # even on runs that skip the montage.
+    # The projection direction is the gradient of the TRAINING id network, so
+    # its ID gain measured by that same network is partly self-referential.
+    # The eval's own metrics (facenet casia ID_ind, calibrated CLIP) decide.
+    indep_id = clip_judge = None
+    if not args.no_independent_judges:
+        try:
+            indep_id = IndependentIDJudge('cuda', pretrained=args.id_indep_pretrained)
+        except ImportError:
+            print('[WARN] facenet-pytorch not installed -> no ID_ind.')
+        try:
+            clip_judge = CLIPAttributeJudge(
+                [args.attr], args.clip_judge_model, 'cuda',
+                calibration=parse_clip_calibration(args.clip_calibration))
+        except ImportError:
+            print('[WARN] CLIP not installed -> no CLIP score.')
+    ind = {}   # variant -> list of ID_ind
+    clp = {}   # variant -> list of CLIP attribute score
+
+    def score_indep(variant, image, src_ind):
+        if indep_id is not None:
+            ind.setdefault(variant, []).append(
+                (indep_id.extract(image) * src_ind).sum(1).item())
+        if clip_judge is not None:
+            clp.setdefault(variant, []).append(clip_judge.scores(image)[0, 0].item())
+
     face_parser = None
     try:
         face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
@@ -272,6 +297,9 @@ def main(args):
 
         base_ids.append(base_cos.item()); proj_ids.append(proj_cos.item())
         ctrl_ids.append(ctrl_cos.item())
+        src_ind = indep_id.extract(src_recon) if indep_id is not None else None
+        score_indep('base', base_img, src_ind)
+        score_indep('proj', proj_img, src_ind)
         keep = (proj_delta.norm() / guided_delta.norm().clamp(min=1e-8)).item()
         keep_ratios.append(keep)
         # Uniformly weaker edit: same direction, smaller step.
@@ -280,6 +308,7 @@ def main(args):
         for f in shrink_factors:
             f_cos, f_img = id_cosine(G, id_criterion, latent, guided_delta * f, src_feat)
             shrink_ids[f].append(f_cos.item())
+            score_indep(f, f_img, src_ind)
             if judge is not None:
                 shrink_scores[f].append(
                     judge.scores(F.interpolate(f_img, (256, 256)))[0, args.attr].item())
@@ -362,7 +391,7 @@ def main(args):
         # the shrink curve's ID at the projected edit's attribute score.
         pts = sorted((sc, i) for _, i, sc in curve)
         target = mean(proj_scores)
-        xs = [p_[0] for p_ in pts]; ys = [p_[1] for p_ in pts]
+        xs = [p_[0] for p_ in pts]
         if xs[0] <= target <= xs[-1]:
             for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
                 if x0 <= target <= x1:
@@ -379,6 +408,39 @@ def main(args):
         else:
             print(f'  projected {attr_name} score {target:.3f} is outside the shrink curve '
                   f'[{xs[0]:.3f}, {xs[-1]:.3f}]; add --shrink_factors to cover it.')
+
+    if ind or clp:
+        want_low = args.direction == 'rm'   # rm: success = attribute score below 0.5
+        def acc(v):
+            return mean([float((x < 0.5) if want_low else (x >= 0.5)) for x in clp[v]])
+        print(f'\n=== same comparison on the EVAL metrics (facenet ID_ind, CLIP) ===')
+        variants = [('base x1.00', 'base')] + [(f'shrink x{f:.2f}', f) for f in shrink_factors] \
+            + [('projected', 'proj')]
+        for label, v in variants:
+            line = f'  {label:<12}'
+            if v in ind:
+                line += f'  ID_ind={mean(ind[v]):.4f}'
+            if v in clp:
+                line += f'  CLIP={mean(clp[v]):.3f}  AccCLIP={acc(v):.1%}'
+            print(line)
+        if ind and clp:
+            pts = sorted([(acc(f), mean(ind[f])) for f in shrink_factors]
+                         + [(acc('base'), mean(ind['base']))])
+            target = acc('proj')
+            hit = None
+            for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+                if x0 <= target <= x1:
+                    t = 0.0 if x1 == x0 else (target - x0) / (x1 - x0)
+                    hit = y0 + t * (y1 - y0)
+                    break
+            if hit is None:
+                print(f'  projected AccCLIP {target:.1%} is outside the shrink curve.')
+            else:
+                print(f'  at AccCLIP {target:.1%}: shrink ID_ind={hit:.4f}  '
+                      f'projected ID_ind={mean(ind["proj"]):.4f}  '
+                      f'-> projection {mean(ind["proj"]) - hit:+.4f}')
+                print('  -> this line, not the training-network one above, decides whether')
+                print('     projection is worth building.')
     print()
     print('How to read this:')
     print('  - ID recovered by "projected" should be >= what "random_ctrl" recovers, by a')
@@ -417,6 +479,12 @@ if __name__ == '__main__':
                    help='How many identity-damaging directions to remove, greedily.')
     p.add_argument('--num_samples', type=int, default=24)
     p.add_argument('--control_seed', type=int, default=777)
+    p.add_argument('--no_independent_judges', action='store_true',
+                   help='Skip facenet ID_ind and CLIP scoring.')
+    p.add_argument('--id_indep_pretrained', default='casia-webface')
+    p.add_argument('--clip_judge_model', default='ViT-L/14')
+    p.add_argument('--clip_calibration', default=None,
+                   help="Same format as evaluate_sdflow, e.g. '39:0.517:0.132'.")
     p.add_argument('--shrink_factors', nargs='*', type=float, default=[0.2, 0.35, 0.5, 0.7, 0.85],
                    help='Uniform edit scalings for the shrink control curve.')
     p.add_argument('--celeba_attr_judge_weights', default=None,
