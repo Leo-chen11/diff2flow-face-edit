@@ -31,6 +31,11 @@ Procedure per sample:
      matched norm instead of the identity-derived ones, so "removing any
      K directions of similar size" can be told apart from "removing K
      directions specifically chosen for hurting identity".
+  5. SHRINK CONTROL: the edit scaled down uniformly (--shrink_factors,
+     plus the factor that matches the projected edit's norm). Projection
+     only helps if, at the SAME attribute score, it keeps more ID than
+     simply making the edit weaker -- the summary interpolates the shrink
+     curve at the projected score to answer exactly that.
 
 ControlNet injection is deliberately left out of this probe -- the
 projection operates on guided_delta, the W+ edit; ControlNet's skip
@@ -230,6 +235,11 @@ def main(args):
     base_ids, proj_ids, ctrl_ids = [], [], []
     base_scores, proj_scores, ctrl_scores = [], [], []
     base_hfs, proj_hfs, ctrl_hfs = [], [], []
+    keep_ratios = []
+    shrink_factors = sorted(set(args.shrink_factors))
+    shrink_ids = {f: [] for f in shrink_factors}
+    shrink_scores = {f: [] for f in shrink_factors}
+    match_ids, match_scores = [], []
     rows = []
     seen = 0
     for img, latent, pred in loader:
@@ -262,6 +272,17 @@ def main(args):
 
         base_ids.append(base_cos.item()); proj_ids.append(proj_cos.item())
         ctrl_ids.append(ctrl_cos.item())
+        keep = (proj_delta.norm() / guided_delta.norm().clamp(min=1e-8)).item()
+        keep_ratios.append(keep)
+        # Uniformly weaker edit: same direction, smaller step.
+        match_cos, match_img = id_cosine(G, id_criterion, latent, guided_delta * keep, src_feat)
+        match_ids.append(match_cos.item())
+        for f in shrink_factors:
+            f_cos, f_img = id_cosine(G, id_criterion, latent, guided_delta * f, src_feat)
+            shrink_ids[f].append(f_cos.item())
+            if judge is not None:
+                shrink_scores[f].append(
+                    judge.scores(F.interpolate(f_img, (256, 256)))[0, args.attr].item())
 
         line = (f'  #{seen:<2} ID  base={base_cos.item():.4f}  '
                f'projected={proj_cos.item():.4f} ({proj_cos.item()-base_cos.item():+.4f})  '
@@ -272,6 +293,8 @@ def main(args):
             ps = judge.scores(F.interpolate(proj_img, (256, 256)))[0, args.attr].item()
             cs = judge.scores(F.interpolate(ctrl_img, (256, 256)))[0, args.attr].item()
             base_scores.append(bs); proj_scores.append(ps); ctrl_scores.append(cs)
+            match_scores.append(
+                judge.scores(F.interpolate(match_img, (256, 256)))[0, args.attr].item())
             line += (f'\n       {attr_name}  base={bs:.2f}  projected={ps:.2f} '
                     f'({ps-bs:+.2f})  random_ctrl={cs:.2f} ({cs-bs:+.2f})')
 
@@ -319,6 +342,43 @@ def main(args):
         print('     projected LOWER/flat than base = same skin-smoothing shortcut the noise')
         print('     probe found, just reached through a different mechanism -- accuracy/ID')
         print('     gain here would not be one to build on; go back to reg_loss_fine instead.')
+
+    mk = mean(keep_ratios)
+    print(f'\n=== vs simply weakening the edit (the control that decides it) ===')
+    print(f'  projected edit keeps {mk:.1%} of the original edit norm')
+    line = f'  shrink x{mk:.2f} (norm-matched): ID={mean(match_ids):.4f}'
+    if match_scores:
+        line += f'  {attr_name}={mean(match_scores):.3f}'
+    print(line)
+    curve = [(1.0, mean(base_ids), mean(base_scores) if base_scores else None)]
+    for f in shrink_factors:
+        curve.append((f, mean(shrink_ids[f]),
+                      mean(shrink_scores[f]) if shrink_scores[f] else None))
+    curve.sort(key=lambda t: t[0])
+    for f, i, sc in curve:
+        print(f'  shrink x{f:.2f}: ID={i:.4f}' + (f'  {attr_name}={sc:.3f}' if sc is not None else ''))
+    if base_scores:
+        # Attribute score moves monotonically with the shrink factor; interpolate
+        # the shrink curve's ID at the projected edit's attribute score.
+        pts = sorted((sc, i) for _, i, sc in curve)
+        target = mean(proj_scores)
+        xs = [p_[0] for p_ in pts]; ys = [p_[1] for p_ in pts]
+        if xs[0] <= target <= xs[-1]:
+            for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+                if x0 <= target <= x1:
+                    t = 0.0 if x1 == x0 else (target - x0) / (x1 - x0)
+                    shrink_id = y0 + t * (y1 - y0)
+                    break
+            gain = mean(proj_ids) - shrink_id
+            print(f'  at the projected {attr_name} score {target:.3f}: '
+                  f'shrink ID={shrink_id:.4f}  projected ID={mean(proj_ids):.4f}  '
+                  f'-> projection {gain:+.4f}')
+            print('  -> clearly > 0 (~+0.02 or more): the identity-derived cut buys ID a weaker')
+            print('     edit cannot; worth building. ~0 or < 0: projection is just a weaker')
+            print('     edit in disguise.')
+        else:
+            print(f'  projected {attr_name} score {target:.3f} is outside the shrink curve '
+                  f'[{xs[0]:.3f}, {xs[-1]:.3f}]; add --shrink_factors to cover it.')
     print()
     print('How to read this:')
     print('  - ID recovered by "projected" should be >= what "random_ctrl" recovers, by a')
@@ -357,6 +417,8 @@ if __name__ == '__main__':
                    help='How many identity-damaging directions to remove, greedily.')
     p.add_argument('--num_samples', type=int, default=24)
     p.add_argument('--control_seed', type=int, default=777)
+    p.add_argument('--shrink_factors', nargs='*', type=float, default=[0.2, 0.35, 0.5, 0.7, 0.85],
+                   help='Uniform edit scalings for the shrink control curve.')
     p.add_argument('--celeba_attr_judge_weights', default=None,
                    help='Optional but recommended -- without it only ID cosine is reported, '
                         'not whether the attribute edit itself survived the projection.')
