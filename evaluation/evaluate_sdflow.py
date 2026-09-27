@@ -502,7 +502,7 @@ RUN_CONFIG_KEYS = [
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
     'controlnet_region_cond', 'content_bank_path', 'region_saliency_path',
-    'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers',
+    'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers', 'gate_uniform_attrs',
 ]
 
 
@@ -808,6 +808,9 @@ def load_models(args):
         else:
             print(f'Direction bank init (no trained weights at {db_ckpt_path})')
         from models.direction_bank import parse_attr_spec
+        for _a in (getattr(args, 'gate_uniform_attrs', None) or []):
+            direction_bank.set_uniform_gate(args.attribute_index.index(int(_a)))
+            print(f'[Gate] attr {_a}: direction-bank gate forced uniform (averaged slots)')
         for _a, _c in parse_attr_spec(getattr(args, 'residual_scale_cap', None)).items():
             direction_bank.set_residual_cap(args.attribute_index.index(_a), _c)
             print(f'[RunConfig] residual_scale for attr {_a} capped at {_c:g} (as trained)')
@@ -1763,6 +1766,10 @@ if __name__ == '__main__':
                              'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
                              'edits to get a real region mask instead of the all-ones fallback. '
                              'Auto-restored from config.json.')
+    parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
+                        help="Force these attributes' direction-bank gate uniform at eval (average "
+                             "of the slots instead of the trained gate's pick). Diagnostic on a "
+                             "checkpoint trained without it; auto-restored for one trained with it.")
     parser.add_argument('--edit_target', default='mirror', choices=['mirror', 'train'],
                         help="What value an edit of strength s asks the flow for. mirror "
                              "(default, all previous evals): src*(1-s)+(1-src)*s. train: "

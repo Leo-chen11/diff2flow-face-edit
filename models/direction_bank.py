@@ -166,6 +166,8 @@ class AttributeDirectionBank(nn.Module):
         # attributes re-applied from the run config at train and eval time.
         self._residual_cap = {}
         self._dir_layer_mask = {}
+        # Local attrs whose gate is forced uniform (see set_uniform_gate).
+        self._uniform_gate = set()
 
         # Optional per-attribute LoRA-style adapter on top of magnitude_net's
         # shared hidden representation. magnitude_net is ONE MLP shared across
@@ -409,9 +411,28 @@ class AttributeDirectionBank(nn.Module):
             logits = self.gate_net(w).view(B, self.num_attrs, self.num_k)  # (B, A, K)
         else:
             logits = torch.zeros(B, self.num_attrs, self.num_k, device=device, dtype=dtype)
+        if self._uniform_gate:
+            uni = torch.zeros(self.num_attrs, dtype=torch.bool, device=device)
+            uni[list(self._uniform_gate)] = True
+            logits = torch.where(uni.view(1, -1, 1), torch.zeros_like(logits), logits)
         if slot_mask is not None:
             logits = logits.masked_fill(~slot_mask, float('-inf'))
         return F.softmax(logits, dim=-1)
+
+    def set_uniform_gate(self, attr_local_idx):
+        """Average this attribute's slots with equal weight instead of letting
+        gate_net pick. Combined with strata routing: uniform over the source's
+        own stratum's slots.
+
+        Why: the gate's sharpness loss drives each face to ONE sub-style slot
+        (dir_gate_sharpness_loss ~0.09 of max in v30). A single k-means
+        sub-cluster direction carries that sub-population's quirks (hair
+        style, pose, lighting) on top of aging -- they cost identity without
+        making the face look older. The age trade-off sweep
+        (scripts/probe_age_tradeoff.py) measured AVERAGED directions, and v34
+        (one slot per face) landed ~8-10 AccCLIP points below that curve at
+        matched ID."""
+        self._uniform_gate.add(int(attr_local_idx))
 
     # Stratum label order written by precompute_directions_stratified.py for
     # age(39) when --age_k > 1 (confident_strata_masks' hi/lo order on
@@ -568,6 +589,8 @@ class AttributeDirectionBank(nn.Module):
                 # the batch by construction; pushing it toward uniform over
                 # all K would fight the routing. Sharpness (within the
                 # allowed slots) still applies below.
+                if int(a) in self._uniform_gate:
+                    continue     # no gate choice to regularize
                 if int(a) not in self._strata_routing:
                     p = batch_mean.clamp(min=1e-8)
                     p = p / p.sum()
@@ -592,7 +615,8 @@ class AttributeDirectionBank(nn.Module):
                 sharp_losses.append(cond_entropy / max_entropy)
             self._last_gate_diversity_loss = (torch.stack(div_losses).mean() if div_losses
                                               else torch.zeros([], device=device, dtype=dtype))
-            self._last_gate_sharpness_loss = torch.stack(sharp_losses).mean()
+            self._last_gate_sharpness_loss = (torch.stack(sharp_losses).mean() if sharp_losses
+                                              else torch.zeros([], device=device, dtype=dtype))
         else:
             self._last_gate_diversity_loss = torch.zeros([], device=device, dtype=dtype)
             self._last_gate_sharpness_loss = torch.zeros([], device=device, dtype=dtype)

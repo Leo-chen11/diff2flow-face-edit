@@ -1938,6 +1938,12 @@ if __name__ == '__main__':
                              "ID_ind 0.63), so the shared 0.8 floor pushes the model to age by "
                              "texture only. Use scripts/probe_age_tradeoff.py to choose it. "
                              "Default off (every attribute uses --id_hinge_threshold).")
+    parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
+                        help="CelebA ids whose direction-bank gate is forced uniform: the edit uses "
+                             "the AVERAGE of the attribute's slots (of its own stratum, with "
+                             "--age_gate_by_strata) instead of the one sub-style slot the sharpness "
+                             "loss makes gate_net pick. Test at eval first (evaluate_sdflow.py "
+                             "--gate_uniform_attrs). Restored at eval. Default off.")
     parser.add_argument('--age_gate_by_strata', action='store_true', default=False,
                         help="Route each Young(39) edit to the bank slots of the SOURCE's own "
                              "gender x glasses stratum (read from the conditioner's Male / "
@@ -2413,6 +2419,9 @@ if __name__ == '__main__':
                 args.attribute_index.index(15))
             print(f'** Age strata routing ON: each Young edit uses only the {_per} slot(s) of '
                   f'its source\'s gender x glasses stratum.')
+        for _a in (args.gate_uniform_attrs or []):
+            direction_bank.set_uniform_gate(args.attribute_index.index(_a))
+            print(f'** direction-bank gate for attr {_a} forced uniform (averaged slots)')
         for _a, _c in parse_attr_spec(args.residual_scale_cap).items():
             direction_bank.set_residual_cap(args.attribute_index.index(_a), _c)
             print(f'** residual_scale for attr {_a} capped at {_c:g}')
