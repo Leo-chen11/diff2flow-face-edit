@@ -21,6 +21,15 @@ Usage:
 
     # 2. build the bank
     python -m scripts.precompute_content_bank --dump --out ./data/content_bank_age.pth
+
+The preds file stores THRESHOLDED attribute predictions (0/1), so the Young
+thresholds only split Young==0 / Young==1: the "old" side then also holds
+bearded thirty-somethings and the "young" side holds children. Index 40 of
+each pred is the classifier's age bin (sum of its 6 ordinal age heads).
+Look at what each bin means, then restrict the buckets with it:
+
+    python -m scripts.precompute_content_bank --preview_age_bins --out_dir ./content_bank_preview
+    python -m scripts.precompute_content_bank --preview --old_min_age_bin 4 --young_age_bins 1-2
 """
 import argparse
 import os
@@ -50,25 +59,54 @@ def build_dataset(args):
                          train=True, transform=tf)
 
 
+def age_bin(pred):
+    """Classifier age bin (0-6) stored at index 40, or None if the preds file
+    has no age column."""
+    return int(round(float(pred[40]))) if pred.numel() > 40 else None
+
+
+def _parse_bins(spec):
+    if spec is None:
+        return None
+    lo, _, hi = spec.partition('-')
+    return int(lo), int(hi or lo)
+
+
 def select_rows(dataset, args):
     """Returns [(dataset_index, bucket, male)], capped per (bucket, gender)."""
     g = torch.Generator().manual_seed(args.seed)
     buckets = {(b, m): [] for b in (BUCKET_OLD, BUCKET_YOUNG) for m in (True, False)}
+    hist = {k: {} for k in buckets}
+    young_bins = _parse_bins(args.young_age_bins)
+    warned = False
     for idx in range(len(dataset)):
         pred = dataset._lookup_precomputed(dataset.preds, dataset.image_list[idx])
         young, male = float(pred[39]), float(pred[20]) >= 0.5
+        ab = age_bin(pred)
+        if ab is None and (args.old_min_age_bin is not None or young_bins) and not warned:
+            print('[WARN] preds file has no age column (index 40); age-bin filters ignored.')
+            warned = True
         if young <= args.old_thresh:
-            buckets[(BUCKET_OLD, male)].append(idx)
+            if ab is not None and args.old_min_age_bin is not None and ab < args.old_min_age_bin:
+                continue
+            key = (BUCKET_OLD, male)
         elif young >= args.young_thresh:
-            buckets[(BUCKET_YOUNG, male)].append(idx)
+            if ab is not None and young_bins and not (young_bins[0] <= ab <= young_bins[1]):
+                continue
+            key = (BUCKET_YOUNG, male)
+        else:
+            continue
+        buckets[key].append(idx)
+        hist[key][ab] = hist[key].get(ab, 0) + 1
     rows = []
     for (b, m), idxs in sorted(buckets.items()):
         total = len(idxs)
         if total > args.max_per_bucket:
             perm = torch.randperm(total, generator=g)[:args.max_per_bucket].tolist()
             idxs = [idxs[i] for i in sorted(perm)]
+        bins = ' '.join(f'{k}:{v}' for k, v in sorted(hist[(b, m)].items(), key=lambda t: (t[0] is None, t[0])))
         print(f'  {"old  " if b == BUCKET_OLD else "young"} {"male  " if m else "female"}: '
-              f'{total} candidates, using {len(idxs)}')
+              f'{total} candidates, using {len(idxs)}   age bins {{{bins}}}')
         rows += [(i, b, m) for i in idxs]
     return rows
 
@@ -129,6 +167,8 @@ def run_dump(args):
         'dim_std': dim_std,
         'config': {'res': args.res, 'erode': args.erode, 'min_frac': args.min_frac,
                    'old_thresh': args.old_thresh, 'young_thresh': args.young_thresh,
+                   'old_min_age_bin': args.old_min_age_bin,
+                   'young_age_bins': args.young_age_bins,
                    'regions': ['skin', 'hair'], 'vgg_taps': ['relu2_2', 'relu3_3']},
     }
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -140,6 +180,25 @@ def run_dump(args):
 def _to_pil(img, size):
     x = ((img.clamp(-1, 1) + 1) * 127.5).byte().permute(1, 2, 0).cpu().numpy()
     return Image.fromarray(x).resize((size, size))
+
+
+def _save_strip(G, parser, tex, dataset, sel, label, path, tile):
+    lat = torch.stack([dataset._lookup_precomputed(dataset.latents, dataset.image_list[i])
+                       for i in sel]).cuda()
+    img = render(G, lat)
+    masks = tex.region_masks(parser, img)
+    canvas = Image.new('RGB', (tile * len(sel), tile * 2))
+    for k in range(len(sel)):
+        face = F.interpolate(img[k:k + 1], (tex.res, tex.res), mode='bilinear',
+                             align_corners=False)[0]
+        over = face.clone()
+        over[0] = torch.where(masks['skin'][k, 0] > 0.5, torch.ones_like(over[0]), over[0])
+        over[1] = torch.where(masks['hair'][k, 0] > 0.5, torch.ones_like(over[1]), over[1])
+        canvas.paste(_to_pil(face, tile), (k * tile, 0))
+        canvas.paste(_to_pil(0.5 * face + 0.5 * over, tile), (k * tile, tile))
+    ImageDraw.Draw(canvas).text((4, 4), label, fill=(255, 255, 0))
+    canvas.save(path)
+    print(f'  wrote {path}')
 
 
 def run_preview(args):
@@ -154,25 +213,32 @@ def run_preview(args):
             sel = [i for i, bb, mm in rows if bb == b and mm == m]
             if not sel:
                 continue
-            lat = torch.stack([dataset._lookup_precomputed(dataset.latents, dataset.image_list[i])
-                               for i in sel]).cuda()
-            img = render(G, lat)
-            masks = tex.region_masks(parser, img)
-            T_ = args.tile
-            canvas = Image.new('RGB', (T_ * len(sel), T_ * 2))
-            for k in range(len(sel)):
-                face = F.interpolate(img[k:k + 1], (tex.res, tex.res), mode='bilinear',
-                                     align_corners=False)[0]
-                over = face.clone()
-                over[0] = torch.where(masks['skin'][k, 0] > 0.5, torch.ones_like(over[0]), over[0])
-                over[1] = torch.where(masks['hair'][k, 0] > 0.5, torch.ones_like(over[1]), over[1])
-                canvas.paste(_to_pil(face, T_), (k * T_, 0))
-                canvas.paste(_to_pil(0.5 * face + 0.5 * over, T_), (k * T_, T_))
-            ImageDraw.Draw(canvas).text((4, 4), f'{names[b]} {"male" if m else "female"}',
-                                        fill=(255, 255, 0))
-            path = os.path.join(args.out_dir, f'bank_{names[b]}_{"male" if m else "female"}.png')
-            canvas.save(path)
-            print(f'  wrote {path}')
+            gender = 'male' if m else 'female'
+            _save_strip(G, parser, tex, dataset, sel, f'{names[b]} {gender}',
+                        os.path.join(args.out_dir, f'bank_{names[b]}_{gender}.png'), args.tile)
+
+
+def run_preview_age_bins(args):
+    """One strip per classifier age bin, genders mixed, so the bins can be
+    mapped to real ages by eye before choosing --old_min_age_bin / --young_age_bins."""
+    dataset = build_dataset(args)
+    g = torch.Generator().manual_seed(args.seed)
+    by_bin = {}
+    for idx in range(len(dataset)):
+        pred = dataset._lookup_precomputed(dataset.preds, dataset.image_list[idx])
+        ab = age_bin(pred)
+        if ab is None:
+            raise SystemExit('preds file has no age column (index 40).')
+        by_bin.setdefault(ab, []).append(idx)
+    G, parser, tex = build_models(args)
+    os.makedirs(args.out_dir, exist_ok=True)
+    for ab in sorted(by_bin):
+        idxs = by_bin[ab]
+        pick = torch.randperm(len(idxs), generator=g)[:args.num_faces].tolist()
+        sel = [idxs[i] for i in pick]
+        print(f'  age bin {ab}: {len(idxs)} faces')
+        _save_strip(G, parser, tex, dataset, sel, f'age bin {ab} (n={len(idxs)})',
+                    os.path.join(args.out_dir, f'age_bin_{ab}.png'), args.tile)
 
 
 def main():
@@ -180,6 +246,8 @@ def main():
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument('--preview', action='store_true')
     mode.add_argument('--dump', action='store_true')
+    mode.add_argument('--preview_age_bins', action='store_true',
+                      help='One strip per classifier age bin, to map bins to real ages.')
     p.add_argument('--out', default='./data/content_bank_age.pth')
     p.add_argument('--out_dir', default='./content_bank_preview')
     p.add_argument('--num_faces', type=int, default=8, help='--preview: faces per bucket.')
@@ -188,6 +256,11 @@ def main():
                    help='Young pred <= this counts as an OLD reference.')
     p.add_argument('--young_thresh', type=float, default=0.8,
                    help='Young pred >= this counts as a YOUNG reference.')
+    p.add_argument('--old_min_age_bin', type=int, default=None,
+                   help='OLD references must also have classifier age bin >= this.')
+    p.add_argument('--young_age_bins', default=None,
+                   help="YOUNG references must have age bin in this range, e.g. '1-2' "
+                        '(drops children and forty-somethings).')
     p.add_argument('--max_per_bucket', type=int, default=2000,
                    help='Cap per (old/young, male/female) bucket.')
     p.add_argument('--res', type=int, default=256,
@@ -204,7 +277,9 @@ def main():
     p.add_argument('--stygan2_weights', default='./data/stylegan2-ffhq-config-f.pt')
     p.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth')
     args = p.parse_args()
-    if args.preview:
+    if args.preview_age_bins:
+        run_preview_age_bins(args)
+    elif args.preview:
         run_preview(args)
     else:
         run_dump(args)
