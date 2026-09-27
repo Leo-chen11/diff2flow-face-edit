@@ -264,6 +264,11 @@ def main(args):
             control_encoder=control_encoder,
             controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
             controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
+            # --force_direction: tell the model the audited direction instead
+            # of letting the conditioner's reading pick it (see evaluate_sdflow
+            # --edit_direction).
+            direction=(torch.full((img.size(0),), -1.0 if args.direction == 'rm' else 1.0,
+                                  device=img.device) if args.force_direction else None),
         )
         edited_256 = F.interpolate(edited, (256, 256))
         edit_celeba = celeba_judge.scores(edited_256)    # (B, 40)
@@ -381,6 +386,9 @@ if __name__ == '__main__':
     p.add_argument('--attr', type=int, default=39, help='Global attribute index being edited.')
     p.add_argument('--direction', default='rm', choices=['add', 'rm'])
     p.add_argument('--edit_scale', type=float, default=1.0)
+    p.add_argument('--force_direction', action='store_true',
+                   help='Edit every audited sample in --direction, instead of the direction the '
+                        'conditioner reads off the source. Removes the told-backwards failures.')
     p.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
                    help='Same as evaluate_sdflow.py --gate_uniform_attrs.')
     p.add_argument('--edit_target', default='mirror', choices=['mirror', 'train'],

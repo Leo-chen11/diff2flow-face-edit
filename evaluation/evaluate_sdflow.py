@@ -978,7 +978,7 @@ TRAIN_SOFT_TARGET_DEFAULT = (0.20, 0.80)
 _EDIT_TARGET_MODE = 'mirror'
 
 
-def edited_attr_value(src, scale, attr_global_idx, mode=None):
+def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
     """The attribute value the flow is asked to reach at edit strength `scale`.
 
     'mirror' (default, what every eval so far used): src*(1-s) + (1-src)*s, so
@@ -992,6 +992,14 @@ def edited_attr_value(src, scale, attr_global_idx, mode=None):
     that are hardest to flip, and asks for a smaller change than training
     taught the model to make for that source. Numbers from the two modes are
     not comparable: compare checkpoints under the same mode."""
+    if direction is not None:
+        # Explicit direction (+1 add, -1 rm), e.g. from the eval judge's own
+        # add/rm split: move toward the matching end of [0, 1] by `scale`.
+        # Always moves the requested way, even when the conditioner reads the
+        # source on the other side of 0.5 (where mirror / train would edit the
+        # wrong way, or not at all at src == 0.5).
+        end = (direction.to(src.dtype) > 0).to(src.dtype)
+        return src + scale * (end - src)
     mode = mode or _EDIT_TARGET_MODE
     if mode == 'train' and attr_global_idx is not None:
         low, high = TRAIN_SOFT_TARGET.get(int(attr_global_idx), TRAIN_SOFT_TARGET_DEFAULT)
@@ -1080,8 +1088,13 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                           face_parser=None, composite_method='alpha', composite_blur_sigma=15,
                           control_encoder=None, controlnet_max_norm=0.0,
                           controlnet_disable_attrs=None, controlnet_embed_res=64,
-                          composite=True):
+                          composite=True, direction=None):
     """
+    direction: optional (B,) tensor, +1 = add the attribute, -1 = remove it.
+    None (default) = the old behaviour: the direction follows the
+    conditioner's own reading of the source (src > 0.5 -> remove). See
+    --edit_direction.
+
     face_parser: if given AND composite=True (the default), composite the
     edited face back onto the SOURCE RECONSTRUCTION's background/hair (see
     composite_faces() above). A long-running complaint in this project was
@@ -1129,7 +1142,9 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
 
     new_attr_cond = attr_cond.clone()
     src = attr_cond[:, attr_local_idx]
-    new_attr_cond[:, attr_local_idx] = edited_attr_value(src, edit_scale, attr_global_idx)
+    new_attr_cond[:, attr_local_idx] = edited_attr_value(src, edit_scale, attr_global_idx,
+                                                         direction=direction)
+    is_rm = (src > 0.5) if direction is None else (direction.to(src.device) < 0)
     new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
     new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
@@ -1169,11 +1184,11 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                     with torch.no_grad():
                         region_mask = region_parser.get_region_mask(
                             src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
-            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
                                             latent=latent, region_mask=region_mask,
                                             content_bias=_content_bias(
                                                 control_encoder, attr_global_idx,
-                                                attr_cond, src > 0.5))
+                                                attr_cond, is_rm))
             control_skips = clip_skips(control_skips, controlnet_max_norm)
     else:
         new_latents = new_latents_raw
@@ -1187,6 +1202,15 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                                       blur_sigma=composite_blur_sigma)
 
     return edited_face
+
+
+def _eval_direction(args, src_probs_clip, local_idx):
+    """--edit_direction clip: tell the model the direction the eval scores it
+    on (the CLIP judge's add/rm split; the BiSeNet parser for Eyeglasses).
+    None = conditioner-chosen direction (the old behaviour)."""
+    if getattr(args, 'edit_direction', 'cond') != 'clip' or src_probs_clip is None:
+        return None
+    return torch.where(src_probs_clip[:, local_idx] > 0.5, -1.0, 1.0)
 
 
 def edit_multi_attribute(prior, conditioner, G, id_criterion,
@@ -1477,6 +1501,7 @@ def evaluate(args):
                     # -- decoupled from whether compositing was actually
                     # requested, so it doesn't silently turn on here too.
                     composite=args.composite_face_region,
+                    direction=_eval_direction(args, src_probs_clip, local_idx),
                 )
                 edited_256 = F.interpolate(edited_face, (256, 256))
 
@@ -1766,6 +1791,15 @@ if __name__ == '__main__':
                              'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
                              'edits to get a real region mask instead of the all-ones fallback. '
                              'Auto-restored from config.json.')
+    parser.add_argument('--edit_direction', default='cond', choices=['cond', 'clip'],
+                        help="Who decides add vs remove. cond (default, all previous evals): the "
+                             "conditioner's reading of the source. clip: the CLIP judge's add/rm "
+                             "split that AccCLIP scores the edit against. The conditioner reads "
+                             "some CLIP-young faces as old (middle-aged faces, children; 8%% of men "
+                             "vs 2%% of women in v34), so under cond they are edited the wrong way "
+                             "or barely at all, and fail at any scale. clip measures editing "
+                             "ability with the intended direction given, as a user would; report "
+                             "it alongside cond, not instead of it.")
     parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
                         help="Force these attributes' direction-bank gate uniform at eval (average "
                              "of the slots instead of the trained gate's pick). Diagnostic on a "
