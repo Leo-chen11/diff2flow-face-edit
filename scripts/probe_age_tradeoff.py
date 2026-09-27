@@ -21,6 +21,11 @@ Usage:
     python -m scripts.probe_age_tradeoff \
         --direction_bank_path ./data/direction_bank_k4_stratified_v3.pth \
         --clip_calibration 39:0.517:0.132 --out_dir ./age_tradeoff
+
+    # 2-D: structure-layer strength x detail-layer strength, best per ID floor
+    python -m scripts.probe_age_tradeoff --split \
+        --direction_bank_path ./data/direction_bank_k4_stratified_v3.pth \
+        --clip_calibration 39:0.517:0.132 --out_dir ./age_tradeoff
 """
 import argparse
 import os
@@ -85,6 +90,30 @@ def to_pil(x, size):
     return Image.fromarray(x).resize((size, size))
 
 
+def build_configs(args, device):
+    """[(label, coef (18,1))]: per-layer strength of the age direction.
+
+    Default: one strength over a layer set (--layer_sets x --alphas).
+    --split: structure layers and detail layers get separate strengths
+    (--struct_alphas x --detail_alphas), to find the per-band allocation that
+    buys the most accuracy for a given identity cost."""
+    configs = []
+    if args.split:
+        s_lo, s_hi = (int(x) for x in args.struct_layers.split('-'))
+        d_lo, d_hi = (int(x) for x in args.detail_layers.split('-'))
+        ms, md = layer_mask(s_lo, s_hi).to(device), layer_mask(d_lo, d_hi).to(device)
+        for a_s in args.struct_alphas:
+            for a_d in args.detail_alphas:
+                configs.append((f's{a_s:g}+d{a_d:g}', a_s * ms + a_d * md))
+    else:
+        for sk in args.layer_sets:
+            lo, hi = LAYER_SETS[sk]
+            m = layer_mask(lo, hi).to(device)
+            for a in args.alphas:
+                configs.append((f'{sk} a{a:g}', a * m))
+    return configs
+
+
 @torch.no_grad()
 def main(args):
     from evaluation.evaluate_sdflow import (CLIPAttributeJudge, IndependentIDJudge, is_clear,
@@ -92,10 +121,9 @@ def main(args):
     from models.dataset import SDFlowDataset
     from models.stylegan2.model import Generator
 
-    device = 'cuda'
+    device = args.device
     dirs = {k: v.to(device) for k, v in load_age_dirs(args.direction_bank_path, args.dir_mode).items()}
-    sets = {k: LAYER_SETS[k] for k in args.layer_sets}
-    masks = {k: layer_mask(*v).to(device) for k, v in sets.items()}
+    configs = build_configs(args, device)
 
     ckpt = torch.load(args.stygan2_weights, map_location='cpu')
     G = Generator(size=1024, style_dim=512, n_mlp=8)
@@ -112,11 +140,10 @@ def main(args):
                        train=False, transform=tf)
     loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
 
-    # stats[(set, alpha)] -> lists
+    tile = 192
     stats = defaultdict(lambda: defaultdict(list))
-    mont_keys = [tuple(x.split(':')) for x in args.montage]
-    mont_keys = [(k, float(a)) for k, a in mont_keys]
-    mont_rows = []
+    tiles = defaultdict(list)          # label -> PIL tiles of the first montage_n aging sources
+    src_tiles = []
     seen = 0
     for _img, latent, pred in loader:
         if seen >= args.num_samples:
@@ -139,76 +166,86 @@ def main(args):
             d = torch.stack([dirs[n] for n in names])                  # (B, 18, 512)
         else:
             d = dirs['average'].unsqueeze(0).expand(B, -1, -1)
-        mont_imgs = {}
-        for sk, m in masks.items():
-            for a in args.alphas:
-                w = latent + (sign.view(B, 1, 1) * a) * d * m.unsqueeze(0)
-                e = G([w], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-                e256 = F.interpolate(e, (256, 256))
-                ey = clip_judge.scores(e256)[:, 0]
-                idc = (src_id * id_judge.extract(e256)).sum(1)
-                for b in range(B):
-                    if not bool(clear[b]):
-                        continue
-                    rm = bool(s_young[b] > 0.5)
-                    ok = float(ey[b] < 0.5) if rm else float(ey[b] > 0.5)
-                    st = stats[(sk, a)]
-                    st['ok'].append(ok)
-                    st['id'].append(idc[b].item())
-                    st['ok_rm' if rm else 'ok_add'].append(ok)
-                    if rm:
-                        st['ok_rm_m' if bool(male[b]) else 'ok_rm_f'].append(ok)
-                        st['id_rm'].append(idc[b].item())
-                if (sk, a) in mont_keys:
-                    mont_imgs[(sk, a)] = e256
-        for b in range(B):
-            if len(mont_rows) >= args.montage_n or not bool(clear[b]) or not bool(s_young[b] > 0.5):
-                continue
-            mont_rows.append([src256[b]] + [mont_imgs[k][b] for k in mont_keys if k in mont_imgs])
+        mont_b = [b for b in range(B) if bool(clear[b]) and bool(s_young[b] > 0.5)]
+        mont_b = mont_b[:max(0, args.montage_n - len(src_tiles))]
+        for b in mont_b:
+            src_tiles.append(to_pil(src256[b], tile))
+        for label, coef in configs:
+            w = latent + sign.view(B, 1, 1) * d * coef.unsqueeze(0)
+            e = G([w], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+            e256 = F.interpolate(e, (256, 256))
+            ey = clip_judge.scores(e256)[:, 0]
+            idc = (src_id * id_judge.extract(e256)).sum(1)
+            st = stats[label]
+            for b in range(B):
+                if not bool(clear[b]):
+                    continue
+                rm = bool(s_young[b] > 0.5)
+                ok = float(ey[b] < 0.5) if rm else float(ey[b] > 0.5)
+                st['ok'].append(ok)
+                st['id'].append(idc[b].item())
+                st['ok_rm' if rm else 'ok_add'].append(ok)
+                if rm:
+                    st['ok_rm_m' if bool(male[b]) else 'ok_rm_f'].append(ok)
+                    st['id_rm'].append(idc[b].item())
+            for b in mont_b:
+                tiles[label].append(to_pil(e256[b], tile))
         seen += int(clear.sum())
 
     def mean(v):
         return sum(v) / len(v) if v else float('nan')
 
-    print(f'\n{seen} clear sources, dir_mode={args.dir_mode}. rm = aging (young sources).')
-    print(f'{"layers":<12}{"W+":<7}{"alpha":>6}  {"AccCLIP":>8} {"rm":>7} {"rm_M":>7} '
-          f'{"rm_F":>7} {"add":>7}  {"ID_ind":>7} {"ID_rm":>7}')
+    print(f'\n{seen} clear sources, dir_mode={args.dir_mode}'
+          + (f', split: structure {args.struct_layers} x detail {args.detail_layers}'
+             if args.split else '') + '. rm = aging (young sources).')
+    print(f'{"setting":<18}  {"AccCLIP":>8} {"rm":>7} {"rm_M":>7} {"rm_F":>7} {"add":>7}  '
+          f'{"ID_ind":>7} {"ID_rm":>7}')
     rows = []
-    for sk, (lo, hi) in sets.items():
-        for a in args.alphas:
-            st = stats[(sk, a)]
-            r = dict(set=sk, lo=lo, hi=hi, a=a, acc=mean(st['ok']), rm=mean(st['ok_rm']),
-                     rm_m=mean(st['ok_rm_m']), rm_f=mean(st['ok_rm_f']), add=mean(st['ok_add']),
-                     id=mean(st['id']), id_rm=mean(st['id_rm']))
-            rows.append(r)
-            print(f'{sk:<12}{f"{lo}-{hi}":<7}{a:>6.2f}  {r["acc"] * 100:7.1f}% {r["rm"] * 100:6.1f}% '
-                  f'{r["rm_m"] * 100:6.1f}% {r["rm_f"] * 100:6.1f}% {r["add"] * 100:6.1f}%  '
-                  f'{r["id"]:7.4f} {r["id_rm"]:7.4f}')
+    for label, _ in configs:
+        st = stats[label]
+        r = dict(label=label, acc=mean(st['ok']), rm=mean(st['ok_rm']), rm_m=mean(st['ok_rm_m']),
+                 rm_f=mean(st['ok_rm_f']), add=mean(st['ok_add']), id=mean(st['id']),
+                 id_rm=mean(st['id_rm']))
+        rows.append(r)
+        print(f'{label:<18}  {r["acc"] * 100:7.1f}% {r["rm"] * 100:6.1f}% {r["rm_m"] * 100:6.1f}% '
+              f'{r["rm_f"] * 100:6.1f}% {r["add"] * 100:6.1f}%  {r["id"]:7.4f} {r["id_rm"]:7.4f}')
+    best = {}
     for floor in args.id_floors:
         ok = sorted([r for r in rows if r['id'] >= floor], key=lambda r: -r['acc'])[:5]
         print(f'\nBest AccCLIP with ID_ind >= {floor}:')
         if not ok:
             print('  (none)')
         for r in ok:
-            print(f'  {r["set"]:<12} layers {r["lo"]}-{r["hi"]}  alpha {r["a"]:.2f}  '
-                  f'AccCLIP {r["acc"] * 100:.1f}% (men {r["rm_m"] * 100:.1f}%)  ID {r["id"]:.3f}')
-    print('\nReference, trained v30_gbal @ scale 1.0 (evaluate_sdflow): Young AccCLIP 71.9%, '
-          'ID_ind 0.787 -- texture-only aging.')
+            print(f'  {r["label"]:<18} AccCLIP {r["acc"] * 100:.1f}% (men {r["rm_m"] * 100:.1f}%, '
+                  f'women {r["rm_f"] * 100:.1f}%)  ID {r["id"]:.3f}')
+        if ok:
+            best[floor] = ok[0]['label']
 
-    if mont_rows:
+    # Montage: the settings named by --montage, or in --split mode the best
+    # setting at each ID floor.
+    if args.split:
+        show = list(dict.fromkeys(best[f] for f in sorted(best, reverse=True)))
+    else:
+        show = []
+        for x in args.montage:
+            k, a = x.split(':')
+            show.append(f'{k} a{float(a):g}')
+    show = [s for s in show if s in tiles]
+    if src_tiles and show:
         os.makedirs(args.out_dir, exist_ok=True)
-        tile = 192
-        labels = ['source'] + [f'{k} a{a:g}' for k, a in mont_keys]
-        canvas = Image.new('RGB', (tile * len(labels), tile * len(mont_rows) + 18), (20, 20, 20))
+        labels = ['source'] + show
+        canvas = Image.new('RGB', (tile * len(labels), tile * len(src_tiles) + 18), (20, 20, 20))
         dr = ImageDraw.Draw(canvas)
         for c, lab in enumerate(labels):
             dr.text((c * tile + 4, 3), lab, fill=(255, 255, 0))
-        for r, row in enumerate(mont_rows):
-            for c, im in enumerate(row):
-                canvas.paste(to_pil(im, tile), (c * tile, 18 + r * tile))
-        path = os.path.join(args.out_dir, f'age_tradeoff_{args.dir_mode}.png')
+        for r in range(len(src_tiles)):
+            canvas.paste(src_tiles[r], (0, 18 + r * tile))
+            for c, lab in enumerate(show, start=1):
+                canvas.paste(tiles[lab][r], (c * tile, 18 + r * tile))
+        path = os.path.join(args.out_dir, f'age_tradeoff_{args.dir_mode}'
+                                          f'{"_split" if args.split else ""}.png')
         canvas.save(path)
-        print(f'\nwrote {path}')
+        print(f'\nwrote {path}  (columns: {", ".join(show)})')
 
 
 if __name__ == '__main__':
@@ -221,11 +258,19 @@ if __name__ == '__main__':
     p.add_argument('--layer_sets', nargs='*', default=list(LAYER_SETS),
                    choices=list(LAYER_SETS))
     p.add_argument('--alphas', nargs='*', type=float, default=[0.75, 1.0, 1.25, 1.5])
-    p.add_argument('--id_floors', nargs='*', type=float, default=[0.70, 0.75, 0.80])
+    p.add_argument('--id_floors', nargs='*', type=float, default=[0.75, 0.78, 0.80, 0.82])
+    p.add_argument('--device', default='cuda')
     p.add_argument('--montage', nargs='*',
                    default=['all:1.0', 'no_fine:1.25', 'structure:1.5', 'texture:1.0'],
                    help='set:alpha pairs to show side by side (alpha must be in --alphas).')
     p.add_argument('--montage_n', type=int, default=8)
+    p.add_argument('--split', action='store_true',
+                   help='2-D sweep: separate strengths for structure and detail layers '
+                        '(--struct_alphas x --detail_alphas) instead of one strength per set.')
+    p.add_argument('--struct_layers', default='0-6')
+    p.add_argument('--detail_layers', default='7-10')
+    p.add_argument('--struct_alphas', nargs='*', type=float, default=[1.0, 1.25, 1.5, 1.75, 2.0])
+    p.add_argument('--detail_alphas', nargs='*', type=float, default=[0.0, 0.25, 0.5, 0.75, 1.0])
     p.add_argument('--num_samples', type=int, default=200)
     p.add_argument('--batch', type=int, default=4)
     p.add_argument('--out_dir', default='./age_tradeoff')
