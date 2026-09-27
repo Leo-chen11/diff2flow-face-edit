@@ -286,11 +286,14 @@ class FrozenDiffusionDDSGuidance(nn.Module):
         noisy_src = self.scheduler.add_noise(src_latents, noise, timesteps)
 
         autocast_ctx = torch.cuda.amp.autocast if (self.fp16 and torch.cuda.is_available()) else contextlib.nullcontext
+        # Both UNet passes run without autograd: the DDS gradient below is
+        # (eps_edit - eps_src).detach() applied to edit_latents, so nothing
+        # ever backpropagates through the UNet. Recording its graph for the
+        # edit pass only held every UNet activation in memory until return.
         with torch.no_grad():
             with autocast_ctx():
                 eps_src = self._predict_noise(noisy_src, timesteps, src_text)
-        with autocast_ctx():
-            eps_edit = self._predict_noise(noisy_edit, timesteps, edit_text)
+                eps_edit = self._predict_noise(noisy_edit, timesteps, edit_text)
 
         grad = (eps_edit - eps_src).detach()
         if face_mask is not None:
