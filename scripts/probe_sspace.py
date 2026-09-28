@@ -181,13 +181,14 @@ def attribute_stats(ss, ds, attr, args, device):
         d_s.append(ma - mb)
         z_s.append((ma - mb) / pooled)
         d_w.append(aw / na - bw / nb)
+    per = {st: (d_s[i].float(), z_s[i].float(), d_w[i].float()) for i, st in enumerate(strata)}
     d_s = torch.stack(d_s).mean(0).float()
     z = torch.stack(z_s)
     # A channel whose sign flips between strata is not a consistent carrier.
     agree = (torch.sign(z) == torch.sign(z[0:1])).all(0)
     z_s = torch.where(agree, z.mean(0), torch.zeros_like(z[0])).float()
     d_w = torch.stack(d_w).mean(0).float()
-    return d_s, z_s, d_w, {f'{st}/{g}': counts[(st, g)] for st in strata for g in (0, 1)}
+    return (d_s, z_s, d_w, {f'{st}/{g}': counts[(st, g)] for st in strata for g in (0, 1)}, per)
 
 
 # ── evaluation ──────────────────────────────────────────────────────────────
@@ -208,24 +209,29 @@ def interp_at(points, x):
 @torch.no_grad()
 def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
     ind_judge, clip_judge, id_judge = judges
-    d_s, z_s, d_w, _ = stats
-    score = z_s.abs().clone()
-    if not args.include_torgb:
-        score[ss.kind.to(score.device) == 1] = 0
-    order = torch.argsort(score, descending=True)
-    n_valid = int((score > 0).sum())
-    ks = [k for k in args.k_list if k != 'all']
-    families = [('wplus', None)]
-    for k in ks:
-        kk = int(k)
-        if kk < n_valid:
+    d_s, z_s, d_w, _, per = stats
+    # Groups whose statistics drive the edit: one shared set, or with
+    # --per_stratum each stratum (e.g. men / women) its own directions and
+    # its own top-K channels, picked per face from the classifier.
+    groups = ({st: v for st, v in per.items()} if args.per_stratum
+              else {'all': (d_s, z_s, d_w)})
+    ks = [int(k) for k in args.k_list if k != 'all']
+    fam_names = ['wplus'] + [f's_top{k}' for k in ks] + ['s_topall']
+    fam_mask = defaultdict(dict)       # family -> group -> mask
+    for g, (_, zg, _) in groups.items():
+        score = zg.abs().clone()
+        if not args.include_torgb:
+            score[ss.kind.to(score.device) == 1] = 0
+        og = torch.argsort(score, descending=True)
+        n_valid = int((score > 0).sum())
+        for k in ks:
             m = torch.zeros(ss.total, device=device)
-            m[order[:kk]] = 1
-            families.append((f's_top{kk}', m))
-    m_all = (score > 0).float()
-    families.append(('s_topall', m_all))
-    configs = [(fam, a) for fam, _ in families for a in args.alphas]
-    fam_mask = dict(families)
+            m[og[:min(k, n_valid)]] = 1
+            fam_mask[f's_top{k}'][g] = m
+        fam_mask['s_topall'][g] = (score > 0).float()
+    families = [(f, None) for f in fam_names]
+    configs = [(fam, a) for fam in fam_names for a in args.alphas]
+    strat_attr = STRATUM_ATTR[attr]
     others = [a for a in args.attrs if a != attr]
     clip_idx = clip_judge.attribute_index.index(attr) if clip_judge is not None else None
 
@@ -251,6 +257,11 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
         has = pa >= 0.5
         male = p_src[:, 20] >= 0.5
         sign = torch.where(has, -torch.ones_like(pa), torch.ones_like(pa))
+        gkey = ([int(v) for v in (p_src[:, strat_attr] >= 0.5).tolist()] if args.per_stratum
+                else ['all'] * lat.size(0))
+        gkey = [k if k in groups else next(iter(groups)) for k in gkey]
+        dw_b = torch.stack([groups[k][2] for k in gkey])
+        ds_b = torch.stack([groups[k][0] for k in gkey])
         src_id = id_judge.extract(src256)
         B = lat.size(0)
         mont = [b for b in range(B) if bool(clear[b])]
@@ -262,10 +273,11 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
         for fam, a in configs:
             if fam == 'wplus':
                 ss.set_delta(None)
-                w = lat + sign.view(B, 1, 1) * a * d_w.unsqueeze(0)
+                w = lat + sign.view(B, 1, 1) * a * dw_b
                 e = G([w], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             else:
-                ss.set_delta(sign.view(B, 1) * a * (fam_mask[fam] * d_s).unsqueeze(0))
+                mask_b = torch.stack([fam_mask[fam][k] for k in gkey])
+                ss.set_delta(sign.view(B, 1) * a * mask_b * ds_b)
                 e = G([lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                 ss.set_delta(None)
             e256 = F.interpolate(e, (256, 256))
@@ -296,7 +308,9 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
 
     name = ATTR_NAMES.get(attr, str(attr))
     rows = {}
-    print(f'\n=== {name} ({attr}): {seen} clear test faces; rm = source has it ===')
+    print(f'\n=== {name} ({attr}): {seen} clear test faces; rm = source has it'
+          + (f'; per-stratum directions/channels by attr {strat_attr}' if args.per_stratum else '')
+          + ' ===')
     hdr = f'{"family":<12}{"alpha":>6}  {"AccInd":>7} {"rm":>6} {"add":>6}'
     if attr == 39:
         hdr += f' {"rm_M":>6} {"rm_F":>6}'
@@ -348,17 +362,19 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
         canvas.save(path)
         print(f'  montage -> {path}  (each family at the alpha closest to ID_ind 0.80)')
 
-    top = order[:args.show_top]
-    print(f'\n  {name}: top {args.show_top} channels by |z| '
-          + ', '.join(f'{ss.describe(int(j))} z={z_s[j]:+.2f}' for j in top))
-    for k in ks:
-        kk = int(k)
-        if kk >= n_valid:
-            continue
-        res_hist = defaultdict(int)
-        for j in order[:kk].tolist():
-            res_hist[ss.res_of(j)] += 1
-        print(f'  top{kk} by resolution: ' + ' '.join(f'{r}:{n}' for r, n in sorted(res_hist.items())))
+    for g, (_, zg, _) in groups.items():
+        score = zg.abs().clone()
+        if not args.include_torgb:
+            score[ss.kind.to(score.device) == 1] = 0
+        og = torch.argsort(score, descending=True)
+        tag = '' if g == 'all' else f' [stratum {strat_attr}={g}]'
+        print(f'\n  {name}{tag}: top {args.show_top} channels by |z| '
+              + ', '.join(f'{ss.describe(int(j))} z={zg[j]:+.2f}' for j in og[:args.show_top]))
+        for kk in ks:
+            res_hist = defaultdict(int)
+            for j in og[:kk].tolist():
+                res_hist[ss.res_of(j)] += 1
+            print(f'  top{kk} by resolution: ' + ' '.join(f'{r}:{n}' for r, n in sorted(res_hist.items())))
     return {'rows': {f'{f}@{a:g}': r for (f, a), r in rows.items()}, 'frontier': frontier,
             'faces': seen}
 
@@ -369,6 +385,9 @@ def main():
     p.add_argument('--k_list', nargs='*', default=['25', '50', '100', '200', '400', '800', 'all'])
     p.add_argument('--alphas', nargs='*', type=float, default=[0.5, 1.0, 1.5, 2.0, 3.0, 4.0])
     p.add_argument('--id_targets', nargs='*', type=float, default=[0.85, 0.80, 0.75])
+    p.add_argument('--per_stratum', action='store_true',
+                   help='Separate directions and top-K channels per stratum (gender for Young / '
+                        'Eyeglasses, Young for Male), chosen per face by the classifier.')
     p.add_argument('--include_torgb', action='store_true',
                    help='Allow tRGB (colour) channels in the top-K selection.')
     p.add_argument('--young_bins', default='2-2', help='Classifier age bins counted as young.')
