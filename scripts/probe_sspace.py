@@ -235,9 +235,24 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
     others = [a for a in args.attrs if a != attr]
     clip_idx = clip_judge.attribute_index.index(attr) if clip_judge is not None else None
 
+    watch = [a for a in args.watch_attrs if a != attr]
+
+    def render(fam, a, lat, sign, gkey):
+        B = lat.size(0)
+        if fam == 'wplus':
+            ss.set_delta(None)
+            dw = torch.stack([groups[k][2] for k in gkey])
+            return G([lat + sign.view(B, 1, 1) * a * dw], input_is_latent=True,
+                     randomize_noise=False)[0].clamp(-1, 1)
+        ds = torch.stack([groups[k][0] for k in gkey])
+        mask_b = torch.stack([fam_mask[fam][k] for k in gkey])
+        ss.set_delta(sign.view(B, 1) * a * mask_b * ds)
+        out = G([lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+        ss.set_delta(None)
+        return out
+
     st = defaultdict(lambda: defaultdict(list))
-    tiles = defaultdict(list)
-    src_tiles = []
+    mont_lat, mont_sign, mont_key, src_tiles = [], [], [], []
     tile = 160
     seen = 0
     files = list(test_ds.image_list)
@@ -260,8 +275,6 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
         gkey = ([int(v) for v in (p_src[:, strat_attr] >= 0.5).tolist()] if args.per_stratum
                 else ['all'] * lat.size(0))
         gkey = [k if k in groups else next(iter(groups)) for k in gkey]
-        dw_b = torch.stack([groups[k][2] for k in gkey])
-        ds_b = torch.stack([groups[k][0] for k in gkey])
         src_id = id_judge.extract(src256)
         B = lat.size(0)
         mont = [b for b in range(B) if bool(clear[b])]
@@ -270,16 +283,11 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
         mont = mont[:max(0, args.montage_n - len(src_tiles))]
         for b in mont:
             src_tiles.append(to_pil(src256[b], tile))
+            mont_lat.append(lat[b])
+            mont_sign.append(sign[b])
+            mont_key.append(gkey[b])
         for fam, a in configs:
-            if fam == 'wplus':
-                ss.set_delta(None)
-                w = lat + sign.view(B, 1, 1) * a * dw_b
-                e = G([w], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-            else:
-                mask_b = torch.stack([fam_mask[fam][k] for k in gkey])
-                ss.set_delta(sign.view(B, 1) * a * mask_b * ds_b)
-                e = G([lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-                ss.set_delta(None)
+            e = render(fam, a, lat, sign, gkey)
             e256 = F.interpolate(e, (256, 256))
             p_e = torch.sigmoid(ind_judge(e256)[0][:, :40])
             idc = (src_id * id_judge.extract(e256)).sum(1)
@@ -299,8 +307,8 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
                     s['clip'].append(float(pc[b] < 0.5) if rm else float(pc[b] >= 0.5))
                 if others:
                     s['leak'].append(sum(abs(p_e[b, o] - p_src[b, o]).item() for o in others) / len(others))
-            for b in mont:
-                tiles[(fam, a)].append(to_pil(e256[b], tile))
+                if watch:
+                    s['watch'].append(sum(abs(p_e[b, o] - p_src[b, o]).item() for o in watch) / len(watch))
         seen += int(clear.sum())
 
     def mean(v):
@@ -314,21 +322,22 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
     hdr = f'{"family":<12}{"alpha":>6}  {"AccInd":>7} {"rm":>6} {"add":>6}'
     if attr == 39:
         hdr += f' {"rm_M":>6} {"rm_F":>6}'
-    hdr += f' {"AccCLIP":>8} {"ID_ind":>7} {"leak":>6}'
+    hdr += f' {"AccCLIP":>8} {"ID_ind":>7} {"leak":>6} {"watch":>6}'
     print(hdr)
     for fam, a in configs:
         s = st[(fam, a)]
         r = dict(acc=mean(s['ok']), rm=mean(s['ok_rm']), add=mean(s['ok_add']),
                  rm_m=mean(s['ok_rm_m']), rm_f=mean(s['ok_rm_f']), clip=mean(s['clip']),
-                 id=mean(s['id']), leak=mean(s['leak']))
+                 id=mean(s['id']), leak=mean(s['leak']), watch=mean(s['watch']))
         rows[(fam, a)] = r
         line = (f'{fam:<12}{a:>6g}  {r["acc"] * 100:6.1f}% {r["rm"] * 100:5.1f}% '
                 f'{r["add"] * 100:5.1f}%')
         if attr == 39:
             line += f' {r["rm_m"] * 100:5.1f}% {r["rm_f"] * 100:5.1f}%'
-        line += f' {r["clip"] * 100:7.1f}% {r["id"]:7.4f} {r["leak"]:6.3f}'
+        line += f' {r["clip"] * 100:7.1f}% {r["id"]:7.4f} {r["leak"]:6.3f} {r["watch"]:6.3f}'
         print(line)
 
+    print(f'  (leak = other edited attributes; watch = mean |change| of CelebA attrs {watch})')
     print(f'\n  {name}: accuracy at matched ID_ind (interpolated over alphas; -- = out of range)')
     frontier = {}
     for fam, _ in families:
@@ -337,30 +346,43 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
             pts_i = [(rows[(fam, a)]['id'], rows[(fam, a)]['acc']) for a in args.alphas]
             pts_c = [(rows[(fam, a)]['id'], rows[(fam, a)]['clip']) for a in args.alphas]
             pts_l = [(rows[(fam, a)]['id'], rows[(fam, a)]['leak']) for a in args.alphas]
-            vi, vc, vl = interp_at(pts_i, t), interp_at(pts_c, t), interp_at(pts_l, t)
-            frontier.setdefault(fam, {})[f'{t:.2f}'] = dict(acc_ind=vi, acc_clip=vc, leak=vl)
-            cells.append(f'@{t:.2f} ' + (f'Ind {vi * 100:5.1f}% CLIP {vc * 100:5.1f}%'
-                                          if vi is not None and vc is not None else '      --        '))
+            pts_w = [(rows[(fam, a)]['id'], rows[(fam, a)]['watch']) for a in args.alphas]
+            vi, vc = interp_at(pts_i, t), interp_at(pts_c, t)
+            vl, vw = interp_at(pts_l, t), interp_at(pts_w, t)
+            frontier.setdefault(fam, {})[f'{t:.2f}'] = dict(acc_ind=vi, acc_clip=vc, leak=vl, watch=vw)
+            cells.append(f'@{t:.2f} ' + (f'Ind {vi * 100:5.1f}% CLIP {vc * 100:5.1f}% '
+                                          f'leak {vl:.3f} watch {vw:.3f}'
+                                          if None not in (vi, vc, vl, vw) else '      --      '))
         print(f'    {fam:<12} ' + '   '.join(cells))
 
     if src_tiles:
-        show = []
+        # Every family rendered at the strength that interpolates to the same
+        # mean ID_ind, so the columns are compared at matched identity cost.
+        lat_m = torch.stack(mont_lat)
+        sign_m = torch.stack(mont_sign)
+        cols, col_tiles = ['source'], []
         for fam, _ in families:
-            best = min(args.alphas, key=lambda a: abs(rows[(fam, a)]['id'] - 0.80))
-            show.append((fam, best))
+            a_star = interp_at([(rows[(fam, a)]['id'], a) for a in args.alphas], args.montage_id)
+            if a_star is None:
+                a_star = min(args.alphas, key=lambda a: abs(rows[(fam, a)]['id'] - args.montage_id))
+            imgs = torch.cat([render(fam, a_star, lat_m[j:j + args.batch], sign_m[j:j + args.batch],
+                                     mont_key[j:j + args.batch])
+                              for j in range(0, lat_m.size(0), args.batch)])
+            col_tiles.append([to_pil(F.interpolate(x[None], (256, 256))[0], tile) for x in imgs])
+            cols.append(f'{fam} a{a_star:.2f}')
         os.makedirs(args.out_dir, exist_ok=True)
-        cols = ['source'] + [f'{f} a{a:g} ID{rows[(f, a)]["id"]:.2f}' for f, a in show]
         canvas = Image.new('RGB', (tile * len(cols), tile * len(src_tiles) + 16), (20, 20, 20))
         dr = ImageDraw.Draw(canvas)
         for c, lab in enumerate(cols):
             dr.text((c * tile + 3, 2), lab, fill=(255, 255, 0))
         for r in range(len(src_tiles)):
             canvas.paste(src_tiles[r], (0, 16 + r * tile))
-            for c, key in enumerate(show, start=1):
-                canvas.paste(tiles[key][r], (c * tile, 16 + r * tile))
+            for c, tl in enumerate(col_tiles, start=1):
+                canvas.paste(tl[r], (c * tile, 16 + r * tile))
         path = os.path.join(args.out_dir, f'sspace_{name}.png')
         canvas.save(path)
-        print(f'  montage -> {path}  (each family at the alpha closest to ID_ind 0.80)')
+        print(f'  montage -> {path}  (every family at the strength interpolated to mean '
+              f'ID_ind {args.montage_id:.2f})')
 
     for g, (_, zg, _) in groups.items():
         score = zg.abs().clone()
@@ -383,7 +405,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--attrs', nargs='*', type=int, default=[39, 20, 15])
     p.add_argument('--k_list', nargs='*', default=['25', '50', '100', '200', '400', '800', 'all'])
-    p.add_argument('--alphas', nargs='*', type=float, default=[0.5, 1.0, 1.5, 2.0, 3.0, 4.0])
+    p.add_argument('--alphas', nargs='*', type=float,
+                   default=[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0])
+    p.add_argument('--montage_id', type=float, default=0.80,
+                   help='Montage renders every family at the strength giving this mean ID_ind.')
+    p.add_argument('--watch_attrs', nargs='*', type=int, default=[22, 24, 18, 36],
+                   help='CelebA attrs whose unwanted change is reported (default Mustache, '
+                        'No_Beard, Heavy_Makeup, Wearing_Lipstick).')
     p.add_argument('--id_targets', nargs='*', type=float, default=[0.85, 0.80, 0.75])
     p.add_argument('--per_stratum', action='store_true',
                    help='Separate directions and top-K channels per stratum (gender for Young / '
