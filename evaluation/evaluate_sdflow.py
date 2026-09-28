@@ -1333,6 +1333,45 @@ def is_clear(score, low=0.35, high=0.65):
     return score > high or score < low
 
 
+def _interp_at(points, x):
+    """points: [(x, y)]; linear interpolation of y at x, None outside the range."""
+    pts = sorted(points)
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x0 <= x <= x1:
+            return y0 if x1 == x0 else y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+    return None
+
+
+def _accuracy_at_matched_id(all_results, args):
+    targets = getattr(args, 'report_id_at', None) or []
+    scales = [k for k in all_results if isinstance(all_results[k], dict)
+              and 'overall' in all_results[k]]
+    if not targets or len(scales) < 2:
+        return {}
+    attr_names = [ATTR_NAMES.get(i, f'attr{i}') for i in args.attribute_index]
+    judges = (('acc_indep', 'AccInd'), ('acc_clip', 'AccCLIP'), ('acc_celeb', 'AccCeleb'))
+    out = {}
+    print(f'\n  Accuracy at matched ID_ind (interpolated over scales {", ".join(scales)}; '
+          f'-- = outside the evaluated range)')
+    for attr_name in attr_names:
+        for t in targets:
+            cells = []
+            for key, label in judges:
+                pts = []
+                for sc in scales:
+                    row = all_results[sc].get(attr_name) or {}
+                    if row.get('id_indep') and row.get(key):
+                        pts.append((row['id_indep']['mean'], row[key]['mean']))
+                if len(pts) < 2:
+                    continue
+                v = _interp_at(pts, t)
+                out.setdefault(attr_name, {}).setdefault(f'{t:.2f}', {})[key] = v
+                cells.append(f'{label} {v * 100:5.1f}%' if v is not None else f'{label}    --')
+            if cells:
+                print(f'    {attr_name:<12} @ID {t:.2f}:  ' + '   '.join(cells))
+    return out
+
+
 def _summ(values):
     if not values:
         return None
@@ -1631,16 +1670,19 @@ def evaluate(args):
             scale_summary[attr_name]['acc_clip_add'] = _a
             scale_summary[attr_name]['acc_clip_rm'] = _r
 
-        if celeb_judge is not None:
-            print(f'  Direction split (AccCeleb): add = source lacks attr, rm = source has attr')
+        for jname, label, present in (('indep', 'AccInd', indep_teacher is not None),
+                                      ('celeb', 'AccCeleb', celeb_judge is not None)):
+            if not present:
+                continue
+            print(f'  Direction split ({label}): add = source lacks attr, rm = source has attr')
             for attr_name in attr_names:
-                _a = _summ(metrics[f'acc_celeb_{attr_name}_add'])
-                _r = _summ(metrics[f'acc_celeb_{attr_name}_rm'])
+                _a = _summ(metrics[f'acc_{jname}_{attr_name}_add'])
+                _r = _summ(metrics[f'acc_{jname}_{attr_name}_rm'])
                 _a_txt = f'{_a["mean"]*100:5.1f}% (n={_a["n"]})' if _a else '   --'
                 _r_txt = f'{_r["mean"]*100:5.1f}% (n={_r["n"]})' if _r else '   --'
                 print(f'    {attr_name:<12} add: {_a_txt}   rm: {_r_txt}')
-                scale_summary[attr_name]['acc_celeb_add'] = _a
-                scale_summary[attr_name]['acc_celeb_rm'] = _r
+                scale_summary[attr_name][f'acc_{jname}_add'] = _a
+                scale_summary[attr_name][f'acc_{jname}_rm'] = _r
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
@@ -1655,14 +1697,17 @@ def evaluate(args):
             ovr[label] = _summ(vals)
         scale_summary['overall'] = ovr
         id_show = ovr['id_indep'] if ovr['id_indep'] else ovr['id_arc']
-        # Prefer the supervised CelebA classifier over CLIP for the headline
-        # number when available -- it doesn't need per-attribute prompt/
-        # threshold tuning, so it's less likely to be silently miscalibrated.
-        acc_show = ovr['acc_celeb'] if ovr['acc_celeb'] else \
-            (ovr['acc_clip'] if ovr['acc_clip'] else ovr['acc_teacher'])
+        # Headline accuracy: the independent evaluation classifier
+        # (--independent_attr_weights, e.g. the ResNet-50 CelebA-HQ judge the
+        # SDFlow protocol uses) when given, else the CelebA ResNet-18, else
+        # CLIP, else the training teacher.
+        acc_label, acc_show = next(
+            ((lbl, ovr[k]) for k, lbl in (('acc_indep', 'Ind'), ('acc_celeb', 'Celeb'),
+                                          ('acc_clip', 'CLIP'), ('acc_teacher', 'teacher'))
+             if ovr[k]), ('--', None))
         print(f'  {"-" * 55}')
         print(f'  {"Overall":<12} ID(ind or arc): {_fmt(id_show)}  '
-              f'Acc(Celeb/CLIP/teacher): {_fmt(acc_show, pct=True)}')
+              f'Acc({acc_label}): {_fmt(acc_show, pct=True)}')
 
         if fid is not None:
             fid_val = float(fid.compute().item())
@@ -1670,6 +1715,14 @@ def evaluate(args):
             print(f'  FID (edited vs source recon): {fid_val:.2f}')
 
         all_results[str(edit_scale)] = scale_summary
+
+    # ── Accuracy at matched identity ──────────────────────────────────────
+    # Models trained with different edit magnitudes land at different ID for
+    # the same scale, so compare accuracy at the SAME ID_ind, linearly
+    # interpolated between the evaluated scales (never extrapolated).
+    matched = _accuracy_at_matched_id(all_results, args)
+    if matched:
+        all_results['acc_at_id'] = matched
 
     # ── Inversion-gap reference ────────────────────────────────────────────
     if inv_metrics:
@@ -1967,6 +2020,9 @@ if __name__ == '__main__':
                              'that boundary was shown to also cut into real aging signal '
                              '(rm-direction AccCLIP 76%%->17%%); default 10 targets only the '
                              'very last, most texture/color-dominated layers.')
+    parser.add_argument('--report_id_at', nargs='*', type=float, default=[0.80],
+                        help='After all --eval_scales, report each judge\'s accuracy at these '
+                             'ID_ind values, interpolated between scales (needs >=2 scales).')
     parser.add_argument('--success_margin', type=float, default=0.0,
                         help='Strict success requires the edited score to cross 0.5 by this '
                              'margin. 0.0 = just cross the decision boundary.')
