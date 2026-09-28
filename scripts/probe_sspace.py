@@ -53,9 +53,24 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
-ATTR_NAMES = {15: 'Eyeglasses', 20: 'Male', 39: 'Young'}
+CELEBA_ATTRS = [
+    '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes', 'Bald',
+    'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair', 'Blurry', 'Brown_Hair',
+    'Bushy_Eyebrows', 'Chubby', 'Double_Chin', 'Eyeglasses', 'Goatee', 'Gray_Hair',
+    'Heavy_Makeup', 'High_Cheekbones', 'Male', 'Mouth_Slightly_Open', 'Mustache',
+    'Narrow_Eyes', 'No_Beard', 'Oval_Face', 'Pale_Skin', 'Pointy_Nose',
+    'Receding_Hairline', 'Rosy_Cheeks', 'Sideburns', 'Smiling', 'Straight_Hair',
+    'Wavy_Hair', 'Wearing_Earrings', 'Wearing_Hat', 'Wearing_Lipstick',
+    'Wearing_Necklace', 'Wearing_Necktie', 'Young',
+]
+ATTR_NAMES = {i: n for i, n in enumerate(CELEBA_ATTRS)}
 # Stratify each attribute's statistics by its main confounder.
+# Default for any other attribute: gender.
 STRATUM_ATTR = {39: 20, 15: 20, 20: 39}
+
+
+def stratum_attr(attr):
+    return STRATUM_ATTR.get(attr, 20)
 
 
 # ── S space access ──────────────────────────────────────────────────────────
@@ -141,7 +156,7 @@ def group_of(pred, attr, args):
 def attribute_stats(ss, ds, attr, args, device):
     """Per stratum and group: running sums of S and W+. Returns
     (d_s (total,), z_s (total,), d_w (18, 512), counts)."""
-    strat_attr = STRATUM_ATTR[attr]
+    strat_attr = stratum_attr(attr)
     buckets = defaultdict(list)
     for f in ds.image_list:
         pred = ds._lookup_precomputed(ds.preds, f)
@@ -231,8 +246,11 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
         fam_mask['s_topall'][g] = (score > 0).float()
     families = [(f, None) for f in fam_names]
     configs = [(fam, a) for fam in fam_names for a in args.alphas]
-    strat_attr = STRATUM_ATTR[attr]
+    strat_attr = stratum_attr(attr)
     others = [a for a in args.attrs if a != attr]
+    # CLIP only scores attributes it has a prompt pair for.
+    if clip_judge is not None and attr not in clip_judge.attribute_index:
+        clip_judge = None
     clip_idx = clip_judge.attribute_index.index(attr) if clip_judge is not None else None
 
     watch = [a for a in args.watch_attrs if a != attr]
@@ -403,7 +421,9 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--attrs', nargs='*', type=int, default=[39, 20, 15])
+    p.add_argument('--attrs', nargs='*', type=int, default=[39, 20, 15],
+                   help='Any CelebA attribute ids (0-39); strata by gender unless listed in '
+                        'STRATUM_ATTR.')
     p.add_argument('--k_list', nargs='*', default=['25', '50', '100', '200', '400', '800', 'all'])
     p.add_argument('--alphas', nargs='*', type=float,
                    default=[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0])
@@ -461,9 +481,13 @@ def main():
     ind_judge = AttributeClassifier(backbone=args.independent_attr_backbone)
     ind_judge.load_state_dict(load_network(args.independent_attr_weights))
     ind_judge.to(device).eval()
-    clip_judge = None if args.no_clip else CLIPAttributeJudge(
-        args.attrs, args.clip_judge_model, device,
+    clip_attrs = [a for a in args.attrs if a in CLIPAttributeJudge.PROMPTS]
+    clip_judge = None if (args.no_clip or not clip_attrs) else CLIPAttributeJudge(
+        clip_attrs, args.clip_judge_model, device,
         calibration=parse_clip_calibration(args.clip_calibration))
+    no_prompt = [a for a in args.attrs if a not in clip_attrs]
+    if no_prompt and not args.no_clip:
+        print(f'[note] no CLIP prompt for {no_prompt}: AccCLIP reported as nan for those')
     id_judge = IndependentIDJudge(device, pretrained=args.id_indep_pretrained)
 
     train_ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root,
