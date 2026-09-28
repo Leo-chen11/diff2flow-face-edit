@@ -55,6 +55,12 @@ def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None,
                 )
             else:
                 prompts.append("a realistic face photo of a female person")
+        elif attr == 5:
+            prompts.append(
+                "a realistic face photo of a person with bangs covering the forehead"
+                if enabled else
+                "a realistic face photo of a person with no bangs and a visible forehead"
+            )
         elif attr == 31:
             prompts.append(
                 "a realistic face photo of a smiling person"

@@ -122,6 +122,8 @@ class CLIPAttributeJudge(nn.Module):
 
     # (positive = "attribute present" in CelebA polarity, negative)
     PROMPTS = {
+        5: ("a headshot of a person with bangs covering the forehead",
+            "a headshot of a person with no bangs and a visible forehead"),
         15: ("a headshot of a person who is wearing glasses",
              "a headshot of a person who is not wearing glasses"),
         20: ("a headshot of a man",
