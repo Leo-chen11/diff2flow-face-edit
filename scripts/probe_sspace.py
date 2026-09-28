@@ -213,6 +213,22 @@ def to_pil(x, size):
     return Image.fromarray(x).resize((size, size))
 
 
+def alpha_at_acc(accs, alphas, t):
+    """Smallest strength reaching accuracy t: first grid point at or above t,
+    linearly interpolated with the one before. None if never reached."""
+    for i, (acc, a) in enumerate(zip(accs, alphas)):
+        if acc >= t:
+            if i == 0:
+                return a
+            a0, c0 = alphas[i - 1], accs[i - 1]
+            return a0 + (t - c0) / max(acc - c0, 1e-9) * (a - a0)
+    return None
+
+
+def value_at_alpha(values, alphas, a):
+    return interp_at(list(zip(alphas, values)), a)
+
+
 def interp_at(points, x):
     pts = sorted(points)
     for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
@@ -373,16 +389,45 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
                                           if None not in (vi, vc, vl, vw) else '      --      '))
         print(f'    {fam:<12} ' + '   '.join(cells))
 
+    # Matched ACCURACY (the SDFlow / Latent Transformer protocol): the weakest
+    # strength that reaches each target accuracy, and the identity / leak it
+    # costs there. For easy attributes (e.g. Smiling reaches ~100% at ID 0.9)
+    # this is the meaningful comparison; ID 0.80 would force over-editing.
+    alphas_sorted = sorted(args.alphas)
+    print(f'\n  {name}: identity and leak at matched AccInd (weakest strength reaching it)')
+    for fam, _ in families:
+        cells = []
+        accs = [rows[(fam, a)]['acc'] for a in alphas_sorted]
+        for t in args.acc_targets:
+            a_t = alpha_at_acc(accs, alphas_sorted, t)
+            if a_t is None:
+                cells.append(f'@{t * 100:.0f}%        --        ')
+                frontier.setdefault(fam, {})[f'acc{t:.2f}'] = None
+                continue
+            v = {k: value_at_alpha([rows[(fam, a)][k] for a in alphas_sorted], alphas_sorted, a_t)
+                 for k in ('id', 'leak', 'watch', 'clip')}
+            frontier.setdefault(fam, {})[f'acc{t:.2f}'] = dict(alpha=a_t, **v)
+            cells.append(f'@{t * 100:.0f}% a{a_t:.2f} ID {v["id"]:.3f} leak {v["leak"]:.3f} '
+                         f'watch {v["watch"]:.3f}')
+        print(f'    {fam:<12} ' + '   '.join(cells))
+
     if src_tiles:
-        # Every family rendered at the strength that interpolates to the same
-        # mean ID_ind, so the columns are compared at matched identity cost.
+        # Every family rendered at the same operating point (--montage_at):
+        # matched accuracy (acc:0.90) or matched identity (id:0.80).
+        kind, _, val = args.montage_at.partition(':')
+        val = float(val)
         lat_m = torch.stack(mont_lat)
         sign_m = torch.stack(mont_sign)
         cols, col_tiles = ['source'], []
         for fam, _ in families:
-            a_star = interp_at([(rows[(fam, a)]['id'], a) for a in args.alphas], args.montage_id)
-            if a_star is None:
-                a_star = min(args.alphas, key=lambda a: abs(rows[(fam, a)]['id'] - args.montage_id))
+            if kind == 'acc':
+                a_star = alpha_at_acc([rows[(fam, a)]['acc'] for a in alphas_sorted], alphas_sorted, val)
+                if a_star is None:
+                    a_star = alphas_sorted[-1]
+            else:
+                a_star = interp_at([(rows[(fam, a)]['id'], a) for a in args.alphas], val)
+                if a_star is None:
+                    a_star = min(args.alphas, key=lambda a: abs(rows[(fam, a)]['id'] - val))
             imgs = torch.cat([render(fam, a_star, lat_m[j:j + args.batch], sign_m[j:j + args.batch],
                                      mont_key[j:j + args.batch])
                               for j in range(0, lat_m.size(0), args.batch)])
@@ -399,8 +444,9 @@ def run_attribute(attr, ss, G, test_ds, stats, judges, args, device):
                 canvas.paste(tl[r], (c * tile, 16 + r * tile))
         path = os.path.join(args.out_dir, f'sspace_{name}.png')
         canvas.save(path)
-        print(f'  montage -> {path}  (every family at the strength interpolated to mean '
-              f'ID_ind {args.montage_id:.2f})')
+        print(f'  montage -> {path}  (every family at {args.montage_at}: '
+              + ('weakest strength reaching that AccInd)' if kind == 'acc'
+                 else 'strength interpolated to that mean ID_ind)'))
 
     for g, (_, zg, _) in groups.items():
         score = zg.abs().clone()
@@ -427,8 +473,11 @@ def main():
     p.add_argument('--k_list', nargs='*', default=['25', '50', '100', '200', '400', '800', 'all'])
     p.add_argument('--alphas', nargs='*', type=float,
                    default=[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0])
-    p.add_argument('--montage_id', type=float, default=0.80,
-                   help='Montage renders every family at the strength giving this mean ID_ind.')
+    p.add_argument('--acc_targets', nargs='*', type=float, default=[0.90, 0.95],
+                   help='Report ID / leak at the weakest strength reaching these AccInd values.')
+    p.add_argument('--montage_at', default='acc:0.90',
+                   help="Montage operating point per family: 'acc:0.90' (weakest strength "
+                        "reaching that AccInd) or 'id:0.80' (strength giving that mean ID_ind).")
     p.add_argument('--watch_attrs', nargs='*', type=int, default=[22, 24, 18, 36],
                    help='CelebA attrs whose unwanted change is reported (default Mustache, '
                         'No_Beard, Heavy_Makeup, Wearing_Lipstick).')
