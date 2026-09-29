@@ -87,6 +87,9 @@ CELEBA_ALL_ATTRS = [
     'Sideburns', 'Smiling', 'Straight_Hair', 'Wavy_Hair', 'Wearing_Earrings',
     'Wearing_Hat', 'Wearing_Lipstick', 'Wearing_Necklace', 'Wearing_Necktie', 'Young',
 ]
+# Every CelebA attribute gets a readable name (e.g. Bangs, not attr5).
+for _i, _n in enumerate(CELEBA_ALL_ATTRS):
+    ATTR_NAMES.setdefault(_i, _n)
 
 
 # ---------------------------------------------------------------------------
