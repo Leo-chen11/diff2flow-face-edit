@@ -156,6 +156,22 @@ def main(args):
             watch_score_fn = lambda imgs: wj.scores(imgs)
     watch_names = [ATTR_NAMES.get(a, f'attr{a}') for a in watch_attrs]
 
+    # --edit_direction clip: same as evaluate_sdflow.py, tell the model the
+    # direction from the CLIP judge's view of the source (parser for glasses)
+    # instead of the conditioner's own guess, so this audit reproduces the eval.
+    dir_fn = None
+    if args.edit_direction == 'clip':
+        if args.attr == 15 and args.glasses_judge == 'parser':
+            dir_fn = score_fn
+        elif args.primary_judge == 'clip':
+            dir_fn = score_fn
+        else:
+            _cj_dir = CLIPAttributeJudge(args.attribute_index, args.clip_judge_model, 'cuda',
+                                         calibration=parse_clip_calibration(args.clip_calibration))
+            dir_fn = lambda imgs: _cj_dir.scores(imgs)[:, local_idx]
+        print('[Direction] --edit_direction clip: add/rm taken from the CLIP '
+              '(parser for glasses) score of the source, as in evaluate_sdflow.py')
+
     # Optional second opinion printed on every pair: lets you see, per image,
     # whether the two judges disagree (the Bangs add CLIP-vs-R50 case).
     second_fn, second_name = None, None
@@ -200,9 +216,11 @@ def main(args):
         src_face_256 = F.interpolate(src_face, (256, 256))
         src_scores = score_fn(src_face_256)
 
+        direction = torch.where(dir_fn(src_face_256) > 0.5, -1.0, 1.0) if dir_fn is not None else None
         edited = edit_single_attribute(
             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
             local_idx, args.edit_scale, direction_bank, attr_global_idx=args.attr,
+            direction=direction,
             bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
             face_parser=composite_face_parser,
             composite_method=args.composite_method,
@@ -373,6 +391,10 @@ if __name__ == '__main__':
     p.add_argument('--celeba_attr_judge_weights', default=None,
                     help='Used for --watch_attrs scoring if given (preferred over CLIP). Also '
                          'used for the AUDITED attribute itself when --primary_judge celeba.')
+    p.add_argument('--edit_direction', default='cond', choices=['cond', 'clip'],
+                    help="Same as evaluate_sdflow.py. 'clip' = take add/rm from the CLIP "
+                         "(parser for glasses) score of the source instead of the conditioner's "
+                         "own guess. Use it whenever the audited run was evaluated with it.")
     p.add_argument('--independent_attr_weights', default=None,
                     help='Independent classifier checkpoint (the ResNet-50 AccInd judge); '
                          'used when --primary_judge indep.')
