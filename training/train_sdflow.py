@@ -326,6 +326,25 @@ class JudgePeakDeclineBalancer:
         return self.weights[self.slot_index(attr_local_idx, is_rm)]
 
 
+# --preserve_all40_weight: per edited attribute, the OTHER CelebA attributes that
+# are allowed to move with it because they are part of what the edit means (or
+# are hidden by it), so the all-attribute preservation loss does not fight the
+# edit itself. Chosen from the --leak40 side-effect report: e.g. Male edits move
+# facial hair / makeup / earrings, Smiling moves cheekbones and an open mouth,
+# Young moves gray hair, eye bags and jowls, glasses occlude the eye region, bangs
+# hide the hairline. Everything else (Big_Nose, Chubby, hair colour, Straight_Hair,
+# Pointy_Nose, Big_Lips, ...) is held at its source value.
+PRESERVE40_ALLOW = {
+    15: [1, 3, 12, 23],                              # Eyeglasses: brows, eye bags, narrow eyes (occluded)
+    20: [0, 1, 12, 16, 18, 22, 24, 30, 34, 36],      # Male: stubble, brows, goatee, makeup, mustache,
+                                                     #   no-beard, sideburns, earrings, lipstick
+    39: [3, 4, 13, 14, 17, 28],                      # Young: eye bags, bald, chubby, double chin,
+                                                     #   gray hair, receding hairline
+    31: [19, 21, 23],                                # Smiling: cheekbones, mouth open, narrow eyes
+    5: [28, 32, 33],                                 # Bangs: receding hairline, straight / wavy hair
+}
+
+
 # Soft-target policy keyed by ABSOLUTE CelebA attribute index. The old version
 # keyed on local position (0/1/2 assumed to be glasses/gender/age), so any
 # other --attribute_index ordering or attribute set silently mis-targeted
@@ -1054,6 +1073,14 @@ if __name__ == '__main__':
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
+    parser.add_argument('--preserve_all40_weight', type=float, default=0.0,
+                        help='Hold the attributes NOBODY edits still too: squared change of the '
+                             'training teacher\'s probability on all 40 CelebA attributes, minus the '
+                             'edited ones (covered by --preserve_attr_weight) and the target\'s '
+                             'PRESERVE40_ALLOW list (attributes that are part of the edit, e.g. '
+                             'facial hair for Male). Motivated by the --leak40 eval: Big_Nose, '
+                             'Chubby, Straight_Hair and hair colour moved under every edit with '
+                             'nothing in training holding them. 0 (default) = off.')
     parser.add_argument('--teacher_aug', action=argparse.BooleanOptionalAction, default=True,
                         help='Shared-parameter random crop/flip/noise on src+edited images '
                              'before the frozen attribute teacher, to break adversarial '
@@ -3799,6 +3826,27 @@ if __name__ == '__main__':
                 preserve_loss = _zero.clone()
             counter_attr_loss = changed_loss + args.preserve_attr_weight * preserve_loss
 
+            # --preserve_all40_weight: the loss above only holds the OTHER EDITED
+            # attributes still. The --leak40 eval showed edits also move attributes
+            # nobody edits (Big_Nose, Chubby, Straight_Hair, hair colour, ...), which
+            # nothing in training constrains. Same squared probability change, on the
+            # training teacher's full 40 outputs, minus the edited attributes (already
+            # above) and the target's PRESERVE40_ALLOW list.
+            preserve40_loss = _zero.clone()
+            if args.preserve_all40_weight > 0:
+                _p_src40 = torch.sigmoid(src_logits)[:, :40].detach()
+                _p_gen40 = torch.sigmoid(gen_logits)[:, :40]
+                _m40 = torch.ones_like(_p_src40, dtype=torch.bool)
+                _m40[:, [int(a) for a in args.attribute_index]] = False
+                for _local in torch.unique(mid_idx):
+                    _allow = PRESERVE40_ALLOW.get(int(args.attribute_index[int(_local.item())]), [])
+                    if _allow:
+                        _rows = (mid_idx == _local).nonzero(as_tuple=True)[0]
+                        _m40[_rows.unsqueeze(1), torch.tensor(_allow, device=_m40.device).unsqueeze(0)] = False
+                _mf = _m40.float()
+                preserve40_loss = ((_p_gen40 - _p_src40).pow(2) * _mf).sum() / _mf.sum().clamp(min=1.0)
+                counter_attr_loss = counter_attr_loss + args.preserve_all40_weight * preserve40_loss
+
             # ── Frozen CLIP semantic target loss ──────────────────────
             clip_semantic_loss = _zero.clone()
             clip_logs = {}
@@ -4158,6 +4206,7 @@ if __name__ == '__main__':
                 'loss_nll': log_p2,
                 'loss_target': changed_loss,
                 'loss_leakage': preserve_loss,
+                'loss_preserve40': preserve40_loss,
                 'loss_reg': reg_loss,
                 'loss_id': id_loss,
                 'id_weight': torch.tensor(id_weight),
