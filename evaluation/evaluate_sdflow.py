@@ -40,6 +40,7 @@ import argparse
 import os
 import sys
 import json
+import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'models', 'stylegan2'))
@@ -1478,6 +1479,7 @@ def evaluate(args):
             'independent_id': indep_id is not None,
             'lpips': lpips_fn is not None,
             'independent_attr_weights': args.independent_attr_weights,
+            'edit_direction': getattr(args, 'edit_direction', 'cond'),
         },
     }
 
@@ -1787,10 +1789,18 @@ def evaluate(args):
               'compare edit metrics against it, not against 1.0/0.0.')
 
     # ── Save JSON ──────────────────────────────────────────────────────────
-    out_path = os.path.join(
+    out_path = args.out_json or os.path.join(
         args.checkpoint_dir,
         f'eval_v2_step{args.step}_n{args.num_samples}.json',
     )
+    # The default name only encodes step and sample count, so a second eval of
+    # the same checkpoint (other scales, other --edit_direction) used to
+    # overwrite the first. Keep the old file instead of destroying it.
+    if os.path.exists(out_path):
+        stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(os.path.getmtime(out_path)))
+        kept = f'{os.path.splitext(out_path)[0]}_prev{stamp}.json'
+        os.replace(out_path, kept)
+        print(f'(existing {os.path.basename(out_path)} kept as {os.path.basename(kept)})')
     with open(out_path, 'w') as f:
         json.dump(all_results, f, indent=2)
     print(f'\nResults saved → {out_path}')
@@ -2093,6 +2103,12 @@ if __name__ == '__main__':
     # Eval config
     parser.add_argument('--batch',        type=int,   default=4)
     parser.add_argument('--num_samples',  type=int,   default=500)
+    parser.add_argument('--out_json', default=None,
+                        help='Where to write the results JSON. Default: '
+                             '<checkpoint_dir>/eval_v2_step<N>_n<samples>.json; an existing file '
+                             'there is renamed (..._prev<timestamp>.json), never overwritten. '
+                             'Several runs of the same checkpoint can be combined with '
+                             'scripts/merge_eval_scales.py.')
     parser.add_argument('--eval_scales',  nargs='*',  type=float,
                         default=[0.80, 0.85, 0.90, 0.95])
 
