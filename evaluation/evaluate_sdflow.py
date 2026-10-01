@@ -1209,13 +1209,21 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     return edited_face
 
 
-def _eval_direction(args, src_probs_clip, local_idx):
-    """--edit_direction clip: tell the model the direction the eval scores it
-    on (the CLIP judge's add/rm split; the BiSeNet parser for Eyeglasses).
-    None = conditioner-chosen direction (the old behaviour)."""
-    if getattr(args, 'edit_direction', 'cond') != 'clip' or src_probs_clip is None:
+def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None):
+    """--edit_direction clip / indep: tell the model the direction the eval
+    scores it on, taken from the source score of that judge (CLIP, or the
+    independent classifier; the BiSeNet parser overrides CLIP for Eyeglasses).
+    None = conditioner-chosen direction (the old behaviour).
+
+    A direction taken from a judge that mislabels the SOURCE sends the edit
+    the wrong way (CLIP calls 40% of bang-less faces "has bangs", so they are
+    told to remove bangs and cannot succeed). indep avoids this when the
+    independent classifier is the judge that scores the edit."""
+    mode = getattr(args, 'edit_direction', 'cond')
+    src = {'clip': src_probs_clip, 'indep': src_probs_indep}.get(mode)
+    if src is None:
         return None
-    return torch.where(src_probs_clip[:, local_idx] > 0.5, -1.0, 1.0)
+    return torch.where(src[:, local_idx] > 0.5, -1.0, 1.0)
 
 
 def edit_multi_attribute(prior, conditioner, G, id_criterion,
@@ -1550,7 +1558,7 @@ def evaluate(args):
                     # -- decoupled from whether compositing was actually
                     # requested, so it doesn't silently turn on here too.
                     composite=args.composite_face_region,
-                    direction=_eval_direction(args, src_probs_clip, local_idx),
+                    direction=_eval_direction(args, src_probs_clip, local_idx, src_probs_indep),
                 )
                 edited_256 = F.interpolate(edited_face, (256, 256))
 
@@ -1887,7 +1895,7 @@ if __name__ == '__main__':
                              'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
                              'edits to get a real region mask instead of the all-ones fallback. '
                              'Auto-restored from config.json.')
-    parser.add_argument('--edit_direction', default='cond', choices=['cond', 'clip'],
+    parser.add_argument('--edit_direction', default='cond', choices=['cond', 'clip', 'indep'],
                         help="Who decides add vs remove. cond (default, all previous evals): the "
                              "conditioner's reading of the source. clip: the CLIP judge's add/rm "
                              "split that AccCLIP scores the edit against. The conditioner reads "
@@ -1895,7 +1903,12 @@ if __name__ == '__main__':
                              "vs 2%% of women in v34), so under cond they are edited the wrong way "
                              "or barely at all, and fail at any scale. clip measures editing "
                              "ability with the intended direction given, as a user would; report "
-                             "it alongside cond, not instead of it.")
+                             "it alongside cond, not instead of it. indep: the same, but the "
+                             "direction comes from the independent classifier "
+                             "(--independent_attr_weights), the judge that scores AccInd. Prefer "
+                             "it to clip whenever CLIP misreads the source (scripts/judge_report.py: "
+                             "CLIP TNR 60%% on Bangs, 44%% on Young), because a wrong direction "
+                             "means no edit and a guaranteed failure.")
     parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
                         help="Force these attributes' direction-bank gate uniform at eval (average "
                              "of the slots instead of the trained gate's pick). Diagnostic on a "

@@ -160,7 +160,13 @@ def main(args):
     # direction from the CLIP judge's view of the source (parser for glasses)
     # instead of the conditioner's own guess, so this audit reproduces the eval.
     dir_fn = None
-    if args.edit_direction == 'clip':
+    if args.edit_direction == 'indep':
+        if args.primary_judge != 'indep':
+            raise SystemExit('--edit_direction indep needs --primary_judge indep.')
+        dir_fn = score_fn
+        print('[Direction] --edit_direction indep: add/rm taken from the independent '
+              'classifier score of the source')
+    elif args.edit_direction == 'clip':
         if args.attr == 15 and args.glasses_judge == 'parser':
             dir_fn = score_fn
         elif args.primary_judge == 'clip':
@@ -391,7 +397,7 @@ if __name__ == '__main__':
     p.add_argument('--celeba_attr_judge_weights', default=None,
                     help='Used for --watch_attrs scoring if given (preferred over CLIP). Also '
                          'used for the AUDITED attribute itself when --primary_judge celeba.')
-    p.add_argument('--edit_direction', default='cond', choices=['cond', 'clip'],
+    p.add_argument('--edit_direction', default='cond', choices=['cond', 'clip', 'indep'],
                     help="Same as evaluate_sdflow.py. 'clip' = take add/rm from the CLIP "
                          "(parser for glasses) score of the source instead of the conditioner's "
                          "own guess. Use it whenever the audited run was evaluated with it.")
