@@ -73,26 +73,33 @@ def main():
     report = {}
     for a in attrs:
         rows = [(float(s), mean(scales[s][a], 'id_indep'), mean(scales[s][a], jk),
-                 mean(scales[s][a], f'{jk}_add'), mean(scales[s][a], f'{jk}_rm')) for s in order
+                 mean(scales[s][a], f'{jk}_add'), mean(scales[s][a], f'{jk}_rm'),
+                 mean(scales[s][a], 'lpips')) for s in order
                 if a in scales[s]]
         rows = [r for r in rows if r[1] is not None and r[2] is not None]
         if len(rows) < 2:
             continue
         print(f'\n=== {a} ===')
-        print(f'  {"scale":>6} {"ID_ind":>7} {jl:>8} {"add":>7} {"rm":>7}')
-        for sc, idv, acc, add, rm in rows:
+        print(f'  {"scale":>6} {"ID_ind":>7} {jl:>8} {"add":>7} {"rm":>7} {"LPIPS":>7}')
+        for sc, idv, acc, add, rm, lp in rows:
             fa = f'{add * 100:6.1f}%' if add is not None else '     --'
             fr = f'{rm * 100:6.1f}%' if rm is not None else '     --'
-            print(f'  {sc:>6.2f} {idv:>7.4f} {acc * 100:7.1f}% {fa} {fr}')
+            fl = f'{lp:7.4f}' if lp is not None else '     --'
+            print(f'  {sc:>6.2f} {idv:>7.4f} {acc * 100:7.1f}% {fa} {fr} {fl}')
         pts = [(r[1], r[2]) for r in rows]
-        cells, rep = [], {}
+        lpts = [(r[1], r[5]) for r in rows if r[5] is not None]
+        cells, rep, lrep = [], {}, {}
         for t in args.at:
             v = interp(pts, t)
             rep[f'{t:.2f}'] = v
-            cells.append(f'@ID {t:.2f}: ' + (f'{v * 100:5.1f}%' if v is not None else '   -- '))
+            lv = interp(lpts, t) if len(lpts) > 1 else None
+            lrep[f'{t:.2f}'] = lv
+            cells.append(f'@ID {t:.2f}: ' + (f'{v * 100:5.1f}%' if v is not None else '   -- ')
+                         + (f' (LPIPS {lv:.3f})' if lv is not None and v is not None else ''))
         print('  ' + '   '.join(cells) + f'   (ID range {min(r[1] for r in rows):.3f}'
               f'-{max(r[1] for r in rows):.3f})')
-        report[a] = {'at_id': rep, 'per_scale': [dict(scale=r[0], id=r[1], acc=r[2]) for r in rows]}
+        report[a] = {'at_id': rep, 'lpips_at_id': lrep,
+                     'per_scale': [dict(scale=r[0], id=r[1], acc=r[2], lpips=r[5]) for r in rows]}
 
     ov = [(s, mean(scales[s]['overall'], 'id_indep'), mean(scales[s]['overall'], jk))
           for s in order]
@@ -100,6 +107,10 @@ def main():
     for s, idv, acc in ov:
         if idv is not None and acc is not None:
             print(f'  {float(s):>6.2f} {idv:>7.4f} {acc * 100:7.1f}%')
+    fids = [(s, scales[s].get('fid_edit_vs_recon')) for s in order]
+    if any(v is not None for _, v in fids):
+        print('\nFID (edited vs source recon, lower = closer to the reconstructions): '
+              + '   '.join(f'x{float(s):.2f}: {v:.1f}' for s, v in fids if v is not None))
     print('\nLinear interpolation between neighbouring scales; -- = outside the evaluated ID range '
           '(add a scale rather than extrapolating).')
     if args.out:
