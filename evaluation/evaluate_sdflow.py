@@ -507,7 +507,7 @@ RUN_CONFIG_KEYS = [
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
-    'controlnet_region_cond', 'content_bank_path', 'region_saliency_path',
+    'controlnet_region_cond', 'content_bank_path', 'content_film', 'region_saliency_path',
     'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers', 'gate_uniform_attrs',
 ]
 
@@ -688,7 +688,7 @@ def _attach_content_context(args, control_encoder, device):
             f'<path> to point at it, or --disable_content_cond to evaluate without content.')
     bank = ContentBank(bank_path, device=device)
     encoder = ContentEncoder(in_dim=bank.dim,
-                             out_dim=control_encoder.fc[0].out_features).to(device).eval()
+                             out_dim=control_encoder.content_bias_dim).to(device).eval()
     _check_load(encoder.load_state_dict(load_network(ckpt), strict=False), 'content_encoder')
     for p in encoder.parameters():
         p.requires_grad_(False)
@@ -931,6 +931,7 @@ def load_models(args):
                 per_direction=getattr(args, 'controlnet_per_direction', False),
                 latent_cond=getattr(args, 'controlnet_latent_cond', False),
                 region_cond=getattr(args, 'controlnet_region_cond', False),
+                content_film=bool(getattr(args, 'content_film', False)),
             ).to(device).eval()
         if _ce_state is not None:
             result = control_encoder.load_state_dict(_ce_state, strict=False)

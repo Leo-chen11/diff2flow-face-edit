@@ -1825,6 +1825,19 @@ if __name__ == '__main__':
                              "the encoder has no reason to read it. Needs --content_bank_path. "
                              "Watch loss_content fall and content_sensitivity rise above ~0.05 "
                              "(below that the encoder is not using the reference).")
+    parser.add_argument('--content_film', action=argparse.BooleanOptionalAction, default=False,
+                        help="Content as per-block FiLM instead of a bias on the first layer only: "
+                             "the ContentEncoder also emits a per-channel scale and shift for the "
+                             "4x4 seed and every upsampling stage of the ControlNet ladder, so the "
+                             "reference steers the feature maps up to the injection taps. v35's "
+                             "content (a vector added to ONE early layer, then L2-normalised away "
+                             "at the taps) had no measurable effect; at initialisation the FiLM "
+                             "parameters near the taps get ~100-1000x the gradient of that bias. "
+                             "The ControlNet's own parameters are unchanged (the FiLM weights live "
+                             "in content_encoder), so --resume_dir from a run WITHOUT a "
+                             "content_encoder checkpoint works; resuming a run whose content_encoder "
+                             "has the old width fails the strict load by design. Needs "
+                             "--content_bank_path. Default off.")
     parser.add_argument('--content_cond_dropout', type=float, default=0.2,
                         help="Probability a Young edit gets NO content (and no content loss) this "
                              "step, so the model still edits sensibly without a reference -- same "
@@ -2492,6 +2505,7 @@ if __name__ == '__main__':
                 per_direction=args.controlnet_per_direction,
                 latent_cond=args.controlnet_latent_cond,
                 region_cond=args.controlnet_region_cond,
+                content_film=bool(getattr(args, 'content_film', False)),
             ).cuda()
         trainable_params += list(control_encoder.parameters())
         _warm = args.controlnet_warmup_steps
@@ -2526,8 +2540,15 @@ if __name__ == '__main__':
         content_local_idx = args.attribute_index.index(39)
         content_bank = ContentBank(args.content_bank_path, device='cuda')
         _bcfg = content_bank.config
+        if getattr(args, 'content_film', False) and not control_encoder.content_film:
+            raise ValueError('--content_film needs the multi-resolution AttributeControlEncoder.')
         content_encoder = ContentEncoder(in_dim=content_bank.dim,
-                                         out_dim=control_encoder.fc[0].out_features).cuda()
+                                         out_dim=control_encoder.content_bias_dim).cuda()
+        if control_encoder.content_film:
+            print(f'** Content FiLM: {len(control_encoder.film_channels)} blocks '
+                  f'{control_encoder.film_channels}, content vector width '
+                  f'{control_encoder.content_bias_dim} (trunk bias '
+                  f'{control_encoder.fc[0].out_features} + FiLM {control_encoder.film_dim})')
         trainable_params += list(content_encoder.parameters())
         if args.content_loss_weight > 0:
             content_tex = RegionTextureStats(res=int(_bcfg.get('res', 256)),
@@ -3208,6 +3229,16 @@ if __name__ == '__main__':
                                                 is_rm=(src_attr_flow > 0.5),
                                                 latent=latent, region_mask=region_mask,
                                                 content_bias=content_bias)
+                if control_encoder.last_film_stats:
+                    # Read before the sensitivity probe below reruns the encoder.
+                    # Mean over the whole batch, so rows without content (other
+                    # attributes, dropout) pull it toward 0.
+                    _fs = control_encoder.last_film_stats
+                    content_logs['content_film_gamma'] = torch.stack(
+                        [_fs[b][0] for b in sorted(_fs)]).mean()
+                    content_logs['content_film_beta'] = torch.stack(
+                        [_fs[b][1] for b in sorted(_fs)]).mean()
+                    content_logs['content_film_gamma_last'] = _fs[max(_fs)][0]
 
                 # content_sensitivity: does the encoder READ the reference?
                 # Same inputs, a different reference: relative change of the
