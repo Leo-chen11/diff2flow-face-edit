@@ -1127,7 +1127,12 @@ def main():
                              "extract_continuous_attr.py --cross_judge clip; attributes not covered "
                              "by that file's --cross_judge_attrs fall back to r34-only with a "
                              "warning regardless of this flag. Omit entirely for the old default "
-                             "(r34-only for everything).")
+                             "(r34-only for everything). Passing the flag with NO attribute list "
+                             "is a silent no-op (empty list: every attribute stays r34-only). "
+                             "NOTE: scripts/judge_report.py measured CLIP on real CelebA faces: "
+                             "Young TNR 44%% (it calls 87%% of faces young), Bangs TNR 60%%, "
+                             "Smiling TPR 72%%. Only Male (98-99%%) agrees with the labels, so "
+                             "prefer r34-only for Young/Bangs/Smiling.")
     parser.add_argument("--substyle_k", type=int, default=1,
                         help="Split each stratum's 'high' (attribute-present) group into this "
                              "many k-means sub-clusters BEFORE computing a direction, instead of "
