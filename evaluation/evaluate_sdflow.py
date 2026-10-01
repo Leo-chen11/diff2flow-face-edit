@@ -1495,6 +1495,9 @@ def evaluate(args):
         print(f'{"="*60}')
 
         metrics = defaultdict(list)
+        # --leak40: per (edited attribute, direction) list of (delta (40,), flipped (40,),
+        # clear (40,)) from the independent classifier's full 40-attribute output.
+        leak40 = defaultdict(list)
         sample_count = 0
         fid = build_fid(args)
         first_scale = str(edit_scale) == str(args.eval_scales[0])
@@ -1520,8 +1523,10 @@ def evaluate(args):
             src_probs_clip = clip_judge.scores(src_face_256) if clip_judge is not None else None
             if glasses_parser is not None and src_probs_clip is not None and _glasses_local is not None:
                 src_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(src_face_256)
-            src_probs_indep = torch.sigmoid(indep_teacher(src_face_256)[0])[:, attribute_index] \
+            src_probs_indep_all = torch.sigmoid(indep_teacher(src_face_256)[0]) \
                 if indep_teacher is not None else None
+            src_probs_indep = src_probs_indep_all[:, attribute_index] \
+                if src_probs_indep_all is not None else None
             src_probs_celeb = celeb_judge.scores(src_face_256)[:, attribute_index] \
                 if celeb_judge is not None else None
             src_id_indep = indep_id.extract(src_face_256) if indep_id is not None else None
@@ -1570,8 +1575,10 @@ def evaluate(args):
                 edit_probs_clip = clip_judge.scores(edited_256) if clip_judge is not None else None
                 if glasses_parser is not None and edit_probs_clip is not None and _glasses_local is not None:
                     edit_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(edited_256)
-                edit_probs_indep = torch.sigmoid(indep_teacher(edited_256)[0])[:, attribute_index] \
+                edit_probs_indep_all = torch.sigmoid(indep_teacher(edited_256)[0]) \
                     if indep_teacher is not None else None
+                edit_probs_indep = edit_probs_indep_all[:, attribute_index] \
+                    if edit_probs_indep_all is not None else None
                 edit_probs_celeb = celeb_judge.scores(edited_256)[:, attribute_index] \
                     if celeb_judge is not None else None
                 edit_id_indep = indep_id.extract(edited_256) if indep_id is not None else None
@@ -1623,6 +1630,21 @@ def evaluate(args):
                                 continue
                             metrics[f'leak_{jname}_{attr_name}'].append(
                                 abs(ep[b, other_idx].item() - sp[b, other_idx].item()))
+
+                    # ── Side effects on all 40 attributes (--leak40) ─────────
+                    # What ELSE the edit changed, read by the independent
+                    # classifier: signed probability change per attribute, and
+                    # whether an attribute whose source score was clear crossed
+                    # 0.5. Split by direction, since e.g. lipstick rises in
+                    # male->female and falls in female->male and would cancel.
+                    if getattr(args, 'leak40', False) and src_probs_indep_all is not None:
+                        _st = src_probs_indep[b, local_idx].item()
+                        if is_clear(_st):
+                            _sa = src_probs_indep_all[b].float().cpu()
+                            _ea = edit_probs_indep_all[b].float().cpu()
+                            _clr = (_sa > 0.65) | (_sa < 0.35)
+                            leak40[f'{attr_name}_{"add" if _st < 0.5 else "rm"}'].append(
+                                (_ea - _sa, ((_sa > 0.5) != (_ea > 0.5)) & _clr, _clr))
 
                     if not any_clear:
                         continue
@@ -1737,6 +1759,36 @@ def evaluate(args):
                     cells.append(f'{_dir}: n={prog["n_fail"]:<3} dP={prog["mean_delta"]:+.2f} '
                                  f'near {prog["near"] * 100:4.0f}% still {prog["still"] * 100:4.0f}%')
                 print(f'    {attr_name:<12} ' + '   '.join(cells))
+
+        if leak40:
+            top_n = int(getattr(args, 'leak40_top', 6))
+            print(f'  Side effects on all 40 attributes (AccInd judge): top {top_n} by mean |dP|, '
+                  f'shown as signed mean dP (flip% = clear sources that crossed 0.5)')
+            for attr_name in attr_names:
+                gidx = args.attribute_index[attr_names.index(attr_name)]
+                for _dir in ('add', 'rm'):
+                    rows = leak40.get(f'{attr_name}_{_dir}')
+                    if not rows:
+                        continue
+                    D = torch.stack([r[0] for r in rows])
+                    FL = torch.stack([r[1] for r in rows]).float()
+                    CL = torch.stack([r[2] for r in rows]).float()
+                    mean_d, abs_d = D.mean(0), D.abs().mean(0)
+                    flip = FL.sum(0) / CL.sum(0).clamp(min=1)
+                    others = [j for j in range(D.shape[1]) if j != gidx]
+                    order = sorted(others, key=lambda j: -abs_d[j].item())
+                    cells = ', '.join(f'{CELEBA_ALL_ATTRS[j]} {mean_d[j]:+.2f} ({flip[j] * 100:.0f}%)'
+                                      for j in order[:top_n])
+                    print(f'    {attr_name:<12} {_dir} (n={len(rows)}, mean|dP| others '
+                          f'{abs_d[others].mean():.3f}): {cells}')
+                    scale_summary.setdefault(attr_name, {})[f'leak40_{_dir}'] = {
+                        'n': len(rows),
+                        'mean_abs_others': float(abs_d[others].mean()),
+                        'per_attr': {CELEBA_ALL_ATTRS[j]: {'mean': float(mean_d[j]),
+                                                           'abs': float(abs_d[j]),
+                                                           'flip': float(flip[j])}
+                                     for j in range(D.shape[1])},
+                    }
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
@@ -2104,6 +2156,14 @@ if __name__ == '__main__':
     # Eval config
     parser.add_argument('--batch',        type=int,   default=4)
     parser.add_argument('--num_samples',  type=int,   default=500)
+    parser.add_argument('--leak40', action='store_true',
+                        help='Report what ELSE each edit changed: the independent classifier\'s '
+                             'signed probability change on all 40 CelebA attributes, per edited '
+                             'attribute and direction, with the rate at which clear source '
+                             'attributes crossed 0.5. Needs --independent_attr_weights. Saved '
+                             'as leak40_add / leak40_rm in the JSON.')
+    parser.add_argument('--leak40_top', type=int, default=6,
+                        help='How many of the most-changed other attributes to print per edit.')
     parser.add_argument('--out_json', default=None,
                         help='Where to write the results JSON. Default: '
                              '<checkpoint_dir>/eval_v2_step<N>_n<samples>.json; an existing file '
