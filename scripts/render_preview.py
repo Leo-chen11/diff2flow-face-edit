@@ -108,6 +108,20 @@ def main(args):
     face_ids = pick_balanced_faces(dataset, args.attribute_index, args.num_faces)
     print(f'faces: {face_ids}')
 
+    # --edit_direction indep: add vs remove from the independent classifier's
+    # reading of the source reconstruction, as evaluate_sdflow.py
+    # --edit_direction indep does, so the grid shows the edits the numbers score.
+    indep = None
+    if args.edit_direction == 'indep':
+        if not args.independent_attr_weights:
+            raise SystemExit('--edit_direction indep needs --independent_attr_weights.')
+        from common.ops import load_network
+        from models.attribute_estimator import AttributeClassifier
+        indep = AttributeClassifier(backbone=args.independent_attr_backbone)
+        indep.load_state_dict(load_network(args.independent_attr_weights))
+        indep = indep.cuda().eval()
+        print(f'[Direction] add/rm from {args.independent_attr_weights} on the source')
+
     rows = []
     for idx in face_ids:
         img, latent, _pred = dataset[idx]
@@ -117,6 +131,8 @@ def main(args):
 
         recon = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         cells = [F.interpolate(recon, (args.cell_size, args.cell_size))]
+        src_p = torch.sigmoid(indep(F.interpolate(recon, (256, 256)))[0])[0] \
+            if indep is not None else None
 
         for local_idx in range(len(args.attribute_index)):
             edited = edit_single_attribute(
@@ -136,6 +152,9 @@ def main(args):
                 # --controlnet_region_cond needed it for age's region mask --
                 # decoupled from whether compositing was actually requested.
                 composite=args.composite_face_region,
+                direction=(torch.tensor([-1.0 if src_p[args.attribute_index[local_idx]] > 0.5
+                                         else 1.0], device='cuda')
+                           if src_p is not None else None),
             )
             cells.append(F.interpolate(edited, (args.cell_size, args.cell_size)))
 
@@ -167,6 +186,12 @@ if __name__ == '__main__':
     parser.add_argument('--edit_target', default='mirror', choices=['mirror', 'train'],
                    help='Same as evaluate_sdflow.py --edit_target.')
     parser.add_argument('--num_faces', type=int, default=8)
+    parser.add_argument('--edit_direction', default='cond', choices=['cond', 'indep'],
+                        help="cond: the conditioner's own add/rm (old behaviour). indep: from "
+                             "--independent_attr_weights on the source, as the eval's "
+                             "--edit_direction indep.")
+    parser.add_argument('--independent_attr_weights', default=None)
+    parser.add_argument('--independent_attr_backbone', default='r50')
     parser.add_argument('--cell_size', type=int, default=256)
     parser.add_argument('--out', default=None)
 
