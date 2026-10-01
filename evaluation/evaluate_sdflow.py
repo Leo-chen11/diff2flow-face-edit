@@ -1640,8 +1640,11 @@ def evaluate(args):
                     if getattr(args, 'leak40', False) and src_probs_indep_all is not None:
                         _st = src_probs_indep[b, local_idx].item()
                         if is_clear(_st):
-                            _sa = src_probs_indep_all[b].float().cpu()
-                            _ea = edit_probs_indep_all[b].float().cpu()
+                            # The classifier emits more than the 40 CelebA
+                            # attributes (age outputs follow them); keep the 40.
+                            _n40 = len(CELEBA_ALL_ATTRS)
+                            _sa = src_probs_indep_all[b, :_n40].float().cpu()
+                            _ea = edit_probs_indep_all[b, :_n40].float().cpu()
                             _clr = (_sa > 0.65) | (_sa < 0.35)
                             _ok = strict_success(_st, edit_probs_indep[b, local_idx].item(),
                                                  args.success_margin)
