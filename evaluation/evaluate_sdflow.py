@@ -1334,6 +1334,11 @@ def lenient_success(src_score, edit_score):
         else (edit_score > src_score + 0.05)
 
 
+# Failure-progress buckets (change in judge probability toward the target).
+NEAR_DELTA = 0.20
+STILL_DELTA = 0.05
+
+
 def is_clear(score, low=0.35, high=0.65):
     return score > high or score < low
 
@@ -1594,8 +1599,13 @@ def evaluate(args):
                         if jname == 'teacher':
                             metrics[f'acc_lenient_{attr_name}'].append(
                                 float(lenient_success(s, e)))
-                        metrics[f'delta_{jname}_{attr_name}'].append(
-                            (e - s) if s < 0.5 else (s - e))  # signed toward target
+                        _delta = (e - s) if s < 0.5 else (s - e)   # signed toward target
+                        metrics[f'delta_{jname}_{attr_name}'].append(_delta)
+                        # How far the edit got on samples the strict test calls
+                        # failures: "moved but did not cross 0.5" (judge/label
+                        # strictness) vs "did not move" (model/direction).
+                        if not _succ:
+                            metrics[f'fail_delta_{jname}_{attr_name}_{_dir}'].append(_delta)
                         # Leakage on non-target attributes, same judge
                         for other_idx in range(len(args.attribute_index)):
                             if other_idx == local_idx:
@@ -1642,6 +1652,8 @@ def evaluate(args):
                 (f'acc_celeb_{attr_name}', True),
                 (f'delta_teacher_{attr_name}', False),
                 (f'delta_clip_{attr_name}', False),
+                (f'delta_indep_{attr_name}', False),
+                (f'delta_celeb_{attr_name}', False),
                 (f'lpips_{attr_name}', False),
                 (f'leak_teacher_{attr_name}', False),
                 (f'leak_clip_{attr_name}', False),
@@ -1688,6 +1700,32 @@ def evaluate(args):
                 print(f'    {attr_name:<12} add: {_a_txt}   rm: {_r_txt}')
                 scale_summary[attr_name][f'acc_{jname}_add'] = _a
                 scale_summary[attr_name][f'acc_{jname}_rm'] = _r
+
+        # ── Progress among failures ───────────────────────────────────────
+        # Strict success needs the judge's probability to CROSS 0.5. A sample
+        # that went 0.05 -> 0.45 is a failure here although the edit visibly
+        # worked, so split the failures by how far they got.
+        for jname, label, present in (('indep', 'AccInd', indep_teacher is not None),
+                                      ('clip', 'AccCLIP', True)):
+            if not present:
+                continue
+            print(f'  Failures by progress ({label}): "near" = moved >= {NEAR_DELTA:.2f} toward '
+                  f'the target without crossing, "still" = moved < {STILL_DELTA:.2f}')
+            for attr_name in attr_names:
+                cells = []
+                for _dir in ('add', 'rm'):
+                    d = metrics[f'fail_delta_{jname}_{attr_name}_{_dir}']
+                    if not d:
+                        cells.append(f'{_dir}: no failures')
+                        continue
+                    arr = np.asarray(d)
+                    prog = {'n_fail': int(arr.size), 'mean_delta': float(arr.mean()),
+                            'near': float((arr >= NEAR_DELTA).mean()),
+                            'still': float((arr < STILL_DELTA).mean())}
+                    scale_summary[attr_name][f'fail_progress_{jname}_{_dir}'] = prog
+                    cells.append(f'{_dir}: n={prog["n_fail"]:<3} dP={prog["mean_delta"]:+.2f} '
+                                 f'near {prog["near"] * 100:4.0f}% still {prog["still"] * 100:4.0f}%')
+                print(f'    {attr_name:<12} ' + '   '.join(cells))
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
