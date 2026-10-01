@@ -1643,8 +1643,10 @@ def evaluate(args):
                             _sa = src_probs_indep_all[b].float().cpu()
                             _ea = edit_probs_indep_all[b].float().cpu()
                             _clr = (_sa > 0.65) | (_sa < 0.35)
+                            _ok = strict_success(_st, edit_probs_indep[b, local_idx].item(),
+                                                 args.success_margin)
                             leak40[f'{attr_name}_{"add" if _st < 0.5 else "rm"}'].append(
-                                (_ea - _sa, ((_sa > 0.5) != (_ea > 0.5)) & _clr, _clr))
+                                (_ea - _sa, ((_sa > 0.5) != (_ea > 0.5)) & _clr, _clr, bool(_ok)))
 
                     if not any_clear:
                         continue
@@ -1770,24 +1772,46 @@ def evaluate(args):
                     rows = leak40.get(f'{attr_name}_{_dir}')
                     if not rows:
                         continue
-                    D = torch.stack([r[0] for r in rows])
-                    FL = torch.stack([r[1] for r in rows]).float()
-                    CL = torch.stack([r[2] for r in rows]).float()
-                    mean_d, abs_d = D.mean(0), D.abs().mean(0)
-                    flip = FL.sum(0) / CL.sum(0).clamp(min=1)
-                    others = [j for j in range(D.shape[1]) if j != gidx]
-                    order = sorted(others, key=lambda j: -abs_d[j].item())
-                    cells = ', '.join(f'{CELEBA_ALL_ATTRS[j]} {mean_d[j]:+.2f} ({flip[j] * 100:.0f}%)'
+                    others = [j for j in range(rows[0][0].shape[0]) if j != gidx]
+
+                    def _stats(sel):
+                        D = torch.stack([r[0] for r in sel])
+                        FL = torch.stack([r[1] for r in sel]).float()
+                        CL = torch.stack([r[2] for r in sel]).float()
+                        return D.mean(0), D.abs().mean(0), FL.sum(0) / CL.sum(0).clamp(min=1)
+
+                    mean_d, abs_d, flip = _stats(rows)
+                    ok_rows = [r for r in rows if r[3]]
+                    # Side effects of SUCCESSFUL edits only: a setting that barely
+                    # edits (low success) also barely changes anything else, so
+                    # comparing all-sample averages across settings with different
+                    # success rates rewards doing nothing. Ranked on these when
+                    # there are enough successes.
+                    if len(ok_rows) >= 5:
+                        s_mean, s_abs, s_flip = _stats(ok_rows)
+                    else:
+                        s_mean = s_abs = s_flip = None
+                    rank_mean, rank_abs, rank_flip = (s_mean, s_abs, s_flip) if s_abs is not None \
+                        else (mean_d, abs_d, flip)
+                    order = sorted(others, key=lambda j: -rank_abs[j].item())
+                    cells = ', '.join(f'{CELEBA_ALL_ATTRS[j]} {rank_mean[j]:+.2f} ({rank_flip[j] * 100:.0f}%)'
                                       for j in order[:top_n])
-                    print(f'    {attr_name:<12} {_dir} (n={len(rows)}, mean|dP| others '
-                          f'{abs_d[others].mean():.3f}): {cells}')
+                    succ_txt = (f', successful n={len(ok_rows)} mean|dP| others {s_abs[others].mean():.3f}'
+                                if s_abs is not None else f', successful n={len(ok_rows)} (too few)')
+                    print(f'    {attr_name:<12} {_dir} (all n={len(rows)} mean|dP| others '
+                          f'{abs_d[others].mean():.3f}{succ_txt}): '
+                          f'{"[successful] " if s_abs is not None else "[all] "}{cells}')
+
+                    def _per(m, a, f):
+                        return {CELEBA_ALL_ATTRS[j]: {'mean': float(m[j]), 'abs': float(a[j]),
+                                                      'flip': float(f[j])} for j in range(len(m))}
                     scale_summary.setdefault(attr_name, {})[f'leak40_{_dir}'] = {
-                        'n': len(rows),
+                        'n': len(rows), 'n_success': len(ok_rows),
                         'mean_abs_others': float(abs_d[others].mean()),
-                        'per_attr': {CELEBA_ALL_ATTRS[j]: {'mean': float(mean_d[j]),
-                                                           'abs': float(abs_d[j]),
-                                                           'flip': float(flip[j])}
-                                     for j in range(D.shape[1])},
+                        'mean_abs_others_success': (float(s_abs[others].mean())
+                                                    if s_abs is not None else None),
+                        'per_attr': _per(mean_d, abs_d, flip),
+                        'per_attr_success': _per(s_mean, s_abs, s_flip) if s_abs is not None else None,
                     }
 
         # Overall (independent judges only, so the headline number is honest)
