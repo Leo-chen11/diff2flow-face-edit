@@ -1080,7 +1080,10 @@ if __name__ == '__main__':
                              'PRESERVE40_ALLOW list (attributes that are part of the edit, e.g. '
                              'facial hair for Male). Motivated by the --leak40 eval: Big_Nose, '
                              'Chubby, Straight_Hair and hair colour moved under every edit with '
-                             'nothing in training holding them. 0 (default) = off.')
+                             'nothing in training holding them. Compared against the source '
+                             'RECONSTRUCTION (not the real photo, whose inversion gap is a floor '
+                             'the edit cannot remove); preserve40_inversion_floor logs that gap. '
+                             '0 (default) = off.')
     parser.add_argument('--teacher_aug', action=argparse.BooleanOptionalAction, default=True,
                         help='Shared-parameter random crop/flip/noise on src+edited images '
                              'before the frozen attribute teacher, to break adversarial '
@@ -3833,9 +3836,25 @@ if __name__ == '__main__':
             # training teacher's full 40 outputs, minus the edited attributes (already
             # above) and the target's PRESERVE40_ALLOW list.
             preserve40_loss = _zero.clone()
+            preserve40_floor = _zero.clone()
             if args.preserve_all40_weight > 0:
-                _p_src40 = torch.sigmoid(src_logits)[:, :40].detach()
-                _p_gen40 = torch.sigmoid(gen_logits)[:, :40]
+                # Compare against the source RECONSTRUCTION, not the real photo
+                # the teacher losses above use: the real photo differs from any
+                # G() output by the inversion gap, so its 40 attribute scores
+                # differ from the reconstruction's even with no edit at all. That
+                # gap is a floor the flow cannot remove; against the photo this
+                # loss sat flat at it (~0.025) and its gradient chased an
+                # unreachable target. Same shared crop/flip/noise for the pair.
+                if src_recon is not None:
+                    _ref_aug, _gen_aug = teacher_augment(
+                        src_recon, new_face_tensors,
+                        enabled=args.teacher_aug, noise_std=args.teacher_aug_noise)
+                    with torch.no_grad():
+                        _p_src40 = torch.sigmoid(attr_teacher(_ref_aug)[0])[:, :40]
+                    _p_gen40 = torch.sigmoid(attr_teacher(_gen_aug)[0])[:, :40]
+                else:
+                    _p_src40 = torch.sigmoid(src_logits)[:, :40].detach()
+                    _p_gen40 = torch.sigmoid(gen_logits)[:, :40]
                 _m40 = torch.ones_like(_p_src40, dtype=torch.bool)
                 _m40[:, [int(a) for a in args.attribute_index]] = False
                 for _local in torch.unique(mid_idx):
@@ -3846,6 +3865,17 @@ if __name__ == '__main__':
                 _mf = _m40.float()
                 preserve40_loss = ((_p_gen40 - _p_src40).pow(2) * _mf).sum() / _mf.sum().clamp(min=1.0)
                 counter_attr_loss = counter_attr_loss + args.preserve_all40_weight * preserve40_loss
+                # Logging only: the same quantity between the real photo and its
+                # reconstruction (no edit), i.e. what the photo-referenced
+                # version could never get below.
+                if src_recon is not None:
+                    with torch.no_grad():
+                        _img_aug, _rec_aug = teacher_augment(
+                            img, src_recon, enabled=args.teacher_aug,
+                            noise_std=args.teacher_aug_noise)
+                        _pi = torch.sigmoid(attr_teacher(_img_aug)[0])[:, :40]
+                        _pr = torch.sigmoid(attr_teacher(_rec_aug)[0])[:, :40]
+                        preserve40_floor = ((_pi - _pr).pow(2) * _mf).sum() / _mf.sum().clamp(min=1.0)
 
             # ── Frozen CLIP semantic target loss ──────────────────────
             clip_semantic_loss = _zero.clone()
@@ -4207,6 +4237,7 @@ if __name__ == '__main__':
                 'loss_target': changed_loss,
                 'loss_leakage': preserve_loss,
                 'loss_preserve40': preserve40_loss,
+                'preserve40_inversion_floor': preserve40_floor,
                 'loss_reg': reg_loss,
                 'loss_id': id_loss,
                 'id_weight': torch.tensor(id_weight),
