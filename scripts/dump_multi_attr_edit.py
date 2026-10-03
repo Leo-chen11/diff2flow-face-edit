@@ -107,7 +107,7 @@ def main(args):
         edited = edit_multi_attribute(
             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
             local_idxs, args.edit_scale, direction_bank,
-            attr_global_idxs=args.attrs,
+            attr_global_idxs=args.attrs, compose=args.compose,
             control_encoder=control_encoder,
             controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
             controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
@@ -169,6 +169,10 @@ if __name__ == '__main__':
                     help='Extra attributes to SCORE but not edit, to check for leakage '
                          'into attributes you deliberately left out of --attrs.')
     p.add_argument('--edit_scale', type=float, default=1.0)
+    p.add_argument('--compose', default='sum', choices=['sum', 'orth'],
+                   help='How the per-attribute W+ deltas are combined; see '
+                        'evaluate_sdflow.edit_multi_attribute. scripts/eval_multi_attr.py scores both '
+                        '(and sequential editing).')
     p.add_argument('--num_samples', type=int, default=16)
     p.add_argument('--out_dir', default='./multi_attr_test')
     p.add_argument('--batch', type=int, default=4)

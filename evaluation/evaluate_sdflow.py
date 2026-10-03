@@ -1228,12 +1228,29 @@ def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None):
     return torch.where(src[:, local_idx] > 0.5, -1.0, 1.0)
 
 
+def remove_span(v, others, eps=1e-8):
+    """v minus its projection onto span(others), separately for every sample
+    and W+ layer. v, others[i]: (B, L, D). Gram-Schmidt over `others` first,
+    so overlapping others are not subtracted twice."""
+    basis = []
+    for o in others:
+        u = o
+        for b in basis:
+            u = u - (u * b).sum(-1, keepdim=True) * b
+        n = u.norm(dim=-1, keepdim=True)
+        basis.append(torch.where(n > eps, u / n.clamp(min=eps), torch.zeros_like(u)))
+    out = v
+    for b in basis:
+        out = out - (out * b).sum(-1, keepdim=True) * b
+    return out
+
+
 def edit_multi_attribute(prior, conditioner, G, id_criterion,
                          img, latent, attr_cond, id_cond,
                          attr_local_idxs, edit_scales, direction_bank,
                          attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0,
                          controlnet_embed_res=64, controlnet_disable_attrs=None,
-                         face_parser=None):
+                         face_parser=None, directions=None, compose='sum', return_parts=False):
     """Edit several attributes on the same face at once.
 
     Composes N independently-computed single-attribute guided deltas by
@@ -1265,10 +1282,27 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         the same all-ones fallback regardless. None (the default) is safe --
         region_cond=True samples then fall back to all-ones for every
         attribute, same as region_cond=False's behavior.
+    directions: optional list (same order as attr_local_idxs) of (B,) tensors,
+        +1 = add, -1 = remove, or None entries -- as edit_single_attribute's
+        `direction` (--edit_direction). None = the conditioner's own reading.
+    compose: how the per-attribute W+ deltas are combined.
+        'sum'  (default, old behaviour) adds them.
+        'orth' first removes from each delta, per W+ layer, its component in
+               the span of the OTHER attributes' deltas, then adds. Shared
+               components (two edits pushing the same latent direction, e.g.
+               male and old both thickening the jaw) are then not applied
+               twice. Training-free; ControlNet skips are still added as-is.
+    return_parts: also return the edited W+ latent and the combined ControlNet
+        skips, as (edited_face, new_latents, combined_skips) -- for callers
+        that keep editing from the result (sequential composition).
     """
     if isinstance(edit_scales, (int, float)):
         edit_scales = [edit_scales] * len(attr_local_idxs)
     assert len(edit_scales) == len(attr_local_idxs)
+    if compose not in ('sum', 'orth'):
+        raise ValueError(f"compose must be 'sum' or 'orth', got {compose!r}")
+    if directions is None:
+        directions = [None] * len(attr_local_idxs)
 
     B = img.size(0)
     device = img.device
@@ -1286,13 +1320,15 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
-    combined_delta = torch.zeros_like(latent)
+    deltas = []
     combined_skips = None
     for i, (local_idx, scale) in enumerate(zip(attr_local_idxs, edit_scales)):
         new_attr_cond = attr_cond.clone()
         src = attr_cond[:, local_idx]
         new_attr_cond[:, local_idx] = edited_attr_value(
-            src, scale, attr_global_idxs[i] if attr_global_idxs is not None else None)
+            src, scale, attr_global_idxs[i] if attr_global_idxs is not None else None,
+            direction=directions[i])
+        is_rm = (src > 0.5) if directions[i] is None else (directions[i].to(src.device) < 0)
         new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
         new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
@@ -1302,7 +1338,7 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent,
                                       route_scores=attr_cond)
-        combined_delta = combined_delta + guided_delta
+        deltas.append(guided_delta)
         this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
         use_controlnet_here = (control_encoder is not None and not (
             controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
@@ -1314,16 +1350,21 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
                     with torch.no_grad():
                         region_mask = face_parser.get_region_mask(
                             src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5),
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
                                    latent=latent, region_mask=region_mask,
                                    content_bias=_content_bias(
-                                       control_encoder, this_global_idx, attr_cond, src > 0.5))
+                                       control_encoder, this_global_idx, attr_cond, is_rm))
             skip = clip_skips(skip, controlnet_max_norm)
             combined_skips = add_skips(combined_skips, skip)
 
-    new_latents = latent + combined_delta
+    if compose == 'orth' and len(deltas) > 1:
+        deltas = [remove_span(d, [o for j, o in enumerate(deltas) if j != i])
+                  for i, d in enumerate(deltas)]
+    new_latents = latent + torch.stack(deltas, 0).sum(0)
     edited_face = G([new_latents], skips=combined_skips, embed_res=controlnet_embed_res,
                     input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+    if return_parts:
+        return edited_face, new_latents, combined_skips
     return edited_face
 
 
@@ -1946,7 +1987,9 @@ def evaluate(args):
 # CLI
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+def build_parser():
+    """The evaluate_sdflow.py CLI, also used by scripts that load a checkpoint
+    the same way (scripts/eval_multi_attr.py adds its own options on top)."""
     parser = argparse.ArgumentParser()
 
     # Required
@@ -2214,7 +2257,7 @@ if __name__ == '__main__':
                              'Diagnostic for the confirmed color-cast artifact living in the '
                              'age direction fine layers -- but a blanket cut at layer 4 also '
                              'kills real aging signal (500-sample eval: rm-direction AccCLIP '
-                             '76%->17%), so narrow the range with --age_fine_layer_start.')
+                             '76%%->17%%), so narrow the range with --age_fine_layer_start.')
     parser.add_argument('--age_fine_layer_start', type=int, default=10,
                         help='First W+ layer index (0-17) affected by the age fine-layer '
                              'color-cast mitigation (see load_models). The reg_loss_fine '
@@ -2270,7 +2313,11 @@ if __name__ == '__main__':
                         help='With --adaptive_ladder: stop when the teacher probability is past '
                              '0.5 by this margin in the edit direction. Larger = stronger edits, '
                              'lower ID; each margin is one point of the curve.')
+    return parser
 
+
+if __name__ == '__main__':
+    parser = build_parser()
     args = parser.parse_args()
     args = apply_run_config(args)
     args = resolve_controlnet_disable_attrs(args)
