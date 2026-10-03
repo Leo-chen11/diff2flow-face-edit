@@ -26,5 +26,6 @@ facenet-pytorch      # id_indep judge (evaluation), fallback ID backbone (common
 lpips                # perceptual distance metric (evaluation/evaluate_sdflow.py)
 matplotlib           # eval plots (evaluation/eval_strength_sweep.py, plot scripts)
 torchmetrics         # --compute_fid (evaluation/evaluate_sdflow.py)
+torch-fidelity       # Inception feature extractor torchmetrics' FID needs at runtime
 diffusers            # frozen diffusion DDS guidance (training/train_sdflow.py)
 git+https://github.com/openai/CLIP.git   # OpenAI CLIP: CLIP judge + CLIP prompt loss (NOT the PyPI "clip" package)

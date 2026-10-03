@@ -36,6 +36,11 @@ Usage, two passes:
 """
 import argparse
 import os
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'models', 'stylegan2'))
+sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 import torch.nn.functional as F
@@ -45,13 +50,82 @@ from torch.utils import data
 
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CLIPAttributeJudge, apply_run_config, edit_single_attribute,
-    load_models,
+    resolve_controlnet_disable_attrs,
+    load_models, _latest_step,
 )
 from models.dataset import SDFlowDataset
 
 
+def _stratified_indices(continuous_path, attr, image_list, n_per_bin, n_bins=5, seed=0):
+    """DATASET indices (0..len(image_list)-1, i.e. into the already train/
+    test-split-filtered SDFlowDataset) spanning the full continuous-score
+    range for `attr`, evenly drawn across `n_bins` equal-width score bins,
+    instead of relying on a plain shuffle to happen to cover rare classes.
+
+    WHY BY FILENAME, NOT ROW POSITION: SDFlowDataset filters its image list
+    by the index CSV's 'split' column BEFORE building self.image_list (see
+    models/dataset.py), so dataset[i] is NOT row i of the continuous-preds
+    file -- that file covers the whole unfiltered image list. Same reason
+    models/dataset.py's own _lookup_precomputed() looks scores up by
+    filename via a path->index dict instead of assuming positional
+    alignment; this mirrors that pattern rather than reintroducing the bug.
+
+    WHY STRATIFY AT ALL: a plain `shuffle=True` draw of the first few
+    hundred images samples the SOURCE population's natural class balance.
+    For an attribute with a rare class (e.g. Young: only ~25% of FFHQ
+    scores <0.5 "old" by r34, and an even smaller ~13% by CLIP's own
+    judgment -- see extract_continuous_attr.py --cross_judge clip), a small
+    random draw can easily under-represent that class enough that the human
+    sorting has too few real examples of it to fit a reliable threshold
+    against. Binning the actual continuous score and drawing evenly from
+    every bin guarantees the human gets a real spread to look at,
+    independent of how imbalanced the underlying population is.
+    """
+    preds = torch.load(continuous_path, map_location='cpu')
+    if not (isinstance(preds, dict) and 'paths' in preds and 'values' in preds):
+        raise SystemExit(f'--continuous_preds_file {continuous_path} is missing paths/values '
+                         '(expected the output of extract_continuous_attr.py).')
+    path_to_row = {p: i for i, p in enumerate(preds['paths'])}
+    missing = [f for f in image_list if f not in path_to_row]
+    if missing:
+        raise SystemExit(
+            f'{len(missing)}/{len(image_list)} dataset images have no row in '
+            f'--continuous_preds_file (e.g. {missing[0]!r}) -- it must cover this dataset\'s '
+            'full image list, not just a subset.'
+        )
+    # dataset-local index -> that image's continuous score for `attr`.
+    scores = torch.tensor([preds['values'][path_to_row[f], attr] for f in image_list])
+
+    g = torch.Generator().manual_seed(seed)
+    bin_edges = torch.linspace(0, 1, n_bins + 1)
+    indices = []
+    for i in range(n_bins):
+        lo, hi = bin_edges[i].item(), bin_edges[i + 1].item()
+        in_bin = ((scores >= lo) & (scores < hi if i < n_bins - 1 else scores <= hi)).nonzero(as_tuple=True)[0]
+        if in_bin.numel() == 0:
+            print(f'  [stratify] bin [{lo:.2f},{hi:.2f}): 0 samples, skipping')
+            continue
+        take = min(n_per_bin, in_bin.numel())
+        picked = in_bin[torch.randperm(in_bin.numel(), generator=g)[:take]]
+        print(f'  [stratify] bin [{lo:.2f},{hi:.2f}): {in_bin.numel()} available, took {take}')
+        indices.extend(picked.tolist())
+    return indices
+
+
 @torch.no_grad()
 def do_dump(args):
+    if args.step is None:
+        # load_models() has no fallback for this -- unlike evaluate_sdflow.py's
+        # own __main__, which resolves args.step before calling load_models(),
+        # this script calls load_models() directly. Without this, _ckpt_path()
+        # does f'{module_name}-{str(None).zfill(7)}' -> 'prior-000None' and
+        # crashes with a FileNotFoundError that gives no hint why.
+        args.step = _latest_step(args.checkpoint_dir)
+        if args.step is None:
+            raise SystemExit(f'No checkpoints found under {args.checkpoint_dir}/save_models -- '
+                             'pass --step explicitly if they use a different naming scheme.')
+        print(f'Auto-detected latest step: {args.step}')
+
     os.makedirs(os.path.join(args.out_dir, 'unsorted'), exist_ok=True)
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank, control_encoder = load_models(args)
@@ -69,6 +143,21 @@ def do_dump(args):
         latents_file=args.latent_file, preds_file=args.preds_file,
         train=False, transform=img_transform,
     )
+    src_target = args.num_per_bucket
+    if args.stratify_src_by_score:
+        print(f'Stratifying source sampling by attr {args.attr}\'s continuous score '
+              f'({args.continuous_preds_file}) so rare classes are not just left to shuffle luck:')
+        strat_idx = _stratified_indices(
+            args.continuous_preds_file, args.attr, list(dataset.image_list),
+            n_per_bin=max(args.num_per_bucket, 1), n_bins=args.stratify_bins,
+        )
+        dataset = data.Subset(dataset, strat_idx)
+        # Save the WHOLE balanced pool, not just num_per_bucket of it -- a
+        # further random truncation back down to num_per_bucket would
+        # undo the balancing this just did.
+        src_target = len(strat_idx)
+        print(f'  -> saving all {src_target} stratified source crops (not truncated back '
+              f'down to --num_per_bucket={args.num_per_bucket}).')
     loader = data.DataLoader(dataset, shuffle=True, batch_size=args.batch,
                              num_workers=4, drop_last=False)
 
@@ -87,7 +176,7 @@ def do_dump(args):
         # Save some untouched source crops too -- real, unedited faces are
         # part of the score distribution the judge has to handle.
         for b in range(img.size(0)):
-            if saved_src >= args.num_per_bucket:
+            if saved_src >= src_target:
                 break
             _save(src_face[b], src_scores[b].item(), args.out_dir, 'src', saved_src)
             saved_src += 1
@@ -98,6 +187,7 @@ def do_dump(args):
                 local_idx, scale, direction_bank, attr_global_idx=args.attr,
                 control_encoder=control_encoder,
                 controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+                controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
             )
             edited_256 = F.interpolate(edited, (256, 256))
             edit_scores = cj.scores(edited_256)[:, local_idx]
@@ -109,7 +199,7 @@ def do_dump(args):
                 saved_edit += 1
 
         n += img.size(0)
-        if saved_src >= args.num_per_bucket and \
+        if saved_src >= src_target and \
            saved_edit >= args.num_per_bucket * len(scales):
             break
 
@@ -202,6 +292,22 @@ if __name__ == '__main__':
     d.add_argument('--image_root', default='data/FFHQ')
     d.add_argument('--latent_file', default='./data/ffhq_e4e_latents.pth')
     d.add_argument('--preds_file', default='./data/ffhq_e4e_preds.pth')
+    d.add_argument('--continuous_preds_file', default='./data/ffhq_e4e_preds_continuous.pth',
+                    help='Output of extract_continuous_attr.py, used by --stratify_src_by_score '
+                         'to bin the SOURCE sampling by this attribute\'s actual score instead '
+                         'of leaving rare-class coverage to shuffle luck.')
+    d.add_argument('--stratify_src_by_score',
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help='Bin source-face sampling by --continuous_preds_file\'s score for '
+                         '--attr into --stratify_bins equal-width bins and draw evenly from '
+                         'each, instead of a plain shuffle. Default on: a plain shuffle draw '
+                         'undersamples any attribute whose classes are imbalanced in the real '
+                         'population (confirmed for Young: ~25%% "old" by r34, ~13%% by CLIP\'s '
+                         'own judgment), leaving too few real examples of the rare class for a '
+                         'reliable fit. --no-stratify_src_by_score reproduces the old plain-'
+                         'shuffle behavior.')
+    d.add_argument('--stratify_bins', type=int, default=5,
+                    help='Number of equal-width score bins for --stratify_src_by_score.')
     d.add_argument('--stygan2_weights', default='./data/stylegan2-ffhq-config-f.pt')
     d.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth')
     d.add_argument('--direction_bank_path', default=None)
@@ -225,8 +331,11 @@ if __name__ == '__main__':
     d.add_argument('--guided_delta_max_norm', type=float, default=0.0)
     d.add_argument('--override_residual_scale', type=float, default=None)
     d.add_argument('--age_fine_layer_scale', type=float, default=None)
-    d.add_argument('--age_fine_layer_start', type=int, default=4)
+    d.add_argument('--age_fine_layer_start', type=int, default=10)
     d.add_argument('--force_bank_directions', action='store_true')
+    d.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                    help='Same knob/default as evaluate_sdflow.py: omitted -> auto-resolved '
+                         'to gender/age (20, 39) via resolve_controlnet_disable_attrs().')
     d.add_argument('--ignore_run_config', action='store_true')
 
     f = sub.add_parser('fit')
@@ -237,6 +346,7 @@ if __name__ == '__main__':
     args = p.parse_args()
     if args.mode == 'dump':
         args = apply_run_config(args)
+        args = resolve_controlnet_disable_attrs(args)
         do_dump(args)
     else:
         do_fit(args)

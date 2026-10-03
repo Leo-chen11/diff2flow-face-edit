@@ -27,24 +27,19 @@ classifier and the same identity encoder to produce them.
 import argparse
 import csv
 import os
-from collections import defaultdict
+import sys
+
+# Same preamble every other evaluation/ script carries: makes the project
+# root importable so this file can be run as `python evaluation/<name>.py`
+# and still resolve `evaluation._shared`.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, PROJECT_ROOT)
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-
-def parse_named_path(value):
-    if '=' not in value:
-        raise argparse.ArgumentTypeError('Expected NAME=path/to/metrics_summary.csv')
-    name, path = value.split('=', 1)
-    name = name.strip()
-    path = path.strip()
-    if not name:
-        raise argparse.ArgumentTypeError('Run name cannot be empty.')
-    if not os.path.exists(path):
-        raise argparse.ArgumentTypeError(f'File does not exist: {path}')
-    return name, path
+from evaluation._shared import parse_named_path
 
 
 def read_summary(path):

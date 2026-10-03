@@ -52,14 +52,7 @@ from tqdm import tqdm
 from common.id_loss import IDLoss
 from models.dataset import SDFlowDataset
 from models.stylegan2.model import Generator
-
-
-def attr_name_map(indices, names):
-    if names and len(names) != len(indices):
-        raise ValueError('--attribute_names must have the same length as --attribute_index.')
-    if names:
-        return {int(idx): name for idx, name in zip(indices, names)}
-    return {int(idx): f'attr_{idx}' for idx in indices}
+from evaluation._shared import attr_name_map
 
 
 def load_bank_directions(bank_path, attribute_index):

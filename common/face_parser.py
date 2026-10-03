@@ -195,6 +195,38 @@ class FaceParser(nn.Module):
         mask = F.interpolate(mask, (h, w), mode='bilinear', align_corners=False)
         return mask.clamp(0, 1)
 
+    def region_prob(self, x, classes):
+        """DIFFERENTIABLE soft region occupancy, as a probability map.
+
+        get_region_mask above is deliberately non-differentiable: it is
+        decorated @torch.no_grad() and takes an argmax, because every caller
+        so far wanted a fixed mask to weight some OTHER differentiable
+        quantity (pixel colour, saturation) inside a region. Gradient flowed
+        through those pixel values, never through the mask.
+
+        A loss on the SIZE of a region cannot work that way -- the quantity
+        being optimised IS the mask, so an argmax'd one gives it exactly zero
+        gradient and the loss silently does nothing. This returns the summed
+        softmax probability of `classes` instead, which is a differentiable
+        relaxation of the same area: gradient reaches the generator through
+        BiSeNet's input.
+
+        The net's parameters stay frozen (requires_grad_(False) in __init__);
+        that does not block gradient w.r.t. the INPUT image, which is what a
+        caller optimising the generator needs. It does mean a backward pass
+        through BiSeNet, so only call this when such a loss is enabled.
+
+        x: [-1,1] tensor [B,3,H,W]; classes: list of BiSeNet label ids.
+        returns: [B,1,H,W] in [0,1].
+        """
+        h, w = x.shape[2:]
+        inp = F.interpolate(x, 512, mode='bilinear', align_corners=False)
+        inp = (inp * 0.5 + 0.5 - self.mean) / self.std
+        prob = self.net(inp).softmax(dim=1)           # [B, 19, 512, 512]
+        region = prob[:, list(classes)].sum(dim=1, keepdim=True)
+        region = F.interpolate(region, (h, w), mode='bilinear', align_corners=False)
+        return region.clamp(0, 1)
+
     @torch.no_grad()
     def get_mask(self, x, blur_sigma=3):
         """

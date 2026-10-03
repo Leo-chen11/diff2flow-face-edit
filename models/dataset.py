@@ -96,9 +96,42 @@ class SDFlowDataset(Dataset):
         pred = self._lookup_precomputed(self.preds, file)
         
         return img,latent,pred
-    
+
     def __len__(self):
         return len(self.image_list)
+
+
+class IndexedDataset(Dataset):
+    """Wraps any Dataset and appends the sample's INDEX to what __getitem__
+    returns, without touching the wrapped class's own return signature.
+
+    WHY: a per-sample lookup keyed by filename (e.g.
+    --region_saliency_path's precomputed attribution maps in
+    training/train_sdflow.py) needs to know which file each batch element
+    came from. SDFlowDataset.__getitem__ returns (img, latent, pred) only --
+    no index, no path -- and every caller in this project (train_sdflow.py's
+    training loop, evaluate_sdflow.py, render_preview.py, the probe scripts)
+    unpacks that exact 3-tuple, so changing SDFlowDataset itself would break
+    all of them simultaneously. Wrapping only the ONE DataLoader that needs
+    the index (train_sdflow.py's train_loader) keeps every other consumer
+    untouched.
+
+    Works with either a plain shuffling DataLoader or a custom
+    batch_sampler (e.g. ScoreBalancedBatchSampler): both call
+    dataset[index] for whatever index they pick, so the index this class
+    appends is always the real index into the WRAPPED dataset, regardless
+    of sampling order -- exactly what a caller needs to recover the
+    original file via base_dataset.image_list[index].
+    """
+
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+
+    def __getitem__(self, index):
+        return (*self.base_dataset[index], index)
+
+    def __len__(self):
+        return len(self.base_dataset)
 
 
 class ImageDataset(Dataset):
