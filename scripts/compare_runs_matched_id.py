@@ -9,6 +9,12 @@ inside the ID range BOTH runs cover:
     AccInd                     add / rm success rate
     side effects (successful)  mean |dP| over the other attributes, successful edits
                                only (leak40 'mean_abs_others_success')
+    penalised side effects     the same mean over only the attributes that
+                               --preserve_all40_weight holds fixed (not the edited
+                               attributes, not the target's PRESERVE40_ALLOW list).
+                               The all-others mean is dominated by attributes that
+                               are SUPPOSED to move (Smiling -> cheekbones, mouth;
+                               Male -> beard, makeup), which dilutes the change.
 
 Each side is one or more evaluate_sdflow.py JSONs of one checkpoint (pooled like
 scripts/merge_eval_scales.py). Run evaluate_sdflow.py with --leak40 for the side
@@ -21,9 +27,27 @@ Usage:
         --names ctrl p40
 """
 import argparse
+import ast
 import json
+import os
 
 from scripts.merge_eval_scales import interp, mean
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def _literal(path, name):
+    """A module-level literal from a source file, read without importing it (the
+    training / eval modules pull in heavy dependencies at import time)."""
+    tree = ast.parse(open(os.path.join(ROOT, path)).read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise KeyError(f'{name} not found in {path}')
+
+
+CELEBA = _literal('evaluation/evaluate_sdflow.py', 'CELEBA_ALL_ATTRS')
+ALLOW = _literal('training/train_sdflow.py', 'PRESERVE40_ALLOW')
 
 
 def load(files):
@@ -37,9 +61,18 @@ def load(files):
     return scales
 
 
-def curves(scales, attr):
+def penalised(per_attr, attr, edited):
+    """Mean |dP| over the attributes preserve_all40 holds fixed for this target."""
+    tgt = CELEBA.index(attr)
+    skip = {CELEBA.index(a) for a in edited} | set(ALLOW.get(tgt, []))
+    vals = [per_attr[n]['abs'] for j, n in enumerate(CELEBA) if j not in skip and n in per_attr]
+    return sum(vals) / len(vals) if vals else None
+
+
+def curves(scales, attr, edited):
     """{metric: [(id, value), ...]} over the scales of one run."""
-    out = {'acc': [], 'acc_add': [], 'acc_rm': [], 'leak_add': [], 'leak_rm': []}
+    out = {'acc': [], 'acc_add': [], 'acc_rm': [], 'leak_add': [], 'leak_rm': [],
+           'pen_add': [], 'pen_rm': []}
     for s in sorted(scales, key=float):
         row = scales[s].get(attr)
         if not isinstance(row, dict):
@@ -56,6 +89,10 @@ def curves(scales, attr):
             v = lk.get('mean_abs_others_success')
             if v is not None:
                 out[f'leak_{d}'].append((idv, v))
+            if lk.get('per_attr_success'):
+                pv = penalised(lk['per_attr_success'], attr, edited)
+                if pv is not None:
+                    out[f'pen_{d}'].append((idv, pv))
     return out
 
 
@@ -74,7 +111,7 @@ def main():
     attrs = [k for k, v in first.items() if isinstance(v, dict) and k not in ('overall', 'num_samples')]
 
     for attr in attrs:
-        ca, cb = curves(A, attr), curves(B, attr)
+        ca, cb = curves(A, attr, attrs), curves(B, attr, attrs)
         ida, idb = [x for x, _ in ca['acc']], [x for x, _ in cb['acc']]
         print(f'\n=== {attr} ===   ID range {na} {min(ida):.3f}-{max(ida):.3f}, '
               f'{nb} {min(idb):.3f}-{max(idb):.3f}' if ida and idb else f'\n=== {attr} === (no data)')
@@ -88,8 +125,10 @@ def main():
                   f'evaluate {side} at larger edit_scale (or the other at smaller) until they overlap')
             continue
         ids = [hi] if args.points == 1 else [lo + (hi - lo) * i / (args.points - 1) for i in range(args.points)]
-        print(f'  {"@ID":>6} | {"AccInd " + na:>11} {nb:>6} {"Δ":>6} | {"add":>5} {"":>5} | {"rm":>5} {"":>5} |'
-              f' {"side add " + na:>13} {nb:>6} {"Δ%":>5} | {"side rm " + na:>12} {nb:>6} {"Δ%":>5}')
+        print(f'  {"@ID":>6} | {"AccInd " + na:>11} {nb:>6} {"Δ":>6} | {"add " + na:>9} {nb:>5} |'
+              f' {"rm " + na:>8} {nb:>5} |'
+              f' {"side add " + na:>13} {nb:>6} {"Δ%":>5} | {"side rm " + na:>12} {nb:>6} {"Δ%":>5} |'
+              f' {"penal add":>9} {"Δ%":>5} | {"penal rm":>8} {"Δ%":>5}')
         for t in ids:
             def g(c, k):
                 return interp(c[k], t) if len(c[k]) > 1 else None
@@ -107,13 +146,18 @@ def main():
             d = f'{(ab - aa) * 100:+5.1f}' if aa is not None and ab is not None else '   --'
             la, lb = g(ca, 'leak_add'), g(cb, 'leak_add')
             ra, rb = g(ca, 'leak_rm'), g(cb, 'leak_rm')
-            print(f'  {t:6.3f} | {pc(aa):>11} {pc(ab):>6} {d:>6} | {pc(g(ca, "acc_add"))} {pc(g(cb, "acc_add"))} |'
-                  f' {pc(g(ca, "acc_rm"))} {pc(g(cb, "acc_rm"))} |'
-                  f' {lk(la):>13} {lk(lb):>6} {rel(la, lb):>5} | {lk(ra):>12} {lk(rb):>6} {rel(ra, rb):>5}')
+            pa = rel(g(ca, 'pen_add'), g(cb, 'pen_add'))
+            pr = rel(g(ca, 'pen_rm'), g(cb, 'pen_rm'))
+            print(f'  {t:6.3f} | {pc(aa):>11} {pc(ab):>6} {d:>6} | {pc(g(ca, "acc_add")):>9} {pc(g(cb, "acc_add"))} |'
+                  f' {pc(g(ca, "acc_rm")):>8} {pc(g(cb, "acc_rm"))} |'
+                  f' {lk(la):>13} {lk(lb):>6} {rel(la, lb):>5} | {lk(ra):>12} {lk(rb):>6} {rel(ra, rb):>5} |'
+                  f' {lk(g(cb, "pen_add")):>9} {pa:>5} | {lk(g(cb, "pen_rm")):>8} {pr:>5}')
     print('\nAll columns are read off at the same ID_ind (linear interpolation between scales; '
           'ID is per attribute, shared by its add and rm halves).\n'
           'add/rm columns: AccInd of each run. side = mean |dP| over the other attributes, '
-          'successful edits only; Δ% < 0 means the changed run leaks less.')
+          'successful edits only; Δ% < 0 means the changed run leaks less.\n'
+          'penal = the same over only the attributes preserve_all40 penalises for that target '
+          f'({nb} value and Δ% vs {na}).')
 
 
 if __name__ == '__main__':
