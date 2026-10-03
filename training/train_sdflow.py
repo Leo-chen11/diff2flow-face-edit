@@ -504,7 +504,8 @@ def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
     return targets
 
 
-def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_size=256):
+def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_size=256,
+                    ref_images=None):
     """Shared-parameter, differentiable augmentation applied to BOTH the source
     and the edited image before the frozen attribute teacher.
 
@@ -516,10 +517,17 @@ def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_s
     Gradients still flow to the generator (crop/flip/interpolate/add are all
     differentiable); parameters are shared so src/edit scores stay comparable
     for preserve_loss.
+
+    ref_images: optional third batch given the SAME crop/flip/noise (returned
+    third), so another reference can be scored against the edit without a
+    second, gradient-carrying teacher pass over the edit.
     """
     if not enabled:
-        return (F.interpolate(src_images, (out_size, out_size)),
-                F.interpolate(edit_images, (out_size, out_size)))
+        out = (F.interpolate(src_images, (out_size, out_size)),
+               F.interpolate(edit_images, (out_size, out_size)))
+        if ref_images is not None:
+            out = out + (F.interpolate(ref_images, (out_size, out_size)),)
+        return out
     H, W = src_images.shape[-2:]
     s = float(torch.empty(1).uniform_(0.85, 1.0))
     ch, cw = int(H * s), int(W * s)
@@ -527,16 +535,21 @@ def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_s
     left = int(torch.randint(0, W - cw + 1, (1,)))
     src = src_images[:, :, top:top + ch, left:left + cw]
     edit = edit_images[:, :, top:top + ch, left:left + cw]
+    ref = ref_images[:, :, top:top + ch, left:left + cw] if ref_images is not None else None
     if float(torch.rand(1)) < 0.5:
         src = torch.flip(src, [-1])
         edit = torch.flip(edit, [-1])
+        ref = torch.flip(ref, [-1]) if ref is not None else None
     src = F.interpolate(src, (out_size, out_size), mode='bilinear', align_corners=False)
     edit = F.interpolate(edit, (out_size, out_size), mode='bilinear', align_corners=False)
+    if ref is not None:
+        ref = F.interpolate(ref, (out_size, out_size), mode='bilinear', align_corners=False)
     if noise_std > 0:
         noise = torch.randn_like(edit) * noise_std
         src = (src + noise).clamp(-1, 1)
         edit = (edit + noise).clamp(-1, 1)
-    return src, edit
+        ref = (ref + noise).clamp(-1, 1) if ref is not None else None
+    return (src, edit) if ref is None else (src, edit, ref)
 
 
 def resolve_resume_save_dir(resume_dir):
@@ -3736,11 +3749,17 @@ if __name__ == '__main__':
             # Frozen counterfactual teacher: external supervision on visual attribute change.
             # Shared-parameter augmentation before the teacher breaks adversarial
             # teacher-fooling (see teacher_augment docstring).
-            src_face_256, new_face_256 = teacher_augment(
+            # --preserve_all40_weight scores the reconstruction too; it gets the
+            # same crop/flip/noise so the edit's existing teacher pass is reused.
+            _p40_ref = src_recon if (args.preserve_all40_weight > 0 and src_recon is not None) else None
+            _aug = teacher_augment(
                 img, new_face_tensors,
                 enabled=args.teacher_aug,
                 noise_std=args.teacher_aug_noise,
+                ref_images=_p40_ref,
             )
+            src_face_256, new_face_256 = _aug[0], _aug[1]
+            recon_face_256 = _aug[2] if _p40_ref is not None else None
             src_logits, _ = attr_teacher(src_face_256)
             gen_logits, _ = attr_teacher(new_face_256)
             src_probs = torch.sigmoid(src_logits)[:, attribute_index].detach()
@@ -3845,16 +3864,14 @@ if __name__ == '__main__':
                 # gap is a floor the flow cannot remove; against the photo this
                 # loss sat flat at it (~0.025) and its gradient chased an
                 # unreachable target. Same shared crop/flip/noise for the pair.
-                if src_recon is not None:
-                    _ref_aug, _gen_aug = teacher_augment(
-                        src_recon, new_face_tensors,
-                        enabled=args.teacher_aug, noise_std=args.teacher_aug_noise)
+                # The edit's teacher pass (gen_logits) is reused; only the
+                # reconstruction gets one extra, gradient-free pass.
+                _p_gen40 = torch.sigmoid(gen_logits)[:, :40]
+                if recon_face_256 is not None:
                     with torch.no_grad():
-                        _p_src40 = torch.sigmoid(attr_teacher(_ref_aug)[0])[:, :40]
-                    _p_gen40 = torch.sigmoid(attr_teacher(_gen_aug)[0])[:, :40]
+                        _p_src40 = torch.sigmoid(attr_teacher(recon_face_256)[0])[:, :40]
                 else:
                     _p_src40 = torch.sigmoid(src_logits)[:, :40].detach()
-                    _p_gen40 = torch.sigmoid(gen_logits)[:, :40]
                 _m40 = torch.ones_like(_p_src40, dtype=torch.bool)
                 _m40[:, [int(a) for a in args.attribute_index]] = False
                 for _local in torch.unique(mid_idx):
@@ -3868,14 +3885,10 @@ if __name__ == '__main__':
                 # Logging only: the same quantity between the real photo and its
                 # reconstruction (no edit), i.e. what the photo-referenced
                 # version could never get below.
-                if src_recon is not None:
+                if recon_face_256 is not None:
                     with torch.no_grad():
-                        _img_aug, _rec_aug = teacher_augment(
-                            img, src_recon, enabled=args.teacher_aug,
-                            noise_std=args.teacher_aug_noise)
-                        _pi = torch.sigmoid(attr_teacher(_img_aug)[0])[:, :40]
-                        _pr = torch.sigmoid(attr_teacher(_rec_aug)[0])[:, :40]
-                        preserve40_floor = ((_pi - _pr).pow(2) * _mf).sum() / _mf.sum().clamp(min=1.0)
+                        _pi = torch.sigmoid(src_logits)[:, :40]
+                        preserve40_floor = ((_pi - _p_src40).pow(2) * _mf).sum() / _mf.sum().clamp(min=1.0)
 
             # ── Frozen CLIP semantic target loss ──────────────────────
             clip_semantic_loss = _zero.clone()
