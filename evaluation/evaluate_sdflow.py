@@ -1481,6 +1481,9 @@ def evaluate(args):
             'lpips': lpips_fn is not None,
             'independent_attr_weights': args.independent_attr_weights,
             'edit_direction': getattr(args, 'edit_direction', 'cond'),
+            'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
+            'adaptive_margins': (getattr(args, 'adaptive_margins', None)
+                                 if getattr(args, 'adaptive_ladder', None) else None),
         },
     }
 
@@ -1489,9 +1492,17 @@ def evaluate(args):
     # every edit inherits before the flow touches anything.
     inv_metrics = defaultdict(list)
 
-    for edit_scale in args.eval_scales:
+    # --adaptive_ladder: each face gets its own edit_scale (see the edit loop);
+    # the outer loop then runs over teacher margins instead of fixed scales,
+    # each margin giving one point on the accuracy-vs-identity curve.
+    adaptive = bool(getattr(args, 'adaptive_ladder', None))
+    if adaptive:
+        args.adaptive_ladder = sorted(args.adaptive_ladder)
+    outer = args.adaptive_margins if adaptive else args.eval_scales
+    for edit_scale in outer:
         print(f'\n{"="*60}')
-        print(f'edit_scale = {edit_scale}')
+        print(f'adaptive edit_scale, teacher margin = {edit_scale} '
+              f'(ladder {args.adaptive_ladder})' if adaptive else f'edit_scale = {edit_scale}')
         print(f'{"="*60}')
 
         metrics = defaultdict(list)
@@ -1500,7 +1511,7 @@ def evaluate(args):
         leak40 = defaultdict(list)
         sample_count = 0
         fid = build_fid(args)
-        first_scale = str(edit_scale) == str(args.eval_scales[0])
+        first_scale = str(edit_scale) == str(outer[0])
 
         for img, latent, pred in tqdm(test_loader, desc=f'scale={edit_scale}'):
             if sample_count >= args.num_samples:
@@ -1548,26 +1559,59 @@ def evaluate(args):
                 attr_name = ATTR_NAMES.get(args.attribute_index[local_idx],
                                            f'attr{args.attribute_index[local_idx]}')
 
-                edited_face = edit_single_attribute(
-                    prior, conditioner, G, id_criterion,
-                    img, latent, attr_cond, id_cond,
-                    local_idx, edit_scale, direction_bank,
-                    attr_global_idx=args.attribute_index[local_idx],
-                    bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-                    face_parser=composite_face_parser,
-                    composite_method=args.composite_method,
-                    composite_blur_sigma=args.composite_blur_sigma,
-                    control_encoder=control_encoder,
-                    controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-                    controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
-                    controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
-                    # composite_face_parser may now exist ONLY because
-                    # --controlnet_region_cond needs it for age's region mask
-                    # -- decoupled from whether compositing was actually
-                    # requested, so it doesn't silently turn on here too.
-                    composite=args.composite_face_region,
-                    direction=_eval_direction(args, src_probs_clip, local_idx, src_probs_indep),
-                )
+                _direction = _eval_direction(args, src_probs_clip, local_idx, src_probs_indep)
+
+                def _edit(scale):
+                    return edit_single_attribute(
+                        prior, conditioner, G, id_criterion,
+                        img, latent, attr_cond, id_cond,
+                        local_idx, scale, direction_bank,
+                        attr_global_idx=args.attribute_index[local_idx],
+                        bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
+                        face_parser=composite_face_parser,
+                        composite_method=args.composite_method,
+                        composite_blur_sigma=args.composite_blur_sigma,
+                        control_encoder=control_encoder,
+                        controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+                        controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
+                        controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
+                        # composite_face_parser may now exist ONLY because
+                        # --controlnet_region_cond needs it for age's region mask
+                        # -- decoupled from whether compositing was actually
+                        # requested, so it doesn't silently turn on here too.
+                        composite=args.composite_face_region,
+                        direction=_direction,
+                    )
+
+                if adaptive:
+                    # Per-face edit strength: walk up the ladder and keep, for
+                    # each face, the FIRST scale at which the training teacher
+                    # (r34, not the R50 judge that scores the result) sees the
+                    # edit done by `edit_scale` (= the teacher margin here).
+                    # Easy faces stop early and keep their identity; faces a
+                    # fixed scale leaves unedited ("still" failures) get more.
+                    # Faces that never get there keep the largest scale.
+                    _gidx = args.attribute_index[local_idx]
+                    _add = (_direction > 0) if _direction is not None \
+                        else (src_probs_teacher[:, local_idx] < 0.5)
+                    _add = _add.to(img.device)
+                    edited_face, _done = None, torch.zeros(B, dtype=torch.bool, device=img.device)
+                    _chosen = torch.full((B,), float(args.adaptive_ladder[-1]), device=img.device)
+                    for _k, _sc in enumerate(args.adaptive_ladder):
+                        _ef = _edit(_sc)
+                        _pt = torch.sigmoid(attr_teacher(F.interpolate(_ef, (256, 256)))[0])[:, _gidx]
+                        _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
+                        _take = (~_done) & (_ok | (_k == len(args.adaptive_ladder) - 1))
+                        if edited_face is None:
+                            edited_face = _ef.clone()
+                        edited_face[_take] = _ef[_take]
+                        _chosen[_take] = float(_sc)
+                        _done |= _take
+                        if bool(_done.all()):
+                            break
+                    metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
+                else:
+                    edited_face = _edit(edit_scale)
                 edited_256 = F.interpolate(edited_face, (256, 256))
 
                 edit_id_arc = F.normalize(id_criterion.extract_features(edited_256), dim=1)
@@ -1816,6 +1860,18 @@ def evaluate(args):
                         'per_attr': _per(mean_d, abs_d, flip),
                         'per_attr_success': _per(s_mean, s_abs, s_flip) if s_abs is not None else None,
                     }
+
+        if adaptive:
+            print('  Chosen edit_scale per face (training-teacher stop rule; '
+                  '"at max" = never reached the margin, kept the largest scale):')
+            for attr_name in attr_names:
+                cs = metrics.get(f'chosen_scale_{attr_name}')
+                if not cs:
+                    continue
+                arr = np.asarray(cs)
+                hist = '  '.join(f'{sc:g}:{(arr == sc).mean() * 100:.0f}%' for sc in args.adaptive_ladder)
+                print(f'    {attr_name:<12} mean {arr.mean():.2f}  at max {(arr == args.adaptive_ladder[-1]).mean() * 100:4.1f}%   {hist}')
+                scale_summary.setdefault(attr_name, {})['chosen_scale'] = _summ(cs)
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
@@ -2199,6 +2255,21 @@ if __name__ == '__main__':
                              'scripts/merge_eval_scales.py.')
     parser.add_argument('--eval_scales',  nargs='*',  type=float,
                         default=[0.80, 0.85, 0.90, 0.95])
+    parser.add_argument('--adaptive_ladder', nargs='*', type=float, default=None,
+                        help='Per-face edit strength instead of one fixed scale: for every face '
+                             'and attribute, try these edit_scales from small to large and keep '
+                             'the first edit the TRAINING teacher (--attribute_weights, r34) '
+                             'scores as done by --adaptive_margins; faces that never get there '
+                             'keep the largest. The R50 judge, ID and LPIPS then score the kept '
+                             'edit as usual. Replaces --eval_scales: the results are keyed by '
+                             'margin, one accuracy-vs-identity point per margin, so keep them in '
+                             'their own --out_json. Costs up to len(ladder) generations per edit '
+                             '(stops early once every face in the batch is done). '
+                             'e.g. 0.5 0.7 0.85 1.0 1.25 1.5')
+    parser.add_argument('--adaptive_margins', nargs='*', type=float, default=[0.0, 0.15, 0.3],
+                        help='With --adaptive_ladder: stop when the teacher probability is past '
+                             '0.5 by this margin in the edit direction. Larger = stronger edits, '
+                             'lower ID; each margin is one point of the curve.')
 
     args = parser.parse_args()
     args = apply_run_config(args)
