@@ -1552,6 +1552,11 @@ def apply_residual_basis(args, direction_bank):
               f'[ResidualBasis] {ATTR_NAMES.get(g, g)}: residual removed (k=0)')
 
 
+# no_grad: prior, conditioner and direction bank are not frozen, so without it
+# every edit kept an autograd graph (through the 1024px synthesis too) and a
+# 24GB card ran out of memory even at --batch 1. The ODE function enables
+# grad locally for its divergence term, so the flow still runs.
+@torch.no_grad()
 def evaluate(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank, control_encoder = load_models(args)
