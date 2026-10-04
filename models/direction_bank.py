@@ -317,6 +317,12 @@ class AttributeDirectionBank(nn.Module):
         #     one fixed direction scaled by the requested edit (ref = the mean
         #     |attr_delta| vec was measured at) -- the flow's output is unused.
         self.residual_fixed = {}
+        #   residual_head: {local attr idx: models.residual_head.ResidualHead};
+        #     that attribute's residual term is predicted from the latent, the
+        #     attribute change, route_scores and _id_cond (set by the caller)
+        #     instead of taken from the flow.
+        self.residual_head = {}
+        self._id_cond = None
         self._last_residual = None
 
         # Optional safety controls applied to the final guided delta. These are
@@ -695,6 +701,17 @@ class AttributeDirectionBank(nn.Module):
         else:
             rs = scales.mean()
         res_term = rs * residual
+        if self.residual_head and attr_idx is not None:
+            res_term = res_term.clone()
+            attr_idx_long = attr_idx.view(-1).long()
+            idc = self._id_cond if (self._id_cond is not None and self._id_cond.size(0) == B) else None
+            for a, head in self.residual_head.items():
+                m = attr_idx_long == int(a)
+                if m.any():
+                    pred = head(latent[m], attr_delta[m, int(a)],
+                                route_scores[m] if route_scores is not None else None,
+                                idc[m] if idc is not None else None)
+                    res_term[m] = pred.to(dtype).view(-1, self.num_layers, self.latent_dim)
         if self.residual_fixed and attr_idx is not None:
             res_term = res_term.clone()
             attr_idx_long = attr_idx.view(-1).long()

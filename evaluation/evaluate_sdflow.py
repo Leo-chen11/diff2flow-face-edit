@@ -1165,6 +1165,7 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), attr_local_idx, device=device, dtype=torch.long)
+        direction_bank._id_cond = id_cond      # read only by a --residual_head
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent,
                                       route_scores=attr_cond)
@@ -1335,6 +1336,7 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
+        direction_bank._id_cond = id_cond      # read only by a --residual_head
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent,
                                       route_scores=attr_cond)
@@ -1464,9 +1466,27 @@ def apply_residual_basis(args, direction_bank):
     scripts/analyze_residual.py found for that attribute (0 = no residual)."""
     fixed = getattr(args, 'residual_fixed', None)
     path = getattr(args, 'residual_basis', None)
-    if fixed and path:
-        raise SystemExit('--residual_basis and --residual_fixed are alternatives; give one')
+    head_path = getattr(args, 'residual_head', None)
+    if sum(bool(x) for x in (fixed, path, head_path)) > 1:
+        raise SystemExit('--residual_basis, --residual_fixed and --residual_head are alternatives; give one')
+    if head_path and direction_bank is not None:
+        from models.residual_head import ResidualHead
+        saved = torch.load(head_path, map_location='cpu')
+        dev = direction_bank.residual_scale_raw.device
+        for g, entry in saved['attrs'].items():
+            g = int(g)
+            if g not in args.attribute_index:
+                continue
+            head = ResidualHead(entry['in_dim'], entry['basis'], hidden=entry.get('hidden', 256))
+            head.load_state_dict(entry['state_dict'])
+            direction_bank.residual_head[args.attribute_index.index(g)] = head.to(dev).eval()
+            print(f'[ResidualHead] {ATTR_NAMES.get(g, g)}: residual predicted on {entry["basis"].shape[0]} '
+                  f'directions by a small network (val R2 {entry.get("val_r2", float("nan")):.3f}); '
+                  f'the flow\'s residual is not used')
+        return
     if fixed and direction_bank is not None:
+        from models.direction_bank import parse_attr_spec
+        mult = parse_attr_spec(getattr(args, 'residual_fixed_mult', None))
         saved = torch.load(fixed, map_location='cpu')
         for g, entry in saved['attrs'].items():
             g = int(g)
@@ -1475,11 +1495,13 @@ def apply_residual_basis(args, direction_bank):
             if 'mean_aligned' not in entry:
                 raise SystemExit(f'{fixed} has no mean_aligned: rerun scripts/analyze_residual.py '
                                  f'(the fixed-residual vector was added later)')
+            m = float(mult.get(g, 1.0))
             direction_bank.residual_fixed[args.attribute_index.index(g)] = (
-                entry['mean_aligned'], max(entry['mean_abs_attr_delta'], 1e-6))
+                entry['mean_aligned'] * m, max(entry['mean_abs_attr_delta'], 1e-6))
             print(f'[ResidualFixed] {ATTR_NAMES.get(g, g)}: residual -> one fixed direction '
-                  f'(|v| {float(entry["mean_aligned"].norm()):.2f}) x attr_delta / '
-                  f'{entry["mean_abs_attr_delta"]:.3f}; the flow\'s residual is not used')
+                  f'(|v| {float(entry["mean_aligned"].norm()) * m:.2f}'
+                  + (f', x{m:g}' if m != 1.0 else '') +
+                  f') x attr_delta / {entry["mean_abs_attr_delta"]:.3f}; the flow\'s residual is not used')
         return
     if not path or direction_bank is None:
         return
@@ -1564,6 +1586,9 @@ def evaluate(args):
             'edit_direction': getattr(args, 'edit_direction', 'cond'),
             'residual_basis': getattr(args, 'residual_basis', None),
             'residual_fixed': getattr(args, 'residual_fixed', None),
+            'residual_fixed_mult': (getattr(args, 'residual_fixed_mult', None)
+                                    if getattr(args, 'residual_fixed', None) else None),
+            'residual_head': getattr(args, 'residual_head', None),
             'residual_basis_k': (getattr(args, 'residual_basis_k', None)
                                  if getattr(args, 'residual_basis', None) else None),
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
@@ -2371,6 +2396,14 @@ def build_parser():
                              'direction) scaled by the requested attribute change. Nothing in the edit '
                              'then depends on the flow: tests whether the flow is only needed to FIND '
                              'that direction during training.')
+    parser.add_argument('--residual_fixed_mult', default=None,
+                        help="With --residual_fixed: scale one attribute's fixed residual, e.g. '39:3' "
+                             "(Young's residual is capped at 0.05 in training, so it barely contributes; "
+                             "this tests whether more of it helps). Check images for fake texture.")
+    parser.add_argument('--residual_head', default=None,
+                        help='A scripts/distill_residual_head.py output (.pth): each attribute\'s residual is '
+                             'predicted on its top principal directions by a small network instead of '
+                             'taken from the flow (no ODE solve for the residual).')
     return parser
 
 

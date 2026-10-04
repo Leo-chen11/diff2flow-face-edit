@@ -33,6 +33,7 @@ import torchvision.transforms as T
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES,
     _latest_step,
+    apply_residual_basis,
     apply_run_config,
     edit_single_attribute,
     load_models,
@@ -72,6 +73,7 @@ def pick_balanced_faces(dataset, attribute_index, num_faces):
 def main(args):
     prior, conditioner, G, id_criterion, attr_teacher, attribute_index, \
         direction_bank, control_encoder = load_models(args)
+    apply_residual_basis(args, direction_bank)
 
     composite_face_parser = None
     if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
@@ -269,6 +271,12 @@ if __name__ == '__main__':
     parser.add_argument('--composite_blur_sigma', type=float, default=15,
                         help='Feather width for --composite_method alpha. Ignored for poisson.')
     parser.add_argument('--ignore_run_config', action='store_true')
+    # Residual variants, same as evaluate_sdflow.py (see its --help)
+    parser.add_argument('--residual_basis', default=None)
+    parser.add_argument('--residual_basis_k', type=int, default=4)
+    parser.add_argument('--residual_fixed', default=None)
+    parser.add_argument('--residual_fixed_mult', default=None)
+    parser.add_argument('--residual_head', default=None)
 
     args = parser.parse_args()
     args = apply_run_config(args)
