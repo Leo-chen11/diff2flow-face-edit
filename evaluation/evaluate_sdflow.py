@@ -712,6 +712,9 @@ def load_models(args):
     _EDIT_TARGET_MODE = getattr(args, 'edit_target', None) or 'mirror'
     global _SRC_COND_CLAMP
     _SRC_COND_CLAMP = getattr(args, 'src_cond_clamp', None)
+    set_preserve_boundaries(getattr(args, 'preserve_boundaries', None),
+                            getattr(args, 'preserve_strength', 1.0),
+                            getattr(args, 'preserve_min_auc', 0.8))
     if _SRC_COND_CLAMP is not None:
         print(f'[SrcCondClamp] {_SRC_COND_CLAMP}: an edit with a given direction starts from a source '
               f'value on the far side of 0.5 (add <= {0.5 - _SRC_COND_CLAMP:.2f}, '
@@ -1015,6 +1018,86 @@ def consistent_source(attr_cond, local_idx, direction, margin=None):
     return out
 
 
+_PRESERVE = None            # --preserve_boundaries; set in load_models()
+
+
+def _source_literal(path, name):
+    """A module-level literal read from a source file without importing it."""
+    import ast
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    for node in ast.parse(open(os.path.join(root, path)).read()).body:
+        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise KeyError(f'{name} not found in {path}')
+
+
+def set_preserve_boundaries(path, strength=1.0, min_auc=0.8):
+    """Load scripts/fit_attr_boundaries.py normals for project_preserve(); None = off."""
+    global _PRESERVE
+    if not path:
+        _PRESERVE = None
+        return
+    d = torch.load(path, map_location='cpu')
+    normals = d['normals'].float().reshape(40, -1)
+    auc = d['auc'].float()
+    usable = [a for a in range(40) if float(auc[a]) >= min_auc]
+    _PRESERVE = {'normals': normals, 'usable': set(usable), 'strength': float(strength),
+                 'allow': _source_literal('training/train_sdflow.py', 'PRESERVE40_ALLOW'),
+                 'cache': {}}
+    weak = [CELEBA_ALL_ATTRS[a] for a in range(40) if a not in _PRESERVE['usable']]
+    print(f'[Preserve] {path}: edits lose their component along the boundaries of the attributes '
+          f'they should not change (strength {strength:g}); {len(usable)}/40 boundaries with AUC >= '
+          f'{min_auc:g}' + (f' (not used: {", ".join(weak)})' if weak else ''))
+
+
+def preserve_basis(edited_globals):
+    """Orthonormal basis (L*D, m) of the protected boundary normals for an edit
+    of `edited_globals`: all 40 minus the edited attributes, minus what their
+    PRESERVE40_ALLOW lists say may change with them, minus unreliable
+    boundaries. Each normal first loses its component along the edited
+    attributes' own normals, so the edited attributes' linear scores change
+    exactly as before; a protected attribute tied to the edited one (cos of the
+    normals) keeps that tied part of its change."""
+    key = frozenset(int(g) for g in edited_globals)
+    cache = _PRESERVE['cache']
+    if key in cache:
+        return cache[key]
+    N = _PRESERVE['normals']
+    keep_out = set(key)
+    for g in key:
+        keep_out |= set(_PRESERVE['allow'].get(g, []))
+    protected = [a for a in sorted(_PRESERVE['usable']) if a not in keep_out]
+    Q = None
+    if protected:
+        E = N[sorted(key)].t()                                    # (L*D, k) edited normals
+        Qe, _ = torch.linalg.qr(E)
+        P = N[protected].t()
+        P = P - Qe @ (Qe.t() @ P)
+        Q, R = torch.linalg.qr(P)
+        Q = Q[:, R.diagonal().abs() > 1e-6]                       # drop normals inside the edited span
+        names = [CELEBA_ALL_ATTRS[a] for a in key]
+        print(f'[Preserve] {"+".join(names)}: {Q.size(1)} protected directions '
+              f'({len(protected)} attributes; allowed to change: '
+              f'{", ".join(CELEBA_ALL_ATTRS[a] for a in sorted(keep_out - key)) or "-"})')
+    cache[key] = Q
+    return Q
+
+
+def project_preserve(delta, edited_globals):
+    """delta (B, L, D) minus strength x its projection on preserve_basis().
+    Unchanged when --preserve_boundaries is off or the edited attributes are
+    unknown. Only the W+ delta; ControlNet feature injection is not affected."""
+    if _PRESERVE is None or edited_globals is None or any(g is None for g in edited_globals):
+        return delta
+    Q = preserve_basis(edited_globals)
+    if Q is None:
+        return delta
+    Q = Q.to(device=delta.device, dtype=delta.dtype)
+    flat = delta.reshape(delta.size(0), -1)
+    flat = flat - _PRESERVE['strength'] * (flat @ Q) @ Q.t()
+    return flat.view_as(delta)
+
+
 def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
     """The attribute value the flow is asked to reach at edit strength `scale`.
 
@@ -1200,6 +1283,7 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent,
                                       route_scores=attr_cond)
+        guided_delta = project_preserve(guided_delta, [attr_global_idx])
         new_latents = latent + guided_delta
         # controlnet_disable_attrs: some attributes (e.g. eyeglasses) need the
         # ControlNet feature-map injection to synthesize structure the W+
@@ -1373,6 +1457,7 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         guided_delta = direction_bank(flow_delta, attr_delta,
                                       attr_idx=batch_attr_idx, latent=latent,
                                       route_scores=attr_cond)
+        guided_delta = project_preserve(guided_delta, attr_global_idxs)
         deltas.append(guided_delta)
         this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
         use_controlnet_here = (control_encoder is not None and not (
@@ -1623,6 +1708,11 @@ def evaluate(args):
             'independent_attr_weights': args.independent_attr_weights,
             'edit_direction': getattr(args, 'edit_direction', 'cond'),
             'src_cond_clamp': getattr(args, 'src_cond_clamp', None),
+            'preserve_boundaries': getattr(args, 'preserve_boundaries', None),
+            'preserve_strength': (getattr(args, 'preserve_strength', None)
+                                  if getattr(args, 'preserve_boundaries', None) else None),
+            'preserve_min_auc': (getattr(args, 'preserve_min_auc', None)
+                                 if getattr(args, 'preserve_boundaries', None) else None),
             'residual_basis': getattr(args, 'residual_basis', None),
             'residual_fixed': getattr(args, 'residual_fixed', None),
             'residual_fixed_mult': (getattr(args, 'residual_fixed_mult', None)
@@ -2449,6 +2539,16 @@ def build_parser():
                              'flow runs (add: min(src, 0.5-M), rm: max(src, 0.5+M)). Without it, a source the '
                              'conditioner already reads on the target side asks for ~no change (Young add: '
                              '37/51 failures had zero edit). Default off. See consistent_source().')
+    parser.add_argument('--preserve_boundaries', default=None,
+                        help='A scripts/fit_attr_boundaries.py output: remove from each edit\'s W+ delta its '
+                             'component along the linear boundaries of the CelebA attributes it should not '
+                             'change (all 40 minus the edited ones and their PRESERVE40_ALLOW lists), after '
+                             'making those normals orthogonal to the edited attributes\' own. Cuts side '
+                             'effects; the delta gets smaller, so compare at matched ID. Default off.')
+    parser.add_argument('--preserve_strength', type=float, default=1.0,
+                        help='With --preserve_boundaries: share of the protected component removed (0-1).')
+    parser.add_argument('--preserve_min_auc', type=float, default=0.8,
+                        help='With --preserve_boundaries: boundaries with a lower held-out AUC are not used.')
     return parser
 
 
