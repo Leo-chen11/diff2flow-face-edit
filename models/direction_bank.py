@@ -304,6 +304,15 @@ class AttributeDirectionBank(nn.Module):
             scales = torch.full((self.num_attrs,), float(residual_scale))
         self.residual_scale_raw = nn.Parameter(_inverse_softplus(scales))   # (num_attrs,)
         self.residual_max_norm = float(residual_max_norm) if residual_max_norm is not None else None
+        # Analysis hooks (scripts/analyze_residual.py, evaluate_sdflow.py
+        # --residual_basis); neither changes the edit unless set.
+        #   residual_basis: {local attr idx: (k, num_layers*latent_dim) orthonormal
+        #     rows}; that attribute's residual is replaced by its projection onto
+        #     the rows (k=0 -> no residual).
+        #   _last_residual: the residual actually added by the last forward
+        #     (after the norm clip and the residual scale), detached.
+        self.residual_basis = {}
+        self._last_residual = None
 
         # Optional safety controls applied to the final guided delta. These are
         # especially useful for Age/Young, whose dataset-level direction can
@@ -352,6 +361,23 @@ class AttributeDirectionBank(nn.Module):
         )
         self.last_logs = {}
         self._last_alpha = None   # (B, num_attrs, K) — set each forward, used for selection loss
+
+    def _project_residual(self, residual, attr_idx):
+        """Replace each sample's residual by its projection onto the basis
+        set for its attribute in self.residual_basis (others unchanged)."""
+        B = residual.size(0)
+        flat = residual.reshape(B, -1)
+        out = flat.clone()
+        for a, basis in self.residual_basis.items():
+            m = attr_idx == int(a)
+            if not m.any():
+                continue
+            if basis is None or basis.numel() == 0:
+                out[m] = 0.0
+                continue
+            Bm = basis.to(device=flat.device, dtype=flat.dtype)             # (k, L*D)
+            out[m] = (flat[m] @ Bm.t()) @ Bm
+        return out.view_as(residual)
 
     def current_residual_scale(self):
         """(num_attrs,) learned residual_scale values, always positive, capped
@@ -644,6 +670,8 @@ class AttributeDirectionBank(nn.Module):
         coeff = torch.einsum('lms,bls->blm', pinv_D, flow_delta)       # (B, 18, M)
         proj = torch.einsum('lsm,blm->bls', D, coeff)                  # (B, 18, 512)
         residual = flow_delta - proj
+        if self.residual_basis and attr_idx is not None:
+            residual = self._project_residual(residual, attr_idx.view(-1).long())
 
         # Clip per-sample residual norm to prevent explosion from large DDS gradients.
         if self.residual_max_norm is not None:
@@ -661,6 +689,7 @@ class AttributeDirectionBank(nn.Module):
             rs = scales[attr_idx_long].view(B, 1, 1)
         else:
             rs = scales.mean()
+        self._last_residual = (rs * residual).detach()
         guided_delta = dir_delta + rs * residual
 
         guided_delta_pre_clip = guided_delta

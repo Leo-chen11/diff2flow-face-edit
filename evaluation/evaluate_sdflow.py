@@ -1458,9 +1458,31 @@ def _fmt(summary, pct=False):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def apply_residual_basis(args, direction_bank):
+    """--residual_basis: replace each attribute's learned residual by its
+    projection onto the top --residual_basis_k components that
+    scripts/analyze_residual.py found for that attribute (0 = no residual)."""
+    path = getattr(args, 'residual_basis', None)
+    if not path or direction_bank is None:
+        return
+    saved = torch.load(path, map_location='cpu')
+    k = int(args.residual_basis_k)
+    for g, entry in saved['attrs'].items():
+        g = int(g)
+        if g not in args.attribute_index:
+            continue
+        basis = entry['basis'][:k]
+        direction_bank.residual_basis[args.attribute_index.index(g)] = basis
+        print(f'[ResidualBasis] {ATTR_NAMES.get(g, g)}: residual -> projection onto top {basis.shape[0]} '
+              f'components (energy {entry["energy"][min(k, len(entry["energy"])) - 1] * 100:.1f}% of the '
+              f'sampled residuals)' if k > 0 else
+              f'[ResidualBasis] {ATTR_NAMES.get(g, g)}: residual removed (k=0)')
+
+
 def evaluate(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank, control_encoder = load_models(args)
+    apply_residual_basis(args, direction_bank)
 
     clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
@@ -1522,6 +1544,9 @@ def evaluate(args):
             'lpips': lpips_fn is not None,
             'independent_attr_weights': args.independent_attr_weights,
             'edit_direction': getattr(args, 'edit_direction', 'cond'),
+            'residual_basis': getattr(args, 'residual_basis', None),
+            'residual_basis_k': (getattr(args, 'residual_basis_k', None)
+                                 if getattr(args, 'residual_basis', None) else None),
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
             'adaptive_margins': (getattr(args, 'adaptive_margins', None)
                                  if getattr(args, 'adaptive_ladder', None) else None),
@@ -2313,6 +2338,14 @@ def build_parser():
                         help='With --adaptive_ladder: stop when the teacher probability is past '
                              '0.5 by this margin in the edit direction. Larger = stronger edits, '
                              'lower ID; each margin is one point of the curve.')
+    parser.add_argument('--residual_basis', default=None,
+                        help='A scripts/analyze_residual.py output (.pth). Each attribute\'s learned '
+                             'residual is replaced by its projection onto the top --residual_basis_k '
+                             'principal components found for that attribute. Diagnostic: is the '
+                             'residual a few missing global directions (small k keeps the accuracy) '
+                             'or a per-face correction (needs large k)?')
+    parser.add_argument('--residual_basis_k', type=int, default=4,
+                        help='Components kept with --residual_basis (0 = no residual at all).')
     return parser
 
 
