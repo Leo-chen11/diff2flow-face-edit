@@ -17,6 +17,9 @@ barely move (R50 dP < 0.05), while "rm" (young -> old) succeeds ~93%.
   H3 locked fine layers   the bank edit is restricted to W+ layers 0-10
                           (bank_dir_layers 39:0-10); un-greying hair or smoothing
                           skin may need 11-17.  D: layers 0-17 for this edit.
+  fix candidate           E<m> (--clamp_margins): the source condition moved to
+                          the far side of 0.5 by m from the requested direction
+                          (evaluate_sdflow --src_cond_clamp m); needs no judge.
   H4 judge threshold      very old sources may need a drastic change before R50
                           says "young", or the face changes but R50 disagrees.
                           Look at the source readings and the montage.
@@ -52,7 +55,7 @@ from tqdm import tqdm
 
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges, build_parser,
-    edit_single_attribute, load_models, resolve_controlnet_disable_attrs,
+    consistent_source, edit_single_attribute, load_models, resolve_controlnet_disable_attrs,
 )
 from models.dataset import SDFlowDataset
 from scripts.analyze_residual import bank_edit
@@ -87,6 +90,9 @@ def main():
     p = build_parser()
     p.add_argument('--attr', type=int, default=39)
     p.add_argument('--scales_extra', nargs='+', type=float, default=[1.5, 2.0, 3.0])
+    p.add_argument('--clamp_margins', nargs='*', type=float, default=[],
+                   help='Extra conditions E<m>: the source condition moved to the far side of 0.5 by m '
+                        '(evaluate_sdflow --src_cond_clamp m), e.g. 0.2 0.35 0.5.')
     p.add_argument('--montage_rows', type=int, default=24)
     p.add_argument('--out_dir', default=None)
     args = p.parse_args()
@@ -111,7 +117,9 @@ def main():
                  controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
                  controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64))
     b2 = 2.0 if 2.0 in args.scales_extra else args.scales_extra[-1]
-    conds = ['A'] + [f'B{s:g}' for s in args.scales_extra] + ['C', "C'", 'D']
+    conds = ['A'] + [f'B{s:g}' for s in args.scales_extra] + ['C', "C'", 'D'] + \
+        [f'E{m:g}' for m in args.clamp_margins]
+    keys = ['A', f'B{b2:g}', 'C', "C'", 'D'] + [f'E{m:g}' for m in args.clamp_margins]   # montage columns
 
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root,
@@ -173,6 +181,9 @@ def main():
                 else:
                     direction_bank._dir_layer_mask[li] = old_mask
 
+            for m in args.clamp_margins:
+                out[f'E{m:g}'] = run(acond=consistent_source(attr_cond, li, d, margin=m))
+
             for b in range(B):
                 if not keep[b]:
                     continue
@@ -189,7 +200,7 @@ def main():
                 if add and len(imgs) < keep_imgs:
                     small = lambda x: F.interpolate(x[b:b + 1], (160, 160), mode='area')[0].cpu()
                     imgs[len(recs)] = {'src': small(src),
-                                       **{c: small(out[c][0]) for c in ['A', f'B{b2:g}', 'C', "C'", 'D']}}
+                                       **{c: small(out[c][0]) for c in keys}}
                 recs.append(rec)
 
     def mean(xs):
@@ -235,11 +246,12 @@ def main():
               f'{row["rm"]["id"]:6.3f} {resc(row["add"]):>18} {resc(row["rm"]):>17}')
     print('\nA = scale 1.0; B<s> = scale s; C = condition set to the R50 reading (diagnostic: R50 is the '
           'judge); C\' = condition set to the training r34 reading (usable at inference); D = W+ layers '
-          '0-17 unlocked.\n"cond wrong side" = the conditioner reads the source on the target side already '
+          '0-17 unlocked; E<m> = source condition moved to the far side of 0.5 by m (--src_cond_clamp m, '
+          'uses only the direction).\n"cond wrong side" = the conditioner reads the source on the target side already '
           '(add: > 0.5), so the flow is asked for a small change.')
 
-    labels = ['source', 'A 1.0', f'B {b2:g}', 'C R50', "C' r34", 'D 0-17']
-    keys = ['A', f'B{b2:g}', 'C', "C'", 'D']
+    labels = ['source', 'A 1.0', f'B {b2:g}', 'C R50', "C' r34", 'D 0-17'] + \
+        [f'E clamp {m:g}' for m in args.clamp_margins]
 
     def rows_for(okv, n):
         out_rows = []

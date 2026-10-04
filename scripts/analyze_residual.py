@@ -51,7 +51,7 @@ from tqdm import tqdm
 
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges, build_parser,
-    edited_attr_value, load_models, resolve_controlnet_disable_attrs,
+    consistent_source, edited_attr_value, load_models, resolve_controlnet_disable_attrs,
 )
 from models.dataset import SDFlowDataset
 
@@ -69,6 +69,7 @@ def bank_edit(prior, direction_bank, latent, attr_cond, id_cond, local_idx, scal
     applied W+ delta and the residual part of it."""
     B = latent.size(0)
     zero_pad = torch.zeros(B, 18, 1, device=latent.device)
+    attr_cond = consistent_source(attr_cond, local_idx, direction)      # no-op unless --src_cond_clamp
     mid, _ = prior(latent, torch.cat([id_cond, attr_cond], 1), zero_pad)
     new_attr = attr_cond.clone()
     new_attr[:, local_idx] = edited_attr_value(attr_cond[:, local_idx], scale, global_idx, direction=direction)

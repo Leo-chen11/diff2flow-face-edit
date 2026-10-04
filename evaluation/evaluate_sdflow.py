@@ -710,6 +710,12 @@ def _content_bias(control_encoder, attr_global_idx, attr_cond, is_rm):
 def load_models(args):
     global _EDIT_TARGET_MODE
     _EDIT_TARGET_MODE = getattr(args, 'edit_target', None) or 'mirror'
+    global _SRC_COND_CLAMP
+    _SRC_COND_CLAMP = getattr(args, 'src_cond_clamp', None)
+    if _SRC_COND_CLAMP is not None:
+        print(f'[SrcCondClamp] {_SRC_COND_CLAMP}: an edit with a given direction starts from a source '
+              f'value on the far side of 0.5 (add <= {0.5 - _SRC_COND_CLAMP:.2f}, '
+              f'rm >= {0.5 + _SRC_COND_CLAMP:.2f}).')
     if _EDIT_TARGET_MODE != 'mirror':
         print(f'[EditTarget] {_EDIT_TARGET_MODE}: edits aim at the training targets '
               f'(0.2/0.8, Eyeglasses 0.1/0.9) -- not comparable with mirror-mode numbers.')
@@ -983,6 +989,30 @@ TRAIN_SOFT_TARGET_DEFAULT = (0.20, 0.80)
 # --edit_target, set once by load_models() so every script that edits through
 # edit_single_attribute / edit_multi_attribute follows it without passing it.
 _EDIT_TARGET_MODE = 'mirror'
+_SRC_COND_CLAMP = None      # --src_cond_clamp; set in load_models()
+
+
+def consistent_source(attr_cond, local_idx, direction, margin=None):
+    """attr_cond with the edited attribute's SOURCE value moved to the far side
+    of 0.5 from the requested direction: add -> min(src, 0.5 - m), rm ->
+    max(src, 0.5 + m). Off (attr_cond unchanged) without a margin or a
+    direction.
+
+    Why: with a given direction the flow is asked for src + s*(end - src). When
+    the conditioner already reads the source on the target side (Young: a face
+    the judge calls old, conditioner 1.00) that is ~0 and the edit is a no-op
+    at any scale -- 37 of 51 failed Young add edits in
+    scripts/diagnose_attr_edit.py had |edit| = 0. Only the direction is used,
+    which an edit request has anyway; values already on the right side and
+    at least m from 0.5 are untouched."""
+    m = _SRC_COND_CLAMP if margin is None else margin
+    if m is None or direction is None:
+        return attr_cond
+    out = attr_cond.clone()
+    src = out[:, local_idx]
+    add = direction.to(src.device) > 0
+    out[:, local_idx] = torch.where(add, src.clamp(max=0.5 - m), src.clamp(min=0.5 + m))
+    return out
 
 
 def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
@@ -1144,6 +1174,7 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
             src_recon = G([latent], input_is_latent=True,
                           randomize_noise=False)[0].clamp(-1, 1)
 
+    attr_cond = consistent_source(attr_cond, attr_local_idx, direction)
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
@@ -1318,6 +1349,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
             src_recon = G([latent], input_is_latent=True,
                           randomize_noise=False)[0].clamp(-1, 1)
 
+    for local_idx, dr in zip(attr_local_idxs, directions):
+        attr_cond = consistent_source(attr_cond, local_idx, dr)
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
@@ -1584,6 +1617,7 @@ def evaluate(args):
             'lpips': lpips_fn is not None,
             'independent_attr_weights': args.independent_attr_weights,
             'edit_direction': getattr(args, 'edit_direction', 'cond'),
+            'src_cond_clamp': getattr(args, 'src_cond_clamp', None),
             'residual_basis': getattr(args, 'residual_basis', None),
             'residual_fixed': getattr(args, 'residual_fixed', None),
             'residual_fixed_mult': (getattr(args, 'residual_fixed_mult', None)
@@ -2404,6 +2438,12 @@ def build_parser():
                         help='A scripts/distill_residual_head.py output (.pth): each attribute\'s residual is '
                              'predicted on its top principal directions by a small network instead of '
                              'taken from the flow (no ODE solve for the residual).')
+    parser.add_argument('--src_cond_clamp', type=float, default=None,
+                        help='With a given edit direction (--edit_direction indep/clip): move the edited '
+                             'attribute\'s source condition to the far side of 0.5 by this margin before the '
+                             'flow runs (add: min(src, 0.5-M), rm: max(src, 0.5+M)). Without it, a source the '
+                             'conditioner already reads on the target side asks for ~no change (Young add: '
+                             '37/51 failures had zero edit). Default off. See consistent_source().')
     return parser
 
 

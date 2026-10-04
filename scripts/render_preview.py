@@ -170,7 +170,8 @@ def main(args):
         names = '-'.join(ATTR_NAMES.get(i, str(i)) for i in args.attribute_index)
         out = os.path.join(
             args.checkpoint_dir,
-            f'preview_step{args.step}_scale{args.scale}_{names}.png',
+            f'preview_step{args.step}_scale{args.scale}_{names}'
+            + (f'_clamp{args.src_cond_clamp:g}' if args.src_cond_clamp is not None else '') + '.png',
         )
     torchvision.utils.save_image(grid, out)
     print(f'saved -> {out}')
@@ -192,6 +193,8 @@ if __name__ == '__main__':
                         help="cond: the conditioner's own add/rm (old behaviour). indep: from "
                              "--independent_attr_weights on the source, as the eval's "
                              "--edit_direction indep.")
+    parser.add_argument('--src_cond_clamp', type=float, default=None,
+                        help='Same as evaluate_sdflow.py --src_cond_clamp (needs --edit_direction indep).')
     parser.add_argument('--independent_attr_weights', default=None)
     parser.add_argument('--independent_attr_backbone', default='r50')
     parser.add_argument('--cell_size', type=int, default=256)
