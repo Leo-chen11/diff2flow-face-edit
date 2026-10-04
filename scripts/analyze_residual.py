@@ -76,7 +76,7 @@ def bank_edit(prior, direction_bank, latent, attr_cond, id_cond, local_idx, scal
     idx = torch.full((B,), local_idx, device=latent.device, dtype=torch.long)
     delta = direction_bank(raw - latent, new_attr - attr_cond, attr_idx=idx, latent=latent, route_scores=attr_cond)
     delta = delta[0] if isinstance(delta, tuple) else delta
-    return delta, direction_bank._last_residual
+    return delta, direction_bank._last_residual, (new_attr - attr_cond)[:, local_idx]
 
 
 def main():
@@ -109,7 +109,7 @@ def main():
                        train=False, transform=tf)
     loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
 
-    res, edit_norm, dirs = defaultdict(list), defaultdict(list), defaultdict(list)
+    res, edit_norm, dirs, adel = defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list)
     keep_lat = []
     seen = 0
     with torch.no_grad():
@@ -122,8 +122,9 @@ def main():
             sp = torch.sigmoid(indep_teacher(F.interpolate(src, (256, 256)))[0])
             for li, g in enumerate(args.attribute_index):
                 d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
-                delta, r = bank_edit(prior, direction_bank, latent, attr_cond, id_cond, li, args.scale, g, d)
+                delta, r, ad = bank_edit(prior, direction_bank, latent, attr_cond, id_cond, li, args.scale, g, d)
                 res[g].append(r.flatten(1).float().cpu())
+                adel[g].append(ad.float().cpu())
                 edit_norm[g].append(delta.flatten(1).norm(dim=1).float().cpu())
                 dirs[g].append(d.cpu())
             if len(keep_lat) * args.batch < args.render_faces:
@@ -142,6 +143,7 @@ def main():
     for g in args.attribute_index:
         R = torch.cat(res[g])[:seen]
         D = torch.cat(dirs[g])[:seen]
+        AD = torch.cat(adel[g])[:seen]
         En = torch.cat(edit_norm[g])[:seen]
         rn = R.norm(dim=1)
         # sign-aligned by edit direction, so add and rm along one axis do not cancel
@@ -168,7 +170,12 @@ def main():
         out['attrs'][g] = {'basis': Vh[:args.keep].contiguous(), 'energy': energy[:max(args.keep, max(KS))],
                            'mean_ratio': mean_ratio, 'add_rm_cos': cos, 'layer_energy': layer_e,
                            'residual_over_edit': ratio, 'mean_residual_norm': float(rn.mean()),
-                           'n': int(R.size(0))}
+                           'n': int(R.size(0)),
+                           # for evaluate_sdflow.py --residual_fixed: the residual as ONE
+                           # fixed direction, signed and scaled by the requested edit
+                           # (attr_delta / mean|attr_delta| here)
+                           'mean_aligned': (R * D.view(-1, 1)).mean(0).contiguous(),
+                           'mean_abs_attr_delta': float(AD.abs().mean())}
 
         if args.render_pcs > 0 and render_lat is not None:
             step = args.render_mult * float(rn.mean())
@@ -193,8 +200,9 @@ def main():
           'residual for every face.\nE@k: energy in the top k components (uncentred SVD).  '
           'k50/k80/k90: components for 50/80/90% of the energy.\nadd-rm cos: mean residual of '
           'add edits vs rm edits (-1 = the same axis both ways).\n'
-          'Next: evaluate_sdflow.py --residual_basis <this file> --residual_basis_k 1 / 4 / 16 and compare '
-          'at matched ID with scripts/compare_runs_matched_id.py.')
+          'Next: evaluate_sdflow.py --residual_basis <this file> --residual_basis_k 1 / 4 / 16, and '
+          '--residual_fixed <this file> (no flow at edit time: one fixed residual direction per '
+          'attribute), compared at matched ID with scripts/compare_runs_matched_id.py.')
     path = args.out or os.path.join(args.checkpoint_dir, f'residual_pca_s{args.step}.pth')
     torch.save(out, path)
     print(f'saved {path}')

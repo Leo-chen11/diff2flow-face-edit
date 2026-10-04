@@ -312,6 +312,11 @@ class AttributeDirectionBank(nn.Module):
         #   _last_residual: the residual actually added by the last forward
         #     (after the norm clip and the residual scale), detached.
         self.residual_basis = {}
+        #   residual_fixed: {local attr idx: (vec (num_layers*latent_dim), ref)};
+        #     that attribute's residual term becomes attr_delta / ref * vec, i.e.
+        #     one fixed direction scaled by the requested edit (ref = the mean
+        #     |attr_delta| vec was measured at) -- the flow's output is unused.
+        self.residual_fixed = {}
         self._last_residual = None
 
         # Optional safety controls applied to the final guided delta. These are
@@ -689,8 +694,18 @@ class AttributeDirectionBank(nn.Module):
             rs = scales[attr_idx_long].view(B, 1, 1)
         else:
             rs = scales.mean()
-        self._last_residual = (rs * residual).detach()
-        guided_delta = dir_delta + rs * residual
+        res_term = rs * residual
+        if self.residual_fixed and attr_idx is not None:
+            res_term = res_term.clone()
+            attr_idx_long = attr_idx.view(-1).long()
+            for a, (vec, ref) in self.residual_fixed.items():
+                m = attr_idx_long == int(a)
+                if m.any():
+                    v = vec.to(device=device, dtype=dtype).view(self.num_layers, self.latent_dim)
+                    coef = attr_delta[m, int(a)] / float(ref)
+                    res_term[m] = coef.view(-1, 1, 1) * v
+        self._last_residual = res_term.detach()
+        guided_delta = dir_delta + res_term
 
         guided_delta_pre_clip = guided_delta
         active_direction_scale = self.direction_scale.to(device=device, dtype=dtype).mean()

@@ -1462,7 +1462,25 @@ def apply_residual_basis(args, direction_bank):
     """--residual_basis: replace each attribute's learned residual by its
     projection onto the top --residual_basis_k components that
     scripts/analyze_residual.py found for that attribute (0 = no residual)."""
+    fixed = getattr(args, 'residual_fixed', None)
     path = getattr(args, 'residual_basis', None)
+    if fixed and path:
+        raise SystemExit('--residual_basis and --residual_fixed are alternatives; give one')
+    if fixed and direction_bank is not None:
+        saved = torch.load(fixed, map_location='cpu')
+        for g, entry in saved['attrs'].items():
+            g = int(g)
+            if g not in args.attribute_index:
+                continue
+            if 'mean_aligned' not in entry:
+                raise SystemExit(f'{fixed} has no mean_aligned: rerun scripts/analyze_residual.py '
+                                 f'(the fixed-residual vector was added later)')
+            direction_bank.residual_fixed[args.attribute_index.index(g)] = (
+                entry['mean_aligned'], max(entry['mean_abs_attr_delta'], 1e-6))
+            print(f'[ResidualFixed] {ATTR_NAMES.get(g, g)}: residual -> one fixed direction '
+                  f'(|v| {float(entry["mean_aligned"].norm()):.2f}) x attr_delta / '
+                  f'{entry["mean_abs_attr_delta"]:.3f}; the flow\'s residual is not used')
+        return
     if not path or direction_bank is None:
         return
     saved = torch.load(path, map_location='cpu')
@@ -1545,6 +1563,7 @@ def evaluate(args):
             'independent_attr_weights': args.independent_attr_weights,
             'edit_direction': getattr(args, 'edit_direction', 'cond'),
             'residual_basis': getattr(args, 'residual_basis', None),
+            'residual_fixed': getattr(args, 'residual_fixed', None),
             'residual_basis_k': (getattr(args, 'residual_basis_k', None)
                                  if getattr(args, 'residual_basis', None) else None),
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
@@ -2346,6 +2365,12 @@ def build_parser():
                              'or a per-face correction (needs large k)?')
     parser.add_argument('--residual_basis_k', type=int, default=4,
                         help='Components kept with --residual_basis (0 = no residual at all).')
+    parser.add_argument('--residual_fixed', default=None,
+                        help='A scripts/analyze_residual.py output (.pth). Each attribute\'s residual is '
+                             'replaced by ONE fixed W+ vector (its mean residual, signed by the edit '
+                             'direction) scaled by the requested attribute change. Nothing in the edit '
+                             'then depends on the flow: tests whether the flow is only needed to FIND '
+                             'that direction during training.')
     return parser
 
 
