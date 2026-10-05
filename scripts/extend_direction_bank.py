@@ -24,6 +24,7 @@ sys.path.insert(0, PROJECT_ROOT)
 import torch
 import torch.nn.functional as F
 
+from common.attr_tables import bank_num_k
 from scripts.precompute_directions_stratified import (
     compute_generic_directions, intra_attr_orthogonalize_safe, load_latents, load_paths,
     load_preds, project_out_direction, representative_direction,
@@ -53,7 +54,7 @@ def main():
     du, ln = bank['direction_units'].float(), bank['layer_norms'].float()
     if du.ndim == 3:
         du, ln = du.unsqueeze(1), ln.unsqueeze(1)
-    K = int(bank.get('num_k', du.shape[1]))
+    K = bank_num_k(bank, default=du.shape[1])
     pct = float(bank.get('extreme_pct', 20.0))
     method = bank.get('direction_method', 'lda')
     decorrelate = bool(bank.get('decorrelate_cross_attr', False)) if args.decorrelate is None \

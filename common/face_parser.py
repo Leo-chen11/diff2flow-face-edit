@@ -260,11 +260,3 @@ class FaceParser(nn.Module):
         kernel = g[:, None] * g[None, :]
         return kernel.view(1, 1, ks, ks)
 
-    def composite(self, orig, edited):
-        """
-        Blend edited face onto original background.
-        orig, edited: [-1,1] tensors [B,3,H,W]
-        returns: composited tensor [-1,1]
-        """
-        mask = self.get_mask(orig)
-        return edited * mask + orig * (1 - mask)

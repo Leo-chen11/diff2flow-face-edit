@@ -3,42 +3,18 @@ import torch
 import torch.distributed as dist
 
 
-def modify_one_attribute(attributes:torch.Tensor,idx:int=-1,scale:float=None,mode='random'):
-    """
-
-    Args:
-        attributes (torch.Tensor): 0-1 tensor
-        idx (int, optional): _description_. Defaults to -1.
-
-    Returns:
-        _type_: _description_
-    """    
+def modify_one_attribute(attributes: torch.Tensor, mode='negative'):
+    """Pick one attribute column at random (the same for the whole batch) and
+    flip it. Returns (idx of shape (1,), flipped 0-1 attributes). Only the
+    'negative' mode training uses is left."""
+    if mode != 'negative':
+        raise ValueError(f"modify_one_attribute: only mode='negative' is supported, got {mode!r}")
     attributes = attributes.to(torch.float32)
-    bs,columns = attributes.shape[:2]
+    bs, columns = attributes.shape[:2]
     new_attributes = attributes.detach().clone()
-    
-    if mode == 'keep':
-        return None,new_attributes
-    
-    if idx < 0 or idx >= columns:
-        # if modified index is not given , randomly generate one !
-        if mode=='random':
-            idx = torch.randint(0,columns,(bs,))
-            new_attributes[torch.arange(bs), idx] = torch.randint(0, 2, (bs,),dtype=torch.float32).to(new_attributes)
-        elif mode == 'uniform':
-            idx = torch.randint(0,columns,(bs,))
-            new_attributes[torch.arange(bs), idx] = torch.rand((bs,),dtype=torch.float32).to(new_attributes)
-        elif mode=='negative':
-            idx = torch.randint(0,columns,(1,))
-            new_attributes[torch.arange(bs), idx] = 1. -new_attributes[torch.arange(bs), idx]
-        
-    elif scale is not None:
-        new_attributes[attributes[:,idx]==1,idx] = 1.0 - scale
-        new_attributes[attributes[:,idx]==0,idx] = scale
-    else:
-        new_attributes[:,idx] = 1 - new_attributes[:,idx]
-    
-    return idx,new_attributes
+    idx = torch.randint(0, columns, (1,))
+    new_attributes[torch.arange(bs), idx] = 1. - new_attributes[torch.arange(bs), idx]
+    return idx, new_attributes
 
 
 def reduce_tensor(tensor, world_size=None):

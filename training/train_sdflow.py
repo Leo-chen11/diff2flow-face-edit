@@ -17,6 +17,8 @@ from torch.utils import data
 from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
 
+from common.attr_tables import (AGE_TEXTURE_REGION_CLASS, DEFAULT_SOFT_TARGET, PRESERVE40_ALLOW,
+                                SOFT_TARGET_TABLE, bank_num_k)
 from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
@@ -326,35 +328,7 @@ class JudgePeakDeclineBalancer:
         return self.weights[self.slot_index(attr_local_idx, is_rm)]
 
 
-# --preserve_all40_weight: per edited attribute, the OTHER CelebA attributes that
-# are allowed to move with it because they are part of what the edit means (or
-# are hidden by it), so the all-attribute preservation loss does not fight the
-# edit itself. Chosen from the --leak40 side-effect report: e.g. Male edits move
-# facial hair / makeup / earrings, Smiling moves cheekbones and an open mouth,
-# Young moves gray hair, eye bags and jowls, glasses occlude the eye region, bangs
-# hide the hairline. Everything else (Big_Nose, Chubby, hair colour, Straight_Hair,
-# Pointy_Nose, Big_Lips, ...) is held at its source value.
-PRESERVE40_ALLOW = {
-    15: [1, 3, 12, 23],                              # Eyeglasses: brows, eye bags, narrow eyes (occluded)
-    20: [0, 1, 12, 16, 18, 22, 24, 30, 34, 36],      # Male: stubble, brows, goatee, makeup, mustache,
-                                                     #   no-beard, sideburns, earrings, lipstick
-    39: [3, 4, 13, 14, 17, 28],                      # Young: eye bags, bald, chubby, double chin,
-                                                     #   gray hair, receding hairline
-    31: [19, 21, 23],                                # Smiling: cheekbones, mouth open, narrow eyes
-    5: [28, 32, 33],                                 # Bangs: receding hairline, straight / wavy hair
-}
-
-
-# Soft-target policy keyed by ABSOLUTE CelebA attribute index. The old version
-# keyed on local position (0/1/2 assumed to be glasses/gender/age), so any
-# other --attribute_index ordering or attribute set silently mis-targeted
-# every edit with no error.
-SOFT_TARGET_TABLE = {
-    15: (0.10, 0.90),   # eyeglasses needs a stronger local-edit signal
-    20: (0.20, 0.80),   # gender should move without forcing a full identity flip
-    39: (0.20, 0.80),   # age is the most identity-sensitive edit; conservative
-}
-DEFAULT_SOFT_TARGET = (0.20, 0.80)
+# PRESERVE40_ALLOW, SOFT_TARGET_TABLE, DEFAULT_SOFT_TARGET: common/attr_tables.py
 
 # Local attributes: edits that should only touch a specific facial region.
 # Maps absolute CelebA attribute index -> BiSeNet parsing classes defining the
@@ -369,14 +343,7 @@ LOCAL_REGION_CLASSES = {
 # BiSeNet hair class, used by --hair_gray_loss_weight (see that flag's help).
 HAIR_REGION_CLASS = [17]
 
-# BiSeNet skin class, used by --age_gate_region_loss_weight and
-# --age_skin_hf_loss_weight (see those flags' help). Deliberately the SAME
-# single class scripts/probe_noise_texture.py's SKIN_CLASS uses for its
-# skin_hf_energy diagnostic -- these losses target exactly the region that
-# diagnostic already measures, so a change in skin_hf between two checkpoints
-# has a direct, named mechanism to attribute it to instead of a fresh
-# unexplained correlation.
-AGE_TEXTURE_REGION_CLASS = [1]
+# AGE_TEXTURE_REGION_CLASS (BiSeNet skin): common/attr_tables.py
 
 
 # Startup mechanism report. 144 CLI flags is far more surface than any single
@@ -952,12 +919,6 @@ def apply_id_condition_dropout(id_cond, drop_prob):
     keep_prob = 1.0 - drop_prob
     mask = torch.empty_like(id_cond).bernoulli_(keep_prob)
     return id_cond * mask
-
-
-def masked_mean(values, mask):
-    if mask.any():
-        return values[mask].mean()
-    return values.new_tensor(0.0)
 
 
 def collect_lag_dof_losses(flow_model):
@@ -1986,13 +1947,13 @@ if __name__ == '__main__':
     parser.add_argument('--bank_dir_layers', type=str, default=None,
                         help="Restrict an attribute's DIRECTION edit to a W+ layer range, e.g. "
                              "'39:0-10' (inclusive; 0-2 = 4-8px, 3-6 = 16-32px structure, 7-10 = "
-                             "64-128px, 11-17 = 256-1024px). Pick it with "
-                             "scripts/probe_age_tradeoff.py. Restored at eval. Default off.")
+                             "64-128px, 11-17 = 256-1024px). Pick it by comparing eval runs at "
+                             "matched ID. Restored at eval. Default off.")
     parser.add_argument('--id_hinge_threshold_override', type=str, default=None,
                         help="Per-attribute --id_hinge_threshold, e.g. '39:0.72'. Real aging lowers "
                              "ArcFace similarity (the raw age direction reaches CLIP 85.8%% at "
                              "ID_ind 0.63), so the shared 0.8 floor pushes the model to age by "
-                             "texture only. Use scripts/probe_age_tradeoff.py to choose it. "
+                             "texture only. Choose it by comparing eval runs at matched ID. "
                              "Default off (every attribute uses --id_hinge_threshold).")
     parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
                         help="CelebA ids whose direction-bank gate is forced uniform: the edit uses "
@@ -2009,8 +1970,7 @@ if __name__ == '__main__':
                              "losses are met by any split of faces -- so a male face can age "
                              "with a female direction. Needs a bank built with --age_k 4 (a "
                              "--age_k 1 bank tiles one gender-averaged direction into every "
-                             "slot and is refused) and 15, 20, 39 in --attribute_index. Run "
-                             "scripts/probe_age_routing.py first. Default off.")
+                             "slot and is refused) and 15, 20, 39 in --attribute_index. Default off.")
     parser.add_argument('--cap_train_target', action='store_true', default=False,
                         help="Cap the edit strength used to build the TARGETS at 1.0: target = "
                              "src + min(train_scale, 1) * (hard - src), so it never passes the "
@@ -2239,7 +2199,7 @@ if __name__ == '__main__':
     print(f'** run config saved to {os.path.join(save_root, "config.json")}')
     _mechanism_report(args)
     attribute_index = torch.tensor(args.attribute_index,dtype=int)
-    # Local column of src_probs/target_probs (both ordered by attribute_index)
+    # Local column of src_probs (ordered by attribute_index)
     # that holds the source image's Male probability, for the age DDS
     # prompt's gender-conditioned wording. None when 20 isn't being trained.
     gender_local_idx = args.attribute_index.index(20) if 20 in args.attribute_index else None
@@ -2418,7 +2378,7 @@ if __name__ == '__main__':
         # direction_units shape mismatch. There is only one correct K per bank
         # file; don't let two independently-set numbers disagree about it.
         _bank_meta = torch.load(args.direction_bank_path, map_location='cpu')
-        _bank_num_k = int(_bank_meta.get('num_k', args.direction_k)) if isinstance(_bank_meta, dict) else args.direction_k
+        _bank_num_k = bank_num_k(_bank_meta, default=args.direction_k) if isinstance(_bank_meta, dict) else args.direction_k
         if _bank_num_k != args.direction_k:
             print(f'** Direction Bank: --direction_k={args.direction_k} ignored, '
                   f'using num_k={_bank_num_k} from {args.direction_bank_path}')
@@ -3764,7 +3724,6 @@ if __name__ == '__main__':
             gen_logits, _ = attr_teacher(new_face_256)
             src_probs = torch.sigmoid(src_logits)[:, attribute_index].detach()
             gen_probs = torch.sigmoid(gen_logits)[:, attribute_index]
-            target_probs = src_probs.clone()
             src_attr = src_probs[batch_indices, mid_idx]
             # Which way is this edit going? Same convention evaluate_sdflow
             # reports its direction split under: rm = the source already has
@@ -3788,7 +3747,6 @@ if __name__ == '__main__':
                 hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
             soft_target = src_attr + _s_tgt * (hard_teacher_target - src_attr)
             soft_target_for_loss = soft_target.detach()
-            target_probs[batch_indices, mid_idx] = soft_target_for_loss
             edited_probs = gen_probs[batch_indices, mid_idx]
             if args.target_loss == 'hinge':
                 # AccCeleb only asks whether the edited score CROSSED 0.5; it is

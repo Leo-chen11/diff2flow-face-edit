@@ -55,6 +55,8 @@ from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
 
+from common.attr_tables import (AGE_TEXTURE_REGION_CLASS, CELEBA_ALL_ATTRS, DEFAULT_SOFT_TARGET,
+                                PRESERVE40_ALLOW, SOFT_TARGET_TABLE, bank_num_k)
 from common.id_loss import IDLoss
 from common.ops import load_network
 from models.dataset import SDFlowDataset
@@ -68,26 +70,6 @@ from models.stylegan2.model import Generator
 ATTR_NAMES = {15: 'Eyeglasses', 20: 'Male', 24: 'No_Beard', 31: 'Smiling',
               33: 'Wavy_Hair', 39: 'Young'}
 
-# BiSeNet skin class -- MUST match training/train_sdflow.py's
-# AGE_TEXTURE_REGION_CLASS (and scripts/probe_noise_texture.py's SKIN_CLASS)
-# exactly: this is the region a --controlnet_region_cond checkpoint was
-# trained to read for age(39) edits, so evaluating it with a different
-# region definition would silently feed it something it never learned to use.
-AGE_TEXTURE_REGION_CLASS = [1]
-
-# Official CelebA list_attr_celeba.txt column order (0-indexed). Index 15 =
-# Eyeglasses, 20 = Male, 24 = No_Beard, 31 = Smiling, 33 = Wavy_Hair, 39 =
-# Young -- matches this project's attribute indices directly.
-CELEBA_ALL_ATTRS = [
-    '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes', 'Bald',
-    'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
-    'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby', 'Double_Chin',
-    'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones',
-    'Male', 'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard',
-    'Oval_Face', 'Pale_Skin', 'Pointy_Nose', 'Receding_Hairline', 'Rosy_Cheeks',
-    'Sideburns', 'Smiling', 'Straight_Hair', 'Wavy_Hair', 'Wearing_Earrings',
-    'Wearing_Hat', 'Wearing_Lipstick', 'Wearing_Necklace', 'Wearing_Necktie', 'Young',
-]
 # Every CelebA attribute gets a readable name (e.g. Bangs, not attr5).
 for _i, _n in enumerate(CELEBA_ALL_ATTRS):
     ATTR_NAMES.setdefault(_i, _n)
@@ -328,7 +310,6 @@ class GlassesParserJudge(nn.Module):
     def glasses_prob(self, images):
         """images: [-1,1] (B,3,H,W) -> (B,) probability eyeglasses are present."""
         import cv2
-        import numpy as np
         inp = F.interpolate(images, 512, mode='bilinear', align_corners=False)
         inp = (inp * 0.5 + 0.5 - self.parser.mean) / self.parser.std
         seg = self.parser.net(inp).argmax(dim=1)                     # (B,512,512)
@@ -632,8 +613,8 @@ def _attach_region_parser(args, control_encoder, device):
     """A --controlnet_region_cond encoder was trained with a BiSeNet skin mask
     as its region input for EVERY age(39) edit. edit_single_attribute /
     edit_multi_attribute only built that mask when the CALLER passed a
-    face_parser, and several scripts never do (probe_direction_gender_split,
-    calibrate_clip_thresh, inspect_zero_edit_magnitude, dump_multi_attr_edit).
+    face_parser, and several scripts never do (e.g. calibrate_clip_thresh,
+    dump_multi_attr_edit).
     Their age edits silently got the all-ones mask instead: a different input
     from training, so a different edit from the one evaluate_sdflow.py scores.
     Attaching the parser here gives every caller the training-time mask.
@@ -764,8 +745,7 @@ def load_models(args):
     if bank_path:
         from models.direction_bank import AttributeDirectionBank
         bank_meta = torch.load(bank_path, map_location='cpu')
-        num_k = int(bank_meta.get('num_k', bank_meta.get('K', 1))) \
-            if isinstance(bank_meta, dict) else 1
+        num_k = bank_num_k(bank_meta) if isinstance(bank_meta, dict) else 1
         _per_attr_rs = [
             args.glasses_residual_scale if idx == 15 else args.direction_residual_scale
             for idx in args.attribute_index
@@ -984,11 +964,6 @@ def load_models(args):
 # Editing
 # ---------------------------------------------------------------------------
 
-# Copy of training/train_sdflow.py SOFT_TARGET_TABLE (not imported: that module
-# pulls in the whole training stack). Keep the two in sync.
-TRAIN_SOFT_TARGET = {15: (0.10, 0.90), 20: (0.20, 0.80), 39: (0.20, 0.80)}
-TRAIN_SOFT_TARGET_DEFAULT = (0.20, 0.80)
-
 # --edit_target, set once by load_models() so every script that edits through
 # edit_single_attribute / edit_multi_attribute follows it without passing it.
 _EDIT_TARGET_MODE = 'mirror'
@@ -1021,16 +996,6 @@ def consistent_source(attr_cond, local_idx, direction, margin=None):
 _PRESERVE = None            # --preserve_boundaries; set in load_models()
 
 
-def _source_literal(path, name):
-    """A module-level literal read from a source file without importing it."""
-    import ast
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    for node in ast.parse(open(os.path.join(root, path)).read()).body:
-        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == name for t in node.targets):
-            return ast.literal_eval(node.value)
-    raise KeyError(f'{name} not found in {path}')
-
-
 def set_preserve_boundaries(path, strength=1.0, min_auc=0.8):
     """Load scripts/fit_attr_boundaries.py normals for project_preserve(); None = off."""
     global _PRESERVE
@@ -1042,7 +1007,7 @@ def set_preserve_boundaries(path, strength=1.0, min_auc=0.8):
     auc = d['auc'].float()
     usable = [a for a in range(40) if float(auc[a]) >= min_auc]
     _PRESERVE = {'normals': normals, 'usable': set(usable), 'strength': float(strength),
-                 'allow': _source_literal('training/train_sdflow.py', 'PRESERVE40_ALLOW'),
+                 'allow': PRESERVE40_ALLOW,
                  'cache': {}}
     weak = [CELEBA_ALL_ATTRS[a] for a in range(40) if a not in _PRESERVE['usable']]
     print(f'[Preserve] {path}: edits lose their component along the boundaries of the attributes '
@@ -1122,7 +1087,7 @@ def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
         return src + scale * (end - src)
     mode = mode or _EDIT_TARGET_MODE
     if mode == 'train' and attr_global_idx is not None:
-        low, high = TRAIN_SOFT_TARGET.get(int(attr_global_idx), TRAIN_SOFT_TARGET_DEFAULT)
+        low, high = SOFT_TARGET_TABLE.get(int(attr_global_idx), DEFAULT_SOFT_TARGET)
         hard = torch.where(src > 0.5, torch.full_like(src, low), torch.full_like(src, high))
         return src + scale * (hard - src)
     return src * (1.0 - scale) + (1.0 - src) * scale
@@ -1658,7 +1623,7 @@ def evaluate(args):
             composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
             if args.composite_face_region:
                 print('[Composite] Compositing edited face back onto source-reconstruction '
-                      'background/hair (common/face_parser.py FaceParser.composite) for ALL '
+                      'background/hair (composite_faces) for ALL '
                       'attributes -- reduces background/hair leakage from global W+ edits, '
                       'training-free.')
             if getattr(args, 'controlnet_region_cond', False):
@@ -2395,7 +2360,7 @@ def build_parser():
                         action=argparse.BooleanOptionalAction, default=False,
                         help='Training-free post-process: composite the edited face back onto '
                              'the source-RECONSTRUCTION background/hair using the BiSeNet face '
-                             'mask (common/face_parser.py FaceParser.composite), for every '
+                             'mask (composite_faces), for every '
                              'attribute. Targets the long-standing complaint that gender/age '
                              'edits move far more of the image than intended (global W+ edits '
                              'leak into background/hair) and directly helps both ID score '

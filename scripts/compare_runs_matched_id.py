@@ -27,27 +27,17 @@ Usage:
         --names ctrl p40
 """
 import argparse
-import ast
 import json
 import os
+import sys
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from common.attr_tables import CELEBA_ALL_ATTRS, PRESERVE40_ALLOW
 from scripts.merge_eval_scales import interp, mean
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-
-def _literal(path, name):
-    """A module-level literal from a source file, read without importing it (the
-    training / eval modules pull in heavy dependencies at import time)."""
-    tree = ast.parse(open(os.path.join(ROOT, path)).read())
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == name for t in node.targets):
-            return ast.literal_eval(node.value)
-    raise KeyError(f'{name} not found in {path}')
-
-
-CELEBA = _literal('evaluation/evaluate_sdflow.py', 'CELEBA_ALL_ATTRS')
-ALLOW = _literal('training/train_sdflow.py', 'PRESERVE40_ALLOW')
+CELEBA = CELEBA_ALL_ATTRS
+ALLOW = PRESERVE40_ALLOW
 
 
 def load(files):

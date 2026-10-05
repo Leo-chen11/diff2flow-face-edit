@@ -58,6 +58,7 @@ import torchvision.transforms as T
 from torch.utils import data
 from tqdm import tqdm
 
+from common.attr_tables import bank_num_k
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_residual_basis, apply_run_config, build_optional_judges,
     build_parser, edit_single_attribute, load_models, resolve_controlnet_disable_attrs,
@@ -79,7 +80,7 @@ def linear_directions(bank_path, attribute_index):
     du, ln = bank['direction_units'].float(), bank['layer_norms'].float()
     if du.ndim == 3:
         du, ln = du.unsqueeze(1), ln.unsqueeze(1)
-    K = int(bank.get('num_k', du.shape[1]))
+    K = bank_num_k(bank, default=du.shape[1])
     bank_attrs = [int(a) for a in bank['attribute_index']]
     missing = [a for a in attribute_index if a not in bank_attrs]
     if missing:

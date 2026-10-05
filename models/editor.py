@@ -4,6 +4,7 @@ import os
 
 import torch
 
+from common.attr_tables import bank_num_k
 from common.id_loss import IDLoss
 from models.conditioner import IdentityAttributeConditioner
 from models.direction_bank import AttributeDirectionBank
@@ -103,9 +104,6 @@ class SDFlow(object):
             if cfg_path is not None:
                 with open(cfg_path) as f:
                     cfg = json.load(f)
-                overrides = {
-                    'attribute_index': lambda v: None if v == attr_list else v,
-                }
                 local_vars = {
                     'flow_modules': flow_modules, 'num_blocks': num_blocks,
                     'velocity_field': velocity_field,
@@ -223,7 +221,7 @@ class SDFlow(object):
         self.direction_bank = None
         if direction_bank_path is not None:
             _bank_meta = torch.load(direction_bank_path, map_location="cpu")
-            _num_k = int(_bank_meta.get("num_k", 1)) if isinstance(_bank_meta, dict) else 1
+            _num_k = bank_num_k(_bank_meta) if isinstance(_bank_meta, dict) else 1
             # No per-attribute direction_scale/layer_scale/delta_max_norm here:
             # every attribute gets the same (default) treatment, and the only
             # magnitude safety net is the shared guided_delta_max_norm below.
@@ -290,7 +288,6 @@ class SDFlow(object):
         source_attr = sources[:, self.attr_num]
         targets[:, self.attr_num] = source_attr * (1.0 - strength) + (1.0 - source_attr) * strength
 
-        sources = sources[:, self.class_indices]
         targets = targets[:, self.class_indices]
 
         src_cond, id_cond, attr_cond = self.conditioner.make_condition(images, inputs, self.id_extractor)

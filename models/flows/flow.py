@@ -3,40 +3,6 @@ from .normalization import MovingBatchNorm1d
 from .cnf import CNF, SequentialFlow
 
 
-def count_nfe(model):
-    class AccNumEvals(object):
-
-        def __init__(self):
-            self.num_evals = 0
-
-        def __call__(self, module):
-            if isinstance(module, CNF):
-                self.num_evals += module.num_evals()
-
-    accumulator = AccNumEvals()
-    model.apply(accumulator)
-    return accumulator.num_evals
-
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def count_total_time(model):
-    class Accumulator(object):
-
-        def __init__(self):
-            self.total_time = 0
-
-        def __call__(self, module):
-            if isinstance(module, CNF):
-                self.total_time = self.total_time + module.sqrt_end_time * module.sqrt_end_time
-
-    accumulator = Accumulator()
-    model.apply(accumulator)
-    return accumulator.total_time
-
-
 def build_model(input_dim, hidden_dims, context_dim, num_blocks, conditional,
                 layer_type='concatsquash', nonlinearity='relu',
                 velocity_field='original', num_layers=18, gate_hidden_dim=64,
@@ -117,7 +83,6 @@ def cnf(input_dim, dims, zdim, num_blocks, velocity_field='original',
                         atol=atol,
                         rtol=rtol,
                         attr_context_dim=attr_context_dim)
-    # print("Number of trainable parameters of Point CNF: {}".format(count_parameters(model)))
     return model
 
 

@@ -42,8 +42,10 @@ TARGET = '#8B8578'
 def _load(path):
     with open(path) as f:
         data = json.load(f)
-    scales = sorted((k for k in data if k not in ('config', 'inversion_gap')),
-                     key=float)
+    # Scale blocks are the entries with an 'overall' summary (not config,
+    # inversion_gap, acc_at_id, ...).
+    scales = sorted((k for k, v in data.items() if isinstance(v, dict) and 'overall' in v),
+                    key=float)
     return data, scales
 
 

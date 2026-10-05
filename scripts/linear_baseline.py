@@ -54,6 +54,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from common.attr_tables import bank_num_k
+
 MALE, YOUNG, GLASSES = 20, 39, 15      # CelebA indices used to route sources to strata
 VARIANTS = ('single', 'strata')
 
@@ -225,7 +227,7 @@ def main(args):
     du, ln = bank['direction_units'].float(), bank['layer_norms'].float()
     if du.ndim == 3:
         du, ln = du.unsqueeze(1), ln.unsqueeze(1)
-    K = int(bank.get('num_k', du.shape[1]))
+    K = bank_num_k(bank, default=du.shape[1])
     bank_attrs = [int(a) for a in bank['attribute_index']]
     attrs = [a for a in (args.attrs or bank_attrs) if a in bank_attrs]
     if not attrs:

@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from common.attr_tables import bank_num_k
+
 
 def _inverse_softplus(x):
     x = x.clamp(min=1e-6)
@@ -88,8 +90,7 @@ class AttributeDirectionBank(nn.Module):
         if bank_path is not None:
             bank = torch.load(bank_path, map_location="cpu")
             self.bank_meta = {
-                "num_k": int(bank.get("num_k", bank["direction_units"].shape[1]
-                                      if bank["direction_units"].ndim == 4 else 1)),
+                "num_k": bank_num_k(bank),
                 "age_k": bank.get("age_k"),
                 "stratification": bank.get("stratification", {}),
                 "attribute_index": [int(x) for x in bank.get("attribute_index", [])],
