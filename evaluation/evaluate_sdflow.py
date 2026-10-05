@@ -490,7 +490,14 @@ RUN_CONFIG_KEYS = [
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
     'controlnet_region_cond', 'content_bank_path', 'content_film', 'region_saliency_path',
     'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers', 'gate_uniform_attrs',
+    # training's caps on the edit (the eval applies them as training did;
+    # --no_train_caps turns them off to reproduce numbers from before)
+    'residual_max_norm', 'direction_guided_delta_max_norm', 'final_delta_max_norm',
 ]
+
+# Old eval flag names -> the training name they now share (apply_run_config
+# treats either spelling on the command line as explicit).
+_FLAG_ALIASES = {'guided_delta_max_norm': 'direction_guided_delta_max_norm'}
 
 
 def apply_run_config(args):
@@ -511,7 +518,8 @@ def apply_run_config(args):
     explicit = set()
     for tok in sys.argv[1:]:
         if tok.startswith('--'):
-            explicit.add(tok.split('=')[0].lstrip('-').replace('-', '_'))
+            name = tok.split('=')[0].lstrip('-').replace('-', '_')
+            explicit.add(_FLAG_ALIASES.get(name, name))
     for key in RUN_CONFIG_KEYS:
         if key not in cfg or key in explicit:
             continue
@@ -691,8 +699,14 @@ def _content_bias(control_encoder, attr_global_idx, attr_cond, is_rm):
 def load_models(args):
     global _EDIT_TARGET_MODE
     _EDIT_TARGET_MODE = getattr(args, 'edit_target', None) or 'mirror'
-    global _SRC_COND_CLAMP
+    global _SRC_COND_CLAMP, _FINAL_DELTA_MAX_NORM
     _SRC_COND_CLAMP = getattr(args, 'src_cond_clamp', None)
+    caps = train_caps(args)
+    _FINAL_DELTA_MAX_NORM = caps['final']
+    print(f'[Caps] residual max norm {caps["residual"]}, guided delta max norm {caps["guided"]}, '
+          f'final delta max norm {caps["final"]}'
+          + (' (--no_train_caps: training caps off)' if getattr(args, 'no_train_caps', False)
+             else ' (as in training)'))
     set_preserve_boundaries(getattr(args, 'preserve_boundaries', None),
                             getattr(args, 'preserve_strength', 1.0),
                             getattr(args, 'preserve_min_auc', 0.8))
@@ -760,9 +774,8 @@ def load_models(args):
             residual_scale=args.direction_residual_scale,
             per_attr_residual_scale=_per_attr_rs,
             freeze_directions=True,
-            guided_delta_max_norm=(
-                args.guided_delta_max_norm if args.guided_delta_max_norm > 0 else None
-            ),
+            guided_delta_max_norm=caps['guided'],
+            residual_max_norm=caps['residual'],
             use_attr_lora=getattr(args, 'use_attr_lora', False),
             attr_lora_rank=getattr(args, 'attr_lora_rank', 4),
             signed_magnitude_input=getattr(args, 'signed_magnitude_input', False),
@@ -834,7 +847,9 @@ def load_models(args):
                   f'{args.override_residual_scale} for ALL attributes '
                   f'(trained value ignored)')
 
-        if 39 in args.attribute_index:
+        if 39 in args.attribute_index and getattr(args, 'age_fine_layer_scale', None) is not None:
+            # Off unless --age_fine_layer_scale is given: training never damps
+            # these layers, so the default eval edits as training did.
             # StyleGAN's fine W+ layers (index >=4, matching the reg_loss_fine
             # grouping used elsewhere in this codebase) control color/texture,
             # while global/coarse layers (<4) control structure (face shape,
@@ -852,31 +867,6 @@ def load_models(args):
                     direction_bank.layer_scale[_age_local, _start:] = float(_scale)
                 print(f'[Override] age (attr 39) direction layer scale forced to '
                       f'{_scale} for layers [{_start}:18] (layers [0:{_start}] untouched).')
-            else:
-                # DEFAULT mitigation (was previously off by default, requiring
-                # --age_fine_layer_scale to be discovered and set by hand). A
-                # blanket cut at layer 4 was measured to also kill real aging
-                # signal (500-sample eval: rm-direction AccCLIP 76%->17%),
-                # because texture-level aging cues (wrinkles) and the color
-                # artifact are not cleanly separable that early. Default here
-                # to a GRADUATED ramp starting later (layer 10, matching the
-                # "try 10-14" recommendation) down to a floor of 0.6 -- not
-                # 0.0 -- at the last layer, so most of the aging signal in
-                # layers 10-17 survives while the strongest color-cast
-                # contribution (concentrated in the very last, most texture/
-                # color-dominated layers) is damped rather than deleted
-                # outright. Pass --age_fine_layer_scale explicitly (1.0 to
-                # disable this mitigation, 0.0 to reproduce the old hard cut)
-                # to override.
-                n_fine = direction_bank.layer_scale.shape[1] - _start
-                if n_fine > 0:
-                    ramp = torch.linspace(1.0, 0.6, steps=n_fine,
-                                          device=direction_bank.layer_scale.device)
-                    with torch.no_grad():
-                        direction_bank.layer_scale[_age_local, _start:] = ramp
-                    print(f'[Default] age (attr 39) fine-layer color-cast mitigation: '
-                          f'graduated damping 1.0->0.6 over layers [{_start}:18]. '
-                          f'Pass --age_fine_layer_scale to override (e.g. 1.0 to disable).')
 
     # ── ControlNet-style attribute control encoder (optional) ─────────────
     control_encoder = None
@@ -994,6 +984,65 @@ def consistent_source(attr_cond, local_idx, direction, margin=None):
 
 
 _PRESERVE = None            # --preserve_boundaries; set in load_models()
+_FINAL_DELTA_MAX_NORM = None    # training's --final_delta_max_norm; set in load_models()
+
+
+def train_caps(args):
+    """The caps training put on the edit: residual / guided-delta max norm
+    (inside the direction bank) and the final delta max norm (on the whole W+
+    edit). None = no cap. All None with --no_train_caps. Also reads the old
+    eval name guided_delta_max_norm for scripts with their own parser."""
+    if getattr(args, 'no_train_caps', False):
+        return {'residual': None, 'guided': None, 'final': None}
+
+    def pos(v):
+        return float(v) if v is not None and float(v) > 0 else None
+    guided = getattr(args, 'direction_guided_delta_max_norm', None)
+    if guided is None:
+        guided = getattr(args, 'guided_delta_max_norm', None)
+    return {'residual': pos(getattr(args, 'residual_max_norm', None)), 'guided': pos(guided),
+            'final': pos(getattr(args, 'final_delta_max_norm', None))}
+
+
+def cap_delta_norm(delta, max_norm):
+    """training/train_sdflow.py's cap: scale each sample's W+ delta down to at
+    most max_norm (None / <=0 = unchanged)."""
+    if max_norm is None or max_norm <= 0:
+        return delta
+    n = delta.reshape(delta.shape[0], -1).norm(dim=1)
+    return delta * (float(max_norm) / n.clamp(min=1e-8)).clamp(max=1.0).view(-1, 1, 1)
+
+
+def bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent, attr_cond, id_cond,
+                      edited_globals):
+    """The W+ edit the model applies for one attribute, as training builds it:
+    direction bank, then the final delta cap; then (eval only, off by default)
+    the --preserve_boundaries projection. Shared by edit_single_attribute,
+    edit_multi_attribute and bank_edit."""
+    B = latent.size(0)
+    idx = torch.full((B,), local_idx, device=latent.device, dtype=torch.long)
+    direction_bank._id_cond = id_cond      # read only by a --residual_head
+    delta = direction_bank(flow_delta, attr_delta, attr_idx=idx, latent=latent, route_scores=attr_cond)
+    delta = delta[0] if isinstance(delta, tuple) else delta
+    delta = cap_delta_norm(delta, _FINAL_DELTA_MAX_NORM)
+    return project_preserve(delta, edited_globals)
+
+
+@torch.no_grad()
+def bank_edit(prior, direction_bank, latent, attr_cond, id_cond, local_idx, scale, global_idx, direction):
+    """edit_single_attribute up to the W+ edit (no rendering, no ControlNet):
+    returns the applied W+ delta, the bank's residual part of it and the
+    requested attribute change. Used by the analysis scripts."""
+    B = latent.size(0)
+    zero_pad = torch.zeros(B, 18, 1, device=latent.device)
+    attr_cond = consistent_source(attr_cond, local_idx, direction)
+    mid, _ = prior(latent, torch.cat([id_cond, attr_cond], 1), zero_pad)
+    new_attr = attr_cond.clone()
+    new_attr[:, local_idx] = edited_attr_value(attr_cond[:, local_idx], scale, global_idx, direction=direction)
+    raw, _ = prior(mid, torch.cat([id_cond, new_attr], 1), zero_pad, reverse=True)
+    delta = bank_guided_delta(direction_bank, raw - latent, new_attr - attr_cond, local_idx, latent,
+                              attr_cond, id_cond, [global_idx])
+    return delta, direction_bank._last_residual, (new_attr - attr_cond)[:, local_idx]
 
 
 def set_preserve_boundaries(path, strength=1.0, min_auc=0.8):
@@ -1152,16 +1201,25 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
         m = (mask[b, 0].cpu().numpy() > 0.5).astype(np.uint8) * 255
         h, w = m.shape
         if m.sum() < 255 * 50:   # degenerate mask (parser found ~no face) -> keep original
+            print('[Composite] warning: no face region found; keeping the UNEDITED reconstruction '
+                  '(it will score as a failed edit)')
             out.append(orig[b])
             continue
+        # seamlessClone places the centre of the mask's bounding box at `center`;
+        # for the pasted face to stay where it is that must be the box's own
+        # centre, not the image centre (the face+hair mask is not centred).
+        ys, xs = np.nonzero(m)
+        x0, y0 = int(xs.min()), int(ys.min())
+        center = (x0 + (int(xs.max()) - x0 + 1) // 2, y0 + (int(ys.max()) - y0 + 1) // 2)
         try:
             blended = cv2.seamlessClone(
-                np.ascontiguousarray(e), np.ascontiguousarray(o), m,
-                (w // 2, h // 2), cv2.NORMAL_CLONE,
+                np.ascontiguousarray(e), np.ascontiguousarray(o), m, center, cv2.NORMAL_CLONE,
             )
             t = torch.from_numpy(blended).to(orig.device).float().permute(2, 0, 1) / 255.0 * 2 - 1
-        except cv2.error:
-            t = orig[b]   # mask touched the image border or similar -> fall back safely
+        except cv2.error as err:
+            print(f'[Composite] warning: seamlessClone failed ({err}); keeping the UNEDITED '
+                  f'reconstruction for this face')
+            t = orig[b]
         out.append(t)
     return torch.stack(out, dim=0).to(dtype=orig.dtype)
 
@@ -1244,11 +1302,8 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), attr_local_idx, device=device, dtype=torch.long)
-        direction_bank._id_cond = id_cond      # read only by a --residual_head
-        guided_delta = direction_bank(flow_delta, attr_delta,
-                                      attr_idx=batch_attr_idx, latent=latent,
-                                      route_scores=attr_cond)
-        guided_delta = project_preserve(guided_delta, [attr_global_idx])
+        guided_delta = bank_guided_delta(direction_bank, flow_delta, attr_delta, attr_local_idx,
+                                         latent, attr_cond, id_cond, [attr_global_idx])
         new_latents = latent + guided_delta
         # controlnet_disable_attrs: some attributes (e.g. eyeglasses) need the
         # ControlNet feature-map injection to synthesize structure the W+
@@ -1278,8 +1333,10 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                                                 control_encoder, attr_global_idx,
                                                 attr_cond, is_rm))
             control_skips = clip_skips(control_skips, controlnet_max_norm)
+    elif direction_bank is None:
+        new_latents = latent + cap_delta_norm(new_latents_raw - latent, _FINAL_DELTA_MAX_NORM)
     else:
-        new_latents = new_latents_raw
+        new_latents = new_latents_raw      # --bypass_glasses_direction_bank (eval-only)
 
     edited_face = G([new_latents], skips=control_skips, embed_res=controlnet_embed_res,
                     input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
@@ -1303,9 +1360,14 @@ def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None):
     told to remove bangs and cannot succeed). indep avoids this when the
     independent classifier is the judge that scores the edit."""
     mode = getattr(args, 'edit_direction', 'cond')
+    if mode == 'cond':
+        return None
     src = {'clip': src_probs_clip, 'indep': src_probs_indep}.get(mode)
     if src is None:
-        return None
+        # used to fall back to the conditioner's direction silently while the
+        # results still said edit_direction=<mode>
+        raise ValueError(f'--edit_direction {mode} needs its judge, which is not loaded '
+                         f'({"--independent_attr_weights" if mode == "indep" else "the CLIP judge"}).')
     return torch.where(src[:, local_idx] > 0.5, -1.0, 1.0)
 
 
@@ -1418,11 +1480,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
-        direction_bank._id_cond = id_cond      # read only by a --residual_head
-        guided_delta = direction_bank(flow_delta, attr_delta,
-                                      attr_idx=batch_attr_idx, latent=latent,
-                                      route_scores=attr_cond)
-        guided_delta = project_preserve(guided_delta, attr_global_idxs)
+        guided_delta = bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent,
+                                         attr_cond, id_cond, attr_global_idxs)
         deltas.append(guided_delta)
         this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
         use_controlnet_here = (control_encoder is not None and not (
@@ -1688,6 +1747,21 @@ def evaluate(args):
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
             'adaptive_margins': (getattr(args, 'adaptive_margins', None)
                                  if getattr(args, 'adaptive_ladder', None) else None),
+            # everything else that changes what an edit is, so a results file
+            # can be tied to the pipeline that produced it
+            'train_caps': train_caps(args),
+            'no_train_caps': bool(getattr(args, 'no_train_caps', False)),
+            'edit_target': getattr(args, 'edit_target', 'mirror'),
+            'controlnet_disable_attrs': getattr(args, 'controlnet_disable_attrs', None),
+            'age_fine_layer_scale': getattr(args, 'age_fine_layer_scale', None),
+            'age_fine_layer_start': (getattr(args, 'age_fine_layer_start', None)
+                                     if getattr(args, 'age_fine_layer_scale', None) is not None else None),
+            'glasses_judge': getattr(args, 'glasses_judge', None),
+            'composite_face_region': getattr(args, 'composite_face_region', False),
+            'composite_method': (getattr(args, 'composite_method', None)
+                                 if getattr(args, 'composite_face_region', False) else None),
+            'force_bank_directions': getattr(args, 'force_bank_directions', False),
+            'override_residual_scale': getattr(args, 'override_residual_scale', None),
         },
     }
 
@@ -2086,7 +2160,10 @@ def evaluate(args):
                               ('lpips_', 'lpips'),
                               ('id_arc_', 'id_arc'),
                               ('acc_teacher_', 'acc_teacher')]:
-            vals = [v for k, vl in metrics.items() if k.startswith(prefix) for v in vl]
+            # the per-attribute key only: '<prefix><attr>_add' / '_rm' hold the same
+            # samples again (they used to be counted twice in 'n')
+            vals = [v for a in args.attribute_index
+                    for v in metrics.get(prefix + ATTR_NAMES.get(a, f'attr{a}'), [])]
             ovr[label] = _summ(vals)
         scale_summary['overall'] = ovr
         id_show = ovr['id_indep'] if ovr['id_indep'] else ovr['id_arc']
@@ -2203,9 +2280,21 @@ def build_parser():
                              'Eyeglasses only. Off by default so every attribute goes through '
                              'the same pipeline; turning it on mixes two different systems '
                              'into one results table.')
-    parser.add_argument('--guided_delta_max_norm', type=float, default=0.0,
-                        help='Shared max norm for the final guided W+ delta, applied uniformly to '
-                             'every attribute. Set <=0 to disable (no cap).')
+    parser.add_argument('--direction_guided_delta_max_norm', '--guided_delta_max_norm',
+                        dest='direction_guided_delta_max_norm', type=float, default=0.0,
+                        help='Max norm of the direction bank\'s guided W+ delta (training\'s '
+                             '--direction_guided_delta_max_norm). Restored from config.json. '
+                             '<=0 = no cap.')
+    parser.add_argument('--residual_max_norm', type=float, default=0.0,
+                        help='Max norm of the bank\'s residual before scaling (training\'s '
+                             '--residual_max_norm, 10 by default there). Restored from config.json; '
+                             '<=0 = no cap (a run whose config predates the flag).')
+    parser.add_argument('--final_delta_max_norm', type=float, default=0.0,
+                        help='Max norm of the whole W+ edit (training\'s --final_delta_max_norm). '
+                             'Restored from config.json. <=0 = no cap.')
+    parser.add_argument('--no_train_caps', action='store_true',
+                        help='Do not apply the three training caps above (eval before they were '
+                             'restored edited without them; use this to reproduce those numbers).')
     parser.add_argument('--use_attr_lora', action='store_true',
                         help='Must match training: whether the checkpoint has a per-attribute '
                              'LoRA adapter (see train_sdflow.py --use_attr_lora). Auto-restored '
@@ -2416,7 +2505,8 @@ def build_parser():
                              'value (which tends to be frozen near its 0.05 init). Diagnostic only.')
     parser.add_argument('--age_fine_layer_scale', type=float, default=None,
                         help='Scale the age (attr 39) direction layers [age_fine_layer_start:18] '
-                             'by this factor at eval time (e.g. 0.0 to zero them out). '
+                             'by this factor at eval time (e.g. 0.0 to zero them out). Default: '
+                             'not applied (training never damps them; 1.0 is the same). '
                              'Diagnostic for the confirmed color-cast artifact living in the '
                              'age direction fine layers -- but a blanket cut at layer 4 also '
                              'kills real aging signal (500-sample eval: rm-direction AccCLIP '

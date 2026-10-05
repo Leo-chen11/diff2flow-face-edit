@@ -267,10 +267,12 @@ class LegacySingleResControlEncoder(_PerDirectionSlots, nn.Module):
         layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1))
         return nn.Sequential(*layers)
 
-    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None):
+    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None, content_bias=None):
         """Returns {out_res: (B, C, out_res, out_res)} -- a one-entry dict, so
         callers handle either architecture through the same interface. The
-        generator accepts a dict at any number of resolutions, including one."""
+        generator accepts a dict at any number of resolutions, including one.
+        region_mask / content_bias are accepted (callers pass them to either
+        architecture) and ignored: this encoder predates both inputs."""
         B = attr_delta.size(0)
         device, dtype = attr_delta.device, attr_delta.dtype
         trunk_in = attr_delta

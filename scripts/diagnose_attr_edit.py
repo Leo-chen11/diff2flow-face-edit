@@ -54,11 +54,10 @@ from torch.utils import data
 from tqdm import tqdm
 
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges, build_parser,
+    ATTR_NAMES, _latest_step, apply_run_config, bank_edit, build_optional_judges, build_parser,
     consistent_source, edit_single_attribute, load_models, resolve_controlnet_disable_attrs,
 )
 from models.dataset import SDFlowDataset
-from scripts.analyze_residual import bank_edit
 
 CLEAR_LO, CLEAR_HI = 0.35, 0.65
 

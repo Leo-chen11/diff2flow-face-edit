@@ -42,12 +42,11 @@ from torch.utils import data
 from tqdm import tqdm
 
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges, build_parser,
+    ATTR_NAMES, _latest_step, apply_run_config, bank_edit, build_optional_judges, build_parser,
     load_models, resolve_controlnet_disable_attrs,
 )
 from models.dataset import SDFlowDataset
 from models.residual_head import ResidualHead, head_features
-from scripts.analyze_residual import bank_edit
 
 
 def name(g):

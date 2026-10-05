@@ -50,8 +50,8 @@ from torch.utils import data
 from tqdm import tqdm
 
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges, build_parser,
-    consistent_source, edited_attr_value, load_models, resolve_controlnet_disable_attrs,
+    ATTR_NAMES, _latest_step, apply_run_config, bank_edit, build_optional_judges, build_parser,
+    load_models, resolve_controlnet_disable_attrs,
 )
 from models.dataset import SDFlowDataset
 
@@ -61,23 +61,6 @@ KS = (1, 2, 4, 8, 16, 32)
 
 def name(g):
     return ATTR_NAMES.get(g, f'attr{g}')
-
-
-@torch.no_grad()
-def bank_edit(prior, direction_bank, latent, attr_cond, id_cond, local_idx, scale, global_idx, direction):
-    """edit_single_attribute up to the direction bank (no rendering): returns the
-    applied W+ delta and the residual part of it."""
-    B = latent.size(0)
-    zero_pad = torch.zeros(B, 18, 1, device=latent.device)
-    attr_cond = consistent_source(attr_cond, local_idx, direction)      # no-op unless --src_cond_clamp
-    mid, _ = prior(latent, torch.cat([id_cond, attr_cond], 1), zero_pad)
-    new_attr = attr_cond.clone()
-    new_attr[:, local_idx] = edited_attr_value(attr_cond[:, local_idx], scale, global_idx, direction=direction)
-    raw, _ = prior(mid, torch.cat([id_cond, new_attr], 1), zero_pad, reverse=True)
-    idx = torch.full((B,), local_idx, device=latent.device, dtype=torch.long)
-    delta = direction_bank(raw - latent, new_attr - attr_cond, attr_idx=idx, latent=latent, route_scores=attr_cond)
-    delta = delta[0] if isinstance(delta, tuple) else delta
-    return delta, direction_bank._last_residual, (new_attr - attr_cond)[:, local_idx]
 
 
 def main():
