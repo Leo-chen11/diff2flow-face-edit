@@ -28,19 +28,19 @@ import torch
 
 
 def region_mean_saturation(img_pm1, mask):
-    """Mask-weighted mean HSV-style saturation over a batch.
+    """Mask-weighted mean HSV-style saturation, per sample.
 
     img_pm1: (N, 3, H, W) in [-1, 1] (generator output range).
-    mask:    (N, 1, H, W) or broadcastable, typically a FaceParser region
-             mask (e.g. FaceParser.get_region_mask output).
-    Returns a single scalar tensor -- the mean over the whole batch, not
-    per-sample, matching what the original inline version computed.
+    mask:    (N, 1, H, W), typically a FaceParser region mask (e.g.
+             FaceParser.get_region_mask output).
+    Returns (N,): each sample's own mean (it used to be one value pooled over
+    the batch, so a sample's target depended on the others in it).
     """
     img01 = img_pm1 * 0.5 + 0.5
     mx = img01.max(dim=1, keepdim=True).values
     mn = img01.min(dim=1, keepdim=True).values
     sat = (mx - mn) / mx.clamp(min=1e-4)
-    return (sat * mask).sum() / mask.sum().clamp(min=1e-4)
+    return (sat * mask).flatten(1).sum(1) / mask.flatten(1).sum(1).clamp(min=1e-4)
 
 
 def directional_region_saturation_loss(src_img, edit_img, src_mask, edit_mask,
@@ -60,27 +60,28 @@ def directional_region_saturation_loss(src_img, edit_img, src_mask, edit_mask,
         toward natural color.
 
     src_sat is detached (it is the fixed reference point the edit is
-    scored against, not something this loss should push on).
+    scored against, not something this loss should push on). The hinge is
+    taken per sample against that sample's own source, then averaged.
     """
     with torch.no_grad():
         src_sat = region_mean_saturation(src_img, src_mask)
     edit_sat = region_mean_saturation(edit_img, edit_mask)
     if push < 0:
         target = (src_sat * relative_ratio).clamp(max=bound)
-        return torch.relu(edit_sat - target)
+        return torch.relu(edit_sat - target).mean()
     target = (src_sat + (1.0 - src_sat) * relative_ratio).clamp(min=bound)
-    return torch.relu(target - edit_sat)
+    return torch.relu(target - edit_sat).mean()
 
 
 def region_area_fraction(prob):
-    """Mask-weighted area of a region as a fraction of the frame.
+    """Area of a region as a fraction of the frame, per sample: (N,).
 
     prob MUST come from a differentiable source -- FaceParser.region_prob,
     not FaceParser.get_region_mask. The latter is @torch.no_grad() and
     argmax'd, so a loss on the value returned here would have exactly zero
     gradient and would silently do nothing.
     """
-    return prob.sum() / prob.numel()
+    return prob.flatten(1).mean(1)
 
 
 def directional_region_area_loss(src_prob, edit_prob, push, relative_change, bound):
@@ -105,9 +106,9 @@ def directional_region_area_loss(src_prob, edit_prob, push, relative_change, bou
     edit_a = region_area_fraction(edit_prob)
     if push > 0:
         target = (src_a * (1.0 + relative_change)).clamp(max=bound)
-        return torch.relu(target - edit_a)
+        return torch.relu(target - edit_a).mean()
     target = (src_a * (1.0 - relative_change)).clamp(min=bound)
-    return torch.relu(edit_a - target)
+    return torch.relu(edit_a - target).mean()
 
 
 def outside_region_preservation_loss(edit_img, ref_img, allowed):

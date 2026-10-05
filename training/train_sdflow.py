@@ -104,10 +104,11 @@ class LearnableRegLossWeights(nn.Module):
     loss groups, replacing the fixed 2.0/1.0/reg_fine_weight constants that used to be
     shared identically by every attribute. Softplus reparam (same style as
     AttributeDirectionBank.residual_scale_raw) keeps weights positive with no upper
-    bound; each attribute finds its own global/coarse/fine balance via gradient
-    descent on the same losses already driving training (id_loss pulls a group's
-    weight up when moving there is hurting identity, counter_attr_loss pulls it down
-    when more freedom in that group is needed to hit the target).
+    bound. In practice they only go DOWN: the weights appear only as the
+    multipliers of reg_loss, whose gradient with respect to them is always
+    positive, so every weight decays to its floor (--reg_weight_min, per-attribute
+    --reg_fine_weight_min_override) at a speed set by the meta learning rate. The
+    floors are what actually sets the regularisation strength late in training.
     """
 
     def __init__(self, n_edit_attrs, init_global=2.0, init_coarse=1.0, init_fine=0.5,
@@ -487,6 +488,8 @@ def generate_test_image(flow_model:torch.nn.Module,
             attr_delta = new_attr_cond - test_attr_cond
             guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=source_latent,
                                           route_scores=test_attr_cond)
+            if args is not None:      # the same final cap the training step applies
+                guided_delta, _ = cap_delta_norm(guided_delta, args.final_delta_max_norm)
             new_latents = source_latent + guided_delta
         else:
             new_latents = new_latents_raw
@@ -821,8 +824,14 @@ if __name__ == '__main__':
     # 0.9-1.25, but the old 0.35-0.55 range meant training never saw anything
     # stronger than 0.55 and inference had to extrapolate. Cover the deployed
     # range instead.
-    parser.add_argument('--train_scale_min', type=float, default=0.5)
-    parser.add_argument('--train_scale_max', type=float, default=0.9)
+    parser.add_argument('--train_scale_min', type=float, default=0.5,
+                        help='With --train_scale_max: only (max - min) / 2 is used, as the '
+                             'half-width of the random noise added to each attribute\'s learned '
+                             'edit-strength centre (LearnableAttributeScales, starts at 1.0, '
+                             'clamped to [0.3, 1.5]). The defaults give strengths of about '
+                             '0.8-1.2 at the start, not 0.5-0.9.')
+    parser.add_argument('--train_scale_max', type=float, default=0.9,
+                        help='See --train_scale_min.')
     parser.add_argument('--attribute_sampling', default='cycle', choices=['cycle', 'random'],
                         help='cycle trains attributes in a balanced round-robin order.')
     parser.add_argument('--score_balanced_sampling', dest='score_balanced_sampling', action='store_true', default=True,
@@ -830,13 +839,14 @@ if __name__ == '__main__':
     parser.add_argument('--disable_score_balanced_sampling', dest='score_balanced_sampling', action='store_false')
     parser.add_argument('--score_balance_low', type=float, default=0.35)
     parser.add_argument('--score_balance_high', type=float, default=0.65)
-    parser.add_argument('--align_sampler_global_step', action='store_true', default=False,
+    parser.add_argument('--align_sampler_global_step', action=argparse.BooleanOptionalAction,
+                        default=True,
                         help='Make ScoreBalancedBatchSampler pick each batch for the SAME '
                              'attribute the training loop edits at that step (n_iter %% '
                              'num_attrs, counted from --resume_step). Without it, any resume '
                              'whose --resume_step (or steps/epoch) is not a multiple of the '
-                             'number of attributes balances the wrong attribute. Default off '
-                             'only so older commands reproduce; turn it on for new runs.')
+                             'number of attributes balances the wrong attribute. Default on; '
+                             '--no-align_sampler_global_step reproduces runs from before.')
     parser.add_argument('--age_gender_balance', action='store_true', default=False,
                         help='For the age attribute (39) only, split its low/high source '
                              'pools again by source Male score (preds index 20, >=0.5 = male) '
@@ -1042,7 +1052,8 @@ if __name__ == '__main__':
     parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
                         help='Compare the edited image against the source RECONSTRUCTION '
                              'G(latent) instead of the real photo in id_loss, the directional '
-                             'CLIP loss, and the DDS diffusion guidance. The real photo differs '
+                             'CLIP loss, the DDS diffusion guidance and the other-attribute '
+                             'preservation loss (preserve_attr). The real photo differs '
                              'from any generated image by (inversion gap) + (edit); referencing '
                              'it charges the fixed e4e/StyleGAN reconstruction error to the edit, '
                              'which the flow cannot remove without spending W+ budget on '
@@ -1656,6 +1667,16 @@ if __name__ == '__main__':
 
     os.environ['WANDB_MODE'] = args.wandb_mode
 
+    # Settled before wandb and config.json record the args, so the saved config
+    # is what runs.
+    if args.age_gender_balance:
+        if not (args.score_balanced_sampling and args.attribute_sampling == 'cycle'):
+            raise ValueError('--age_gender_balance needs score-balanced cycle sampling '
+                             '(--attribute_sampling cycle, without --disable_score_balanced_sampling)')
+        if 39 not in [int(a) for a in args.attribute_index] or 20 not in [int(a) for a in args.attribute_index]:
+            raise ValueError('--age_gender_balance needs both 39 (Young) and 20 (Male) in --attribute_index')
+        args.align_sampler_global_step = True
+
     wandb_kwargs = dict(
         project=args.wandb_project,
         name='{}_{}'.format(args.model_name,args.run_name),
@@ -1717,14 +1738,6 @@ if __name__ == '__main__':
                                         train=False,
                                         transform=img_transform)
     
-    if args.age_gender_balance:
-        if not (args.score_balanced_sampling and args.attribute_sampling == 'cycle'):
-            raise ValueError('--age_gender_balance needs score-balanced cycle sampling '
-                             '(--attribute_sampling cycle, without --disable_score_balanced_sampling)')
-        if 39 not in [int(a) for a in args.attribute_index] or 20 not in [int(a) for a in args.attribute_index]:
-            raise ValueError('--age_gender_balance needs both 39 (Young) and 20 (Male) in --attribute_index')
-        args.align_sampler_global_step = True
-
     if args.score_balanced_sampling and args.attribute_sampling == 'cycle':
         train_attr_scores = _collect_dataset_attr_scores(train_dataset, args.attribute_index)
         _gender_scores = None
@@ -1970,6 +1983,10 @@ if __name__ == '__main__':
     if direction_bank is not None and direction_bank.residual_scale_raw.requires_grad:
         low_lr_params.append(direction_bank.residual_scale_raw)
     low_lr_ids = {id(p) for p in low_lr_params}
+    # Everything the optimizer steps is gradient-clipped together (the bank's
+    # residual_scale_raw is only in the low-lr group, and used to be left out).
+    _tp_ids = {id(p) for p in trainable_params}
+    clip_params = trainable_params + [p for p in low_lr_params if id(p) not in _tp_ids]
 
     # control_encoder gets its own group so --controlnet_lr_mult can move the
     # branch independently of the W+ path it runs alongside.
@@ -2203,8 +2220,17 @@ if __name__ == '__main__':
                       f'so it adds a BiSeNet backward pass on the steps it fires')
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
-            print(f'[WARN] Face parser unavailable ({exc}); locality/hair-gray/DDS-mask '
-                  f'disabled.')
+            _needs = [n for n, on in (('--hair_gray_loss_weight', args.hair_gray_loss_weight > 0),
+                                      ('--hair_extent_loss_weight', args.hair_extent_loss_weight > 0),
+                                      ('--controlnet_region_cond', args.controlnet_region_cond))
+                      if on]
+            if _needs:
+                # region_cond would train on an all-ones age mask the eval never
+                # uses, and the hair losses would silently be 0
+                raise RuntimeError(f'BiSeNet face parser failed to load ({exc}) but '
+                                   f'{", ".join(_needs)} need(s) it.') from exc
+            print(f'[WARN] Face parser unavailable ({exc}); DISABLED: local_region_loss '
+                  f'(Eyeglasses locality) and the DDS face mask.')
 
     # region_saliency: replaces --controlnet_region_cond's all-ones fallback
     # (see the region_mask construction below) with a precomputed
@@ -2333,6 +2359,12 @@ if __name__ == '__main__':
         for i, datas in tqdm(enumerate(train_loader),total=len(train_loader)):
             local_step = epoch*len(train_loader)+i
             n_iter = start_step + local_step
+            # Interval-gated terms count steps PER ATTRIBUTE when attributes are
+            # cycled (attribute = n_iter % A): with n_iter % K, any K sharing a
+            # factor with A only ever fired for some attributes (5 attributes and
+            # --celeba_judge_interval 50 judged Eyeglasses only).
+            _attr_step = (n_iter // len(args.attribute_index)
+                          if args.attribute_sampling == 'cycle' else n_iter)
             if args.max_steps is not None and local_step > args.max_steps:
                 _stop_training = True
                 break
@@ -2580,7 +2612,8 @@ if __name__ == '__main__':
             # (not the real photo) so the inversion gap is not charged to the
             # edit. In cycle mode this fires on the local attribute's steps only.
             #
-            # REMOVAL-ONLY: the region mask is computed from the SOURCE
+            # Both directions, with a direction-dependent mask (below). The
+            # region mask is computed from the SOURCE
             # reconstruction. For a face that does not yet have glasses, BiSeNet
             # only labels the bare eyes/brows (no "glasses" class pixels exist
             # yet), which is much smaller than the actual frame footprint (it
@@ -2590,8 +2623,6 @@ if __name__ == '__main__':
             # drawing one (observed: v11 preview grid stopped adding glasses
             # entirely). For a face that already has glasses, the source mask
             # correctly covers the full frame, so removal edits are safe.
-            # Restrict the loss to src_attr_flow > 0.5 (removal direction only)
-            # so addition edits fall back to the unconstrained v10 behavior.
             # Direction-aware masking:
             #   removal (source HAS the attribute): BiSeNet sees the full frame
             #     on the source, so a precise mask (default blur) is safe.
@@ -2669,14 +2700,17 @@ if __name__ == '__main__':
                             edit_hair_mask = face_parser.get_region_mask(
                                 new_face_tensors[_is_age_rm], HAIR_REGION_CLASS, blur_sigma=3,
                             )
-                        # Skip samples where BiSeNet found ~no hair pixels in
-                        # EITHER pass (bald, hat, hair out of frame) -- the mean
+                        # Skip each sample where BiSeNet found ~no hair pixels in
+                        # EITHER pass (bald, hat, hair out of frame) -- its mean
                         # would be dominated by a handful of misclassified pixels.
-                        _min_px = 0.01 * src_hair_mask.numel()
-                        if src_hair_mask.sum() > _min_px and edit_hair_mask.sum() > _min_px:
+                        # Per sample (it used to be one check on the batch total).
+                        _min_px = 0.01 * src_hair_mask[0].numel()
+                        _ok_hair = ((src_hair_mask.flatten(1).sum(1) > _min_px)
+                                    & (edit_hair_mask.flatten(1).sum(1) > _min_px))
+                        if _ok_hair.any():
                             hair_gray_loss = directional_region_saturation_loss(
-                                src_recon[_is_age_rm], new_face_tensors[_is_age_rm],
-                                src_hair_mask, edit_hair_mask,
+                                src_recon[_is_age_rm][_ok_hair], new_face_tensors[_is_age_rm][_ok_hair],
+                                src_hair_mask[_ok_hair], edit_hair_mask[_ok_hair],
                                 push=-1, relative_ratio=args.hair_gray_relative_ratio,
                                 bound=args.hair_gray_abs_cap,
                             )
@@ -2746,23 +2780,22 @@ if __name__ == '__main__':
             # Frozen counterfactual teacher: external supervision on visual attribute change.
             # Shared-parameter augmentation before the teacher breaks adversarial
             # teacher-fooling (see teacher_augment docstring).
+            # The source RECONSTRUCTION gets the same crop/flip/noise, for the
+            # preservation loss below (with --losses_vs_recon).
+            _pres_ref = src_recon if (args.losses_vs_recon and src_recon is not None) else None
             _aug = teacher_augment(
                 img, new_face_tensors,
                 enabled=args.teacher_aug,
                 noise_std=args.teacher_aug_noise,
+                ref_images=_pres_ref,
             )
             src_face_256, new_face_256 = _aug[0], _aug[1]
+            recon_face_256 = _aug[2] if _pres_ref is not None else None
             src_logits, _ = attr_teacher(src_face_256)
             gen_logits, _ = attr_teacher(new_face_256)
             src_probs = torch.sigmoid(src_logits)[:, attribute_index].detach()
             gen_probs = torch.sigmoid(gen_logits)[:, attribute_index]
             src_attr = src_probs[batch_indices, mid_idx]
-            # Which way is this edit going? Same convention evaluate_sdflow
-            # reports its direction split under: rm = the source already has
-            # the attribute. Computed once here so the judge balancer buckets a
-            # sample the same way when it reads a weight out (clip-prompt loss,
-            # below) and when it writes an accuracy back in (monitor block).
-            edit_is_rm = (src_attr > 0.5).detach()
             # The FLOW was told which way to go by the conditioner
             # (src_attr_flow, above); this loss picks its direction from the
             # teacher's score on the real photo. Near 0.5 they can disagree,
@@ -2779,6 +2812,9 @@ if __name__ == '__main__':
                 hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
             soft_target = src_attr + _s_tgt * (hard_teacher_target - src_attr)
             soft_target_for_loss = soft_target.detach()
+            # Which end this edit moves toward, for the losses that only need a
+            # direction (CLIP, DDS prompts read target >= 0.5).
+            edit_end = hard_teacher_target.detach()
             edited_probs = gen_probs[batch_indices, mid_idx]
             # squared error to the soft target (a hinge variant had no effect at
             # matched identity and was removed)
@@ -2791,7 +2827,16 @@ if __name__ == '__main__':
             attr_range = torch.arange(len(args.attribute_index), device=latent.device)
             preserve_mask = attr_range.unsqueeze(0) != mid_idx.unsqueeze(1)  # [B, num_attrs]
             if preserve_mask.any():
-                diff_sq = (gen_probs - src_probs).pow(2)  # [B, num_attrs]
+                # Reference: the source reconstruction (--losses_vs_recon), like
+                # the ID / CLIP / DDS losses. Against the real photo the other
+                # attributes' scores differ by the inversion gap even with no
+                # edit, a floor this loss could never get below.
+                if recon_face_256 is not None:
+                    with torch.no_grad():
+                        _pres_probs = torch.sigmoid(attr_teacher(recon_face_256)[0])[:, attribute_index]
+                else:
+                    _pres_probs = src_probs
+                diff_sq = (gen_probs - _pres_probs).pow(2)  # [B, num_attrs]
                 preserve_loss = (diff_sq * preserve_mask.float()).sum() / preserve_mask.float().sum()
             else:
                 preserve_loss = _zero.clone()
@@ -2803,7 +2848,7 @@ if __name__ == '__main__':
             if (
                 clip_prompt_loss_fn is not None
                 and args.clip_prompt_weight > 0
-                and (args.clip_prompt_interval <= 1 or n_iter % args.clip_prompt_interval == 0)
+                and (args.clip_prompt_interval <= 1 or _attr_step % args.clip_prompt_interval == 0)
             ):
                 _clip_abs_idx = torch.tensor(
                     [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()],
@@ -2812,7 +2857,10 @@ if __name__ == '__main__':
                 clip_loss_each, clip_logs = clip_prompt_loss_fn(
                     images=new_face_tensors,
                     attr_abs_idx=_clip_abs_idx,
-                    target_values=soft_target_for_loss,
+                    # the END the edit moves toward (only its side of 0.5 is
+                    # read): the soft target sits on the SOURCE side whenever
+                    # train_scale is small, which used to flip the push
+                    target_values=edit_end,
                     reduction='none',
                     # Directional CLIP measures cos(clip(edit) - clip(src), text_delta).
                     # The source MUST be the reconstruction, not the real photo:
@@ -2886,7 +2934,11 @@ if __name__ == '__main__':
             diffusion_loss = _zero.clone()       # non-age DDS (glasses/gender)
             age_diffusion_loss = _zero.clone()   # age DDS, separately weighted
             diffusion_logs = {}
-            if diffusion_guidance is not None and args.diffusion_guidance_weight > 0:
+            _age_dds_w = (args.age_diffusion_weight if args.age_diffusion_weight >= 0
+                          else args.diffusion_guidance_weight)
+            # Each DDS term is gated by its OWN weight: age DDS used to be
+            # skipped whenever --diffusion_guidance_weight was 0.
+            if diffusion_guidance is not None and (args.diffusion_guidance_weight > 0 or _age_dds_w > 0):
                 mid_abs_idx = torch.tensor(
                     [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()],
                     device=latent.device,
@@ -2896,13 +2948,15 @@ if __name__ == '__main__':
 
                 non_age_fires = (
                     (~is_age).any()
+                    and args.diffusion_guidance_weight > 0
                     and args.diffusion_guidance_interval > 0
-                    and n_iter % args.diffusion_guidance_interval == 0
+                    and _attr_step % args.diffusion_guidance_interval == 0
                 )
                 age_fires = (
                     is_age.any()
+                    and _age_dds_w > 0
                     and args.age_diffusion_interval > 0
-                    and n_iter % args.age_diffusion_interval == 0
+                    and _attr_step % args.age_diffusion_interval == 0
                 )
 
                 # Fine-layer masking: DDS gradients only flow through W+ layers below
@@ -2976,7 +3030,7 @@ if __name__ == '__main__':
                             src_images=loss_ref_img[_grp_mask],
                             edit_images=_face_non_age[_grp_mask],
                             attr_abs_idx=mid_abs_idx[_grp_mask],
-                            target_values=soft_target[_grp_mask].detach(),
+                            target_values=edit_end[_grp_mask],
                             face_mask=_dds_mask(_face_non_age[_grp_mask], mid_abs_idx[_grp_mask]),
                             gender_rm_texture_cue=args.gender_rm_prompt_cue,
                         )
@@ -2995,7 +3049,7 @@ if __name__ == '__main__':
                         src_images=loss_ref_img[is_age],
                         edit_images=_face_age[is_age],
                         attr_abs_idx=mid_abs_idx[is_age],
-                        target_values=soft_target[is_age].detach(),
+                        target_values=edit_end[is_age],
                         timestep_min=args.age_diffusion_timestep_min,
                         timestep_max=args.age_diffusion_timestep_max,
                         face_mask=_dds_mask(_face_age[is_age], mid_abs_idx[is_age]),
@@ -3014,8 +3068,7 @@ if __name__ == '__main__':
                 args.lag_reg_weight * lag_reg_loss +\
                 args.dir_gate_reg_weight * dir_gate_reg_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
-                (args.age_diffusion_weight if args.age_diffusion_weight >= 0
-                 else args.diffusion_guidance_weight) * age_diffusion_loss +\
+                _age_dds_w * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
@@ -3030,7 +3083,7 @@ if __name__ == '__main__':
                     attr_scale_grad_norm = _zero.detach().clone()
                 else:
                     attr_scale_grad_norm = attr_scales.attr_log_scales.grad.detach().norm()
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -3053,22 +3106,33 @@ if __name__ == '__main__':
                 test_img = test_img.cuda()
                 test_latent = test_latent.cuda()
                 test_attributes = test_pred[:, attribute_index].cuda()
-                with torch.no_grad():
-                    test_cond, test_id_cond, test_attr_cond = conditioner.make_condition(
-                        test_img, test_latent, id_criterion
-                    )
-                    test_mid_latent, _ = prior(test_latent, test_cond, torch.zeros(test_batch, 18, 1).to(test_latent))
-                    grid_img = generate_test_image(
-                        prior, G, test_id_cond, test_attr_cond, test_img, test_latent, test_attributes,
-                        test_mid_latent, direction_bank=direction_bank,
-                        preview_scale=args.preview_scale,
-                        args=args,
-                        control_encoder=(control_encoder
-                                         if control_encoder is not None
-                                         and n_iter >= args.controlnet_warmup_steps else None),
-                        face_parser=face_parser,
-                    )
-                    logger.save_image(grid_img,n_iter,'test')
+                # Preview in eval mode: in train mode the bank updated its
+                # gate-usage EMA (and any BatchNorm its running stats) from the
+                # preview batch. Modes are restored afterwards.
+                _modes = [(m, m.training) for m in (prior, conditioner, direction_bank, control_encoder)
+                          if m is not None]
+                for _mod, _ in _modes:
+                    _mod.eval()
+                try:
+                    with torch.no_grad():
+                        test_cond, test_id_cond, test_attr_cond = conditioner.make_condition(
+                            test_img, test_latent, id_criterion
+                        )
+                        test_mid_latent, _ = prior(test_latent, test_cond, torch.zeros(test_batch, 18, 1).to(test_latent))
+                        grid_img = generate_test_image(
+                            prior, G, test_id_cond, test_attr_cond, test_img, test_latent, test_attributes,
+                            test_mid_latent, direction_bank=direction_bank,
+                            preview_scale=args.preview_scale,
+                            args=args,
+                            control_encoder=(control_encoder
+                                             if control_encoder is not None
+                                             and n_iter >= args.controlnet_warmup_steps else None),
+                            face_parser=face_parser,
+                        )
+                        logger.save_image(grid_img,n_iter,'test')
+                finally:
+                    for _mod, _was in _modes:
+                        _mod.train(_was)
                 logger.checkpoints(n_iter)
                 if args.use_ema:
                     save_ema_checkpoints(logger.save_root, n_iter, ema_modules_for_save)
@@ -3086,7 +3150,7 @@ if __name__ == '__main__':
             # (did the edited score cross 0.5), scored by the independent judge.
             # No gradient -- purely a readout.
             celeb_acc_log = {}
-            if celeb_monitor is not None and n_iter % args.celeba_judge_interval == 0:
+            if celeb_monitor is not None and _attr_step % args.celeba_judge_interval == 0:
                 with torch.no_grad():
                     _src_c = celeb_monitor.scores(
                         F.interpolate(src_face_256, (256, 256)))[:, attribute_index]
@@ -3103,8 +3167,10 @@ if __name__ == '__main__':
                         # 58.7pp add/rm gap for a whole run; logging both halves
                         # makes that visible in wandb as it happens instead of
                         # only in the eval afterwards.
+                        # rm/add by the JUDGE's own source reading, the same one
+                        # _ok is scored against (was the teacher's).
                         for _rm in (False, True):
-                            _md = _m & (edit_is_rm == _rm)
+                            _md = _m & ((_s > 0.5) == _rm)
                             if _md.any():
                                 celeb_acc_log[
                                     f'judge_celeb_acc/attr_{_abs}_{"rm" if _rm else "add"}'

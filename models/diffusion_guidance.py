@@ -9,6 +9,10 @@ def build_edit_prompts(attr_abs_idx, target_values, gender_prob=None,
                        young_add_hair_cue=False, gender_rm_texture_cue=False):
     """Build the per-sample DDS target-prompt strings.
 
+    target_values: (B,) only its side of 0.5 is read -- the end the edit moves
+    toward (>= 0.5: has the attribute). Pass that end, not a soft target that
+    can still sit on the source side.
+
     gender_prob: optional (B,) tensor, the source image's Male probability
     from the frozen attribute teacher (same one soft_target/src_attr use).
     Only attr 39 (age) reads it -- see the branch below for why.

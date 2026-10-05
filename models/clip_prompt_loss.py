@@ -276,7 +276,8 @@ class FrozenCLIPPromptLoss(nn.Module):
         Args:
             images:        (B, 3, H, W)  range [-1, 1]  -- the EDITED image
             attr_abs_idx:  (B,)  absolute CelebA attribute index
-            target_values: (B,)  target attribute probability (detached)
+            target_values: (B,)  the end the edit moves toward; only its side
+                           of 0.5 is read (>= 0.5: has the attribute)
             reduction:     'none' → return (B,) loss tensor
                            'mean' → return scalar
             src_images:    (B, 3, H, W)  range [-1, 1]  -- the SOURCE image.
