@@ -9,9 +9,9 @@ inside the ID range BOTH runs cover:
     AccInd                     add / rm success rate
     side effects (successful)  mean |dP| over the other attributes, successful edits
                                only (leak40 'mean_abs_others_success')
-    penalised side effects     the same mean over only the attributes that
-                               --preserve_all40_weight holds fixed (not the edited
-                               attributes, not the target's PRESERVE40_ALLOW list).
+    penalised side effects     the same mean over only the attributes that should
+                               stay put (not the edited attributes, not the
+                               target's PRESERVE40_ALLOW list in common/attr_tables.py).
                                The all-others mean is dominated by attributes that
                                are SUPPOSED to move (Smiling -> cheekbones, mouth;
                                Male -> beard, makeup), which dilutes the change.
@@ -52,7 +52,7 @@ def load(files):
 
 
 def penalised(per_attr, attr, edited):
-    """Mean |dP| over the attributes preserve_all40 holds fixed for this target."""
+    """Mean |dP| over the attributes that should stay put for this target."""
     tgt = CELEBA.index(attr)
     skip = {CELEBA.index(a) for a in edited} | set(ALLOW.get(tgt, []))
     vals = [per_attr[n]['abs'] for j, n in enumerate(CELEBA) if j not in skip and n in per_attr]
@@ -146,7 +146,7 @@ def main():
           'ID is per attribute, shared by its add and rm halves).\n'
           'add/rm columns: AccInd of each run. side = mean |dP| over the other attributes, '
           'successful edits only; Δ% < 0 means the changed run leaks less.\n'
-          'penal = the same over only the attributes preserve_all40 penalises for that target '
+          'penal = the same over only the attributes that should stay put for that target '
           f'({nb} value and Δ% vs {na}).')
 
 

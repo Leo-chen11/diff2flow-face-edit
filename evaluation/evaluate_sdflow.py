@@ -488,7 +488,7 @@ RUN_CONFIG_KEYS = [
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
     'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
-    'controlnet_region_cond', 'content_bank_path', 'content_film', 'region_saliency_path',
+    'controlnet_region_cond', 'region_saliency_path',
     'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers', 'gate_uniform_attrs',
     # training's caps on the edit (the eval applies them as training did;
     # --no_train_caps turns them off to reproduce numbers from before)
@@ -515,6 +515,10 @@ def apply_run_config(args):
         return args
     with open(cfg_path) as f:
         cfg = json.load(f)
+    if cfg.get('content_bank_path') or cfg.get('content_film'):
+        raise SystemExit(f'{args.checkpoint_dir} was trained with content conditioning '
+                         f'(--content_bank_path), which this code no longer has; evaluate it '
+                         f'with a checkout from before content conditioning was removed.')
     explicit = set()
     for tok in sys.argv[1:]:
         if tok.startswith('--'):
@@ -645,55 +649,6 @@ def _attach_region_parser(args, control_encoder, device):
               f'edits fall back to an all-ones region mask, which training never used.')
         return
     object.__setattr__(control_encoder, 'region_parser', parser)
-
-
-def _attach_content_context(args, control_encoder, device):
-    """--content_bank_path runs (models/content_cond.py): load content_encoder
-    and attach a ContentContext to control_encoder as .content_ctx.
-    edit_single_attribute / edit_multi_attribute read it from there, so every
-    script that edits through them (render_preview, the probes, ...) gets the
-    same content as training with no change of its own.
-
-    Training gave content to Young(39) edits only; nothing changes for other
-    attributes. --disable_content_cond evaluates the same checkpoint with the
-    reference withheld (the ablation that shows what content adds)."""
-    bank_path = getattr(args, 'content_bank_path', None)
-    if not bank_path:
-        return
-    from models.control_encoder import AttributeControlEncoder
-    from models.content_cond import ContentBank, ContentContext, ContentEncoder
-    if not isinstance(control_encoder, AttributeControlEncoder):
-        print('[WARN] content_bank_path set but control_encoder is the legacy '
-              'single-resolution one; content ignored.')
-        return
-    ckpt = _ckpt_path(args.checkpoint_dir, 'content_encoder', args.step)
-    if not os.path.exists(ckpt):
-        print(f'[WARN] run was trained with --content_bank_path but {ckpt} is missing; '
-              f'evaluating WITHOUT content.')
-        return
-    if not os.path.exists(bank_path):
-        raise FileNotFoundError(
-            f'content bank {bank_path} (from config.json) not found. Pass --content_bank_path '
-            f'<path> to point at it, or --disable_content_cond to evaluate without content.')
-    bank = ContentBank(bank_path, device=device)
-    encoder = ContentEncoder(in_dim=bank.dim,
-                             out_dim=control_encoder.content_bias_dim).to(device).eval()
-    _check_load(encoder.load_state_dict(load_network(ckpt), strict=False), 'content_encoder')
-    for p in encoder.parameters():
-        p.requires_grad_(False)
-    male_local = args.attribute_index.index(20) if 20 in args.attribute_index else None
-    enabled = not getattr(args, 'disable_content_cond', False)
-    control_encoder.content_ctx = ContentContext(bank, encoder, male_local, seed=0,
-                                                 enabled=enabled)
-    print(f'Loading content ← {ckpt}  (bank {bank_path}: {bank.summary()})'
-          + ('' if enabled else '  [--disable_content_cond: reference WITHHELD]'))
-
-
-def _content_bias(control_encoder, attr_global_idx, attr_cond, is_rm):
-    ctx = getattr(control_encoder, 'content_ctx', None)
-    if ctx is None:
-        return None
-    return ctx.bias(attr_global_idx, attr_cond, is_rm)
 
 
 def load_models(args):
@@ -910,7 +865,6 @@ def load_models(args):
                 per_direction=getattr(args, 'controlnet_per_direction', False),
                 latent_cond=getattr(args, 'controlnet_latent_cond', False),
                 region_cond=getattr(args, 'controlnet_region_cond', False),
-                content_film=bool(getattr(args, 'content_film', False)),
             ).to(device).eval()
         if _ce_state is not None:
             result = control_encoder.load_state_dict(_ce_state, strict=False)
@@ -924,7 +878,6 @@ def load_models(args):
         for p in control_encoder.parameters():
             p.requires_grad_(False)
         _attach_region_parser(args, control_encoder, device)
-        _attach_content_context(args, control_encoder, device)
 
     # ── StyleGAN2 ─────────────────────────────────────────────────────────
     ckpt = torch.load(args.stygan2_weights, map_location='cpu')
@@ -1328,10 +1281,7 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                         region_mask = region_parser.get_region_mask(
                             src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
             control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
-                                            latent=latent, region_mask=region_mask,
-                                            content_bias=_content_bias(
-                                                control_encoder, attr_global_idx,
-                                                attr_cond, is_rm))
+                                            latent=latent, region_mask=region_mask)
             control_skips = clip_skips(control_skips, controlnet_max_norm)
     elif direction_bank is None:
         new_latents = latent + cap_delta_norm(new_latents_raw - latent, _FINAL_DELTA_MAX_NORM)
@@ -1495,9 +1445,7 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
                         region_mask = face_parser.get_region_mask(
                             src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
             skip = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
-                                   latent=latent, region_mask=region_mask,
-                                   content_bias=_content_bias(
-                                       control_encoder, this_global_idx, attr_cond, is_rm))
+                                   latent=latent, region_mask=region_mask)
             skip = clip_skips(skip, controlnet_max_norm)
             combined_skips = add_skips(combined_skips, skip)
 
@@ -2361,14 +2309,6 @@ def build_parser():
                              "Eyeglasses), which stops ambiguous sources being under-edited "
                              "relative to what training taught. See edited_attr_value(). Compare "
                              "checkpoints under the SAME mode.")
-    parser.add_argument('--content_bank_path', type=str, default=None,
-                        help='Reference bank of a --content_bank_path training run '
-                             '(models/content_cond.py). Auto-restored from config.json; pass it only '
-                             'if the bank has moved.')
-    parser.add_argument('--disable_content_cond', action='store_true',
-                        help='Evaluate a content-trained checkpoint with the reference withheld '
-                             '(content bias = 0). Run once with and once without to see what the '
-                             'content condition itself contributes.')
     parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
                         help='Must match training --controlnet_init_gain. Only sets the log_gain '
                              'init; the trained value comes from the checkpoint. Auto-restored '

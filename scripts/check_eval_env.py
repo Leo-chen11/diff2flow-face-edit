@@ -94,7 +94,7 @@ def check_data(run=None, step=None):
         else:
             cfg = json.load(open(cfg_path))
             line('OK', cfg_path)
-            for key in ('direction_bank_path', 'content_bank_path'):
+            for key in ('direction_bank_path',):
                 v = cfg.get(key)
                 if v:
                     ok &= line('OK' if os.path.exists(os.path.join(PROJECT_ROOT, v)) else 'MISSING',

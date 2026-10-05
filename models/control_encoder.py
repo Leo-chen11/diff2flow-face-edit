@@ -267,12 +267,12 @@ class LegacySingleResControlEncoder(_PerDirectionSlots, nn.Module):
         layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=1))
         return nn.Sequential(*layers)
 
-    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None, content_bias=None):
+    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None):
         """Returns {out_res: (B, C, out_res, out_res)} -- a one-entry dict, so
         callers handle either architecture through the same interface. The
         generator accepts a dict at any number of resolutions, including one.
-        region_mask / content_bias are accepted (callers pass them to either
-        architecture) and ignored: this encoder predates both inputs."""
+        region_mask is accepted (callers pass it to either architecture) and
+        ignored: this encoder predates it."""
         B = attr_delta.size(0)
         device, dtype = attr_delta.device, attr_delta.dtype
         trunk_in = attr_delta
@@ -358,18 +358,8 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
     def __init__(self, num_attrs, out_channels=None, out_res=(64,), seed_res=4,
                  hidden_dim=256, init_gain=1.0, per_direction=False,
                  latent_cond=False, latent_dim=512, channel_multiplier=2,
-                 region_cond=False, content_film=False):
+                 region_cond=False):
         """
-        content_film: let the content vector (models/content_cond.py) modulate
-            EVERY block of the ladder, not just the trunk's first layer: a
-            per-channel scale and shift (FiLM) after the 4x4 seed and after each
-            upsampling stage, so the reference's texture can steer the feature
-            maps right up to the injection taps. The scale/shift parameters are
-            produced by the ContentEncoder (they live in ITS checkpoint), so
-            this module's own parameters and state_dict are identical with the
-            flag on or off. content_bias then has width content_bias_dim
-            instead of hidden_dim. See forward().
-
         out_res: resolution(s) to inject at. An int is accepted for the
             single-resolution behaviour this module started with; a list or
             tuple turns on multi-resolution injection. Each entry must be a
@@ -494,21 +484,6 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
             c_in = c_out
             self.stage_res.append(r)
         self.stages = nn.ModuleList(stages)
-        # FiLM layout for --content_film: the seed feature map, then every
-        # stage output (the taps read the stage outputs, so they see the
-        # modulation). Offsets index into the tail of content_bias.
-        self.content_film = bool(content_film)
-        self.film_channels = [self.seed_channels] + [st[0].out_channels for st in self.stages]
-        self.film_offsets = []
-        _o = 0
-        for _c in self.film_channels:
-            self.film_offsets.append(_o)
-            _o += 2 * _c
-        self.film_dim = _o if self.content_film else 0
-        # Width of the content_bias this module accepts (what ContentEncoder
-        # must output): the trunk bias, plus the FiLM parameters when enabled.
-        self.content_bias_dim = self.fc[0].out_features + self.film_dim
-        self.last_film_stats = {}
         if self.region_cond:
             # Zero-init the region channel's weight slice: at step 0 this
             # input contributes nothing and the stack matches region_cond's
@@ -528,7 +503,7 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         # ── per-slot output conv at each injected resolution ───────────────
         # Slot layout is attr-major when per_direction: slot 2a is attribute
         # a's add direction, 2a+1 its rm direction (same convention as
-        # direction_bank.py / JudgePeakDeclineBalancer / LearnableAttributeScales).
+        # direction_bank.py / LearnableAttributeScales).
         # NOT zero-initialized: the output is L2-normalized in forward(), so a
         # zero conv would divide by zero. Magnitude safety comes from the gain
         # (and --controlnet_max_norm) instead.
@@ -571,16 +546,15 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
         raw = math.log(math.expm1(init_gain))
         self.log_gain = nn.Parameter(torch.full((self.num_slots, len(self.out_res)), raw))
 
-    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None,
-                content_bias=None):
+    def forward(self, attr_delta, attr_idx, is_rm=None, latent=None, region_mask=None):
         """
         attr_delta: (B, num_attrs) -- same tensor passed to AttributeDirectionBank.
         attr_idx:   (B,) long -- which attribute is being edited, per sample.
         is_rm:      (B,) bool -- True where the source already HAS the
                     attribute (this edit removes it). Required when
                     per_direction=True, same convention as
-                    AttributeDirectionBank/JudgePeakDeclineBalancer/
-                    LearnableAttributeScales; ignored otherwise.
+                    AttributeDirectionBank/LearnableAttributeScales;
+                    ignored otherwise.
         latent:     (B, num_layers, latent_dim) source W+ latent. REQUIRED when
                     latent_cond=True -- it is what makes the injected maps
                     depend on THIS face rather than being one fixed pattern
@@ -595,18 +569,6 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
                     omit the tensor -- region_cond changes the conv shape
                     unconditionally, so every sample needs a value here once
                     it is on. Ignored when region_cond=False.
-        content_bias: optional (B, hidden_dim), added to the trunk's first
-                    Linear BEFORE its ReLU -- the CONTENT half of DC-ControlNet
-                    (what the edited region should look like), produced by
-                    models/content_cond.py ContentEncoder. An additive input
-                    to an existing layer, not a wider layer, so this module's
-                    parameters and checkpoints are the same with or without
-                    it. None (or all-zero rows) is exactly the old behaviour.
-                    With content_film=True it is (B, content_bias_dim): the
-                    first hidden_dim columns are that same trunk bias, the rest
-                    are per-block FiLM parameters (gamma then beta per block,
-                    gamma applied as 1 + tanh(gamma)); all-zero is the identity.
-
         Returns: {resolution: (B, C_res, res, res)}, to pass as StyleGAN2
                  Generator's `skips=` argument.
         """
@@ -620,29 +582,9 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
                     'pass latent=<W+ tensor>.')
             w = latent.mean(dim=1).to(device=device, dtype=dtype)   # (B, latent_dim)
             trunk_in = torch.cat([attr_delta, self.latent_proj(w)], dim=1)
-        film = None
-        self.last_film_stats = {}
-        if content_bias is None:
-            hidden = self.fc(trunk_in)
-        else:
-            hid = self.fc[0].out_features
-            if content_bias.size(1) == hid:
-                trunk_bias = content_bias
-            elif self.content_film and content_bias.size(1) == self.content_bias_dim:
-                trunk_bias, film = content_bias[:, :hid], content_bias[:, hid:]
-            else:
-                raise ValueError(
-                    f'content_bias has width {content_bias.size(1)}; this encoder takes '
-                    f'{hid} (trunk bias only)'
-                    + (f' or {self.content_bias_dim} (with FiLM)' if self.content_film else '')
-                    + '. Build the ContentEncoder with out_dim=control_encoder.content_bias_dim.')
-            # self.fc is Sequential(Linear, ReLU); same computation with the
-            # bias added in between.
-            hidden = F.relu(self.fc[0](trunk_in) + trunk_bias.to(dtype=trunk_in.dtype))
+        hidden = self.fc(trunk_in)
         feat = self.seed_proj(hidden).view(
             B, self.seed_channels, self.seed_res, self.seed_res)
-        if film is not None:
-            feat = self._film(feat, film, 0)
 
         attr_idx = attr_idx.view(-1).long()
         slot_idx = self.slot_index(attr_idx, is_rm)
@@ -685,24 +627,9 @@ class AttributeControlEncoder(_PerDirectionSlots, nn.Module):
                                        feat.shape[-2:], mode='bilinear', align_corners=False)
                 feat = torch.cat([feat, r_mask], dim=1)
             feat = stage(feat)
-            if film is not None:
-                feat = self._film(feat, film, i_stage + 1)
             if res in wanted:
                 skips[res] = self._tap(feat, res, slot_idx, gains, B, device, dtype)
         return skips
-
-    def _film(self, feat, film, block):
-        """Per-channel scale and shift of one ladder block from the content
-        vector. gamma goes through tanh so the scale stays in (0, 2) and cannot
-        blow the block up; zeros in, identity out."""
-        c = self.film_channels[block]
-        o = self.film_offsets[block]
-        film = film.to(dtype=feat.dtype)
-        gamma = torch.tanh(film[:, o:o + c]).view(-1, c, 1, 1)
-        beta = film[:, o + c:o + 2 * c].view(-1, c, 1, 1)
-        with torch.no_grad():
-            self.last_film_stats[block] = (gamma.abs().mean().detach(), beta.abs().mean().detach())
-        return feat * (1.0 + gamma) + beta
 
     def _tap(self, feat, res, slot_idx, gains, B, device, dtype):
         """Per-slot output conv at one resolution: split into content + a

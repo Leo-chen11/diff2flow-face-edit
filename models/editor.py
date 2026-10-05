@@ -9,7 +9,6 @@ from common.id_loss import IDLoss
 from models.conditioner import IdentityAttributeConditioner
 from models.direction_bank import AttributeDirectionBank
 from models.flows.flow import cnf
-from models.layer_mask import AttributeLayerMask
 
 
 def _format_ckpt_step(step):
@@ -209,15 +208,6 @@ class SDFlow(object):
         self.flow.eval()
         print(f'Loaded flow from {filename}')
 
-        self.layer_mask = None
-        if self.velocity_field == 'original':
-            self.layer_mask = AttributeLayerMask(num_attrs=len(self.class_indices)).to(self.device)
-            filename = _find_latest_ckpt_optional(ckpt_dir, 'layer_mask', ckpt_step)
-            if filename is not None:
-                self.layer_mask.load_state_dict(torch.load(filename, map_location='cpu'), strict=True)
-                self.layer_mask.eval()
-                print(f'Loaded layer_mask from {filename}')
-
         self.direction_bank = None
         if direction_bank_path is not None:
             _bank_meta = torch.load(direction_bank_path, map_location="cpu")
@@ -305,14 +295,7 @@ class SDFlow(object):
             reverse=True,
         )
         flow_delta = new_styles_raw - inputs
-        if self.velocity_field == 'original' and self.layer_mask is not None:
-            lm = self.layer_mask(
-                attr_idx,
-                attr_cond[:, attr_local_idx],
-                new_attr_cond[:, attr_local_idx],
-            ).unsqueeze(-1)
-            new_styles = inputs + lm * flow_delta
-        elif self.direction_bank is not None:
+        if self.direction_bank is not None:
             attr_delta = new_attr_cond - attr_cond
             guided_delta = self.direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=inputs)
             new_styles = inputs + guided_delta

@@ -9,10 +9,9 @@ By default only flags that differ from the trainer's defaults are printed.
 
 Usage:
     python -m scripts.rebuild_train_cmd \
-        --config ./output/SDFlow/substyle3_glasses_v34_bank_age/config.json \
-        --set run_name=substyle3_glasses_v35_content \
-        --set content_bank_path=./data/content_bank_age.pth \
-        --set content_loss_weight=0.1
+        --config ./output/SDFlow/multi_v1_cont20k_ctrl/config.json \
+        --set run_name=multi_v1_cont20k_next \
+        --set clip_prompt_weight=0
 """
 import argparse
 import ast
