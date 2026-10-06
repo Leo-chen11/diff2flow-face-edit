@@ -2879,9 +2879,6 @@ if __name__ == '__main__':
                 clip_sample_weight[_clip_abs_idx == 20] = args.clip_prompt_gender_weight
                 clip_sample_weight[_clip_abs_idx == 15] = args.clip_prompt_glasses_weight
                 clip_semantic_loss = (clip_sample_weight * clip_loss_each).mean()
-                clip_logs['clip_prompt_age_fraction'] = (_clip_abs_idx == 39).float().mean().detach()
-                clip_logs['clip_prompt_gender_fraction'] = (_clip_abs_idx == 20).float().mean().detach()
-                clip_logs['clip_prompt_glasses_fraction'] = (_clip_abs_idx == 15).float().mean().detach()
 
             if lag_dof_losses is None:
                 lag_orth = _zero.clone()
@@ -3211,9 +3208,6 @@ if __name__ == '__main__':
                 'dir_bank_guided_delta_norm_pre_clip': dir_logs.get('dir_bank_guided_delta_norm_pre_clip', _zero.detach().clone()),
                 'dir_bank_guided_delta_norm': dir_logs.get('dir_bank_guided_delta_norm', _zero.detach().clone()),
                 'dir_bank_residual_scale': dir_logs.get('dir_bank_residual_scale', _zero.detach().clone()),
-                'dir_bank_active_direction_scale': dir_logs.get('dir_bank_active_direction_scale', _zero.detach().clone()),
-                'dir_bank_active_delta_max_norm': dir_logs.get('dir_bank_active_delta_max_norm', _zero.detach().clone()),
-                'dir_bank_global_delta_max_norm': dir_logs.get('dir_bank_global_delta_max_norm', _zero.detach().clone()),
                 'dir_gate_entropy': dir_logs.get('dir_gate_entropy', _zero.detach().clone()),
                 'dir_gate_diversity_loss': dir_gate_diversity_loss,
                 'dir_gate_sharpness_loss': dir_gate_sharpness_loss,
@@ -3228,16 +3222,12 @@ if __name__ == '__main__':
                 'loss_disc_realism':  disc_realism_loss,
                 'dir_disagree_frac':  dir_disagree.mean(),
                 'target_out_of_range_frac': target_out_of_range,
-                'clip_score_mean':     clip_logs.get('clip_score_mean',     latent.new_tensor(0.0)),
-                'clip_score_pos_mean': clip_logs.get('clip_score_pos_mean', latent.new_tensor(0.0)),
-                'clip_score_neg_mean': clip_logs.get('clip_score_neg_mean', latent.new_tensor(0.0)),
-                'clip_directional_cos': clip_logs.get('clip_directional_cos', latent.new_tensor(0.0)),
-                'clip_direction_mean': clip_logs.get('clip_direction_mean', latent.new_tensor(0.0)),
                 'clip_prompt_weight':  torch.tensor(args.clip_prompt_weight),
-                'clip_prompt_age_fraction':    clip_logs.get('clip_prompt_age_fraction',    latent.new_tensor(0.0)),
-                'clip_prompt_gender_fraction': clip_logs.get('clip_prompt_gender_fraction', latent.new_tensor(0.0)),
-                'clip_prompt_glasses_fraction': clip_logs.get('clip_prompt_glasses_fraction', latent.new_tensor(0.0)),
             }
+            # Only what the CLIP loss measured this step: clip_directional_cos in
+            # directional mode, clip_score_* in absolute mode, clip_direction_mean
+            # in both. (They used to be logged as constant 0 in the other mode.)
+            _log_dict.update(clip_logs)
             _log_dict.update(control_band_logs)
             # Sampler check, from the same dataset preds the sampler pools on:
             # with the sampler aligned, sampler_src_high_frac is exactly 0.5

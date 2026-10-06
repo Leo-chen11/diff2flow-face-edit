@@ -727,16 +727,12 @@ class AttributeDirectionBank(nn.Module):
 
         guided_delta_pre_clip = guided_delta
         active_direction_scale = self.direction_scale.to(device=device, dtype=dtype).mean()
-        active_delta_max_norm = torch.zeros([], device=device, dtype=dtype).detach()
-        active_global_delta_max_norm = torch.zeros([], device=device, dtype=dtype).detach()
         if attr_idx is not None:
             attr_idx_long = attr_idx.view(-1).long()
             direction_scale = self.direction_scale.to(device=device, dtype=dtype)
             layer_scale = self.layer_scale.to(device=device, dtype=dtype)
             delta_max_norm = self.delta_max_norm.to(device=device, dtype=dtype)
 
-            active_direction_scale = direction_scale[attr_idx_long].mean()
-            active_delta_max_norm = delta_max_norm[attr_idx_long].mean()
             guided_delta = guided_delta * direction_scale[attr_idx_long].view(B, 1, 1)
             guided_delta = guided_delta * layer_scale[attr_idx_long].view(B, self.num_layers, 1)
 
@@ -758,7 +754,6 @@ class AttributeDirectionBank(nn.Module):
             g_norm = guided_delta.reshape(B, -1).norm(dim=1)
             clip = (self.guided_delta_max_norm / g_norm.clamp(min=1e-8)).clamp(max=1.0)
             guided_delta = guided_delta * clip.view(B, 1, 1)
-            active_global_delta_max_norm = torch.tensor(float(self.guided_delta_max_norm), device=device, dtype=dtype).detach()
 
         # ── Logging ───────────────────────────────────────────────────────
         with torch.no_grad():
@@ -785,9 +780,6 @@ class AttributeDirectionBank(nn.Module):
                 "dir_bank_guided_delta_norm_pre_clip": guided_pre_clip_norm.detach(),
                 "dir_bank_guided_delta_norm": guided_norm.detach(),
                 "dir_bank_residual_scale": scales.detach(),
-                "dir_bank_active_direction_scale": active_direction_scale.detach(),
-                "dir_bank_active_delta_max_norm": active_delta_max_norm.detach(),
-                "dir_bank_global_delta_max_norm": active_global_delta_max_norm.detach(),
             }
             if self.num_k > 1:
                 # Raw current-step entropy, kept for backward compat -- averages
