@@ -229,6 +229,9 @@ def _mechanism_report(args):
             ('  attrs', str(args.disc_realism_attrs or 'all'), None),
         ]
 
+    # A term whose model is not loaded contributes nothing, whatever its weight.
+    dds_on = args.use_diffusion_guidance
+    age_dds_w = args.age_diffusion_weight if args.age_diffusion_weight >= 0 else args.diffusion_guidance_weight
     losses = [
         ('kd', args.kd_loss_weight), ('nll', args.nll_loss_weight),
         ('reg', args.reg_loss_weight), ('id', args.id_loss_weight),
@@ -236,8 +239,9 @@ def _mechanism_report(args):
         ('preserve_attr (x counter_attr)', args.counter_attr_weight * args.preserve_attr_weight),
         ('lag_reg', args.lag_reg_weight),
         ('dir_gate_reg', args.dir_gate_reg_weight),
-        ('diffusion_dds', args.diffusion_guidance_weight),
-        ('age_dds', args.age_diffusion_weight), ('clip_prompt', args.clip_prompt_weight),
+        ('diffusion_dds', args.diffusion_guidance_weight if dds_on else 0),
+        ('age_dds', age_dds_w if dds_on else 0),
+        ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
