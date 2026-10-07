@@ -205,6 +205,9 @@ def _mechanism_report(args):
          None if args.dir_gate_reg_weight > 0 else 'K-slot gate unsupervised'),
         ('  residual_scale', f'{args.direction_residual_scale:g} (learned from here)', None),
         ('velocity_field', args.velocity_field, None),
+        ('train_edit_direction', args.train_edit_direction, None),
+        ('train_src_cond_clamp', 'off' if args.train_src_cond_clamp is None
+         else f'{args.train_src_cond_clamp:g}', None),
     ]
 
     inject = [
@@ -281,14 +284,18 @@ def _mechanism_report(args):
     print('=' * 62 + '\n')
 
 
-def compute_soft_targets(src_vals, attr_local_idx, attribute_index):
-    """attribute_index: the --attribute_index list mapping local -> absolute idx."""
+def compute_soft_targets(src_vals, attr_local_idx, attribute_index, is_rm=None):
+    """attribute_index: the --attribute_index list mapping local -> absolute idx.
+    is_rm: optional (B,) bool, the edit direction (True = remove); default
+    src_vals > 0.5."""
+    if is_rm is None:
+        is_rm = src_vals > 0.5
     targets = torch.empty_like(src_vals)
     for local in torch.unique(attr_local_idx):
         abs_idx = int(attribute_index[int(local.item())])
         low, high = SOFT_TARGET_TABLE.get(abs_idx, DEFAULT_SOFT_TARGET)
         mask = attr_local_idx == local
-        targets[mask] = torch.where(src_vals[mask] > 0.5,
+        targets[mask] = torch.where(is_rm[mask],
                                     torch.full_like(src_vals[mask], low),
                                     torch.full_like(src_vals[mask], high))
     return targets
@@ -1425,6 +1432,24 @@ if __name__ == '__main__':
                              "0.5, logged as dir_disagree_frac) the default asks the output to move "
                              "opposite to the edit the flow was told to make. Identical whenever "
                              "they agree. Default off (old behaviour).")
+    parser.add_argument('--train_edit_direction', default='cond', choices=['cond', 'teacher'],
+                        help="Which way each training edit goes (add vs rm). 'cond' (old "
+                             "behaviour): the conditioner's own reading of the source, so the flow "
+                             "never sees a source condition on the target side of 0.5. 'teacher': "
+                             "the frozen r34 teacher's precomputed reading (--preds_file), the "
+                             "direction the target loss already uses, so the flow is also asked to "
+                             "edit faces the conditioner misreads -- as at eval, where the "
+                             "direction is given (evaluate_sdflow.py --edit_direction indep). Pair "
+                             "with --train_src_cond_clamp.")
+    parser.add_argument('--train_src_cond_clamp', type=float, default=None,
+                        help="Training counterpart of evaluate_sdflow.py --src_cond_clamp: the "
+                             "edited attribute's SOURCE condition is moved to the far side of 0.5 "
+                             "from the edit direction (add -> min(src, 0.5 - M), rm -> max(src, "
+                             "0.5 + M)) before the flow sees it, so a misread source no longer "
+                             "makes the requested change src + s*(end - src) ~ 0. The NLL term is "
+                             "computed on the same moved condition (one flow pass). kd still "
+                             "fits the unmoved reading. Default off. Evaluate a run trained with "
+                             "it using the same --src_cond_clamp.")
     parser.add_argument('--celeba_attr_judge_weights', default=None,
                         help='Optional independent CelebA attribute classifier (the same weights '
                              'evaluate_sdflow.py scores AccCeleb with). Used for LOGGING ONLY -- it '
@@ -2386,7 +2411,6 @@ if __name__ == '__main__':
             
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             id_cond_train = apply_id_condition_dropout(id_cond, args.id_cond_dropout)
-            src_cond = torch.cat([id_cond_train, attr_cond], dim=1)
             kd_loss = F.mse_loss(attr_cond, attributes)
 
             if args.attribute_sampling == 'cycle':
@@ -2402,7 +2426,25 @@ if __name__ == '__main__':
             mid_idx = modify_idx.to(latent.device).view(-1)
             if mid_idx.numel() == 1:
                 mid_idx = mid_idx.expand(args.batch)
+            # Edit direction (True = remove) and the source condition the flow
+            # edits from: see --train_edit_direction / --train_src_cond_clamp.
+            # Off, both reduce to the conditioner's own reading.
+            _cond_src = attr_cond[batch_indices, mid_idx].detach()
+            if args.train_edit_direction == 'teacher':
+                edit_is_rm = attributes[batch_indices, mid_idx] > 0.5
+            else:
+                edit_is_rm = _cond_src > 0.5
+            if args.train_src_cond_clamp is not None:
+                _m = args.train_src_cond_clamp
+                _moved = torch.where(edit_is_rm, _cond_src.clamp(min=0.5 + _m),
+                                     _cond_src.clamp(max=0.5 - _m))
+                # additive, so the conditioner keeps its gradient through this entry
+                _shift = torch.zeros_like(attr_cond)
+                _shift[batch_indices, mid_idx] = _moved - _cond_src
+                attr_cond = attr_cond + _shift
+            src_cond = torch.cat([id_cond_train, attr_cond], dim=1)
             src_attr_flow = attr_cond[batch_indices, mid_idx].detach()
+            cond_clamp_frac = (src_attr_flow != _cond_src).float().mean().detach()
             approx21, delta_log_p2 = prior(latent, src_cond, zero_pad)
 
             # make base distribution standard normal distibution
@@ -2416,7 +2458,8 @@ if __name__ == '__main__':
                 dtype=latent.dtype,
             )
             _s_tgt = train_scale
-            hard_flow_target = compute_soft_targets(src_attr_flow, mid_idx, args.attribute_index)
+            hard_flow_target = compute_soft_targets(src_attr_flow, mid_idx, args.attribute_index,
+                                                    is_rm=edit_is_rm)
             soft_flow_target = src_attr_flow + _s_tgt * (hard_flow_target - src_attr_flow)
             target_out_of_range = ((soft_flow_target < 0) | (soft_flow_target > 1)).float().mean().detach()
             new_attr_cond = attr_cond.detach().clone()
@@ -2510,7 +2553,7 @@ if __name__ == '__main__':
                     # runs when --region_saliency_path is actually set.
                     if region_saliency is not None:
                         with torch.no_grad():
-                            _is_removal_rc = (src_attr_flow > 0.5).detach().cpu().tolist()
+                            _is_removal_rc = edit_is_rm.detach().cpu().tolist()
                             for _b in range(latent.size(0)):
                                 _a = _mid_abs_rc[_b]
                                 if _is_age_rc is not None and bool(_is_age_rc[_b]):
@@ -2535,7 +2578,7 @@ if __name__ == '__main__':
                                     _mask, (args.img_size, args.img_size),
                                     mode='bilinear', align_corners=False)
                 control_skips = control_encoder(attr_delta, mid_idx,
-                                                is_rm=(src_attr_flow > 0.5),
+                                                is_rm=edit_is_rm,
                                                 latent=latent, region_mask=region_mask)
                 # control_skips has no OTHER loss term constraining its
                 # magnitude -- it's only shaped indirectly through downstream
@@ -2646,7 +2689,7 @@ if __name__ == '__main__':
 
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
-                _is_removal = src_attr_flow > 0.5
+                _is_removal = edit_is_rm
                 _is_local = torch.tensor([a in LOCAL_REGION_CLASSES for a in _mid_abs],
                                          device=latent.device)
                 if _is_local.any():
@@ -2800,18 +2843,19 @@ if __name__ == '__main__':
             src_probs = torch.sigmoid(src_logits)[:, attribute_index].detach()
             gen_probs = torch.sigmoid(gen_logits)[:, attribute_index]
             src_attr = src_probs[batch_indices, mid_idx]
-            # The FLOW was told which way to go by the conditioner
-            # (src_attr_flow, above); this loss picks its direction from the
-            # teacher's score on the real photo. Near 0.5 they can disagree,
-            # and then the flow is asked to go one way while this loss pulls
-            # the output the other: contradictory gradient on exactly the
-            # ambiguous samples. dir_disagree_frac measures how often.
-            # --target_direction_from_cond makes the loss follow the flow's
-            # direction (identical whenever the two agree).
-            dir_disagree = ((src_attr > 0.5) != (src_attr_flow > 0.5)).float()
-            if args.target_direction_from_cond:
-                hard_teacher_target = compute_soft_targets(src_attr_flow.detach(), mid_idx,
-                                                           args.attribute_index)
+            # The FLOW was told which way to go by edit_is_rm (above: the
+            # conditioner's reading, or the precomputed teacher reading with
+            # --train_edit_direction teacher); this loss picks its direction
+            # from the teacher's score on the augmented photo. Near 0.5 they
+            # can disagree, and then the flow is asked to go one way while this
+            # loss pulls the output the other: contradictory gradient on exactly
+            # the ambiguous samples. dir_disagree_frac measures how often.
+            # --target_direction_from_cond (or --train_edit_direction teacher)
+            # makes the loss follow the flow's direction.
+            dir_disagree = ((src_attr > 0.5) != edit_is_rm).float()
+            if args.target_direction_from_cond or args.train_edit_direction == 'teacher':
+                hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index,
+                                                           is_rm=edit_is_rm)
             else:
                 hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index)
             soft_target = src_attr + _s_tgt * (hard_teacher_target - src_attr)
@@ -3225,6 +3269,7 @@ if __name__ == '__main__':
                 'loss_hair_extent':   hair_extent_loss,
                 'loss_disc_realism':  disc_realism_loss,
                 'dir_disagree_frac':  dir_disagree.mean(),
+                'cond_clamp_frac':    cond_clamp_frac,
                 'target_out_of_range_frac': target_out_of_range,
                 'clip_prompt_weight':  torch.tensor(args.clip_prompt_weight),
             }
