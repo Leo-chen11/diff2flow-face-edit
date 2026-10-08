@@ -2095,8 +2095,11 @@ def evaluate(args):
                 if not cs:
                     continue
                 arr = np.asarray(cs)
-                hist = '  '.join(f'{sc:g}:{(arr == sc).mean() * 100:.0f}%' for sc in args.adaptive_ladder)
-                print(f'    {attr_name:<12} mean {arr.mean():.2f}  at max {(arr == args.adaptive_ladder[-1]).mean() * 100:4.1f}%   {hist}')
+                # chosen scales come back as float32: 0.7 / 0.85 never compare equal
+                hist = '  '.join(f'{sc:g}:{np.isclose(arr, sc, atol=1e-4).mean() * 100:.0f}%'
+                                 for sc in args.adaptive_ladder)
+                at_max = np.isclose(arr, args.adaptive_ladder[-1], atol=1e-4).mean() * 100
+                print(f'    {attr_name:<12} mean {arr.mean():.2f}  at max {at_max:4.1f}%   {hist}')
                 scale_summary.setdefault(attr_name, {})['chosen_scale'] = _summ(cs)
 
         # Overall (independent judges only, so the headline number is honest)
