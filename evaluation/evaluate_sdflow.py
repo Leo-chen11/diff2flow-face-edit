@@ -939,6 +939,7 @@ def consistent_source(attr_cond, local_idx, direction, margin=None):
 
 _PRESERVE = None            # --preserve_boundaries; set in load_models()
 _FINAL_DELTA_MAX_NORM = None    # training's --final_delta_max_norm; set in load_models()
+_EDIT_GAIN = 1.0            # diagnostic only (scripts/diagnose_attr_edit.py F<k>): W+ edit x k after the cap
 
 
 def train_caps(args):
@@ -978,7 +979,7 @@ def bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent,
     direction_bank._id_cond = id_cond      # read only by a --residual_head
     delta = direction_bank(flow_delta, attr_delta, attr_idx=idx, latent=latent, route_scores=attr_cond)
     delta = delta[0] if isinstance(delta, tuple) else delta
-    delta = cap_delta_norm(delta, _FINAL_DELTA_MAX_NORM)
+    delta = cap_delta_norm(delta, _FINAL_DELTA_MAX_NORM) * _EDIT_GAIN
     return project_preserve(delta, edited_globals)
 
 

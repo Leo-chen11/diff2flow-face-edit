@@ -20,6 +20,11 @@ barely move (R50 dP < 0.05), while "rm" (young -> old) succeeds ~93%.
   fix candidate           E<m> (--clamp_margins): the source condition moved to
                           the far side of 0.5 by m from the requested direction
                           (evaluate_sdflow --src_cond_clamp m); needs no judge.
+  H5 same edit, too short the edit already points where the successful ones
+                          do but is held at the final norm cap, and a larger
+                          scale changes its direction (out-of-range target).
+                          F<k> (--edit_gains): the scale-1.0 W+ edit, after the
+                          cap, multiplied by k -- same direction, k x longer.
   H4 judge threshold      very old sources may need a drastic change before R50
                           says "young", or the face changes but R50 disagrees.
                           Look at the source readings and the montage.
@@ -49,6 +54,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
+
+import evaluation.evaluate_sdflow as ev
 from PIL import Image, ImageDraw
 from torch.utils import data
 from tqdm import tqdm
@@ -89,10 +96,13 @@ def montage(rows, labels, path, size=160):
 def main():
     p = build_parser()
     p.add_argument('--attr', type=int, default=39)
-    p.add_argument('--scales_extra', nargs='+', type=float, default=[1.5, 2.0, 3.0])
+    p.add_argument('--scales_extra', nargs='*', type=float, default=[1.5, 2.0, 3.0])
     p.add_argument('--clamp_margins', nargs='*', type=float, default=[],
                    help='Extra conditions E<m>: the source condition moved to the far side of 0.5 by m '
                         '(evaluate_sdflow --src_cond_clamp m), e.g. 0.2 0.35 0.5.')
+    p.add_argument('--edit_gains', nargs='*', type=float, default=[],
+                   help='Extra conditions F<k>: the scale-1.0 W+ edit (after the final cap) times k, '
+                        'e.g. 1.3 1.6 2.0.')
     p.add_argument('--montage_rows', type=int, default=24)
     p.add_argument('--out_dir', default=None)
     args = p.parse_args()
@@ -116,10 +126,10 @@ def main():
                  controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
                  controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
                  controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64))
-    b2 = 2.0 if 2.0 in args.scales_extra else args.scales_extra[-1]
-    conds = ['A'] + [f'B{s:g}' for s in args.scales_extra] + ['C', "C'", 'D'] + \
-        [f'E{m:g}' for m in args.clamp_margins]
-    keys = ['A', f'B{b2:g}', 'C', "C'", 'D'] + [f'E{m:g}' for m in args.clamp_margins]   # montage columns
+    b2 = (2.0 if 2.0 in args.scales_extra else args.scales_extra[-1]) if args.scales_extra else None
+    extra = [f'E{m:g}' for m in args.clamp_margins] + [f'F{k:g}' for k in args.edit_gains]
+    conds = ['A'] + [f'B{s:g}' for s in args.scales_extra] + ['C', "C'", 'D'] + extra
+    keys = ['A'] + ([f'B{b2:g}'] if b2 is not None else []) + ['C', "C'", 'D'] + extra   # montage columns
 
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root,
@@ -185,6 +195,12 @@ def main():
 
             for m in args.clamp_margins:
                 out[f'E{m:g}'] = run(acond=consistent_source(attr_cond, li, d, margin=m))
+            for k in args.edit_gains:
+                ev._EDIT_GAIN = k
+                try:
+                    out[f'F{k:g}'] = run()
+                finally:
+                    ev._EDIT_GAIN = 1.0
 
             for b in range(B):
                 if not keep[b]:
@@ -271,15 +287,16 @@ def main():
     print('\nA = scale 1.0; B<s> = scale s; C = condition set to the R50 reading (diagnostic: R50 is the '
           'judge); C\' = condition set to the training r34 reading (usable at inference); D = W+ layers '
           '0-17 unlocked; E<m> = source condition moved to the far side of 0.5 by m (--src_cond_clamp m, '
-          'uses only the direction).\n"cond wrong side" = the conditioner reads the source on the target side already '
+          'uses only the direction); F<k> = the scale-1.0 W+ edit times k after the cap (same direction).'
+          '\n"cond wrong side" = the conditioner reads the source on the target side already '
           '(add: > 0.5), so the flow is asked for a small change.\n|resid| = norm of the learned residual in the '
           'scale-1.0 edit (|edit| is the whole W+ edit, after the final cap); edit cos = cosine of the whole '
           f'edit to the mean edit of the successful ones in the same direction; L0-{COARSE - 1} = share of the '
           'edit\'s energy in those W+ layers; res cos = cosine of the residual to the mean residual '
           'of the successful edits in the same direction (low: the residual points elsewhere).')
 
-    labels = ['source', 'A 1.0', f'B {b2:g}', 'C R50', "C' r34", 'D 0-17'] + \
-        [f'E clamp {m:g}' for m in args.clamp_margins]
+    labels = ['source', 'A 1.0'] + ([f'B {b2:g}'] if b2 is not None else []) + ['C R50', "C' r34", 'D 0-17'] + \
+        [f'E clamp {m:g}' for m in args.clamp_margins] + [f'F edit x{k:g}' for k in args.edit_gains]
 
     def rows_for(okv, n):
         out_rows = []
