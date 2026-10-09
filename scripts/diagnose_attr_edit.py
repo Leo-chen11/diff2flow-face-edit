@@ -60,6 +60,7 @@ from evaluation.evaluate_sdflow import (
 from models.dataset import SDFlowDataset
 
 CLEAR_LO, CLEAR_HI = 0.35, 0.65
+COARSE = 6                          # W+ layers 0-5: pose, face shape, glasses frames
 
 
 def to_pil(x, size=160):
@@ -128,6 +129,7 @@ def main():
 
     recs = []                       # one dict per clear source
     res_vecs = {}                   # index in recs -> the learned residual of its scale-1.0 edit
+    edit_vecs = {}                  # index in recs -> the whole W+ edit at scale 1.0
     imgs = {}                       # index in recs -> {cond: image}, kept for montage candidates
     keep_imgs = args.montage_rows * 4
     seen = 0
@@ -191,7 +193,9 @@ def main():
                 rec = {'dir': 'add' if add else 'rm', 'r50': float(r50[b]), 'r34': float(r34[b]),
                        'cond': float(cond[b]), 'attr_delta': float(ad[b]),
                        'edit_norm': float(delta[b].flatten().norm()),
-                       'res_norm': float(res[b].flatten().norm()) if res is not None else float('nan')}
+                       'res_norm': float(res[b].flatten().norm()) if res is not None else float('nan'),
+                       'coarse': float(delta[b, :COARSE].pow(2).sum() / delta[b].pow(2).sum().clamp(min=1e-12))}
+                edit_vecs[len(recs)] = delta[b].flatten().float().cpu()
                 if res is not None:
                     res_vecs[len(recs)] = res[b].flatten().float().cpu()
                 for c, (_, ep, idv) in out.items():
@@ -209,17 +213,18 @@ def main():
     def mean(xs):
         return float(np.mean(xs)) if len(xs) else float('nan')
 
-    # Residual direction check: is a failed edit's learned residual pointing
-    # where the successful edits' residuals point (cos to their mean direction)?
-    for dr in ('add', 'rm'):
-        ok_idx = [i for i, r in enumerate(recs) if r['dir'] == dr and r['ok_A'] and i in res_vecs]
-        ref = torch.stack([res_vecs[i] for i in ok_idx]).mean(0) if ok_idx else None
-        for i, r in enumerate(recs):
-            if r['dir'] != dr:
-                continue
-            v = res_vecs.get(i)
-            r['res_cos'] = (float(F.cosine_similarity(v, ref, dim=0))
-                            if v is not None and ref is not None and float(ref.norm()) > 0 else float('nan'))
+    # Direction check: does a failed edit (its learned residual / the whole W+
+    # edit) point where the successful edits point (cos to their mean direction)?
+    for key, vecs in (('res_cos', res_vecs), ('edit_cos', edit_vecs)):
+        for dr in ('add', 'rm'):
+            ok_idx = [i for i, r in enumerate(recs) if r['dir'] == dr and r['ok_A'] and i in vecs]
+            ref = torch.stack([vecs[i] for i in ok_idx]).mean(0) if ok_idx else None
+            for i, r in enumerate(recs):
+                if r['dir'] != dr:
+                    continue
+                v = vecs.get(i)
+                r[key] = (float(F.cosine_similarity(v, ref, dim=0))
+                          if v is not None and ref is not None and float(ref.norm()) > 0 else float('nan'))
 
     report = {'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'attr': g,
                          'num_faces': seen, 'scales_extra': args.scales_extra}, 'groups': {}, 'rescue': {}}
@@ -227,7 +232,8 @@ def main():
           f'"cond" = the conditioner\'s score the flow edits from.\n')
     print('Baseline (scale 1.0) by direction and outcome:')
     print(f'  {"group":<14} {"n":>4} {"cond":>6} {"cond wrong side":>15} {"R50 src":>8} {"r34 src":>8} '
-          f'{"|attr_delta|":>12} {"|edit|":>7} {"|resid|":>7} {"res cos":>7} {"R50 dP":>7}')
+          f'{"|attr_delta|":>12} {"|edit|":>7} {"edit cos":>8} {f"L0-{COARSE - 1}":>6} {"|resid|":>7} '
+          f'{"res cos":>7} {"R50 dP":>7}')
     for dr in ('add', 'rm'):
         for okv, lab in ((False, 'fail'), (True, 'success')):
             rs = [r for r in recs if r['dir'] == dr and r['ok_A'] == okv]
@@ -238,10 +244,12 @@ def main():
                        r50=mean([r['r50'] for r in rs]), r34=mean([r['r34'] for r in rs]),
                        attr_delta=mean([abs(r['attr_delta']) for r in rs]),
                        edit_norm=mean([r['edit_norm'] for r in rs]), res_norm=mean([r['res_norm'] for r in rs]),
-                       res_cos=mean([r['res_cos'] for r in rs]), dp=mean([r['dp_A'] for r in rs]))
+                       res_cos=mean([r['res_cos'] for r in rs]), edit_cos=mean([r['edit_cos'] for r in rs]),
+                       coarse=mean([r['coarse'] for r in rs]), dp=mean([r['dp_A'] for r in rs]))
             report['groups'][f'{dr}_{lab}'] = row
             print(f'  {dr + " " + lab:<14} {row["n"]:4d} {row["cond"]:6.2f} {row["cond_wrong_side"] * 100:14.0f}% '
                   f'{row["r50"]:8.2f} {row["r34"]:8.2f} {row["attr_delta"]:12.3f} {row["edit_norm"]:7.2f} '
+                  f'{row["edit_cos"]:8.2f} {row["coarse"] * 100:5.0f}% '
                   f'{row["res_norm"]:7.2f} {row["res_cos"]:7.2f} {row["dp"]:+7.2f}')
 
     print('\nInterventions (same faces):')
@@ -265,7 +273,9 @@ def main():
           '0-17 unlocked; E<m> = source condition moved to the far side of 0.5 by m (--src_cond_clamp m, '
           'uses only the direction).\n"cond wrong side" = the conditioner reads the source on the target side already '
           '(add: > 0.5), so the flow is asked for a small change.\n|resid| = norm of the learned residual in the '
-          'scale-1.0 edit (|edit| is the whole W+ edit); res cos = cosine of that residual to the mean residual '
+          'scale-1.0 edit (|edit| is the whole W+ edit, after the final cap); edit cos = cosine of the whole '
+          f'edit to the mean edit of the successful ones in the same direction; L0-{COARSE - 1} = share of the '
+          'edit\'s energy in those W+ layers; res cos = cosine of the residual to the mean residual '
           'of the successful edits in the same direction (low: the residual points elsewhere).')
 
     labels = ['source', 'A 1.0', f'B {b2:g}', 'C R50', "C' r34", 'D 0-17'] + \
