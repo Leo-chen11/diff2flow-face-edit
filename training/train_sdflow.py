@@ -208,6 +208,8 @@ def _mechanism_report(args):
         ('train_edit_direction', args.train_edit_direction, None),
         ('train_src_cond_clamp', 'off' if args.train_src_cond_clamp is None
          else f'{args.train_src_cond_clamp:g}', None),
+        ('soft_target_override', args.soft_target_override or 'off', None),
+        ('coupled_targets', args.coupled_targets or 'off', None),
     ]
 
     inject = [
@@ -240,6 +242,7 @@ def _mechanism_report(args):
         ('reg', args.reg_loss_weight), ('id', args.id_loss_weight),
         ('counter_attr', args.counter_attr_weight),
         ('preserve_attr (x counter_attr)', args.counter_attr_weight * args.preserve_attr_weight),
+        ('coupled_targets', args.coupled_target_weight if args.coupled_targets else 0),
         ('lag_reg', args.lag_reg_weight),
         ('dir_gate_reg', args.dir_gate_reg_weight),
         ('diffusion_dds', args.diffusion_guidance_weight if dds_on else 0),
@@ -282,6 +285,22 @@ def _mechanism_report(args):
                                    'fresh momentum + LR schedule restarts')):
             print(f'   {"  " + label:<{w}} {onoff(flag)}' + ('' if flag else f'   <- {warn}'))
     print('=' * 62 + '\n')
+
+
+def parse_coupled_targets(spec):
+    """'20+:36-,18-;39-:17+' -> {(20, True): [(36, False), (18, False)], (39, False): [(17, True)]}
+    keys: (edited attribute, True = add); values: (coupled attribute, True = push up)."""
+    out = {}
+    for rule in (spec or '').split(';'):
+        rule = rule.strip()
+        if not rule:
+            continue
+        head, tail = rule.split(':')
+        if head[-1] not in '+-':
+            raise ValueError(f'--coupled_targets rule {rule!r}: edited attribute needs + or -')
+        out[(int(head[:-1]), head[-1] == '+')] = [
+            (int(t.strip()[:-1]), t.strip()[-1] == '+') for t in tail.split(',') if t.strip()]
+    return out
 
 
 def compute_soft_targets(src_vals, attr_local_idx, attribute_index, is_rm=None):
@@ -877,6 +896,21 @@ if __name__ == '__main__':
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
+    parser.add_argument('--soft_target_override', default=None,
+                        help="Per-attribute soft-target ends 'attr:low:high[,...]' (absolute "
+                             "CelebA ids), replacing SOFT_TARGET_TABLE's entry for training: low is "
+                             "where a removal edit is pulled, high an addition, for both the flow "
+                             "target and the target loss. E.g. 20:0.05:0.80 pushes male->female "
+                             "edits further (their failures sit where the r34 teacher already "
+                             "reads ~0.8 while the R50 judge reads ~0.98). Default: the table.")
+    parser.add_argument('--coupled_targets', default=None,
+                        help="Attributes an edit must also move: 'A<+|->:B<+|->[,B<+|->...]"
+                             "[;...]' (absolute ids). When attribute A is added (+) or removed (-), "
+                             "each listed B is pushed up (+, r34 prob >= 0.7) or down (-, <= 0.3) by "
+                             "a squared hinge, zero once there. E.g. '20+:36-,18-': female->male "
+                             "edits also drop lipstick and heavy makeup (the failed ones kept "
+                             "them). Weighted by --coupled_target_weight; default off.")
+    parser.add_argument('--coupled_target_weight', type=float, default=0.0)
     parser.add_argument('--teacher_aug', action=argparse.BooleanOptionalAction, default=True,
                         help='Shared-parameter random crop/flip/noise on src+edited images '
                              'before the frozen attribute teacher, to break adversarial '
@@ -1692,6 +1726,11 @@ if __name__ == '__main__':
     parser.add_argument('--id_hinge_threshold', type=float, default=0.8,
                         help='Identity cosine-similarity floor for --id_loss_hinge.')
     args = parser.parse_args()
+    if args.soft_target_override:
+        for _chunk in args.soft_target_override.split(','):
+            _a, _lo, _hi = _chunk.strip().split(':')
+            SOFT_TARGET_TABLE[int(_a)] = (float(_lo), float(_hi))
+    COUPLED_TARGETS = parse_coupled_targets(args.coupled_targets)
     torch.manual_seed(0)
 
     os.environ['WANDB_MODE'] = args.wandb_mode
@@ -2890,6 +2929,23 @@ if __name__ == '__main__':
                 preserve_loss = _zero.clone()
             counter_attr_loss = changed_loss + args.preserve_attr_weight * preserve_loss
 
+            # --coupled_targets: attributes the edit must move along with it.
+            coupled_loss = _zero.clone()
+            if COUPLED_TARGETS and args.coupled_target_weight > 0:
+                _gen_all = torch.sigmoid(gen_logits)
+                _mid_abs_c = torch.tensor([args.attribute_index[int(j)] for j in mid_idx.tolist()],
+                                          device=latent.device)
+                _terms = []
+                for (_a, _add), _targets in COUPLED_TARGETS.items():
+                    _sel = (_mid_abs_c == _a) & (edit_is_rm != _add)
+                    if not _sel.any():
+                        continue
+                    for _b, _up in _targets:
+                        _p = _gen_all[_sel, _b]
+                        _terms.append((F.relu(0.7 - _p) if _up else F.relu(_p - 0.3)).pow(2))
+                if _terms:
+                    coupled_loss = torch.cat(_terms).mean()
+
             # ── Frozen CLIP semantic target loss ──────────────────────
             clip_semantic_loss = _zero.clone()
             clip_logs = {}
@@ -3110,6 +3166,7 @@ if __name__ == '__main__':
                 args.reg_loss_weight * reg_loss +\
                 id_weight * id_loss +\
                 args.counter_attr_weight * counter_attr_loss +\
+                args.coupled_target_weight * coupled_loss +\
                 args.lag_reg_weight * lag_reg_loss +\
                 args.dir_gate_reg_weight * dir_gate_reg_loss +\
                 args.diffusion_guidance_weight * diffusion_loss +\
@@ -3232,6 +3289,7 @@ if __name__ == '__main__':
                 'loss_kd': kd_loss,
                 'loss_nll': log_p2,
                 'loss_target': changed_loss,
+                'loss_coupled': coupled_loss,
                 'loss_leakage': preserve_loss,
                 'loss_reg': reg_loss,
                 'loss_id': id_loss,
