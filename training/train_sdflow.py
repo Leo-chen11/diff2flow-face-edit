@@ -22,6 +22,7 @@ from common.attr_tables import (AGE_TEXTURE_REGION_CLASS, DEFAULT_SOFT_TARGET, S
 from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
+from common.version import code_version
 from common.region_stat_loss import (directional_region_area_loss,
                                      directional_region_saturation_loss,
                                      outside_region_preservation_loss)
@@ -896,6 +897,10 @@ if __name__ == '__main__':
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Seeds torch and the training batch sampler. Rerun one config with '
+                             'another seed to measure run-to-run variation. Default 0 (the '
+                             'previously hard-coded value).')
     parser.add_argument('--soft_target_override', default=None,
                         help="Per-attribute soft-target ends 'attr:low:high[,...]' (absolute "
                              "CelebA ids), replacing SOFT_TARGET_TABLE's entry for training: low is "
@@ -1731,7 +1736,9 @@ if __name__ == '__main__':
             _a, _lo, _hi = _chunk.strip().split(':')
             SOFT_TARGET_TABLE[int(_a)] = (float(_lo), float(_hi))
     COUPLED_TARGETS = parse_coupled_targets(args.coupled_targets)
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
+    args.code_version = code_version()
+    print(f'** code version {args.code_version}, seed {args.seed}')
 
     os.environ['WANDB_MODE'] = args.wandb_mode
 
@@ -1822,7 +1829,7 @@ if __name__ == '__main__':
             steps_per_epoch=len(train_dataset) // args.batch,
             low_threshold=args.score_balance_low,
             high_threshold=args.score_balance_high,
-            seed=0,
+            seed=args.seed,
             align_global_step=args.align_sampler_global_step,
             gender_scores=_gender_scores,
             gender_balance_attrs=_gender_attrs,

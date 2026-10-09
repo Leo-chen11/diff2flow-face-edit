@@ -59,6 +59,7 @@ from common.attr_tables import (AGE_TEXTURE_REGION_CLASS, CELEBA_ALL_ATTRS, DEFA
                                 PRESERVE40_ALLOW, SOFT_TARGET_TABLE, bank_num_k)
 from common.id_loss import IDLoss
 from common.ops import load_network
+from common.version import code_version
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.attribute_estimator import AttributeClassifier
@@ -1660,17 +1661,21 @@ def evaluate(args):
         train=False,
         transform=img_transform,
     )
+    if args.sample_offset:
+        test_dataset = data.Subset(test_dataset, range(args.sample_offset, len(test_dataset)))
     test_loader = data.DataLoader(
         test_dataset, shuffle=False, batch_size=args.batch,
         num_workers=4, drop_last=False,
     )
-    print(f'Test set: {len(test_dataset)} images')
+    print(f'Test set: {len(test_dataset)} images (offset {args.sample_offset}), code version {code_version()}')
 
     all_results = {
         'config': {
             'checkpoint_dir': args.checkpoint_dir,
             'step': args.step,
             'num_samples': args.num_samples,
+            'sample_offset': args.sample_offset,
+            'code_version': code_version(),
             'eval_scales': args.eval_scales,
             'success_margin': args.success_margin,
             'bypass_glasses_direction_bank': args.bypass_glasses_direction_bank,
@@ -2159,7 +2164,8 @@ def evaluate(args):
     # ── Save JSON ──────────────────────────────────────────────────────────
     out_path = args.out_json or os.path.join(
         args.checkpoint_dir,
-        f'eval_v2_step{args.step}_n{args.num_samples}.json',
+        f'eval_v2_step{args.step}_n{args.num_samples}'
+        + (f'_off{args.sample_offset}' if args.sample_offset else '') + '.json',
     )
     # The default name only encodes step and sample count, so a second eval of
     # the same checkpoint (other scales, other --edit_direction) used to
@@ -2478,6 +2484,10 @@ def build_parser():
     # Eval config
     parser.add_argument('--batch',        type=int,   default=4)
     parser.add_argument('--num_samples',  type=int,   default=500)
+    parser.add_argument('--sample_offset', type=int, default=0,
+                        help='Skip the first N test faces. The first 500 (offset 0) are the '
+                             'development set every comparison so far used; --sample_offset 500 '
+                             'gives the next 500, held out for the final report only.')
     parser.add_argument('--leak40', action='store_true',
                         help='Report what ELSE each edit changed: the independent classifier\'s '
                              'signed probability change on all 40 CelebA attributes, per edited '
