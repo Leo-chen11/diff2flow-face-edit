@@ -4,11 +4,11 @@ import os
 
 import torch
 
+from common.attr_tables import bank_num_k
 from common.id_loss import IDLoss
 from models.conditioner import IdentityAttributeConditioner
-from models.direction_bank import AttributeDirectionBank
+from models.direction_bank import AttributeDirectionBank, bank_mix_at
 from models.flows.flow import cnf
-from models.layer_mask import AttributeLayerMask
 
 
 def _format_ckpt_step(step):
@@ -99,14 +99,15 @@ class SDFlow(object):
         # (velocity_field 'original' vs 'lag_dof', gate bias -1.5 vs -0.5),
         # and a mismatch loads garbage weights without an error. Pass
         # use_run_config=False for full manual control.
+        bank_cfg = {}
         if use_run_config:
             cfg_path = _find_run_config(ckpt_dir)
             if cfg_path is not None:
                 with open(cfg_path) as f:
                     cfg = json.load(f)
-                overrides = {
-                    'attribute_index': lambda v: None if v == attr_list else v,
-                }
+                bank_cfg = {k: cfg[k] for k in ('bank_mode', 'bank_mix_start', 'bank_mix_end',
+                                                'bank_anneal_start_step', 'bank_anneal_steps')
+                            if k in cfg}
                 local_vars = {
                     'flow_modules': flow_modules, 'num_blocks': num_blocks,
                     'velocity_field': velocity_field,
@@ -212,19 +213,10 @@ class SDFlow(object):
         self.flow.eval()
         print(f'Loaded flow from {filename}')
 
-        self.layer_mask = None
-        if self.velocity_field == 'original':
-            self.layer_mask = AttributeLayerMask(num_attrs=len(self.class_indices)).to(self.device)
-            filename = _find_latest_ckpt_optional(ckpt_dir, 'layer_mask', ckpt_step)
-            if filename is not None:
-                self.layer_mask.load_state_dict(torch.load(filename, map_location='cpu'), strict=True)
-                self.layer_mask.eval()
-                print(f'Loaded layer_mask from {filename}')
-
         self.direction_bank = None
         if direction_bank_path is not None:
             _bank_meta = torch.load(direction_bank_path, map_location="cpu")
-            _num_k = int(_bank_meta.get("num_k", 1)) if isinstance(_bank_meta, dict) else 1
+            _num_k = bank_num_k(_bank_meta) if isinstance(_bank_meta, dict) else 1
             # No per-attribute direction_scale/layer_scale/delta_max_norm here:
             # every attribute gets the same (default) treatment, and the only
             # magnitude safety net is the shared guided_delta_max_norm below.
@@ -252,10 +244,17 @@ class SDFlow(object):
                 print(f'Loaded direction_bank from {filename}')
             else:
                 print(f'Loaded direction_bank initialization from {direction_bank_path}')
-            # The mode is a buffer restored from the checkpoint above; pass
-            # bank_mode only to evaluate the same weights under another rule.
-            if bank_mode is not None:
-                self.direction_bank.set_mode(bank_mode)
+            # Combination rule as trained (config.json); pass bank_mode only to
+            # run the same weights under another rule. anneal uses the mix the
+            # schedule had at the loaded step.
+            self.direction_bank.set_mode(bank_mode or bank_cfg.get('bank_mode', 'replace'))
+            if self.direction_bank.bank_mode == 'anneal':
+                step = None
+                if filename is not None:
+                    step = int(os.path.basename(filename).rsplit('-', 1)[-1])
+                self.direction_bank.set_mix(bank_mix_at(
+                    step, bank_cfg.get('bank_mix_start', 1.0), bank_cfg.get('bank_mix_end', 0.0),
+                    bank_cfg.get('bank_anneal_start_step', 0), bank_cfg.get('bank_anneal_steps', 20000)))
             print(f'Direction bank mode: {self.direction_bank.bank_mode}')
             self.direction_bank.eval()
 
@@ -296,7 +295,6 @@ class SDFlow(object):
         source_attr = sources[:, self.attr_num]
         targets[:, self.attr_num] = source_attr * (1.0 - strength) + (1.0 - source_attr) * strength
 
-        sources = sources[:, self.class_indices]
         targets = targets[:, self.class_indices]
 
         src_cond, id_cond, attr_cond = self.conditioner.make_condition(images, inputs, self.id_extractor)
@@ -314,14 +312,7 @@ class SDFlow(object):
             reverse=True,
         )
         flow_delta = new_styles_raw - inputs
-        if self.velocity_field == 'original' and self.layer_mask is not None:
-            lm = self.layer_mask(
-                attr_idx,
-                attr_cond[:, attr_local_idx],
-                new_attr_cond[:, attr_local_idx],
-            ).unsqueeze(-1)
-            new_styles = inputs + lm * flow_delta
-        elif self.direction_bank is not None:
+        if self.direction_bank is not None:
             attr_delta = new_attr_cond - attr_cond
             guided_delta = self.direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=inputs)
             new_styles = inputs + guided_delta

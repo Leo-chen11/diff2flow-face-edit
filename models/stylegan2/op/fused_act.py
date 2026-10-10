@@ -2,17 +2,33 @@ import os
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.autograd import Function
 from torch.utils.cpp_extension import load
 
 module_path = os.path.dirname(__file__)
-fused = load(
-    'fused',
-    sources=[
-        os.path.join(module_path, 'fused_bias_act.cpp'),
-        os.path.join(module_path, 'fused_bias_act_kernel.cu'),
-    ],
-)
+# The CUDA kernels are JIT-compiled with nvcc on first import. If that fails
+# (no CUDA toolkit / nvcc, a compiler that does not match the CUDA version, e.g.
+# WSL or a fresh machine) or SDFLOW_NO_CUDA_OPS=1 is set, fall back to the
+# plain-PyTorch implementation below: same maths, a little slower, and float
+# results can differ from the kernels in the last bits, so a number compared
+# across machines should be checked on both. Training needs the double backward
+# the kernels provide only through autograd of the fallback, which also works.
+fused = None
+if os.environ.get('SDFLOW_NO_CUDA_OPS', '') != '1':
+    try:
+        fused = load(
+            'fused',
+            sources=[
+                os.path.join(module_path, 'fused_bias_act.cpp'),
+                os.path.join(module_path, 'fused_bias_act_kernel.cu'),
+            ],
+        )
+    except Exception as _exc:  # noqa: BLE001
+        print('[stylegan2.op] fused_bias_act CUDA kernel did not build '
+              f'({type(_exc).__name__}); using the pure-PyTorch fallback.')
+else:
+    print('[stylegan2.op] SDFLOW_NO_CUDA_OPS=1: using the pure-PyTorch fused_leaky_relu.')
 
 
 class FusedLeakyReLUFunctionBackward(Function):
@@ -82,4 +98,8 @@ class FusedLeakyReLU(nn.Module):
 
 
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
+    if fused is None:
+        rest = [1] * (input.ndim - bias.ndim - 1)
+        return F.leaky_relu(input + bias.view(1, bias.shape[0], *rest),
+                            negative_slope=negative_slope) * scale
     return FusedLeakyReLUFunction.apply(input, bias, negative_slope, scale)

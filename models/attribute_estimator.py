@@ -66,12 +66,6 @@ class AttributeClassifier(nn.Module):
         preds = (torch.sigmoid(outs) > 0.5).float()
         return outs, preds
 
-    def forward_age(self, x):
-        outs = self.age_heads(x)
-        preds = (torch.sigmoid(outs) > 0.5).float().sum(dim=1)
-        return outs, preds
-    
-
 class AttributeEstimator(nn.Module):
     def __init__(self, backbone='resnet34',attribute_dim=40):
         super(AttributeEstimator, self).__init__()

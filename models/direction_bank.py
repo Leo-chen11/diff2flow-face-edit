@@ -1,6 +1,10 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from common.attr_tables import bank_num_k
 
 
 def _inverse_softplus(x):
@@ -8,11 +12,44 @@ def _inverse_softplus(x):
     return torch.log(torch.expm1(x))
 
 
+def parse_attr_spec(spec, kind=float):
+    """'39:0.05,20:0.1' -> {39: 0.05, 20: 0.1} (CelebA attribute ids).
+    kind='range': '39:0-10' -> {39: (0, 10)} (inclusive W+ layer range).
+    None / '' -> {}. Shared by train_sdflow.py and evaluate_sdflow.py so the
+    two parse run-config values identically."""
+    out = {}
+    if not spec:
+        return out
+    if isinstance(spec, (list, tuple)):
+        spec = ','.join(str(x) for x in spec)
+    for part in str(spec).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        attr, val = part.split(':', 1)
+        if kind == 'range':
+            lo, hi = val.split('-')
+            out[int(attr)] = (int(lo), int(hi))
+        else:
+            out[int(attr)] = kind(val)
+    return out
+
+
 # How the bank combines with the flow's own delta (see AttributeDirectionBank).
-# Stored as an int buffer so every checkpoint carries its mode and editor /
-# evaluation scripts reproduce it without extra flags; checkpoints saved before
-# this existed load as 'replace', the original behavior.
+# Plain attributes, not state_dict entries (same convention as the residual
+# cap / dir-layer mask): train_sdflow.py and evaluate_sdflow.py re-apply them
+# from the run config, and runs without --bank_mode behave as 'replace'.
 BANK_MODES = ('replace', 'anneal', 'prior', 'flow_magnitude')
+
+
+def bank_mix_at(step, mix_start=1.0, mix_end=0.0, start_step=0, anneal_steps=20000):
+    """Bank weight of --bank_mode anneal at a training step: linear from
+    mix_start (at start_step) to mix_end (anneal_steps later). Shared by
+    training and eval so a checkpoint is evaluated with the mix it had."""
+    if step is None or anneal_steps <= 0:
+        return float(mix_end)
+    frac = min(max((step - start_step) / float(anneal_steps), 0.0), 1.0)
+    return float(mix_start + frac * (mix_end - mix_start))
 
 
 class AttributeDirectionBank(nn.Module):
@@ -26,18 +63,18 @@ class AttributeDirectionBank(nn.Module):
     Old bank files (direction_units.ndim==3) are loaded automatically as K=1.
 
     bank_mode decides who actually produces the edit:
-      replace        guided = bank_dir_delta + rs * residual (original). The
-                     flow only contributes the small orthogonal residual.
+      replace        guided = dir_delta + residual term (original). The flow
+                     only contributes the small residual outside the bank span.
       anneal         guided = mix * replace_output + (1 - mix) * flow_delta.
-                     mix is a buffer the trainer lowers over time (curriculum:
-                     start identical to 'replace', end as the pure flow).
+                     The trainer lowers mix over time (bank_mix_at): start
+                     identical to 'replace', end as the pure flow.
       prior          guided = flow_delta. The bank never touches the output;
-                     its prediction is only a training target via prior_loss().
+                     its prediction is only a training target (prior_loss).
       flow_magnitude guided = flow_delta's own projection onto the EDITED
-                     attribute's directions + rs * residual. The bank fixes the
-                     axes, the flow decides how far along them each sample and
-                     layer moves; components along other attributes' axes are
-                     dropped.
+                     attribute's directions + residual term. The bank fixes
+                     the axes, the flow decides how far each sample and layer
+                     moves along them; components along other attributes'
+                     axes are dropped.
     """
 
     def __init__(
@@ -59,6 +96,8 @@ class AttributeDirectionBank(nn.Module):
         use_attr_lora=False,
         attr_lora_rank=4,
         signed_magnitude_input=False,
+        magnitude_latent_cond=False,
+        gate_usage_ema_decay=0.98,
         bank_mode="replace",
         bank_mix=1.0,
     ):
@@ -71,8 +110,24 @@ class AttributeDirectionBank(nn.Module):
         direction_units = torch.zeros(self.num_attrs, self.num_k, self.num_layers, self.latent_dim)
         layer_norms = torch.ones(self.num_attrs, self.num_k, self.num_layers)
 
+        # Bank-file metadata, kept for enable_strata_routing(): which slots
+        # hold which stratum is only knowable from how the bank was built
+        # (precompute_directions_stratified.py saves age_k / stratification).
+        self.bank_meta = {}
+        # {local attr: (gender_local, glasses_local, slots_per_stratum)} --
+        # see enable_strata_routing(). Plain attribute, not state: it is
+        # re-applied from the run config at train and eval time.
+        self._strata_routing = {}
+        self._warned_no_route_scores = False
+
         if bank_path is not None:
             bank = torch.load(bank_path, map_location="cpu")
+            self.bank_meta = {
+                "num_k": bank_num_k(bank),
+                "age_k": bank.get("age_k"),
+                "stratification": bank.get("stratification", {}),
+                "attribute_index": [int(x) for x in bank.get("attribute_index", [])],
+            }
             du = bank["direction_units"].float()
             ln = bank["layer_norms"].float()
 
@@ -136,6 +191,17 @@ class AttributeDirectionBank(nn.Module):
             prior_norms = layer_norms.mean(dim=1).clamp(min=1e-4)   # (num_attrs, 18)
             self.magnitude_net[-1].bias.copy_(_inverse_softplus(prior_norms.reshape(-1)))
             self.magnitude_net[-1].weight.mul_(0.01)
+        # Plain attribute, not a buffer (a new state_dict key would break
+        # strict eval loads of older checkpoints): the bank's own per-layer
+        # magnitude prior, for reset_magnitude().
+        self._prior_norms = prior_norms.detach().clone()
+        # {local attr: max residual_scale} and {local attr: (18,) 0/1 mask on
+        # the DIRECTION edit}; see set_residual_cap / set_dir_layers. Plain
+        # attributes re-applied from the run config at train and eval time.
+        self._residual_cap = {}
+        self._dir_layer_mask = {}
+        # Local attrs whose gate is forced uniform (see set_uniform_gate).
+        self._uniform_gate = set()
 
         # Optional per-attribute LoRA-style adapter on top of magnitude_net's
         # shared hidden representation. magnitude_net is ONE MLP shared across
@@ -173,6 +239,44 @@ class AttributeDirectionBank(nn.Module):
             self.attr_lora_B = nn.Parameter(torch.zeros(self.num_attrs, self.num_layers, rank))
             print(f"[DirectionBank] per-attribute LoRA adapter enabled (rank={rank})")
 
+        # Per-face magnitude conditioning. Without this, magnitude_net's ONLY
+        # input is attr_delta -- so every face gets the identical step size for
+        # a given (attribute, direction), and the whole dir_delta path is
+        # face-independent by construction. The only per-face term left is the
+        # K-slot gate, which measurably collapses to a constant (see the
+        # gate_usage_ema comment below: entropy pinned at log(K) with ~1e-7
+        # variance for 40k steps).
+        #
+        # A residual-ablation scale sweep is what makes this load-bearing: with
+        # the flow residual forced to 0, a single GLOBAL scale from 0.90 to 1.20
+        # recovers five of six add/rm directions back to (Male add: past) the
+        # full model's accuracy. So magnitude, not direction, is the binding
+        # constraint -- and a global scale is the wrong instrument for it,
+        # because it overshoots the easy faces (spending identity for accuracy
+        # already won) while still undershooting the hard ones. That trades
+        # along the Acc/ID frontier instead of moving it. Conditioning the
+        # magnitude on the source face is what lets the two move together.
+        #
+        # Added into magnitude_net's hidden pre-activation rather than
+        # concatenated onto its input, so magnitude_net[0] keeps its shape and
+        # existing checkpoints still load. LayerNorm first because w's large DC
+        # component (the StyleGAN W mean) would otherwise dominate the signal
+        # and make this learn a constant offset instead of a per-face one. The
+        # projection is zero-initialized, so this is a strict no-op until
+        # trained -- same convention as attr_lora_B above and the ControlNet
+        # injection heads.
+        self.magnitude_latent_cond = bool(magnitude_latent_cond)
+        if self.magnitude_latent_cond:
+            hidden_dim = self.magnitude_net[0].out_features   # 64
+            self.mag_w_cond = nn.Sequential(
+                nn.LayerNorm(self.latent_dim),
+                nn.Linear(self.latent_dim, hidden_dim),
+            )
+            with torch.no_grad():
+                self.mag_w_cond[-1].weight.zero_()
+                self.mag_w_cond[-1].bias.zero_()
+            print("[DirectionBank] per-face magnitude conditioning enabled")
+
         # gate_net: learns per-sample mixture weights over K directions (only when K>1)
         if self.num_k > 1:
             self.gate_net = nn.Sequential(
@@ -186,6 +290,36 @@ class AttributeDirectionBank(nn.Module):
                 self.gate_net[-1].bias.zero_()
         else:
             self.gate_net = None
+
+        # gate_usage_ema: (num_attrs, num_k) running average of how much each
+        # K-slot actually gets used, per attribute -- feeds both gate_load_balance_loss()
+        # and the per-attribute entropy wandb logs. WHY AN EMA INSTEAD OF THE RAW
+        # PER-STEP BATCH MEAN: nothing in this project's loss previously supervised
+        # gate_net's routing AT ALL -- it only ever got gradient indirectly through
+        # the final guided_delta, with no signal rewarding correct (demographic-
+        # appropriate) OR even diverse routing. Measured on a real trained checkpoint
+        # (eyeglasses, K=12 from --K 4 x --substyle_k 3): the gate collapsed within
+        # the first few thousand steps onto ~2 of the 12 slots for 81% of samples,
+        # regardless of the source face's actual gender/age -- including almost NEVER
+        # routing female_young samples to the female_young-conditioned slots that
+        # --extreme_min_conf specifically cleaned up, which is why that direction-bank
+        # fix alone did not move the eyeglasses-add failure rate. A single training
+        # step's batch (e.g. --batch 4) spread over K=12 slots is far too noisy to
+        # regularize directly -- an EMA smooths that out across many steps, matching
+        # the pattern this project already uses for --balance_ema_decay.
+        # persistent=False: this is a training-time running stat, not part of the
+        # frozen/learned state a checkpoint needs to reproduce inference -- excluding
+        # it from state_dict avoids key-mismatch noise when eval scripts load_state_dict
+        # with strict=False anyway.
+        if self.num_k > 1:
+            self.register_buffer(
+                "gate_usage_ema",
+                torch.full((self.num_attrs, self.num_k), 1.0 / self.num_k),
+                persistent=False,
+            )
+        else:
+            self.gate_usage_ema = None
+        self.gate_usage_ema_decay = float(gate_usage_ema_decay)
 
         # residual_scale: (num_attrs,) — learned, not hand-tuned. per_attr_residual_scale
         # (or the scalar residual_scale) only sets the *initial* value; gradient descent
@@ -204,6 +338,26 @@ class AttributeDirectionBank(nn.Module):
             scales = torch.full((self.num_attrs,), float(residual_scale))
         self.residual_scale_raw = nn.Parameter(_inverse_softplus(scales))   # (num_attrs,)
         self.residual_max_norm = float(residual_max_norm) if residual_max_norm is not None else None
+        # Analysis hooks (scripts/analyze_residual.py, evaluate_sdflow.py
+        # --residual_basis); neither changes the edit unless set.
+        #   residual_basis: {local attr idx: (k, num_layers*latent_dim) orthonormal
+        #     rows}; that attribute's residual is replaced by its projection onto
+        #     the rows (k=0 -> no residual).
+        #   _last_residual: the residual actually added by the last forward
+        #     (after the norm clip and the residual scale), detached.
+        self.residual_basis = {}
+        #   residual_fixed: {local attr idx: (vec (num_layers*latent_dim), ref)};
+        #     that attribute's residual term becomes attr_delta / ref * vec, i.e.
+        #     one fixed direction scaled by the requested edit (ref = the mean
+        #     |attr_delta| vec was measured at) -- the flow's output is unused.
+        self.residual_fixed = {}
+        #   residual_head: {local attr idx: models.residual_head.ResidualHead};
+        #     that attribute's residual term is predicted from the latent, the
+        #     attribute change, route_scores and _id_cond (set by the caller)
+        #     instead of taken from the flow.
+        self.residual_head = {}
+        self._id_cond = None
+        self._last_residual = None
 
         # Optional safety controls applied to the final guided delta. These are
         # especially useful for Age/Young, whose dataset-level direction can
@@ -250,62 +404,204 @@ class AttributeDirectionBank(nn.Module):
         self.guided_delta_max_norm = (
             float(guided_delta_max_norm) if guided_delta_max_norm is not None else None
         )
-        self.register_buffer("bank_mode_id", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("bank_mix", torch.tensor(1.0))
         self.set_mode(bank_mode)
         self.set_mix(bank_mix)
-
+        self._last_dir_delta = None   # bank's own prediction, target of prior_loss()
         self.last_logs = {}
-        self._last_dir_delta = None   # bank's own prediction, target for prior_loss()
         self._last_alpha = None   # (B, num_attrs, K) — set each forward, used for selection loss
-
-    @property
-    def bank_mode(self):
-        return BANK_MODES[int(self.bank_mode_id)]
 
     def set_mode(self, mode):
         if mode not in BANK_MODES:
             raise ValueError(f"bank_mode must be one of {BANK_MODES}, got {mode!r}")
-        self.bank_mode_id.fill_(BANK_MODES.index(mode))
+        self.bank_mode = mode
 
     def set_mix(self, value):
-        self.bank_mix.fill_(float(min(max(value, 0.0), 1.0)))
+        self.bank_mix = float(min(max(value, 0.0), 1.0))
 
     def prior_loss(self, flow_delta, margin=0.5):
         """Hinge on cos(flow_delta, bank prediction) over the flattened W+ delta.
 
-        The bank's prediction is detached: it is a dataset-level teacher, so the
-        flow is pulled toward it but stays free to deviate per sample as long as
+        The bank's prediction is detached: it is a dataset-level teacher, so
+        the flow is pulled toward it but stays free to deviate per sample once
         the cosine clears `margin`. Flattening across layers also carries the
         bank's per-layer magnitudes, so energy in layers the bank leaves alone
-        lowers the cosine.
+        lowers the cosine. Call after forward() in the same step.
         """
         if self._last_dir_delta is None:
             return flow_delta.new_zeros([])
         B = flow_delta.size(0)
         target = self._last_dir_delta.detach().reshape(B, -1)
-        cos = F.cosine_similarity(flow_delta.reshape(B, -1), target, dim=1, eps=1e-8)
-        # Samples with no requested edit have a zero target; skip them.
-        valid = target.norm(dim=1) > 1e-8
+        valid = target.norm(dim=1) > 1e-8     # no requested edit -> no target
         if not valid.any():
             return flow_delta.new_zeros([])
+        cos = F.cosine_similarity(flow_delta.reshape(B, -1), target, dim=1, eps=1e-8)
         return F.relu(margin - cos[valid]).mean()
 
-    def current_residual_scale(self):
-        """(num_attrs,) learned residual_scale values, always positive."""
-        return F.softplus(self.residual_scale_raw)
+    def _project_residual(self, residual, attr_idx):
+        """Replace each sample's residual by its projection onto the basis
+        set for its attribute in self.residual_basis (others unchanged)."""
+        B = residual.size(0)
+        flat = residual.reshape(B, -1)
+        out = flat.clone()
+        for a, basis in self.residual_basis.items():
+            m = attr_idx == int(a)
+            if not m.any():
+                continue
+            if basis is None or basis.numel() == 0:
+                out[m] = 0.0
+                continue
+            Bm = basis.to(device=flat.device, dtype=flat.dtype)             # (k, L*D)
+            out[m] = (flat[m] @ Bm.t()) @ Bm
+        return out.view_as(residual)
 
-    def _gate_weights(self, latent, B, device, dtype):
-        """Return (B, num_attrs, K) softmax mixture weights."""
+    def current_residual_scale(self):
+        """(num_attrs,) learned residual_scale values, always positive, capped
+        per attribute by set_residual_cap()."""
+        s = F.softplus(self.residual_scale_raw)
+        if self._residual_cap:
+            cap = torch.full_like(s, float('inf'))
+            for a, c in self._residual_cap.items():
+                cap[a] = float(c)
+            s = torch.minimum(s, cap)
+        return s
+
+    def set_residual_cap(self, attr_local_idx, cap):
+        """Upper bound on one attribute's residual_scale. The residual is the
+        part of the flow's edit OUTSIDE every bank direction. An eval ablation
+        (--override_residual_scale 0) showed the trained age edit lives almost
+        entirely there: with it removed, Young stopped changing at all. The
+        real-data age directions, which look right when applied raw, were
+        barely used. Capping the residual forces the age edit back onto them."""
+        self._residual_cap[int(attr_local_idx)] = float(cap)
+
+    def set_dir_layers(self, attr_local_idx, lo, hi):
+        """Restrict one attribute's DIRECTION edit to W+ layers lo..hi
+        (inclusive). The residual is not masked (cap it separately)."""
+        m = torch.zeros(self.num_layers)
+        m[int(lo):int(hi) + 1] = 1.0
+        self._dir_layer_mask[int(attr_local_idx)] = m
+
+    def reset_magnitude(self, attr_local_idx):
+        """Put one attribute's per-layer magnitude back to the bank prior
+        (the dataset's old-vs-young displacement per layer), as at a fresh
+        init. Needed after resuming a checkpoint whose training shrank this
+        attribute's magnitude toward 0: magnitudes go through softplus, whose
+        slope is sigmoid(logit), so a very negative logit has almost no
+        gradient left to grow back even once the residual is capped."""
+        a = int(attr_local_idx)
+        L = self.num_layers
+        lin = self.magnitude_net[-1]
+        with torch.no_grad():
+            before = F.softplus(lin.bias[a * L:(a + 1) * L]).mean().item()
+            prior = self._prior_norms[a].to(lin.bias.device, lin.bias.dtype)
+            lin.bias[a * L:(a + 1) * L].copy_(_inverse_softplus(prior))
+            lin.weight[a * L:(a + 1) * L].mul_(0.01)
+            if self.use_attr_lora:
+                self.attr_lora_B[a].zero_()
+        return before, prior.mean().item()
+
+    def _gate_weights(self, latent, B, device, dtype, slot_mask=None):
+        """Return (B, num_attrs, K) softmax mixture weights.
+
+        slot_mask: optional (B, num_attrs, K) bool, True = slot allowed. The
+        softmax runs over allowed slots only (see enable_strata_routing)."""
         if self.num_k == 1:
             return self.direction_units.new_ones(B, self.num_attrs, 1)
         if latent is not None and self.gate_net is not None:
             w = latent.mean(dim=1).to(device=device, dtype=dtype)        # (B, 512)
-            logits = self.gate_net(w)                                      # (B, A*K)
-            return F.softmax(logits.view(B, self.num_attrs, self.num_k), dim=-1)
-        return self.direction_units.new_ones(B, self.num_attrs, self.num_k) / self.num_k
+            logits = self.gate_net(w).view(B, self.num_attrs, self.num_k)  # (B, A, K)
+        else:
+            logits = torch.zeros(B, self.num_attrs, self.num_k, device=device, dtype=dtype)
+        if self._uniform_gate:
+            uni = torch.zeros(self.num_attrs, dtype=torch.bool, device=device)
+            uni[list(self._uniform_gate)] = True
+            logits = torch.where(uni.view(1, -1, 1), torch.zeros_like(logits), logits)
+        if slot_mask is not None:
+            logits = logits.masked_fill(~slot_mask, float('-inf'))
+        return F.softmax(logits, dim=-1)
 
-    def forward(self, flow_delta, attr_delta, attr_idx=None, latent=None):
+    def set_uniform_gate(self, attr_local_idx):
+        """Average this attribute's slots with equal weight instead of letting
+        gate_net pick. Combined with strata routing: uniform over the source's
+        own stratum's slots.
+
+        Why: the gate's sharpness loss drives each face to ONE sub-style slot
+        (dir_gate_sharpness_loss ~0.09 of max in v30). A single k-means
+        sub-cluster direction carries that sub-population's quirks (hair
+        style, pose, lighting) on top of aging -- they cost identity without
+        making the face look older. The age trade-off sweep
+        (scripts/probe_age_tradeoff.py) measured AVERAGED directions, and v34
+        (one slot per face) landed ~8-10 AccCLIP points below that curve at
+        matched ID."""
+        self._uniform_gate.add(int(attr_local_idx))
+
+    # Stratum label order written by precompute_directions_stratified.py for
+    # age(39) when --age_k > 1 (confident_strata_masks' hi/lo order on
+    # gender x glasses). Each stratum owns age_k/4 consecutive slots
+    # (--substyle_k sub-clusters).
+    AGE_STRATA = ("male_glasses", "male_noglasses", "female_glasses", "female_noglasses")
+
+    def enable_strata_routing(self, attr_local_idx, gender_local_idx, glasses_local_idx):
+        """Route age(39) edits by the SOURCE's stratum instead of letting the
+        gate choose freely among all K slots.
+
+        The bank's age slots were each fit on one gender x glasses stratum,
+        but nothing in training ties the gate's choice to that label: its two
+        losses (sharpness, load balance) are satisfied by ANY split of faces
+        into K groups -- pose, lighting, hair colour. A male face routed to a
+        female slot gets a female aging direction in full. With routing on,
+        the gate can only pick among the (age_k/4) sub-style slots of the
+        source's own stratum, read from the conditioner's Male / Eyeglasses
+        scores (route_scores in forward()); it still learns which sub-style.
+
+        Refuses a bank whose age slots are one tiled direction (--age_k 1):
+        every slot is the same gender-averaged vector there, so there is
+        nothing to route to. Rebuild with --age_k 4 first."""
+        strat = self.bank_meta.get("stratification", {})
+        labels = strat.get(39) or strat.get("39")
+        age_k = self.bank_meta.get("age_k")
+        if not labels or list(labels[:4]) != list(self.AGE_STRATA):
+            raise ValueError(
+                "age strata routing needs a bank built with --age_k 4 (or more): this bank's "
+                f"age stratification is {labels[:2] if labels else None}... (age_k={age_k}), "
+                "i.e. one gender-averaged direction tiled into every slot. Rebuild it with "
+                "scripts/precompute_directions_stratified.py --age_k 4 [--substyle_k 3].")
+        if self.bank_meta.get("num_k") != self.num_k:
+            raise ValueError(f"bank K={self.bank_meta.get('num_k')} was tiled/truncated to "
+                             f"K={self.num_k}; slot->stratum mapping would be wrong.")
+        age_k = int(age_k)
+        if age_k % 4 != 0:
+            raise ValueError(f"age_k={age_k} is not a multiple of the 4 strata.")
+        per = age_k // 4
+        self._strata_routing[int(attr_local_idx)] = (int(gender_local_idx),
+                                                     int(glasses_local_idx), per)
+        return per
+
+    def _routing_mask(self, route_scores, B, device):
+        """(B, A, K) bool slot mask for routed attributes, or None."""
+        if not self._strata_routing:
+            return None
+        if route_scores is None:
+            if not self._warned_no_route_scores:
+                print("[DirectionBank] strata routing is on but this caller passed no "
+                      "route_scores; falling back to the free gate for this call site.")
+                self._warned_no_route_scores = True
+            return None
+        mask = torch.ones(B, self.num_attrs, self.num_k, dtype=torch.bool, device=device)
+        slots = torch.arange(self.num_k, device=device)
+        for a, (g_i, gl_i, per) in self._strata_routing.items():
+            male = route_scores[:, g_i].to(device) >= 0.5
+            glasses = route_scores[:, gl_i].to(device) >= 0.5
+            # AGE_STRATA order: male_glasses=0, male_noglasses=1,
+            # female_glasses=2, female_noglasses=3
+            stratum = (1 - male.long()) * 2 + (1 - glasses.long())             # (B,)
+            lo = (stratum * per).view(B, 1)
+            mask[:, a, :] = (slots.view(1, -1) >= lo) & (slots.view(1, -1) < lo + per)
+        return mask
+
+    def forward(self, flow_delta, attr_delta, attr_idx=None, latent=None, route_scores=None):
+        """route_scores: optional (B, num_attrs) conditioner attribute scores
+        (local order). Only read when enable_strata_routing() is on."""
         B = flow_delta.size(0)
         device = flow_delta.device
         dtype = flow_delta.dtype
@@ -317,7 +613,13 @@ class AttributeDirectionBank(nn.Module):
         # forces them equal. The sign of the edit still comes from attr_delta
         # below either way, so this only affects how far each side travels.
         mag_input = attr_delta if self.signed_magnitude_input else attr_delta.abs()
-        mag_hidden = torch.tanh(self.magnitude_net[0](mag_input))          # (B, 64)
+        mag_pre = self.magnitude_net[0](mag_input)                         # (B, 64)
+        if self.magnitude_latent_cond and latent is not None:
+            # Same pooling as _gate_weights, so both per-face paths read the
+            # source latent identically.
+            w_pooled = latent.mean(dim=1).to(device=device, dtype=dtype)   # (B, 512)
+            mag_pre = mag_pre + self.mag_w_cond(w_pooled)
+        mag_hidden = torch.tanh(mag_pre)                                   # (B, 64)
         mag_logits = self.magnitude_net[2](mag_hidden)                     # (B, A*L)
         mag_logits = mag_logits.view(B, self.num_attrs, self.num_layers)
 
@@ -340,10 +642,86 @@ class AttributeDirectionBank(nn.Module):
             magnitudes = magnitudes * mask.unsqueeze(-1)
 
         signed_magnitudes = magnitudes * attr_delta.unsqueeze(-1)    # (B, A, 18)
+        if self._dir_layer_mask:
+            lm = torch.ones(self.num_attrs, self.num_layers, device=device, dtype=dtype)
+            for a, m in self._dir_layer_mask.items():
+                lm[a] = m.to(device=device, dtype=dtype)
+            signed_magnitudes = signed_magnitudes * lm.unsqueeze(0)
 
         # ── Gate mixture ──────────────────────────────────────────────────
-        alpha = self._gate_weights(latent, B, device, dtype)          # (B, A, K)
+        alpha = self._gate_weights(latent, B, device, dtype,
+                                   slot_mask=self._routing_mask(route_scores, B, device))  # (B, A, K)
         self._last_alpha = alpha                                        # expose for selection loss
+
+        # Update the per-attribute gate usage EMA from THIS batch's active
+        # attribute(s) only -- alpha for an attribute other than the one(s)
+        # actually being edited this step never receives gradient (its
+        # signed_magnitudes are masked to exactly 0 below, see forward()'s
+        # docstring on gate_usage_ema), so folding it into the EMA would
+        # just average in untrained noise.
+        #
+        # gate_usage_ema itself is updated under no_grad -- it is a plain
+        # buffer (requires_grad=False), used ONLY for the dir_gate_entropy_per_attr
+        # LOG (a smoothed, low-variance number to look at, not a value gradients
+        # ever need to flow through). self._last_gate_diversity_loss below is a
+        # SEPARATE, genuinely differentiable quantity computed from this same
+        # step's live `alpha` (no detach) -- that is the one train_sdflow.py's
+        # --dir_gate_diversity_weight actually optimizes. An earlier version of
+        # this method computed the trained loss FROM gate_usage_ema directly,
+        # which silently contributed ZERO gradient (the buffer has no grad_fn),
+        # making --dir_gate_diversity_weight a complete no-op -- confirmed by
+        # training a real run with it that showed no change in gate collapse
+        # behavior traceable to this loss. Fixed here; the EMA is for display only.
+        if self.num_k > 1 and attr_idx is not None:
+            attr_idx_long = attr_idx.view(-1).long()
+            div_losses = []
+            sharp_losses = []
+            max_entropy = math.log(self.num_k)
+            for a in attr_idx_long.unique():
+                m = attr_idx_long == a
+                sample_alpha = alpha[m, a, :]             # (n, K) -- LIVE, per-sample
+                batch_mean = sample_alpha.mean(dim=0)      # (K,)
+                if self.training:
+                    with torch.no_grad():
+                        self.gate_usage_ema[a].mul_(self.gate_usage_ema_decay).add_(
+                            batch_mean.detach(), alpha=1.0 - self.gate_usage_ema_decay
+                        )
+                # A routed attribute's slot usage follows the stratum mix of
+                # the batch by construction; pushing it toward uniform over
+                # all K would fight the routing. Sharpness (within the
+                # allowed slots) still applies below.
+                if int(a) in self._uniform_gate:
+                    continue     # no gate choice to regularize
+                if int(a) not in self._strata_routing:
+                    p = batch_mean.clamp(min=1e-8)
+                    p = p / p.sum()
+                    marginal_entropy = -(p * p.log()).sum()
+                    div_losses.append((max_entropy - marginal_entropy) / max_entropy)
+
+                # Conditional entropy (per-sample sharpness): the marginal
+                # term above only requires the BATCH AVERAGE alpha to stay
+                # spread across K -- satisfied just as well by every sample
+                # independently converging to an identical near-uniform
+                # mixture as by samples genuinely routing to different
+                # slots. Confirmed on a real trained checkpoint (Young,
+                # K=12): dir_gate_entropy_ema/attr_39 sat pinned at exactly
+                # log(K) with ~1e-7 variance for 40k steps -- gate_net had
+                # collapsed to a constant output, not a face-dependent one.
+                # This term pushes each SAMPLE toward a confident,
+                # low-entropy choice, which the marginal term alone cannot
+                # enforce.
+                sp = sample_alpha.clamp(min=1e-8)
+                sp = sp / sp.sum(dim=-1, keepdim=True)
+                cond_entropy = -(sp * sp.log()).sum(dim=-1).mean()
+                sharp_losses.append(cond_entropy / max_entropy)
+            self._last_gate_diversity_loss = (torch.stack(div_losses).mean() if div_losses
+                                              else torch.zeros([], device=device, dtype=dtype))
+            self._last_gate_sharpness_loss = (torch.stack(sharp_losses).mean() if sharp_losses
+                                              else torch.zeros([], device=device, dtype=dtype))
+        else:
+            self._last_gate_diversity_loss = torch.zeros([], device=device, dtype=dtype)
+            self._last_gate_sharpness_loss = torch.zeros([], device=device, dtype=dtype)
+
         # mix_dirs: weighted sum of K direction vectors per attribute
         mix_dirs = (alpha.unsqueeze(-1).unsqueeze(-1)                  # (B, A, K, 1, 1)
                     * dirs.unsqueeze(0)).sum(dim=2)                    # (B, A, 18, 512)
@@ -367,6 +745,8 @@ class AttributeDirectionBank(nn.Module):
         coeff = torch.einsum('lms,bls->blm', pinv_D, flow_delta)       # (B, 18, M)
         proj = torch.einsum('lsm,blm->bls', D, coeff)                  # (B, 18, 512)
         residual = flow_delta - proj
+        if self.residual_basis and attr_idx is not None:
+            residual = self._project_residual(residual, attr_idx.view(-1).long())
 
         # Clip per-sample residual norm to prevent explosion from large DDS gradients.
         if self.residual_max_norm is not None:
@@ -384,17 +764,38 @@ class AttributeDirectionBank(nn.Module):
             rs = scales[attr_idx_long].view(B, 1, 1)
         else:
             rs = scales.mean()
+        res_term = rs * residual
+        if self.residual_head and attr_idx is not None:
+            res_term = res_term.clone()
+            attr_idx_long = attr_idx.view(-1).long()
+            idc = self._id_cond if (self._id_cond is not None and self._id_cond.size(0) == B) else None
+            for a, head in self.residual_head.items():
+                m = attr_idx_long == int(a)
+                if m.any():
+                    pred = head(latent[m], attr_delta[m, int(a)],
+                                route_scores[m] if route_scores is not None else None,
+                                idc[m] if idc is not None else None)
+                    res_term[m] = pred.to(dtype).view(-1, self.num_layers, self.latent_dim)
+        if self.residual_fixed and attr_idx is not None:
+            res_term = res_term.clone()
+            attr_idx_long = attr_idx.view(-1).long()
+            for a, (vec, ref) in self.residual_fixed.items():
+                m = attr_idx_long == int(a)
+                if m.any():
+                    v = vec.to(device=device, dtype=dtype).view(self.num_layers, self.latent_dim)
+                    coef = attr_delta[m, int(a)] / float(ref)
+                    res_term[m] = coef.view(-1, 1, 1) * v
+        self._last_residual = res_term.detach()
 
         self._last_dir_delta = dir_delta
-        mode = self.bank_mode
-        mix = self.bank_mix.to(device=device, dtype=dtype)
-        if mode == "replace":
-            guided_delta = dir_delta + rs * residual
+        if self.bank_mode == "replace":
+            guided_delta = dir_delta + res_term
             bank_only = dir_delta
-        elif mode == "anneal":
-            guided_delta = mix * (dir_delta + rs * residual) + (1.0 - mix) * flow_delta
+        elif self.bank_mode == "anneal":
+            mix = self.bank_mix
+            guided_delta = mix * (dir_delta + res_term) + (1.0 - mix) * flow_delta
             bank_only = mix * dir_delta
-        elif mode == "prior":
+        elif self.bank_mode == "prior":
             guided_delta = flow_delta
             bank_only = torch.zeros_like(flow_delta)
         else:  # flow_magnitude
@@ -404,23 +805,24 @@ class AttributeDirectionBank(nn.Module):
                 col_attr = torch.arange(M, device=device) // self.num_k
                 keep = (col_attr.view(1, M) == attr_idx.view(-1, 1).long()).to(dtype)
                 edit_proj = torch.einsum('lsm,blm->bls', D, coeff * keep.unsqueeze(1))
+                if self._dir_layer_mask:
+                    lm = torch.ones(self.num_attrs, self.num_layers, device=device, dtype=dtype)
+                    for a, m in self._dir_layer_mask.items():
+                        lm[a] = m.to(device=device, dtype=dtype)
+                    edit_proj = edit_proj * lm[attr_idx.view(-1).long()].unsqueeze(-1)
             else:
                 edit_proj = proj
-            guided_delta = edit_proj + rs * residual
+            guided_delta = edit_proj + res_term
             bank_only = torch.zeros_like(flow_delta)
 
         guided_delta_pre_clip = guided_delta
         active_direction_scale = self.direction_scale.to(device=device, dtype=dtype).mean()
-        active_delta_max_norm = torch.zeros([], device=device, dtype=dtype).detach()
-        active_global_delta_max_norm = torch.zeros([], device=device, dtype=dtype).detach()
         if attr_idx is not None:
             attr_idx_long = attr_idx.view(-1).long()
             direction_scale = self.direction_scale.to(device=device, dtype=dtype)
             layer_scale = self.layer_scale.to(device=device, dtype=dtype)
             delta_max_norm = self.delta_max_norm.to(device=device, dtype=dtype)
 
-            active_direction_scale = direction_scale[attr_idx_long].mean()
-            active_delta_max_norm = delta_max_norm[attr_idx_long].mean()
             guided_delta = guided_delta * direction_scale[attr_idx_long].view(B, 1, 1)
             guided_delta = guided_delta * layer_scale[attr_idx_long].view(B, self.num_layers, 1)
 
@@ -442,17 +844,26 @@ class AttributeDirectionBank(nn.Module):
             g_norm = guided_delta.reshape(B, -1).norm(dim=1)
             clip = (self.guided_delta_max_norm / g_norm.clamp(min=1e-8)).clamp(max=1.0)
             guided_delta = guided_delta * clip.view(B, 1, 1)
-            active_global_delta_max_norm = torch.tensor(float(self.guided_delta_max_norm), device=device, dtype=dtype).detach()
 
         # ── Logging ───────────────────────────────────────────────────────
         with torch.no_grad():
             flow_norm = flow_delta.reshape(B, -1).norm(dim=1).mean()
-            dir_norm = dir_delta.reshape(B, -1).norm(dim=1).mean()
+            dir_per_sample = dir_delta.reshape(B, -1).norm(dim=1)          # (B,)
+            dir_norm = dir_per_sample.mean()
+            # Coefficient of variation of the per-sample edit magnitude. This
+            # is the direct check that --magnitude_latent_cond is doing
+            # something: with it off (and the K-gate collapsed) every sample
+            # sharing an attribute gets an identical magnitude, so this sits at
+            # ~0. It should become and stay clearly positive once per-face
+            # conditioning trains. Batches mixing attributes inflate it for a
+            # reason unrelated to per-face adaptivity, so read it on
+            # --attribute_sampling cycle runs.
+            dir_cv = dir_per_sample.std(unbiased=False) / dir_norm.clamp(min=1e-8)
             residual_norm = residual.reshape(B, -1).norm(dim=1).mean()
             guided_pre_clip_norm = guided_delta_pre_clip.reshape(B, -1).norm(dim=1).mean()
             guided_norm = guided_delta.reshape(B, -1).norm(dim=1).mean()
-            # How much of the (pre-cap) edit comes from the flow rather than the
-            # bank's own prediction: 1.0 = all flow, ~0 = the flow is decoration.
+            # Fraction of the (pre-cap) edit coming from the flow rather than
+            # the bank's own prediction: 1.0 = all flow, ~0 = flow is decoration.
             flow_part = (guided_delta_pre_clip - bank_only).reshape(B, -1).norm(dim=1)
             flow_share = (flow_part / guided_delta_pre_clip.reshape(B, -1).norm(dim=1)
                           .clamp(min=1e-8)).mean()
@@ -462,52 +873,93 @@ class AttributeDirectionBank(nn.Module):
             logs = {
                 "dir_bank_flow_share": flow_share.detach(),
                 "dir_bank_flow_bank_cos": flow_bank_cos.detach(),
-                "dir_bank_mix": self.bank_mix.detach().clone(),
+                "dir_bank_mix": torch.tensor(self.bank_mix if self.bank_mode == "anneal"
+                                             else float(self.bank_mode == "replace")),
                 "dir_bank_flow_delta_norm": flow_norm.detach(),
                 "dir_bank_dir_delta_norm": dir_norm.detach(),
+                "dir_bank_dir_delta_norm_cv": dir_cv.detach(),
                 "dir_bank_residual_norm": residual_norm.detach(),
                 "dir_bank_guided_delta_norm_pre_clip": guided_pre_clip_norm.detach(),
                 "dir_bank_guided_delta_norm": guided_norm.detach(),
                 "dir_bank_residual_scale": scales.detach(),
-                "dir_bank_active_direction_scale": active_direction_scale.detach(),
-                "dir_bank_active_delta_max_norm": active_delta_max_norm.detach(),
-                "dir_bank_global_delta_max_norm": active_global_delta_max_norm.detach(),
             }
             if self.num_k > 1:
+                # Raw current-step entropy, kept for backward compat -- averages
+                # over EVERY attribute row including ones not active this step
+                # (their alpha is untrained noise, see gate_usage_ema comment
+                # above), so this number is noisier and less meaningful than the
+                # per-attribute EMA entropy below. Prefer dir_gate_entropy_per_attr.
                 entropy = -(alpha * (alpha + 1e-8).log()).sum(dim=-1).mean()
                 logs["dir_gate_entropy"] = entropy.detach()
+                # Per-attribute entropy computed from the EMA usage vector, not
+                # this step's raw alpha -- see gate_usage_ema for why. Keyed by
+                # LOCAL attribute row index; train_sdflow.py maps this to the
+                # actual CelebA attribute id for wandb.
+                p = self.gate_usage_ema.clamp(min=1e-8)
+                p = p / p.sum(dim=-1, keepdim=True)
+                ema_entropy = -(p * p.log()).sum(dim=-1)   # (num_attrs,)
+                logs["dir_gate_entropy_per_attr"] = ema_entropy.detach()
             self.last_logs = logs
 
         return guided_delta
 
-    def orthogonality_loss(self):
-        """Cross-attribute orthogonality, averaged over all K combinations."""
-        dirs = self.direction_units   # (A, K, 18, 512)
-        loss = torch.zeros([], device=dirs.device, dtype=dirs.dtype)
-        count = 0
-        for i in range(self.num_attrs):
-            for j in range(i + 1, self.num_attrs):
-                for ki in range(self.num_k):
-                    for kj in range(self.num_k):
-                        loss = loss + F.cosine_similarity(
-                            dirs[i, ki], dirs[j, kj], dim=-1
-                        ).abs().mean()
-                        count += 1
-        return loss / max(count, 1)
 
-    def diversity_loss(self):
-        """Intra-attribute diversity: penalize high cosine similarity among the K
-        directions belonging to the same attribute."""
+    def gate_load_balance_loss(self):
+        """Batch-level load-balancing loss for the K-mixture gate (Shazeer-style
+        importance loss). Returns the value computed in the MOST RECENT
+        forward() call (self._last_gate_diversity_loss) -- see that computation
+        for why it must be built from THIS step's live `alpha`, not from
+        gate_usage_ema (a plain buffer with no gradient; using it directly here
+        was an earlier bug that made --dir_gate_diversity_weight a silent
+        no-op). Call this AFTER calling direction_bank(...) in the same step.
+
+        Returns, per attribute active in the last forward() call, how far that
+        attribute's per-batch usage distribution sits from uniform (0 =
+        perfectly uniform, 1 = fully collapsed onto one slot), averaged over
+        whichever attribute(s) were active -- safe to add into the loss every
+        step regardless of --attribute_sampling mode.
+
+        WHAT THIS DOES NOT DO: this has no notion of which slot is "correct"
+        for a given face (that would need a demographic label fed in as a
+        target) -- it only discourages the gate from collapsing onto a
+        minority of slots. Necessary, not sufficient, for the geometry a
+        stratum-level fix like --extreme_min_conf produces to actually get
+        used by the model.
+        """
         if self.num_k <= 1:
             return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
-        dirs = self.direction_units   # (A, K, 18, 512)
-        loss = torch.zeros([], device=dirs.device, dtype=dirs.dtype)
-        count = 0
-        for i in range(self.num_attrs):
-            for ki in range(self.num_k):
-                for kj in range(ki + 1, self.num_k):
-                    loss = loss + F.cosine_similarity(
-                        dirs[i, ki], dirs[i, kj], dim=-1
-                    ).abs().mean()
-                    count += 1
-        return loss / max(count, 1)
+        loss = getattr(self, '_last_gate_diversity_loss', None)
+        if loss is None:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        return loss
+
+    def gate_sharpness_loss(self):
+        """Per-sample conditional-entropy loss for the K-mixture gate.
+
+        gate_load_balance_loss() above only constrains the BATCH-AVERAGE
+        usage distribution to stay spread across K slots -- a constraint
+        every sample independently outputting an identical near-uniform
+        alpha satisfies exactly as well as genuine per-sample routing does.
+        Confirmed as the actual failure mode on a real trained checkpoint:
+        Young's dir_gate_entropy_ema sat pinned at exactly log(K) (K=12)
+        with ~1e-7 variance across 40k steps -- gate_net had collapsed to a
+        constant, face-independent output despite gate_load_balance_loss
+        being active the whole run.
+
+        This loss instead penalizes each SAMPLE's own conditional entropy
+        directly. Minimizing it pushes every
+        sample toward a confident, low-entropy choice among the K
+        directions; used together with gate_load_balance_loss (which still
+        stops that choice from collapsing onto the same one or two slots
+        for everyone), the pair is the standard cond-entropy / marginal-
+        entropy pairing for mixture-of-experts load balancing.
+
+        Returns the value computed in the MOST RECENT forward() call, same
+        call-after-forward contract as gate_load_balance_loss().
+        """
+        if self.num_k <= 1:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        loss = getattr(self, '_last_gate_sharpness_loss', None)
+        if loss is None:
+            return torch.zeros([], device=self.direction_units.device, dtype=self.direction_units.dtype)
+        return loss

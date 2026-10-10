@@ -2,7 +2,7 @@
 
 ## Direction Bank Modes (`--bank_mode`)
 
-With `--direction_bank_path`, `--bank_mode` decides who actually produces the edit. The mode (and the anneal mix weight) is stored as a buffer inside the `direction_bank` checkpoint, so `evaluate_sdflow.py`, `models/editor.py`, and the preview scripts reproduce it without extra flags. Checkpoints saved before this option existed load as `replace`.
+With `--direction_bank_path`, `--bank_mode` decides who actually produces the edit. The mode and the anneal schedule are saved in the run's `config.json` (not in the checkpoint, so `state_dict` keys are unchanged); `evaluate_sdflow.py` (and every script built on its `load_models`) and `models/editor.py` restore them, and for `anneal` use the mix the schedule had at the evaluated step. Runs without `--bank_mode` behave as `replace`.
 
 | Mode | Final W+ delta | Role of the bank |
 | --- | --- | --- |
@@ -13,12 +13,12 @@ With `--direction_bank_path`, `--bank_mode` decides who actually produces the ed
 
 Training logs `dir_bank_flow_share` (fraction of the edit coming from the flow), `dir_bank_flow_bank_cos`, `dir_bank_mix`, and `loss_bank_prior`.
 
-Re-evaluate an existing checkpoint under another rule without retraining:
+Re-evaluate an existing checkpoint under another rule without retraining (an explicit `--bank_mode` overrides config.json; the result JSON gets a `_bank<mode>` suffix):
 
 ```bash
-python evaluation/evaluate_sdflow.py --checkpoint_dir <run> --step <N> --bank_mode_override prior            # flow alone
-python evaluation/evaluate_sdflow.py --checkpoint_dir <run> --step <N> --bank_mode_override flow_magnitude
-python evaluation/evaluate_sdflow.py --checkpoint_dir <run> --step <N> --bank_mode_override anneal --bank_mix_override 0.5
+python evaluation/evaluate_sdflow.py --checkpoint_dir <run> --step <N> --bank_mode prior            # flow alone
+python evaluation/evaluate_sdflow.py --checkpoint_dir <run> --step <N> --bank_mode flow_magnitude
+python evaluation/evaluate_sdflow.py --checkpoint_dir <run> --step <N> --bank_mode anneal --bank_mix 0.5
 ```
 
 Train each mode:

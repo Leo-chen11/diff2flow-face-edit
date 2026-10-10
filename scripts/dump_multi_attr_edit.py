@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw
 from torch.utils import data
 
 from evaluation.evaluate_sdflow import (
+    resolve_controlnet_disable_attrs,
     ATTR_NAMES, CLIPAttributeJudge, CelebAAttrClassifierJudge, _latest_step,
     apply_run_config, edit_multi_attribute, load_models, parse_clip_calibration,
 )
@@ -106,8 +107,10 @@ def main(args):
         edited = edit_multi_attribute(
             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
             local_idxs, args.edit_scale, direction_bank,
+            attr_global_idxs=args.attrs, compose=args.compose,
             control_encoder=control_encoder,
             controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+            controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
         )
 
         src_face_256 = F.interpolate(src_face, (256, 256))
@@ -166,6 +169,10 @@ if __name__ == '__main__':
                     help='Extra attributes to SCORE but not edit, to check for leakage '
                          'into attributes you deliberately left out of --attrs.')
     p.add_argument('--edit_scale', type=float, default=1.0)
+    p.add_argument('--compose', default='sum', choices=['sum', 'orth'],
+                   help='How the per-attribute W+ deltas are combined; see '
+                        'evaluate_sdflow.edit_multi_attribute. scripts/eval_multi_attr.py scores both '
+                        '(and sequential editing).')
     p.add_argument('--num_samples', type=int, default=16)
     p.add_argument('--out_dir', default='./multi_attr_test')
     p.add_argument('--batch', type=int, default=4)
@@ -196,7 +203,10 @@ if __name__ == '__main__':
     p.add_argument('--guided_delta_max_norm', type=float, default=0.0)
     p.add_argument('--override_residual_scale', type=float, default=None)
     p.add_argument('--age_fine_layer_scale', type=float, default=None)
-    p.add_argument('--age_fine_layer_start', type=int, default=4)
+    p.add_argument('--age_fine_layer_start', type=int, default=10)
+    p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                    help='Same knob/default as evaluate_sdflow.py: omitted -> auto-resolved '
+                         'to gender/age (20, 39) via resolve_controlnet_disable_attrs().')
     p.add_argument('--force_bank_directions', action='store_true')
     p.add_argument('--ignore_run_config', action='store_true')
     p.add_argument('--celeba_attr_judge_weights', default=None,
@@ -207,6 +217,7 @@ if __name__ == '__main__':
 
     args = p.parse_args()
     args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
         if args.step is None:

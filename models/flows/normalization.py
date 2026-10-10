@@ -122,19 +122,6 @@ class MovingBatchNormNd(nn.Module):
         )
 
 
-def stable_var(x, mean=None, dim=1):
-    if mean is None:
-        mean = x.mean(dim, keepdim=True)
-    mean = mean.view(-1, 1)
-    res = torch.pow(x - mean, 2)
-    max_sqr = torch.max(res, dim, keepdim=True)[0]
-    var = torch.mean(res / max_sqr, 1, keepdim=True) * max_sqr
-    var = var.view(-1)
-    # change nan to zero
-    var[var != var] = 0
-    return var
-
-
 class MovingBatchNorm1d(MovingBatchNormNd):
     @property
     def shape(self):
