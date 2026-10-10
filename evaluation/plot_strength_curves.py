@@ -5,17 +5,17 @@ from the SDFlow paper's Fig. 4 (InterFaceGAN / Latent Transformer / StyleFlow
 / Ours), but for comparing your own runs (e.g. original vs lag_dof, or before
 vs after a direction-bank fix) or any external baseline you have numbers for.
 
-Each --run points at a metrics_summary.csv with the schema produced by
-evaluation/eval_strength_sweep.py (columns: attribute, strength,
-target_success, effective_success, id_sim_real, preserve_acc). Any CSV with
+Each --run points at a CSV with the schema scripts/editing_curves.py writes
+(columns: attribute, strength, target_success, effective_success,
+id_sim_real, preserve_acc). Any CSV with
 those columns works, so this also accepts a hand-built CSV of baseline
 numbers if you reproduce InterFaceGAN/StyleFlow/Latent Transformer yourself
 under the same protocol.
 
 Usage:
     python evaluation/plot_strength_curves.py \
-        --run Original=./output/compare/original/metrics_summary.csv \
-        --run LAG-DOF=./output/compare/lag_dof/metrics_summary.csv \
+        --run Ours=<ckpt>/curves_model_s100000.csv \
+        --run Linear=<ckpt>/curves_linear_s100000.csv \
         --output_dir ./output/compare/curves
 
 Do not mix runs measured with different identity models or different
@@ -27,7 +27,6 @@ classifier and the same identity encoder to produce them.
 import argparse
 import csv
 import os
-from collections import defaultdict
 
 import matplotlib
 matplotlib.use('Agg')
@@ -35,8 +34,9 @@ import matplotlib.pyplot as plt
 
 
 def parse_named_path(value):
+    """argparse type for NAME=path pairs."""
     if '=' not in value:
-        raise argparse.ArgumentTypeError('Expected NAME=path/to/metrics_summary.csv')
+        raise argparse.ArgumentTypeError('Expected NAME=path/to/curves.csv')
     name, path = value.split('=', 1)
     name = name.strip()
     path = path.strip()

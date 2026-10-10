@@ -43,10 +43,13 @@ from PIL import Image, ImageDraw
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, CLIPAttributeJudge, CelebAAttrClassifierJudge, GlassesParserJudge,
     _latest_step, apply_run_config, edit_single_attribute, is_clear, load_models,
-    parse_clip_calibration,
+    parse_clip_calibration, resolve_controlnet_disable_attrs,
 )
 from common.face_parser import FaceParser
+from common.ops import load_network
+from models.attribute_estimator import AttributeClassifier
 from models.dataset import SDFlowDataset
+from models.flows.constant import CELEBA_ATTRIBUTES
 
 
 def to_pil(img_tensor):
@@ -54,13 +57,14 @@ def to_pil(img_tensor):
     return Image.fromarray(x.permute(1, 2, 0).numpy())
 
 
-def make_pair(src, edited, src_score, edit_score, attr_name, success, size=256, watch=None):
+def make_pair(src, edited, src_score, edit_score, attr_name, success, size=256, watch=None,
+              second=None):
     """watch: optional list of (name, watch_src_score, watch_edit_score) for
     bystander attributes that weren't edited -- flags leakage (any large
     |edit-src| regardless of direction, since there's no "correct" direction
     for something you didn't intend to change)."""
     watch = watch or []
-    header_h = 24 + 14 * len(watch)
+    header_h = 24 + 14 * len(watch) + (14 if second else 0)
     a = to_pil(F.interpolate(src.unsqueeze(0), (size, size))[0])
     b = to_pil(F.interpolate(edited.unsqueeze(0), (size, size))[0])
     canvas = Image.new('RGB', (size * 2, size + header_h), (20, 20, 20))
@@ -69,8 +73,12 @@ def make_pair(src, edited, src_score, edit_score, attr_name, success, size=256, 
     d.text((4, 6), f'src {attr_name}={src_score:.2f}', fill=(180, 180, 180))
     color = (80, 220, 80) if success else (240, 90, 90)
     d.text((size + 4, 6), f'edited {attr_name}={edit_score:.2f}', fill=color)
+    if second:
+        sname, ss, se = second
+        d.text((4, 20), f'[{sname}] src={ss:.2f}', fill=(150, 150, 150))
+        d.text((size + 4, 20), f'[{sname}] edit={se:.2f}', fill=(120, 170, 240))
     for i, (wname, ws, we) in enumerate(watch):
-        y = 20 + (i + 1) * 14
+        y = 20 + (i + 1 + (1 if second else 0)) * 14
         leaked = abs(we - ws) > 0.15
         wcolor = (240, 180, 60) if leaked else (150, 150, 150)
         d.text((4, y), f'[watch]{wname} src={ws:.2f}', fill=(150, 150, 150))
@@ -102,13 +110,30 @@ def main(args):
     local_idx = args.attribute_index.index(args.attr)
     attr_name = ATTR_NAMES.get(args.attr, f'attr{args.attr}')
 
-    # Judge: parser for glasses if asked, else CLIP.
+    # Judge: parser for glasses if asked, else --primary_judge (clip / celeba).
     if args.attr == 15 and args.glasses_judge == 'parser':
         pj = GlassesParserJudge(args.face_parser_weights, 'cuda',
                                 area_thresh=args.glasses_area_thresh,
-                                sharpness=args.glasses_area_sharpness)
+                                sharpness=args.glasses_area_sharpness,
+                                min_component_frac=getattr(args, 'glasses_min_component_frac', 0.00015))
         print(f'[Judge] {attr_name} = BiSeNet parser (class 6)')
         score_fn = lambda imgs: pj.glasses_prob(imgs)
+    elif args.primary_judge == 'indep':
+        if not args.independent_attr_weights:
+            raise SystemExit('--primary_judge indep requires --independent_attr_weights.')
+        _ind = AttributeClassifier(backbone=args.independent_attr_backbone)
+        _ind.load_state_dict(load_network(args.independent_attr_weights))
+        _ind = _ind.cuda().eval()
+        print(f'[Judge] {attr_name} = independent {args.independent_attr_backbone} classifier '
+              f'(matches evaluate_sdflow.py AccInd)')
+        score_fn = lambda imgs: torch.sigmoid(_ind(imgs)[0])[:, args.attr]
+    elif args.primary_judge == 'celeba':
+        if not args.celeba_attr_judge_weights:
+            raise SystemExit('--primary_judge celeba requires --celeba_attr_judge_weights.')
+        pcj = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights, 'cuda')
+        print(f'[Judge] {attr_name} = CelebAAttrClassifierJudge (independent supervised '
+              f'ResNet18, matches evaluate_sdflow.py\'s AccCeleb)')
+        score_fn = lambda imgs: pcj.scores(imgs)[:, args.attr]
     else:
         cj = CLIPAttributeJudge(args.attribute_index, args.clip_judge_model, 'cuda',
                                  calibration=parse_clip_calibration(args.clip_calibration))
@@ -131,11 +156,45 @@ def main(args):
             watch_score_fn = lambda imgs: wj.scores(imgs)
     watch_names = [ATTR_NAMES.get(a, f'attr{a}') for a in watch_attrs]
 
+    # --edit_direction clip: same as evaluate_sdflow.py, tell the model the
+    # direction from the CLIP judge's view of the source (parser for glasses)
+    # instead of the conditioner's own guess, so this audit reproduces the eval.
+    dir_fn = None
+    if args.edit_direction == 'indep':
+        if args.primary_judge != 'indep':
+            raise SystemExit('--edit_direction indep needs --primary_judge indep.')
+        dir_fn = score_fn
+        print('[Direction] --edit_direction indep: add/rm taken from the independent '
+              'classifier score of the source')
+    elif args.edit_direction == 'clip':
+        if args.attr == 15 and args.glasses_judge == 'parser':
+            dir_fn = score_fn
+        elif args.primary_judge == 'clip':
+            dir_fn = score_fn
+        else:
+            _cj_dir = CLIPAttributeJudge(args.attribute_index, args.clip_judge_model, 'cuda',
+                                         calibration=parse_clip_calibration(args.clip_calibration))
+            dir_fn = lambda imgs: _cj_dir.scores(imgs)[:, local_idx]
+        print('[Direction] --edit_direction clip: add/rm taken from the CLIP '
+              '(parser for glasses) score of the source, as in evaluate_sdflow.py')
+
+    # Optional second opinion printed on every pair: lets you see, per image,
+    # whether the two judges disagree (the Bangs add CLIP-vs-R50 case).
+    second_fn, second_name = None, None
+    if args.also_clip and args.primary_judge != 'clip':
+        _cj2 = CLIPAttributeJudge(args.attribute_index, args.clip_judge_model, 'cuda',
+                                  calibration=parse_clip_calibration(args.clip_calibration))
+        second_fn, second_name = (lambda imgs: _cj2.scores(imgs)[:, local_idx]), 'CLIP'
+
     composite_face_parser = None
     if args.composite_face_region:
-        composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-        print(f'[Composite] method={args.composite_method} '
-              f'blur_sigma={args.composite_blur_sigma}')
+        try:
+            composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            print(f'[Composite] method={args.composite_method} '
+                  f'blur_sigma={args.composite_blur_sigma}')
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f'[WARN] --composite_face_region requested but face parser unavailable '
+                  f'({exc}); compositing disabled.')
 
     img_transform = T.Compose([
         T.ToTensor(), T.Resize((args.img_size, args.img_size)),
@@ -150,9 +209,12 @@ def main(args):
                              num_workers=4, drop_last=False)
 
     fails, succs = [], []
+    fail_preds, succ_preds = [], []
     n_dir, n_fail = 0, 0
     watch_leak_abs = {name: [] for name in watch_names}
-    for img, latent, _pred in loader:
+    by_gender = {'male': [0, 0], 'female': [0, 0]}      # [seen, failed]
+    fail_delta = []                                      # change toward target, failures only
+    for img, latent, pred in loader:
         img = img.cuda(); latent = latent.cuda()
         _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
 
@@ -160,15 +222,18 @@ def main(args):
         src_face_256 = F.interpolate(src_face, (256, 256))
         src_scores = score_fn(src_face_256)
 
+        direction = torch.where(dir_fn(src_face_256) > 0.5, -1.0, 1.0) if dir_fn is not None else None
         edited = edit_single_attribute(
             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
             local_idx, args.edit_scale, direction_bank, attr_global_idx=args.attr,
+            direction=direction,
             bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
             face_parser=composite_face_parser,
             composite_method=args.composite_method,
             composite_blur_sigma=args.composite_blur_sigma,
             control_encoder=control_encoder,
             controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+            controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
         )
         edited_256 = F.interpolate(edited, (256, 256))
         edit_scores = score_fn(edited_256)
@@ -176,6 +241,8 @@ def main(args):
         if watch_score_fn is not None:
             watch_src = watch_score_fn(src_face_256)
             watch_edit = watch_score_fn(edited_256)
+        if second_fn is not None:
+            sec_src, sec_edit = second_fn(src_face_256), second_fn(edited_256)
 
         for b in range(img.size(0)):
             s = src_scores[b].item(); e = edit_scores[b].item()
@@ -193,20 +260,69 @@ def main(args):
                     continue                 # source doesn't have it; not a rm case
                 success = e < 0.5            # removed -> crossed down
             n_dir += 1
+            second = (second_name, sec_src[b].item(), sec_edit[b].item()) \
+                if second_fn is not None else None
+            gkey = 'male' if pred[b, 20].item() > 0.5 else 'female'
+            by_gender[gkey][0] += 1
             if watch is not None:
                 for wname, ws, we in watch:
                     watch_leak_abs[wname].append(abs(we - ws))
             if not success:
                 n_fail += 1
+                by_gender[gkey][1] += 1
+                fail_delta.append((e - s) if args.direction == 'add' else (s - e))
                 if len(fails) < args.num_fail:
-                    fails.append(make_pair(src_face[b], edited[b], s, e, attr_name, False, watch=watch))
+                    fails.append(make_pair(src_face[b], edited[b], s, e, attr_name, False,
+                                           watch=watch, second=second))
+                    fail_preds.append(pred[b, :40].clone())
             elif len(succs) < args.num_success:
-                succs.append(make_pair(src_face[b], edited[b], s, e, attr_name, True, watch=watch))
-        if len(fails) >= args.num_fail and len(succs) >= args.num_success:
+                succs.append(make_pair(src_face[b], edited[b], s, e, attr_name, True,
+                                       watch=watch, second=second))
+                succ_preds.append(pred[b, :40].clone())
+        if not args.scan_all and len(fails) >= args.num_fail and len(succs) >= args.num_success:
+            break
+        if args.max_samples and n_dir >= args.max_samples:
             break
 
     print(f'\n{attr_name} {args.direction}: samples seen={n_dir}, judge-failed={n_fail} '
           f'({n_fail / max(1, n_dir):.1%})')
+
+    for g, (seen, failed) in by_gender.items():
+        if seen:
+            print(f'  {g:<6} sources: {seen}  judge-failed {failed} ({failed / seen:.1%})')
+    if fail_delta:
+        fd = torch.tensor(fail_delta)
+        print(f'  failures: mean change toward target {fd.mean():+.3f}  |  '
+              f'moved >= 0.20 without crossing: {(fd >= 0.20).float().mean():.1%}  |  '
+              f'barely moved (< 0.05): {(fd < 0.05).float().mean():.1%}')
+        print('  (moved >= 0.20 = the edit worked but the judge threshold is strict; '
+              'barely moved = the edit did not happen)')
+    if not args.scan_all:
+        print('  NOTE: stopped once enough montage pairs were collected, so the rates above '
+              'cover only the samples seen. Use --scan_all for full-set rates.')
+
+    if fail_preds and succ_preds:
+        # What does the failure group actually have in common, beyond
+        # whatever pattern eyeballing the montage suggests? Compare the
+        # r34 binary prediction for every OTHER CelebA attribute between
+        # the failure and success groups collected above -- a real,
+        # data-driven signal (e.g. "78% of failures are Pale_Skin=1 vs
+        # 25% of successes") is worth acting on; a guess from thumbnails
+        # (skin tone, hair style, makeup) is not, until it shows up here.
+        fail_mat = torch.stack(fail_preds)   # (n_fail_saved, 40)
+        succ_mat = torch.stack(succ_preds)   # (n_succ_saved, 40)
+        fail_rate = fail_mat.mean(dim=0)
+        succ_rate = succ_mat.mean(dim=0)
+        diff = (fail_rate - succ_rate).abs()
+        order = [i for i in torch.argsort(diff, descending=True).tolist() if i != args.attr]
+        print(f'\n=== Failure vs success group: other-attribute fraction "1" '
+              f'(fail n={fail_mat.shape[0]}, success n={succ_mat.shape[0]}) ===')
+        print('Sorted by |difference| -- top of the list is what the failure group '
+              'actually has more/less of, not what it looks like it has:')
+        for i in order[:15]:
+            name = CELEBA_ATTRIBUTES[i] if i < len(CELEBA_ATTRIBUTES) else f'attr{i}'
+            print(f'  {name:<20} fail={fail_rate[i]:.2f}  success={succ_rate[i]:.2f}  '
+                  f'|Δ|={diff[i]:.2f}')
 
     for wname, vals in watch_leak_abs.items():
         if not vals:
@@ -241,9 +357,16 @@ if __name__ == '__main__':
     p.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth')
     p.add_argument('--glasses_area_thresh', type=float, default=0.0010)
     p.add_argument('--glasses_area_sharpness', type=float, default=0.5)
-    p.add_argument('--composite_face_region', action='store_true')
-    p.add_argument('--composite_method', default='alpha', choices=['alpha', 'poisson'])
+    p.add_argument('--glasses_min_component_frac', type=float, default=0.00015)
+    p.add_argument('--composite_face_region', action=argparse.BooleanOptionalAction, default=False,
+                   help='DEFAULT: off -- the Poisson blend leaves a visible tonal seam at the face '
+                        'boundary that inflates LPIPS/depresses ID scores. Pass '
+                        '--composite_face_region to enable it.')
+    p.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'])
     p.add_argument('--composite_blur_sigma', type=float, default=15)
+    p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
+                    help='Same knob/default as evaluate_sdflow.py: omitted -> auto-resolved '
+                         'to gender/age (20, 39) via resolve_controlnet_disable_attrs().')
 
     p.add_argument('--index_file',   default='./data/ffhq.txt')
     p.add_argument('--image_root',   default='data/FFHQ')
@@ -272,7 +395,37 @@ if __name__ == '__main__':
                          'attributes not being edited here (e.g. --attr 39 --watch_attrs 20 '
                          'checks whether editing Young alone shifts Male).')
     p.add_argument('--celeba_attr_judge_weights', default=None,
-                    help='Used for --watch_attrs scoring if given (preferred over CLIP).')
+                    help='Used for --watch_attrs scoring if given (preferred over CLIP). Also '
+                         'used for the AUDITED attribute itself when --primary_judge celeba.')
+    p.add_argument('--edit_direction', default='cond', choices=['cond', 'clip', 'indep'],
+                    help="Same as evaluate_sdflow.py. 'clip' = take add/rm from the CLIP "
+                         "(parser for glasses) score of the source instead of the conditioner's "
+                         "own guess. Use it whenever the audited run was evaluated with it.")
+    p.add_argument('--independent_attr_weights', default=None,
+                    help='Independent classifier checkpoint (the ResNet-50 AccInd judge); '
+                         'used when --primary_judge indep.')
+    p.add_argument('--independent_attr_backbone', default='r50')
+    p.add_argument('--also_clip', action='store_true',
+                    help='Print the CLIP score next to the primary judge on every pair '
+                         '(ignored when CLIP is the primary judge).')
+    p.add_argument('--scan_all', action='store_true',
+                    help='Do not stop once the montages are full: scan every sample (or '
+                         '--max_samples) so the failure rates are over the whole set.')
+    p.add_argument('--max_samples', type=int, default=0,
+                    help='With --scan_all: stop after this many direction-matching samples '
+                         '(0 = whole dataset).')
+    p.add_argument('--primary_judge', default='clip', choices=['clip', 'celeba', 'indep'],
+                    help="Which judge scores the attribute being audited (--attr), i.e. what "
+                         "decides success/failure in the montage and the fail/success table. "
+                         "Default 'clip' matches this script's original behavior. 'celeba' "
+                         "requires --celeba_attr_judge_weights and switches to "
+                         "CelebAAttrClassifierJudge -- use this to see whether a CLIP-vs-Celeb "
+                         "AccCLIP/AccCeleb disagreement in evaluate_sdflow.py (e.g. attr 39 rm: "
+                         "CLIP 45.6%% vs Celeb 84.2%% at scale 0.9) is CLIP misjudging real "
+                         "edits or Celeb missing what CLIP catches: rerun the SAME command with "
+                         "only this flag flipped and compare which judge's failures actually "
+                         "look like failures by eye. Ignored for attr 15 with "
+                         "--glasses_judge parser (the parser always wins for glasses).")
     p.add_argument('--fused_hidden_dim', type=int, default=256)
     p.add_argument('--lag_gate_hidden_dim', type=int,   default=64)
     p.add_argument('--lag_gate_init_bias',  type=float, default=-0.5)
@@ -283,7 +436,7 @@ if __name__ == '__main__':
     p.add_argument('--guided_delta_max_norm', type=float, default=0.0)
     p.add_argument('--override_residual_scale', type=float, default=None)
     p.add_argument('--age_fine_layer_scale', type=float, default=None)
-    p.add_argument('--age_fine_layer_start', type=int, default=4)
+    p.add_argument('--age_fine_layer_start', type=int, default=10)
     p.add_argument('--force_bank_directions', action='store_true')
     p.add_argument('--disable_controlnet', action='store_true',
                    help='ABLATION: skip control_encoder even if the run was trained with it, '
@@ -293,6 +446,7 @@ if __name__ == '__main__':
 
     args = p.parse_args()
     args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
         if args.step is None:

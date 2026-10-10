@@ -5,10 +5,9 @@ from torchvision.transforms.functional import to_pil_image
 import torch.distributed as dist
 import inspect
 import time
-import shutil
 import wandb
 
-from .ops import AverageMeter, load_network, reduce_tensor
+from .ops import AverageMeter, reduce_tensor
 
 
 def get_varname(var):
@@ -68,18 +67,6 @@ class LoggerXBase(object):
         if self.dist:
             dist.barrier()
 
-    def load_checkpoints(self, epoch):
-        for i in range(len(self.modules)):
-            module_name = self.module_names[i]
-            module = self.modules[i]
-            module.load_state_dict(
-                load_network(osp.join(self.models_save_dir, '{}-{}'.format(module_name, str(epoch).zfill(7)))))
-
-    def msg_str(self, stats, step=0):
-        output_str = '[{}] {:05d}, {}'.format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), step, str(stats))
-        if self.rank == 0:
-            print(output_str)
-
     def msg_internal(self, stats, step, precision=7, print_freq=1):
         output_str = '[{}] {:05d}, '.format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), step)
         var_names = []
@@ -119,9 +106,6 @@ class LoggerXBase(object):
 
     def msg(self, stats, step, precision=7):
         self.msg_internal(stats=stats, step=step, precision=precision, print_freq=self.print_freq)
-
-    def msg_metric(self, stats, step, precision=7):
-        self.msg_internal(stats=stats, step=step, precision=precision, print_freq=1)
 
     def msg_handler(self, output_dict, step):
         pass

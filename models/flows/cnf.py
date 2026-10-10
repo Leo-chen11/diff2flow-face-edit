@@ -82,8 +82,6 @@ class CNF(nn.Module):
 
         
         integration_times,_ = torch.sort(integration_times,dim=0,descending=reverse)
-        # if reverse:
-        #     integration_times = _flip(integration_times, 0)
 
         
         # Refresh the odefunc statistics.
@@ -125,7 +123,3 @@ class CNF(nn.Module):
         return self.odefunc._num_evals.item()
 
 
-def _flip(x, dim):
-    indices = [slice(None)] * x.dim()
-    indices[dim] = torch.arange(x.size(dim) - 1, -1, -1, dtype=torch.long, device=x.device)
-    return x[tuple(indices)]

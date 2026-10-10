@@ -1,51 +1,9 @@
-import argparse
-import os
 import os.path as osp
 
 import torch
 import pandas as pd
-import numpy as np
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from torchvision.datasets.folder import pil_loader
-import torchvision.transforms as T
-import torch.nn.functional as F
-
-IMG_EXTENSIONS = [
-    '.jpg', '.JPG', '.jpeg', '.JPEG',
-    '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP', '.tiff'
-]
-
-def is_image_file(filename):
-    return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
-
-def make_dataset(dir):
-    images = []
-    assert os.path.isdir(dir), '%s is not a valid directory' % dir
-    for fname in os.listdir(dir):
-        if is_image_file(fname):
-            path = os.path.join(dir, fname)
-            images.append(path)
-    return images
-
-class FolderDataset(Dataset):
-	def __init__(self, root, transform=None, preprocess=None):
-		self.paths = sorted(make_dataset(root))
-		self.transform = transform
-		self.preprocess = preprocess
-
-	def __len__(self):
-		return len(self.paths)
-
-	def __getitem__(self, index):
-		from_path = self.paths[index]
-		if self.preprocess is not None:
-			from_im = self.preprocess(from_path)
-		else:
-			from_im = pil_loader(from_path).convert('RGB')
-		if self.transform:
-			from_im = self.transform(from_im)
-		return from_im,from_path
-
 
 class SDFlowDataset(Dataset):
     def __init__(self,
@@ -96,36 +54,40 @@ class SDFlowDataset(Dataset):
         pred = self._lookup_precomputed(self.preds, file)
         
         return img,latent,pred
-    
+
     def __len__(self):
         return len(self.image_list)
 
 
-class ImageDataset(Dataset):
-    def __init__(self,
-                 index_file,
-                 image_root,
-                 train=True,
-                 transform=None):
-        
-        self.index_file=index_file
-        self.image_root = image_root
-        self.transform = transform
-        
-       
-        # process the attributes
-        df = pd.read_csv(self.index_file, index_col=None)
-        df = df[df['split'].values.astype(bool) == (not train)]
-        
-        self.image_list = df['path'].values
-    
+class IndexedDataset(Dataset):
+    """Wraps any Dataset and appends the sample's INDEX to what __getitem__
+    returns, without touching the wrapped class's own return signature.
+
+    WHY: a per-sample lookup keyed by filename (e.g.
+    --region_saliency_path's precomputed attribution maps in
+    training/train_sdflow.py) needs to know which file each batch element
+    came from. SDFlowDataset.__getitem__ returns (img, latent, pred) only --
+    no index, no path -- and every caller in this project (train_sdflow.py's
+    training loop, evaluate_sdflow.py, render_preview.py, the probe scripts)
+    unpacks that exact 3-tuple, so changing SDFlowDataset itself would break
+    all of them simultaneously. Wrapping only the ONE DataLoader that needs
+    the index (train_sdflow.py's train_loader) keeps every other consumer
+    untouched.
+
+    Works with either a plain shuffling DataLoader or a custom
+    batch_sampler (e.g. ScoreBalancedBatchSampler): both call
+    dataset[index] for whatever index they pick, so the index this class
+    appends is always the real index into the WRAPPED dataset, regardless
+    of sampling order -- exactly what a caller needs to recover the
+    original file via base_dataset.image_list[index].
+    """
+
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+
     def __getitem__(self, index):
-        file = self.image_list[index]
-        img = pil_loader(osp.join(self.image_root,file))
-        if self.transform is not None:
-            img = self.transform(img)
-            
-        return img
-    
+        return (*self.base_dataset[index], index)
+
     def __len__(self):
-        return len(self.image_list)
+        return len(self.base_dataset)
+

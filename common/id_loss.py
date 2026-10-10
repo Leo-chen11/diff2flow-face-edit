@@ -4,33 +4,17 @@ import torch.nn.functional as F
 
 
 class IDLoss(nn.Module):
-    def __init__(self, crop=True, backbone='r50'):
+    def __init__(self, crop=True):
         super(IDLoss, self).__init__()
-        try:
-            from common.nn.insightface import iresnet34, iresnet50, iresnet100
-            if backbone == 'r50':
-                self.facenet = iresnet50(pretrained=True)
-            elif backbone == 'r100':
-                self.facenet = iresnet100(pretrained=True)
-            else:
-                self.facenet = iresnet34(pretrained=True)
-            self.input_size = 112
-        except (ImportError, ModuleNotFoundError):
-            from facenet_pytorch import InceptionResnetV1
-            self.facenet = InceptionResnetV1(pretrained='vggface2')
-            self.input_size = 160
+        # facenet-pytorch InceptionResnetV1 (VGGFace2). The insightface branch that
+        # used to come first imported a module this repo never had, so this was
+        # always the model in use.
+        from facenet_pytorch import InceptionResnetV1
+        self.facenet = InceptionResnetV1(pretrained='vggface2')
+        self.input_size = 160
 
         self.facenet.eval()
         self.crop = crop
-        self.embeddings = None
-
-    @torch.no_grad()
-    def extract_dataset(self, loader):
-        embeddings = []
-        for inputs in loader:
-            images = inputs[0].cuda()
-            embeddings.append(F.normalize(self.extract_features(images), dim=1))
-        self.embeddings = torch.cat(embeddings, dim=0)
 
     def extract_features(self, x):
         # x: [-1, 1] tensor [B, 3, H, W]

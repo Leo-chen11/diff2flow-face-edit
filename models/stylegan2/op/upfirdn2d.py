@@ -2,16 +2,27 @@ import os
 
 import torch
 from torch.autograd import Function
+import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 
 module_path = os.path.dirname(__file__)
-upfirdn2d_op = load(
-    'upfirdn2d',
-    sources=[
-        os.path.join(module_path, 'upfirdn2d.cpp'),
-        os.path.join(module_path, 'upfirdn2d_kernel.cu'),
-    ],
-)
+# See fused_act.py: compile the CUDA kernel, or fall back to upfirdn2d_native
+# (pure PyTorch) when it cannot be built or SDFLOW_NO_CUDA_OPS=1.
+upfirdn2d_op = None
+if os.environ.get('SDFLOW_NO_CUDA_OPS', '') != '1':
+    try:
+        upfirdn2d_op = load(
+            'upfirdn2d',
+            sources=[
+                os.path.join(module_path, 'upfirdn2d.cpp'),
+                os.path.join(module_path, 'upfirdn2d_kernel.cu'),
+            ],
+        )
+    except Exception as _exc:  # noqa: BLE001
+        print('[stylegan2.op] upfirdn2d CUDA kernel did not build '
+              f'({type(_exc).__name__}); using the pure-PyTorch fallback.')
+else:
+    print('[stylegan2.op] SDFLOW_NO_CUDA_OPS=1: using the pure-PyTorch upfirdn2d.')
 
 
 class UpFirDn2dBackward(Function):
@@ -140,6 +151,11 @@ class UpFirDn2d(Function):
 
 
 def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
+    if upfirdn2d_op is None:
+        batch, channel, in_h, in_w = input.shape
+        out = upfirdn2d_native(input.reshape(-1, in_h, in_w, 1), kernel,
+                               up, up, down, down, pad[0], pad[1], pad[0], pad[1])
+        return out.reshape(batch, channel, out.shape[1], out.shape[2])
     out = UpFirDn2d.apply(
         input, kernel, (up, up), (down, down), (pad[0], pad[1], pad[0], pad[1])
     )

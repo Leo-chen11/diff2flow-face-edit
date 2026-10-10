@@ -40,6 +40,7 @@ import argparse
 import os
 import sys
 import json
+import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'models', 'stylegan2'))
@@ -54,31 +55,25 @@ from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
 
+from common.attr_tables import (AGE_TEXTURE_REGION_CLASS, CELEBA_ALL_ATTRS, DEFAULT_SOFT_TARGET,
+                                PRESERVE40_ALLOW, SOFT_TARGET_TABLE, bank_num_k)
 from common.id_loss import IDLoss
 from common.ops import load_network
+from common.version import code_version
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
+from models.control_encoder import add_skips, clip_skips
 from models.stylegan2.model import Generator
 
 
 ATTR_NAMES = {15: 'Eyeglasses', 20: 'Male', 24: 'No_Beard', 31: 'Smiling',
               33: 'Wavy_Hair', 39: 'Young'}
 
-# Official CelebA list_attr_celeba.txt column order (0-indexed). Index 15 =
-# Eyeglasses, 20 = Male, 24 = No_Beard, 31 = Smiling, 33 = Wavy_Hair, 39 =
-# Young -- matches this project's attribute indices directly.
-CELEBA_ALL_ATTRS = [
-    '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes', 'Bald',
-    'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
-    'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby', 'Double_Chin',
-    'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones',
-    'Male', 'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard',
-    'Oval_Face', 'Pale_Skin', 'Pointy_Nose', 'Receding_Hairline', 'Rosy_Cheeks',
-    'Sideburns', 'Smiling', 'Straight_Hair', 'Wavy_Hair', 'Wearing_Earrings',
-    'Wearing_Hat', 'Wearing_Lipstick', 'Wearing_Necklace', 'Wearing_Necktie', 'Young',
-]
+# Every CelebA attribute gets a readable name (e.g. Bangs, not attr5).
+for _i, _n in enumerate(CELEBA_ALL_ATTRS):
+    ATTR_NAMES.setdefault(_i, _n)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +109,8 @@ class CLIPAttributeJudge(nn.Module):
 
     # (positive = "attribute present" in CelebA polarity, negative)
     PROMPTS = {
+        5: ("a headshot of a person with bangs covering the forehead",
+            "a headshot of a person with no bangs and a visible forehead"),
         15: ("a headshot of a person who is wearing glasses",
              "a headshot of a person who is not wearing glasses"),
         20: ("a headshot of a man",
@@ -287,7 +284,8 @@ class GlassesParserJudge(nn.Module):
     """
     GLASSES_CLASS = 6
 
-    def __init__(self, weights_path, device='cuda', area_thresh=0.0010, sharpness=0.5):
+    def __init__(self, weights_path, device='cuda', area_thresh=0.0010, sharpness=0.5,
+                 min_component_frac=0.00015):
         super().__init__()
         from common.face_parser import FaceParser
         self.parser = FaceParser(weights_path=weights_path).to(device).eval()
@@ -295,14 +293,41 @@ class GlassesParserJudge(nn.Module):
             p.requires_grad_(False)
         self.area_thresh = float(area_thresh)
         self.sharpness = float(sharpness)
+        # Drop connected components smaller than this fraction of the 512x512
+        # mask before summing the glasses area. WHY: with the raw whole-mask
+        # area fraction, denom = sharpness*area_thresh ~= 5e-4, so a dozen
+        # stray pixels BiSeNet mislabels as class 6 (reflections, hair strands,
+        # a compression artifact near the eye) alone saturate the sigmoid to
+        # ~1.0 -- the score reads "confidently has glasses" even when nothing
+        # glasses-shaped was ever drawn, which is exactly the "score is fake"
+        # failure mode reported from visually auditing high-scoring samples.
+        # A real frame (even thin/rimless) forms a connected blob far larger
+        # than sensor noise, so filtering by component size removes the noise
+        # without needing to blunt area_thresh/sharpness (which would also
+        # suppress genuine thin-frame detections).
+        self.min_component_px = max(1, int(round(min_component_frac * 512 * 512)))
 
     @torch.no_grad()
     def glasses_prob(self, images):
         """images: [-1,1] (B,3,H,W) -> (B,) probability eyeglasses are present."""
+        import cv2
         inp = F.interpolate(images, 512, mode='bilinear', align_corners=False)
         inp = (inp * 0.5 + 0.5 - self.parser.mean) / self.parser.std
         seg = self.parser.net(inp).argmax(dim=1)                     # (B,512,512)
-        frac = (seg == self.GLASSES_CLASS).float().mean(dim=(1, 2))  # (B,) area fraction
+        glasses_mask = (seg == self.GLASSES_CLASS)
+
+        fracs = []
+        for b in range(glasses_mask.size(0)):
+            m = glasses_mask[b].byte().cpu().numpy()
+            if m.sum() == 0:
+                fracs.append(0.0)
+                continue
+            num, _labels, stats, _cent = cv2.connectedComponentsWithStats(m, connectivity=8)
+            areas = stats[1:, cv2.CC_STAT_AREA]   # component 0 is background
+            kept = areas[areas >= self.min_component_px].sum() if num > 1 else 0
+            fracs.append(float(kept) / (512 * 512))
+        frac = glasses_mask.new_tensor(fracs, dtype=torch.float32)   # (B,) filtered area fraction
+
         denom = self.sharpness * self.area_thresh + 1e-8
         return torch.sigmoid((frac - self.area_thresh) / denom)      # 0.5 at frac==thresh
 
@@ -412,6 +437,7 @@ def build_optional_judges(args, attribute_index, id_criterion):
                 args.face_parser_weights, device,
                 area_thresh=args.glasses_area_thresh,
                 sharpness=args.glasses_area_sharpness,
+                min_component_frac=getattr(args, 'glasses_min_component_frac', 0.00015),
             )
             print(f'[Judge] Eyeglasses scored by BiSeNet parser (class 6, '
                   f'area_thresh={args.glasses_area_thresh}) -- REPLACES CLIP for '
@@ -459,10 +485,20 @@ RUN_CONFIG_KEYS = [
     'attr_backbone', 'conditioner_backbone', 'clip_model', 'fused_hidden_dim',
     'img_size', 'direction_residual_scale', 'direction_bank_path',
     'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
+    'magnitude_latent_cond',
     'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
     'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
-    'controlnet_per_direction',
+    'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
+    'controlnet_region_cond', 'region_saliency_path',
+    'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers', 'gate_uniform_attrs',
+    # training's caps on the edit (the eval applies them as training did;
+    # --no_train_caps turns them off to reproduce numbers from before)
+    'residual_max_norm', 'direction_guided_delta_max_norm', 'final_delta_max_norm',
 ]
+
+# Old eval flag names -> the training name they now share (apply_run_config
+# treats either spelling on the command line as explicit).
+_FLAG_ALIASES = {'guided_delta_max_norm': 'direction_guided_delta_max_norm'}
 
 
 def apply_run_config(args):
@@ -480,10 +516,15 @@ def apply_run_config(args):
         return args
     with open(cfg_path) as f:
         cfg = json.load(f)
+    if cfg.get('content_bank_path') or cfg.get('content_film'):
+        raise SystemExit(f'{args.checkpoint_dir} was trained with content conditioning '
+                         f'(--content_bank_path), which this code no longer has; evaluate it '
+                         f'with a checkout from before content conditioning was removed.')
     explicit = set()
     for tok in sys.argv[1:]:
         if tok.startswith('--'):
-            explicit.add(tok.split('=')[0].lstrip('-').replace('-', '_'))
+            name = tok.split('=')[0].lstrip('-').replace('-', '_')
+            explicit.add(_FLAG_ALIASES.get(name, name))
     for key in RUN_CONFIG_KEYS:
         if key not in cfg or key in explicit:
             continue
@@ -492,6 +533,49 @@ def apply_run_config(args):
         if old != new:
             print(f'[RunConfig] {key}: {old} -> {new} (from config.json)')
             setattr(args, key, new)
+    return args
+
+
+def resolve_controlnet_disable_attrs(args):
+    """Auto-default for --controlnet_disable_attrs: when ControlNet injection
+    is active and the caller did not explicitly choose which attributes get
+    it (the flag is left at its argparse default of None), skip gender/age
+    (20, 39) and keep the injection only for eyeglasses.
+
+    WHY as a default and not just a documented flag: the finding (see
+    edit_single_attribute) is that ControlNet is load-bearing for eyeglasses
+    structure (AccCeleb add 93%->12% without it) but measured NO accuracy
+    benefit for gender/age (~70.7% either way) while it DOES introduce a
+    hairline/collar sparkle artifact that scale sweeps don't remove. Leaving
+    that as an opt-in flag means every eval/render run pays the artifact cost
+    for attributes that get nothing from it, unless the user remembers to
+    pass the flag by hand. Call this once right after argument parsing (and
+    after apply_run_config, so config.json's use_controlnet_injection has
+    already been applied) in every entry point that edits attributes.
+    """
+    using_controlnet = (getattr(args, 'use_controlnet_injection', False)
+                         and not getattr(args, 'disable_controlnet', False))
+    if using_controlnet and getattr(args, 'controlnet_disable_attrs', None) is None:
+        # The "no benefit for age/gender" measurement that motivates this
+        # default was taken with SINGLE-resolution (64x64) injection, and
+        # 64x64 is the band where mid-level structure lives, not the 128-512
+        # bands that carry wrinkles and skin texture. A multi-resolution run
+        # reaches a band the old finding never tested, so applying the old
+        # default there would silently switch off exactly the thing the run
+        # was built to measure. Keep the default only for single-resolution.
+        multi_res = len(getattr(args, 'controlnet_res', None) or []) > 1
+        auto = [i for i in (20, 39) if i in args.attribute_index]
+        if multi_res:
+            print('[Default] ControlNet injection kept for ALL attributes: this checkpoint '
+                  f'injects at {sorted(args.controlnet_res)}, and the gender/age auto-disable '
+                  'was measured on 64x64-only injection (which cannot reach fine texture). '
+                  'Pass --controlnet_disable_attrs 20 39 to restore the old behaviour.')
+        elif auto:
+            args.controlnet_disable_attrs = auto
+            print(f'[Default] ControlNet injection auto-disabled for {auto} (gender/age) -- '
+                  f'no measured accuracy benefit at 64x64, causes a hairline/collar sparkle '
+                  f'artifact; kept for eyeglasses. Pass --controlnet_disable_attrs explicitly '
+                  f'to override.')
     return args
 
 
@@ -538,7 +622,58 @@ def _latest_step(checkpoint_dir, module_name='prior'):
 # Model loading
 # ---------------------------------------------------------------------------
 
+def _attach_region_parser(args, control_encoder, device):
+    """A --controlnet_region_cond encoder was trained with a BiSeNet skin mask
+    as its region input for EVERY age(39) edit. edit_single_attribute /
+    edit_multi_attribute only built that mask when the CALLER passed a
+    face_parser, and several scripts never do (e.g. calibrate_clip_thresh,
+    dump_multi_attr_edit).
+    Their age edits silently got the all-ones mask instead: a different input
+    from training, so a different edit from the one evaluate_sdflow.py scores.
+    Attaching the parser here gives every caller the training-time mask.
+
+    Stored with object.__setattr__ so it is NOT registered as a submodule of
+    control_encoder (it must stay out of its parameters() / state_dict())."""
+    if not getattr(control_encoder, 'region_cond', False):
+        return
+    if getattr(args, 'region_saliency_path', None):
+        print(f'[WARN] this run trained with --region_saliency_path '
+              f'({args.region_saliency_path}): non-age attributes saw per-sample saliency '
+              f'maps as their region input, but eval has no saliency lookup and feeds them '
+              f'the all-ones mask. Their numbers do NOT reflect what was trained.')
+    from common.face_parser import FaceParser
+    weights = getattr(args, 'face_parser_weights', None) or './data/parsing_bisenet.pth'
+    try:
+        parser = FaceParser(weights_path=weights).to(device).eval()
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f'[WARN] region_cond checkpoint but face parser unavailable ({exc}); age(39) '
+              f'edits fall back to an all-ones region mask, which training never used.')
+        return
+    object.__setattr__(control_encoder, 'region_parser', parser)
+
+
 def load_models(args):
+    global _EDIT_TARGET_MODE
+    _EDIT_TARGET_MODE = getattr(args, 'edit_target', None) or 'mirror'
+    global _SRC_COND_CLAMP, _FINAL_DELTA_MAX_NORM
+    _SRC_COND_CLAMP = getattr(args, 'src_cond_clamp', None)
+    set_edit_gain(getattr(args, 'edit_gain', None) or 1.0)
+    caps = train_caps(args)
+    _FINAL_DELTA_MAX_NORM = caps['final']
+    print(f'[Caps] residual max norm {caps["residual"]}, guided delta max norm {caps["guided"]}, '
+          f'final delta max norm {caps["final"]}'
+          + (' (--no_train_caps: training caps off)' if getattr(args, 'no_train_caps', False)
+             else ' (as in training)'))
+    set_preserve_boundaries(getattr(args, 'preserve_boundaries', None),
+                            getattr(args, 'preserve_strength', 1.0),
+                            getattr(args, 'preserve_min_auc', 0.8))
+    if _SRC_COND_CLAMP is not None:
+        print(f'[SrcCondClamp] {_SRC_COND_CLAMP}: an edit with a given direction starts from a source '
+              f'value on the far side of 0.5 (add <= {0.5 - _SRC_COND_CLAMP:.2f}, '
+              f'rm >= {0.5 + _SRC_COND_CLAMP:.2f}).')
+    if _EDIT_TARGET_MODE != 'mirror':
+        print(f'[EditTarget] {_EDIT_TARGET_MODE}: edits aim at the training targets '
+              f'(0.2/0.8, Eyeglasses 0.1/0.9) -- not comparable with mirror-mode numbers.')
     device = 'cuda'
     attribute_index = torch.tensor(args.attribute_index, dtype=torch.long)
     num_attrs = len(args.attribute_index)
@@ -581,8 +716,7 @@ def load_models(args):
     if bank_path:
         from models.direction_bank import AttributeDirectionBank
         bank_meta = torch.load(bank_path, map_location='cpu')
-        num_k = int(bank_meta.get('num_k', bank_meta.get('K', 1))) \
-            if isinstance(bank_meta, dict) else 1
+        num_k = bank_num_k(bank_meta) if isinstance(bank_meta, dict) else 1
         _per_attr_rs = [
             args.glasses_residual_scale if idx == 15 else args.direction_residual_scale
             for idx in args.attribute_index
@@ -597,12 +731,12 @@ def load_models(args):
             residual_scale=args.direction_residual_scale,
             per_attr_residual_scale=_per_attr_rs,
             freeze_directions=True,
-            guided_delta_max_norm=(
-                args.guided_delta_max_norm if args.guided_delta_max_norm > 0 else None
-            ),
+            guided_delta_max_norm=caps['guided'],
+            residual_max_norm=caps['residual'],
             use_attr_lora=getattr(args, 'use_attr_lora', False),
             attr_lora_rank=getattr(args, 'attr_lora_rank', 4),
             signed_magnitude_input=getattr(args, 'signed_magnitude_input', False),
+            magnitude_latent_cond=getattr(args, 'magnitude_latent_cond', False),
         ).to(device).eval()
         if os.path.exists(db_ckpt_path):
             # The frozen direction_units are a registered buffer, so they live
@@ -638,6 +772,23 @@ def load_models(args):
                       f'stay calibrated.)')
         else:
             print(f'Direction bank init (no trained weights at {db_ckpt_path})')
+        from models.direction_bank import parse_attr_spec
+        for _a in (getattr(args, 'gate_uniform_attrs', None) or []):
+            direction_bank.set_uniform_gate(args.attribute_index.index(int(_a)))
+            print(f'[Gate] attr {_a}: direction-bank gate forced uniform (averaged slots)')
+        for _a, _c in parse_attr_spec(getattr(args, 'residual_scale_cap', None)).items():
+            direction_bank.set_residual_cap(args.attribute_index.index(_a), _c)
+            print(f'[RunConfig] residual_scale for attr {_a} capped at {_c:g} (as trained)')
+        for _a, (_lo, _hi) in parse_attr_spec(getattr(args, 'bank_dir_layers', None),
+                                              'range').items():
+            direction_bank.set_dir_layers(args.attribute_index.index(_a), _lo, _hi)
+            print(f'[RunConfig] direction edit for attr {_a} restricted to W+ layers {_lo}-{_hi}')
+        if getattr(args, 'age_gate_by_strata', False):
+            _per = direction_bank.enable_strata_routing(
+                args.attribute_index.index(39), args.attribute_index.index(20),
+                args.attribute_index.index(15))
+            print(f'[Routing] age strata routing ON (trained with --age_gate_by_strata): '
+                  f'{_per} slot(s) per gender x glasses stratum.')
 
         if args.override_residual_scale is not None:
             # Diagnostic knob: the trained residual_scale is typically frozen
@@ -653,30 +804,26 @@ def load_models(args):
                   f'{args.override_residual_scale} for ALL attributes '
                   f'(trained value ignored)')
 
-        if getattr(args, 'age_fine_layer_scale', None) is not None and 39 in args.attribute_index:
-            # Diagnostic knob: render_preview.py with --override_residual_scale 0
-            # showed the color-cast artifact on age edits comes 100% from the
-            # precomputed direction_units for attribute 39 (age), independent of
-            # the flow/residual entirely -- residual=0 (pure Direction Bank
-            # output) still reproduces the identical artifact. StyleGAN's fine
-            # W+ layers (index >=4, matching the reg_loss_fine grouping used
-            # elsewhere in this codebase) control color/texture, while
-            # global/coarse layers (<4) control structure (face shape,
-            # wrinkles-as-geometry, hairline). This scales down the age
-            # direction's fine-layer components at inference time -- no
-            # retraining, no bank recomputation -- to test whether the color
-            # confound specifically lives in those layers.
+        if 39 in args.attribute_index and getattr(args, 'age_fine_layer_scale', None) is not None:
+            # Off unless --age_fine_layer_scale is given: training never damps
+            # these layers, so the default eval edits as training did.
+            # StyleGAN's fine W+ layers (index >=4, matching the reg_loss_fine
+            # grouping used elsewhere in this codebase) control color/texture,
+            # while global/coarse layers (<4) control structure (face shape,
+            # wrinkles-as-geometry, hairline). A visual audit confirmed the
+            # color-cast artifact on age edits comes 100% from the precomputed
+            # direction_units for attribute 39, independent of the flow/
+            # residual entirely (residual=0, i.e. pure Direction Bank output,
+            # still reproduces it).
             _age_local = args.attribute_index.index(39)
-            _start = int(args.age_fine_layer_start)
-            with torch.no_grad():
-                direction_bank.layer_scale[_age_local, _start:] = float(args.age_fine_layer_scale)
-            print(f'[Override] age (attr 39) direction layer scale forced to '
-                  f'{args.age_fine_layer_scale} for layers [{_start}:18] '
-                  f'(layers [0:{_start}] untouched). 500-sample eval showed a '
-                  f'blanket cut at layer 4 kills real aging signal (rm-direction '
-                  f'AccCLIP 76%->17%) along with the color artifact -- they are '
-                  f'not cleanly separable at that boundary; narrow the cut to '
-                  f'the very last layers first.')
+            _start = int(getattr(args, 'age_fine_layer_start', 10))
+            _scale = getattr(args, 'age_fine_layer_scale', None)
+            if _scale is not None:
+                # Explicit override: flat cut, same as before.
+                with torch.no_grad():
+                    direction_bank.layer_scale[_age_local, _start:] = float(_scale)
+                print(f'[Override] age (attr 39) direction layer scale forced to '
+                      f'{_scale} for layers [{_start}:18] (layers [0:{_start}] untouched).')
 
     # ── ControlNet-style attribute control encoder (optional) ─────────────
     control_encoder = None
@@ -685,18 +832,44 @@ def load_models(args):
               'through the W+ path (flow + Direction Bank) only, even though this run was '
               'trained with the injection active.')
     elif getattr(args, 'use_controlnet_injection', False):
-        from models.control_encoder import AttributeControlEncoder
-        control_encoder = AttributeControlEncoder(
-            num_attrs=num_attrs,
-            out_channels=args.controlnet_channels,
-            out_res=args.controlnet_embed_res,
-            hidden_dim=args.controlnet_hidden_dim,
-            init_gain=getattr(args, 'controlnet_init_gain', 1.0),
-            per_direction=getattr(args, 'controlnet_per_direction', False),
-        ).to(device).eval()
+        from models.control_encoder import (AttributeControlEncoder,
+                                            LegacySingleResControlEncoder,
+                                            is_legacy_state_dict)
+        _cn_res = getattr(args, 'controlnet_res', None) or [args.controlnet_embed_res]
         ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
-        if os.path.exists(ce_ckpt_path):
-            result = control_encoder.load_state_dict(load_network(ce_ckpt_path), strict=False)
+        # Which architecture to build is decided by the CHECKPOINT, not by the
+        # flags: a single-resolution baseline and a multi-resolution challenger
+        # are by construction on opposite sides of this change, and comparing
+        # them is the whole point. Building the wrong one turns every metric
+        # into noise (or, with strict loading, a hard error mid-eval).
+        _ce_state = load_network(ce_ckpt_path) if os.path.exists(ce_ckpt_path) else None
+        if _ce_state is not None and is_legacy_state_dict(_ce_state):
+            if len(_cn_res) > 1:
+                print(f'[Compat] control_encoder checkpoint predates multi-resolution '
+                      f'injection; building the single-resolution architecture at '
+                      f'{args.controlnet_embed_res} and ignoring --controlnet_res {_cn_res}.')
+            control_encoder = LegacySingleResControlEncoder(
+                num_attrs=num_attrs,
+                out_channels=args.controlnet_channels,
+                out_res=args.controlnet_embed_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=getattr(args, 'controlnet_init_gain', 1.0),
+                per_direction=getattr(args, 'controlnet_per_direction', False),
+                latent_cond=getattr(args, 'controlnet_latent_cond', False),
+            ).to(device).eval()
+        else:
+            control_encoder = AttributeControlEncoder(
+                num_attrs=num_attrs,
+                out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
+                out_res=_cn_res,
+                hidden_dim=args.controlnet_hidden_dim,
+                init_gain=getattr(args, 'controlnet_init_gain', 1.0),
+                per_direction=getattr(args, 'controlnet_per_direction', False),
+                latent_cond=getattr(args, 'controlnet_latent_cond', False),
+                region_cond=getattr(args, 'controlnet_region_cond', False),
+            ).to(device).eval()
+        if _ce_state is not None:
+            result = control_encoder.load_state_dict(_ce_state, strict=False)
             if result.missing_keys:
                 print(f'[WARN] control_encoder missing keys: {result.missing_keys[:8]}')
             if result.unexpected_keys:
@@ -706,6 +879,7 @@ def load_models(args):
             print(f'Control encoder init (no trained weights at {ce_ckpt_path})')
         for p in control_encoder.parameters():
             p.requires_grad_(False)
+        _attach_region_parser(args, control_encoder, device)
 
     # ── StyleGAN2 ─────────────────────────────────────────────────────────
     ckpt = torch.load(args.stygan2_weights, map_location='cpu')
@@ -735,6 +909,203 @@ def load_models(args):
 # Editing
 # ---------------------------------------------------------------------------
 
+# --edit_target, set once by load_models() so every script that edits through
+# edit_single_attribute / edit_multi_attribute follows it without passing it.
+_EDIT_TARGET_MODE = 'mirror'
+_SRC_COND_CLAMP = None      # --src_cond_clamp; set in load_models()
+
+
+def consistent_source(attr_cond, local_idx, direction, margin=None):
+    """attr_cond with the edited attribute's SOURCE value moved to the far side
+    of 0.5 from the requested direction: add -> min(src, 0.5 - m), rm ->
+    max(src, 0.5 + m). Off (attr_cond unchanged) without a margin or a
+    direction.
+
+    Why: with a given direction the flow is asked for src + s*(end - src). When
+    the conditioner already reads the source on the target side (Young: a face
+    the judge calls old, conditioner 1.00) that is ~0 and the edit is a no-op
+    at any scale -- 37 of 51 failed Young add edits in
+    scripts/diagnose_attr_edit.py had |edit| = 0. Only the direction is used,
+    which an edit request has anyway; values already on the right side and
+    at least m from 0.5 are untouched."""
+    m = _SRC_COND_CLAMP if margin is None else margin
+    if m is None or direction is None:
+        return attr_cond
+    out = attr_cond.clone()
+    src = out[:, local_idx]
+    add = direction.to(src.device) > 0
+    out[:, local_idx] = torch.where(add, src.clamp(max=0.5 - m), src.clamp(min=0.5 + m))
+    return out
+
+
+_PRESERVE = None            # --preserve_boundaries; set in load_models()
+_FINAL_DELTA_MAX_NORM = None    # training's --final_delta_max_norm; set in load_models()
+_EDIT_GAIN = 1.0            # --edit_gain / --adaptive_gains: W+ edit x k after the final cap
+
+
+def set_edit_gain(k):
+    """Lengthen every W+ edit by k after the final cap, keeping its direction.
+    Unlike a larger edit_scale (a target value past what training saw, which
+    turns the edit), this only moves further along the learned edit."""
+    global _EDIT_GAIN
+    _EDIT_GAIN = float(k)
+
+
+def train_caps(args):
+    """The caps training put on the edit: residual / guided-delta max norm
+    (inside the direction bank) and the final delta max norm (on the whole W+
+    edit). None = no cap. All None with --no_train_caps. Also reads the old
+    eval name guided_delta_max_norm for scripts with their own parser."""
+    if getattr(args, 'no_train_caps', False):
+        return {'residual': None, 'guided': None, 'final': None}
+
+    def pos(v):
+        return float(v) if v is not None and float(v) > 0 else None
+    guided = getattr(args, 'direction_guided_delta_max_norm', None)
+    if guided is None:
+        guided = getattr(args, 'guided_delta_max_norm', None)
+    return {'residual': pos(getattr(args, 'residual_max_norm', None)), 'guided': pos(guided),
+            'final': pos(getattr(args, 'final_delta_max_norm', None))}
+
+
+def cap_delta_norm(delta, max_norm):
+    """training/train_sdflow.py's cap: scale each sample's W+ delta down to at
+    most max_norm (None / <=0 = unchanged)."""
+    if max_norm is None or max_norm <= 0:
+        return delta
+    n = delta.reshape(delta.shape[0], -1).norm(dim=1)
+    return delta * (float(max_norm) / n.clamp(min=1e-8)).clamp(max=1.0).view(-1, 1, 1)
+
+
+def bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent, attr_cond, id_cond,
+                      edited_globals):
+    """The W+ edit the model applies for one attribute, as training builds it:
+    direction bank, then the final delta cap; then (eval only, off by default)
+    the --preserve_boundaries projection. Shared by edit_single_attribute,
+    edit_multi_attribute and bank_edit."""
+    B = latent.size(0)
+    idx = torch.full((B,), local_idx, device=latent.device, dtype=torch.long)
+    direction_bank._id_cond = id_cond      # read only by a --residual_head
+    delta = direction_bank(flow_delta, attr_delta, attr_idx=idx, latent=latent, route_scores=attr_cond)
+    delta = delta[0] if isinstance(delta, tuple) else delta
+    delta = cap_delta_norm(delta, _FINAL_DELTA_MAX_NORM) * _EDIT_GAIN
+    return project_preserve(delta, edited_globals)
+
+
+@torch.no_grad()
+def bank_edit(prior, direction_bank, latent, attr_cond, id_cond, local_idx, scale, global_idx, direction):
+    """edit_single_attribute up to the W+ edit (no rendering, no ControlNet):
+    returns the applied W+ delta, the bank's residual part of it and the
+    requested attribute change. Used by the analysis scripts."""
+    B = latent.size(0)
+    zero_pad = torch.zeros(B, 18, 1, device=latent.device)
+    attr_cond = consistent_source(attr_cond, local_idx, direction)
+    mid, _ = prior(latent, torch.cat([id_cond, attr_cond], 1), zero_pad)
+    new_attr = attr_cond.clone()
+    new_attr[:, local_idx] = edited_attr_value(attr_cond[:, local_idx], scale, global_idx, direction=direction)
+    raw, _ = prior(mid, torch.cat([id_cond, new_attr], 1), zero_pad, reverse=True)
+    delta = bank_guided_delta(direction_bank, raw - latent, new_attr - attr_cond, local_idx, latent,
+                              attr_cond, id_cond, [global_idx])
+    return delta, direction_bank._last_residual, (new_attr - attr_cond)[:, local_idx]
+
+
+def set_preserve_boundaries(path, strength=1.0, min_auc=0.8):
+    """Load scripts/fit_attr_boundaries.py normals for project_preserve(); None = off."""
+    global _PRESERVE
+    if not path:
+        _PRESERVE = None
+        return
+    d = torch.load(path, map_location='cpu')
+    normals = d['normals'].float().reshape(40, -1)
+    auc = d['auc'].float()
+    usable = [a for a in range(40) if float(auc[a]) >= min_auc]
+    _PRESERVE = {'normals': normals, 'usable': set(usable), 'strength': float(strength),
+                 'allow': PRESERVE40_ALLOW,
+                 'cache': {}}
+    weak = [CELEBA_ALL_ATTRS[a] for a in range(40) if a not in _PRESERVE['usable']]
+    print(f'[Preserve] {path}: edits lose their component along the boundaries of the attributes '
+          f'they should not change (strength {strength:g}); {len(usable)}/40 boundaries with AUC >= '
+          f'{min_auc:g}' + (f' (not used: {", ".join(weak)})' if weak else ''))
+
+
+def preserve_basis(edited_globals):
+    """Orthonormal basis (L*D, m) of the protected boundary normals for an edit
+    of `edited_globals`: all 40 minus the edited attributes, minus what their
+    PRESERVE40_ALLOW lists say may change with them, minus unreliable
+    boundaries. Each normal first loses its component along the edited
+    attributes' own normals, so the edited attributes' linear scores change
+    exactly as before; a protected attribute tied to the edited one (cos of the
+    normals) keeps that tied part of its change."""
+    key = frozenset(int(g) for g in edited_globals)
+    cache = _PRESERVE['cache']
+    if key in cache:
+        return cache[key]
+    N = _PRESERVE['normals']
+    keep_out = set(key)
+    for g in key:
+        keep_out |= set(_PRESERVE['allow'].get(g, []))
+    protected = [a for a in sorted(_PRESERVE['usable']) if a not in keep_out]
+    Q = None
+    if protected:
+        E = N[sorted(key)].t()                                    # (L*D, k) edited normals
+        Qe, _ = torch.linalg.qr(E)
+        P = N[protected].t()
+        P = P - Qe @ (Qe.t() @ P)
+        Q, R = torch.linalg.qr(P)
+        Q = Q[:, R.diagonal().abs() > 1e-6]                       # drop normals inside the edited span
+        names = [CELEBA_ALL_ATTRS[a] for a in key]
+        print(f'[Preserve] {"+".join(names)}: {Q.size(1)} protected directions '
+              f'({len(protected)} attributes; allowed to change: '
+              f'{", ".join(CELEBA_ALL_ATTRS[a] for a in sorted(keep_out - key)) or "-"})')
+    cache[key] = Q
+    return Q
+
+
+def project_preserve(delta, edited_globals):
+    """delta (B, L, D) minus strength x its projection on preserve_basis().
+    Unchanged when --preserve_boundaries is off or the edited attributes are
+    unknown. Only the W+ delta; ControlNet feature injection is not affected."""
+    if _PRESERVE is None or edited_globals is None or any(g is None for g in edited_globals):
+        return delta
+    Q = preserve_basis(edited_globals)
+    if Q is None:
+        return delta
+    Q = Q.to(device=delta.device, dtype=delta.dtype)
+    flat = delta.reshape(delta.size(0), -1)
+    flat = flat - _PRESERVE['strength'] * (flat @ Q) @ Q.t()
+    return flat.view_as(delta)
+
+
+def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
+    """The attribute value the flow is asked to reach at edit strength `scale`.
+
+    'mirror' (default, what every eval so far used): src*(1-s) + (1-src)*s, so
+    s=1 lands on 1-src. 'train': src + s*(hard - src) with hard = 0.20/0.80
+    (0.10/0.90 for Eyeglasses), the exact rule training used (soft_flow_target
+    in train_sdflow.py).
+
+    Why it matters: the two agree for confident sources and disagree for
+    ambiguous ones. A source at 0.68 gets a delta of 0.36 under mirror@1.0 but
+    0.48 under train@1.0. Mirror therefore under-edits exactly the sources
+    that are hardest to flip, and asks for a smaller change than training
+    taught the model to make for that source. Numbers from the two modes are
+    not comparable: compare checkpoints under the same mode."""
+    if direction is not None:
+        # Explicit direction (+1 add, -1 rm), e.g. from the eval judge's own
+        # add/rm split: move toward the matching end of [0, 1] by `scale`.
+        # Always moves the requested way, even when the conditioner reads the
+        # source on the other side of 0.5 (where mirror / train would edit the
+        # wrong way, or not at all at src == 0.5).
+        end = (direction.to(src.dtype) > 0).to(src.dtype)
+        return src + scale * (end - src)
+    mode = mode or _EDIT_TARGET_MODE
+    if mode == 'train' and attr_global_idx is not None:
+        low, high = SOFT_TARGET_TABLE.get(int(attr_global_idx), DEFAULT_SOFT_TARGET)
+        hard = torch.where(src > 0.5, torch.full_like(src, low), torch.full_like(src, high))
+        return src + scale * (hard - src)
+    return src * (1.0 - scale) + (1.0 - src) * scale
+
+
 @torch.no_grad()
 def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
     """Blend `edited` face pixels into `orig`'s background/hair, using the
@@ -753,9 +1124,28 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
     the color-mismatch seam that a feathered alpha blend cannot fix. Runs
     per-sample on CPU (cv2), so it's slower than the alpha path; fine for
     eval/deployment post-processing, not for anything in the training loop.
+
+    MASK SOURCE: the face region is taken as the UNION (elementwise max) of
+    the source's and the edited image's BiSeNet face masks, not just the
+    source's. Using only `orig` (as an earlier version of this function did)
+    silently truncates any structure the edit ADDS that extends past the
+    pre-edit face silhouette -- e.g. eyeglasses temple arms reaching past the
+    ears, which a glasses-free source has no reason for BiSeNet to have
+    labeled "face". Those newly-added pixels would then fall outside the
+    orig-only mask and get overwritten by the ORIGINAL (glasses-less)
+    background at composite time, i.e. compositing would cut the very
+    structure it's supposed to only be protecting the background around --
+    directly lowering eyeglasses-add accuracy, not just leaving it flat.
+    Taking the union costs a small amount of background/hair protection
+    right at that boundary; it does not reintroduce the leakage problem
+    compositing exists to fix, since both masks still exclude everything far
+    from the face on both sides.
     """
     if method == 'alpha':
-        mask = face_parser.get_mask(orig, blur_sigma=int(blur_sigma))
+        mask = torch.maximum(
+            face_parser.get_mask(orig, blur_sigma=int(blur_sigma)),
+            face_parser.get_mask(edited, blur_sigma=int(blur_sigma)),
+        )
         return edited * mask + orig * (1.0 - mask)
 
     if method != 'poisson':
@@ -763,7 +1153,11 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
 
     import cv2
     import numpy as np
-    mask = face_parser.get_mask(orig, blur_sigma=0)   # hard silhouette; Poisson handles the boundary
+    # hard silhouette (union of both masks -- see docstring); Poisson handles the boundary
+    mask = torch.maximum(
+        face_parser.get_mask(orig, blur_sigma=0),
+        face_parser.get_mask(edited, blur_sigma=0),
+    )
     out = []
     for b in range(orig.size(0)):
         o = ((orig[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
@@ -771,16 +1165,25 @@ def composite_faces(face_parser, orig, edited, method='alpha', blur_sigma=15):
         m = (mask[b, 0].cpu().numpy() > 0.5).astype(np.uint8) * 255
         h, w = m.shape
         if m.sum() < 255 * 50:   # degenerate mask (parser found ~no face) -> keep original
+            print('[Composite] warning: no face region found; keeping the UNEDITED reconstruction '
+                  '(it will score as a failed edit)')
             out.append(orig[b])
             continue
+        # seamlessClone places the centre of the mask's bounding box at `center`;
+        # for the pasted face to stay where it is that must be the box's own
+        # centre, not the image centre (the face+hair mask is not centred).
+        ys, xs = np.nonzero(m)
+        x0, y0 = int(xs.min()), int(ys.min())
+        center = (x0 + (int(xs.max()) - x0 + 1) // 2, y0 + (int(ys.max()) - y0 + 1) // 2)
         try:
             blended = cv2.seamlessClone(
-                np.ascontiguousarray(e), np.ascontiguousarray(o), m,
-                (w // 2, h // 2), cv2.NORMAL_CLONE,
+                np.ascontiguousarray(e), np.ascontiguousarray(o), m, center, cv2.NORMAL_CLONE,
             )
             t = torch.from_numpy(blended).to(orig.device).float().permute(2, 0, 1) / 255.0 * 2 - 1
-        except cv2.error:
-            t = orig[b]   # mask touched the image border or similar -> fall back safely
+        except cv2.error as err:
+            print(f'[Composite] warning: seamlessClone failed ({err}); keeping the UNEDITED '
+                  f'reconstruction for this face')
+            t = orig[b]
         out.append(t)
     return torch.stack(out, dim=0).to(dtype=orig.dtype)
 
@@ -791,31 +1194,65 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                           attr_global_idx=None, bypass_glasses_direction_bank=False,
                           face_parser=None, composite_method='alpha', composite_blur_sigma=15,
                           control_encoder=None, controlnet_max_norm=0.0,
-                          controlnet_disable_attrs=None, controlnet_embed_res=64):
+                          controlnet_disable_attrs=None, controlnet_embed_res=64,
+                          composite=True, direction=None):
     """
-    face_parser: if given, composite the edited face back onto the SOURCE
-    RECONSTRUCTION's background/hair (see composite_faces() above). A
-    long-running complaint in this project was that gender/age edits move
-    the background and hair far more than intended (the W+ edit is global,
-    not local to the face). Restricting the visible change to the BiSeNet
-    face region is a training-free way to cut that leakage for EVERY
-    attribute at once, instead of another attribute-specific loss tweak.
-    Composites against G(latent) (the source RECONSTRUCTION), not the raw
-    source photo, so the blend doesn't inherit the encoder's inversion gap
-    as a seam. A first attempt at plain alpha blending showed a visible
-    seam (boundary color/brightness mismatch); composite_method='poisson'
-    fixes that via gradient-domain blending instead of a wider feather.
+    direction: optional (B,) tensor, +1 = add the attribute, -1 = remove it.
+    None (default) = the old behaviour: the direction follows the
+    conditioner's own reading of the source (src > 0.5 -> remove). See
+    --edit_direction.
+
+    face_parser: if given AND composite=True (the default), composite the
+    edited face back onto the SOURCE RECONSTRUCTION's background/hair (see
+    composite_faces() above). A long-running complaint in this project was
+    that gender/age edits move the background and hair far more than
+    intended (the W+ edit is global, not local to the face). Restricting the
+    visible change to the BiSeNet face region is a training-free way to cut
+    that leakage for EVERY attribute at once, instead of another
+    attribute-specific loss tweak. Composites against G(latent) (the source
+    RECONSTRUCTION), not the raw source photo, so the blend doesn't inherit
+    the encoder's inversion gap as a seam. A first attempt at plain alpha
+    blending showed a visible seam (boundary color/brightness mismatch);
+    composite_method='poisson' fixes that via gradient-domain blending
+    instead of a wider feather.
+
+    composite: set False to pass a face_parser WITHOUT compositing -- needed
+    when face_parser is only there to build a --controlnet_region_cond
+    region mask (see below) and the caller did not separately ask for
+    --composite_face_region. Defaults True so every existing caller (which
+    only ever passed face_parser when it wanted compositing) is unaffected.
     """
     B = img.size(0)
     device = img.device
     zero_pad = torch.zeros(B, 18, 1, device=device)
 
+    # Hoisted above the control_encoder call (rather than computed only for
+    # compositing at the end, as before): a --controlnet_region_cond encoder
+    # needs a region prior built from the UNEDITED source before it runs, for
+    # the same inversion-gap reason compositing already used src_recon for.
+    # Computed once, reused by both consumers.
+    # region_parser: the caller's face_parser if given, else the one
+    # load_models() attached for a region_cond encoder (_attach_region_parser)
+    # -- used ONLY for the region mask; compositing still needs face_parser.
+    region_parser = face_parser if face_parser is not None else \
+        getattr(control_encoder, 'region_parser', None)
+    need_region = (region_parser is not None and attr_global_idx == 39
+                   and getattr(control_encoder, 'region_cond', False))
+    src_recon = None
+    if face_parser is not None or need_region:
+        with torch.no_grad():
+            src_recon = G([latent], input_is_latent=True,
+                          randomize_noise=False)[0].clamp(-1, 1)
+
+    attr_cond = consistent_source(attr_cond, attr_local_idx, direction)
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
     new_attr_cond = attr_cond.clone()
     src = attr_cond[:, attr_local_idx]
-    new_attr_cond[:, attr_local_idx] = src * (1.0 - edit_scale) + (1.0 - src) * edit_scale
+    new_attr_cond[:, attr_local_idx] = edited_attr_value(src, edit_scale, attr_global_idx,
+                                                         direction=direction)
+    is_rm = (src > 0.5) if direction is None else (direction.to(src.device) < 0)
     new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
     new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
@@ -829,8 +1266,8 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), attr_local_idx, device=device, dtype=torch.long)
-        guided_delta = direction_bank(flow_delta, attr_delta,
-                                      attr_idx=batch_attr_idx, latent=latent)
+        guided_delta = bank_guided_delta(direction_bank, flow_delta, attr_delta, attr_local_idx,
+                                         latent, attr_cond, id_cond, [attr_global_idx])
         new_latents = latent + guided_delta
         # controlnet_disable_attrs: some attributes (e.g. eyeglasses) need the
         # ControlNet feature-map injection to synthesize structure the W+
@@ -844,229 +1281,80 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         if control_encoder is not None and (
                 controlnet_disable_attrs is None
                 or attr_global_idx not in controlnet_disable_attrs):
-            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
-            if controlnet_max_norm > 0:
-                skip_norm = control_skips.reshape(control_skips.shape[0], -1).norm(dim=1)
-                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
-                control_skips = control_skips * clip.view(-1, 1, 1, 1)
+            region_mask = None
+            if getattr(control_encoder, 'region_cond', False):
+                # Same convention as training: all-ones (uninformative) for
+                # any attribute without a defined region, a real BiSeNet
+                # mask for age(39) when face_parser is available.
+                region_mask = torch.ones(B, 1, *img.shape[-2:], device=device, dtype=img.dtype)
+                if need_region:
+                    with torch.no_grad():
+                        region_mask = region_parser.get_region_mask(
+                            src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
+            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
+                                            latent=latent, region_mask=region_mask)
+            control_skips = clip_skips(control_skips, controlnet_max_norm)
+    elif direction_bank is None:
+        new_latents = latent + cap_delta_norm(new_latents_raw - latent, _FINAL_DELTA_MAX_NORM)
     else:
-        new_latents = new_latents_raw
+        new_latents = new_latents_raw      # --bypass_glasses_direction_bank (eval-only)
 
     edited_face = G([new_latents], skips=control_skips, embed_res=controlnet_embed_res,
                     input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
 
-    if face_parser is not None:
-        with torch.no_grad():
-            src_recon = G([latent], input_is_latent=True,
-                          randomize_noise=False)[0].clamp(-1, 1)
-            edited_face = composite_faces(face_parser, src_recon, edited_face,
-                                          method=composite_method,
-                                          blur_sigma=composite_blur_sigma)
+    if composite and face_parser is not None:
+        edited_face = composite_faces(face_parser, src_recon, edited_face,
+                                      method=composite_method,
+                                      blur_sigma=composite_blur_sigma)
 
     return edited_face
 
 
-def edit_sequential_attribute(prior, conditioner, G, id_criterion,
-                              img, latent, attr_cond, id_cond,
-                              attr_local_idxs, edit_scales, direction_bank,
-                              control_encoder=None, controlnet_max_norm=0.0,
-                              controlnet_embed_res=64):
-    """Edit several attributes on the same face ONE AFTER ANOTHER, instead of
-    edit_multi_attribute's parallel sum of independently-computed deltas.
+def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None):
+    """--edit_direction clip / indep: tell the model the direction the eval
+    scores it on, taken from the source score of that judge (CLIP, or the
+    independent classifier; the BiSeNet parser overrides CLIP for Eyeglasses).
+    None = conditioner-chosen direction (the old behaviour).
 
-    Each step re-derives the flow's guided delta from wherever the PREVIOUS
-    step's edit landed (current_latent), instead of every attribute computing
-    its delta from the original source latent and adding the results
-    together blind to each other. direction_bank also receives the evolving
-    current_latent (not the original) as its LAG-DOF context, so the gate/
-    magnitude it picks for step 2 already accounts for what step 1 changed --
-    parallel summation cannot do this even in principle, since both deltas
-    are computed from the same starting point simultaneously.
-
-    Order matters here (A-then-B is not guaranteed to equal B-then-A) --
-    that asymmetry is an accepted trade for less cross-attribute leakage, not
-    an oversight; diagnose_multi_attribute_interference.py's --sequential
-    flag measures whether the trade is actually worth it on this checkpoint.
-
-    attr_local_idxs / edit_scales: same as edit_multi_attribute.
-    """
-    if isinstance(edit_scales, (int, float)):
-        edit_scales = [edit_scales] * len(attr_local_idxs)
-    assert len(edit_scales) == len(attr_local_idxs)
-
-    B = img.size(0)
-    device = img.device
-    zero_pad = torch.zeros(B, 18, 1, device=device)
-
-    current_latent = latent
-    current_attr_cond = attr_cond.clone()
-    combined_skips = None
-    for local_idx, scale in zip(attr_local_idxs, edit_scales):
-        src_cond = torch.cat([id_cond, current_attr_cond], dim=1)
-        mid_latent, _ = prior(current_latent, src_cond, zero_pad)
-
-        new_attr_cond = current_attr_cond.clone()
-        src = current_attr_cond[:, local_idx]
-        new_attr_cond[:, local_idx] = src * (1.0 - scale) + (1.0 - src) * scale
-        new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
-
-        new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
-        flow_delta = new_latents_raw - current_latent
-        attr_delta = new_attr_cond - current_attr_cond
-        batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
-        guided_delta = direction_bank(flow_delta, attr_delta,
-                                      attr_idx=batch_attr_idx, latent=current_latent)
-
-        if control_encoder is not None:
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
-            if controlnet_max_norm > 0:
-                skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
-                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
-                skip = skip * clip.view(-1, 1, 1, 1)
-            combined_skips = skip if combined_skips is None else combined_skips + skip
-
-        current_latent = current_latent + guided_delta
-        current_attr_cond = new_attr_cond
-
-    edited_face = G([current_latent], skips=combined_skips, embed_res=controlnet_embed_res,
-                    input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-    return edited_face
+    A direction taken from a judge that mislabels the SOURCE sends the edit
+    the wrong way (CLIP calls 40% of bang-less faces "has bangs", so they are
+    told to remove bangs and cannot succeed). indep avoids this when the
+    independent classifier is the judge that scores the edit."""
+    mode = getattr(args, 'edit_direction', 'cond')
+    if mode == 'cond':
+        return None
+    src = {'clip': src_probs_clip, 'indep': src_probs_indep}.get(mode)
+    if src is None:
+        # used to fall back to the conditioner's direction silently while the
+        # results still said edit_direction=<mode>
+        raise ValueError(f'--edit_direction {mode} needs its judge, which is not loaded '
+                         f'({"--independent_attr_weights" if mode == "indep" else "the CLIP judge"}).')
+    return torch.where(src[:, local_idx] > 0.5, -1.0, 1.0)
 
 
-# Mirrors training/train_sdflow.py's LOCAL_REGION_CLASSES -- kept as a small
-# local copy instead of importing the training script (heavier module-level
-# deps like wandb) just for one dict. Keep the two in sync if this changes.
-LOCAL_REGION_CLASSES = {
-    15: [2, 3, 4, 5, 6],   # eyeglasses: brows(2,3) + eyes(4,5) + glasses(6)
-}
-
-
-@torch.no_grad()
-def edit_composite_local_global(prior, conditioner, G, id_criterion,
-                                img, latent, attr_cond, id_cond,
-                                local_idx, local_global_idx, local_scale,
-                                global_idxs, global_scales,
-                                direction_bank, face_parser,
-                                add_blur_sigma=15, rm_blur_sigma=5, composite_method='alpha',
-                                control_encoder=None, controlnet_max_norm=0.0,
-                                controlnet_embed_res=64):
-    """Edit one LOCAL attribute (must be a key of LOCAL_REGION_CLASSES, e.g.
-    eyeglasses) together with one or more GLOBAL attributes (gender/age),
-    WITHOUT letting either edit's flow computation see the other at all.
-
-    diagnose_multi_attribute_interference.py found real cross-attribute
-    leakage from both edit_multi_attribute (parallel sum) and
-    edit_sequential_attribute (chained) -- e.g. +0.09 leakage onto the third
-    attribute for Eyeglasses+Male, barely moved by changing composition
-    order. The leakage comes from the flow's nonlinear reverse pass and the
-    generator entangling the two conditions once they are combined in W+ --
-    chaining or summing still puts both edits through the SAME latent/pixels.
-
-    This sidesteps that entirely for any pair involving a LOCAL attribute:
-    compute the global edit and the local edit as two completely independent,
-    single-attribute results (same code path as edit_single_attribute, zero
-    cross-contamination by construction), then composite them in PIXEL SPACE
-    using the BiSeNet region mask that already exists for
-    --local_region_loss_weight -- local attribute's pixels come from its own
-    edit, everywhere else comes from the global edit. Cannot leak into each
-    other because neither ever saw the other's target condition.
-
-    Does not apply to two GLOBAL attributes together (e.g. Male+Young) --
-    there is no spatial region to cut along, both edits are supposed to touch
-    the whole face. That pair still needs edit_multi_attribute/
-    edit_sequential_attribute, or training-time exposure to composed edits.
-
-    add_blur_sigma/rm_blur_sigma: same asymmetry as train_sdflow.py's
-    --local_region_add_blur -- an ADD edit (source lacks the local attribute)
-    has no real pixels for BiSeNet to find yet, so the mask is taken from the
-    EDITED image with a wide dilation as a geometric prior; an RM edit (source
-    already has it) has real source pixels, so a tighter mask on the SOURCE
-    image is precise and safe.
-    """
-    B = img.size(0)
-    is_removal = attr_cond[:, local_idx] > 0.5
-
-    global_face = (
-        edit_single_attribute(
-            prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
-            global_idxs[0], global_scales[0], direction_bank,
-            control_encoder=control_encoder, controlnet_max_norm=controlnet_max_norm,
-            controlnet_embed_res=controlnet_embed_res,
-        ) if len(global_idxs) == 1 else
-        edit_multi_attribute(
-            prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
-            global_idxs, global_scales, direction_bank,
-            control_encoder=control_encoder, controlnet_max_norm=controlnet_max_norm,
-            controlnet_embed_res=controlnet_embed_res,
-        )
-    )
-    local_face = edit_single_attribute(
-        prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
-        local_idx, local_scale, direction_bank,
-        control_encoder=control_encoder, controlnet_max_norm=controlnet_max_norm,
-        controlnet_embed_res=controlnet_embed_res,
-    )
-
-    classes = LOCAL_REGION_CLASSES[local_global_idx]
-    out_hw = (local_face.shape[2], local_face.shape[3])
-    mask = torch.zeros(B, 1, out_hw[0], out_hw[1],
-                       device=local_face.device, dtype=local_face.dtype)
-    if is_removal.any():
-        # img may be a different resolution than local_face/global_face (e.g. G's
-        # native 1024 output vs a smaller dataset img_size) -- get_region_mask
-        # returns a mask sized to whatever it was given, so resize explicitly
-        # rather than assuming the two already match.
-        m = face_parser.get_region_mask(img[is_removal], classes, blur_sigma=rm_blur_sigma)
-        mask[is_removal] = F.interpolate(m, size=out_hw, mode='bilinear', align_corners=False)
-    if (~is_removal).any():
-        m = face_parser.get_region_mask(local_face[~is_removal], classes, blur_sigma=add_blur_sigma)
-        mask[~is_removal] = F.interpolate(m, size=out_hw, mode='bilinear', align_corners=False)
-
-    if composite_method == 'alpha':
-        return local_face * mask + global_face * (1.0 - mask)
-
-    if composite_method != 'poisson':
-        raise ValueError(f'Unknown composite_method: {composite_method}')
-
-    # Gradient-domain blend (cv2.seamlessClone): local_face's region is
-    # inserted into global_face solving for matching gradients at the
-    # boundary, instead of a feathered pixel-value blend. Local_face and
-    # global_face come from two INDEPENDENTLY generated edits (different
-    # global attribute state each), so their overall skin tone/lighting can
-    # differ more than composite_faces()'s use case (editing vs. the SAME
-    # source photo's background) -- alpha blending was found to leave a seam
-    # visible enough to distort both attributes' own classifier scores.
-    import cv2
-    import numpy as np
-    hard_mask = (mask > 0.5).float()
-    out = []
-    for b in range(B):
-        base = ((global_face[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
-        insert = ((local_face[b].clamp(-1, 1) + 1) * 0.5 * 255).byte().permute(1, 2, 0).cpu().numpy()
-        m = hard_mask[b, 0].cpu().numpy().astype(np.uint8) * 255
-        h, w = m.shape
-        if m.sum() < 255 * 20:   # degenerate mask -> keep the global edit as-is
-            out.append(global_face[b])
-            continue
-        ys, xs = np.nonzero(m)
-        center = (int(xs.mean()), int(ys.mean()))
-        try:
-            blended = cv2.seamlessClone(
-                np.ascontiguousarray(insert), np.ascontiguousarray(base), m,
-                center, cv2.NORMAL_CLONE,
-            )
-            t = torch.from_numpy(blended).to(local_face.device).float().permute(2, 0, 1) / 255.0 * 2 - 1
-        except cv2.error:
-            t = global_face[b]   # mask touched the image border or similar -> fall back safely
-        out.append(t)
-    return torch.stack(out, dim=0).to(dtype=local_face.dtype)
+def remove_span(v, others, eps=1e-8):
+    """v minus its projection onto span(others), separately for every sample
+    and W+ layer. v, others[i]: (B, L, D). Gram-Schmidt over `others` first,
+    so overlapping others are not subtracted twice."""
+    basis = []
+    for o in others:
+        u = o
+        for b in basis:
+            u = u - (u * b).sum(-1, keepdim=True) * b
+        n = u.norm(dim=-1, keepdim=True)
+        basis.append(torch.where(n > eps, u / n.clamp(min=eps), torch.zeros_like(u)))
+    out = v
+    for b in basis:
+        out = out - (out * b).sum(-1, keepdim=True) * b
+    return out
 
 
 def edit_multi_attribute(prior, conditioner, G, id_criterion,
                          img, latent, attr_cond, id_cond,
                          attr_local_idxs, edit_scales, direction_bank,
                          attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0,
-                         controlnet_embed_res=64):
+                         controlnet_embed_res=64, controlnet_disable_attrs=None,
+                         face_parser=None, directions=None, compose='sum', return_parts=False):
     """Edit several attributes on the same face at once.
 
     Composes N independently-computed single-attribute guided deltas by
@@ -1087,46 +1375,99 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     attr_local_idxs: list of local indices (into args.attribute_index) to edit.
     edit_scales: float, or list of floats matching attr_local_idxs.
     attr_global_idxs: optional list of absolute CelebA indices, same order
-        as attr_local_idxs (only needed if you rely on bypass_glasses_direction_bank
-        elsewhere; not handled here, direction_bank is always used per attribute).
+        as attr_local_idxs. Needed for controlnet_disable_attrs (below) to know
+        which of these edits are gender/age vs eyeglasses; direction_bank
+        itself is always used per attribute regardless.
+    controlnet_disable_attrs: absolute attribute indices to skip ControlNet
+        injection for, same semantics as edit_single_attribute.
+    face_parser: needed only for a --controlnet_region_cond control_encoder
+        to get a real region mask for age(39) edits within this composite
+        (see edit_single_attribute); every other attribute in the loop gets
+        the same all-ones fallback regardless. None (the default) is safe --
+        region_cond=True samples then fall back to all-ones for every
+        attribute, same as region_cond=False's behavior.
+    directions: optional list (same order as attr_local_idxs) of (B,) tensors,
+        +1 = add, -1 = remove, or None entries -- as edit_single_attribute's
+        `direction` (--edit_direction). None = the conditioner's own reading.
+    compose: how the per-attribute W+ deltas are combined.
+        'sum'  (default, old behaviour) adds them.
+        'orth' first removes from each delta, per W+ layer, its component in
+               the span of the OTHER attributes' deltas, then adds. Shared
+               components (two edits pushing the same latent direction, e.g.
+               male and old both thickening the jaw) are then not applied
+               twice. Training-free; ControlNet skips are still added as-is.
+    return_parts: also return the edited W+ latent and the combined ControlNet
+        skips, as (edited_face, new_latents, combined_skips) -- for callers
+        that keep editing from the result (sequential composition).
     """
     if isinstance(edit_scales, (int, float)):
         edit_scales = [edit_scales] * len(attr_local_idxs)
     assert len(edit_scales) == len(attr_local_idxs)
+    if compose not in ('sum', 'orth'):
+        raise ValueError(f"compose must be 'sum' or 'orth', got {compose!r}")
+    if directions is None:
+        directions = [None] * len(attr_local_idxs)
 
     B = img.size(0)
     device = img.device
     zero_pad = torch.zeros(B, 18, 1, device=device)
 
+    region_cond = getattr(control_encoder, 'region_cond', False) if control_encoder is not None else False
+    if face_parser is None and control_encoder is not None:
+        face_parser = getattr(control_encoder, 'region_parser', None)   # see _attach_region_parser
+    src_recon = None
+    if region_cond and face_parser is not None:
+        with torch.no_grad():
+            src_recon = G([latent], input_is_latent=True,
+                          randomize_noise=False)[0].clamp(-1, 1)
+
+    for local_idx, dr in zip(attr_local_idxs, directions):
+        attr_cond = consistent_source(attr_cond, local_idx, dr)
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
-    combined_delta = torch.zeros_like(latent)
+    deltas = []
     combined_skips = None
-    for local_idx, scale in zip(attr_local_idxs, edit_scales):
+    for i, (local_idx, scale) in enumerate(zip(attr_local_idxs, edit_scales)):
         new_attr_cond = attr_cond.clone()
         src = attr_cond[:, local_idx]
-        new_attr_cond[:, local_idx] = src * (1.0 - scale) + (1.0 - src) * scale
+        new_attr_cond[:, local_idx] = edited_attr_value(
+            src, scale, attr_global_idxs[i] if attr_global_idxs is not None else None,
+            direction=directions[i])
+        is_rm = (src > 0.5) if directions[i] is None else (directions[i].to(src.device) < 0)
         new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
         new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
         batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
-        guided_delta = direction_bank(flow_delta, attr_delta,
-                                      attr_idx=batch_attr_idx, latent=latent)
-        combined_delta = combined_delta + guided_delta
-        if control_encoder is not None:
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=(src > 0.5))
-            if controlnet_max_norm > 0:
-                skip_norm = skip.reshape(skip.shape[0], -1).norm(dim=1)
-                clip = (controlnet_max_norm / skip_norm.clamp(min=1e-8)).clamp(max=1.0)
-                skip = skip * clip.view(-1, 1, 1, 1)
-            combined_skips = skip if combined_skips is None else combined_skips + skip
+        guided_delta = bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent,
+                                         attr_cond, id_cond, attr_global_idxs)
+        deltas.append(guided_delta)
+        this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
+        use_controlnet_here = (control_encoder is not None and not (
+            controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
+        if use_controlnet_here:
+            region_mask = None
+            if region_cond:
+                region_mask = torch.ones(B, 1, *img.shape[-2:], device=device, dtype=img.dtype)
+                if face_parser is not None and this_global_idx == 39:
+                    with torch.no_grad():
+                        region_mask = face_parser.get_region_mask(
+                            src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
+            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
+                                   latent=latent, region_mask=region_mask)
+            skip = clip_skips(skip, controlnet_max_norm)
+            combined_skips = add_skips(combined_skips, skip)
 
-    new_latents = latent + combined_delta
+    if compose == 'orth' and len(deltas) > 1:
+        deltas = [remove_span(d, [o for j, o in enumerate(deltas) if j != i])
+                  for i, d in enumerate(deltas)]
+    new_latents = latent + torch.stack(deltas, 0).sum(0)
     edited_face = G([new_latents], skips=combined_skips, embed_res=controlnet_embed_res,
                     input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+    if return_parts:
+        return edited_face, new_latents, combined_skips
     return edited_face
 
 
@@ -1147,8 +1488,52 @@ def lenient_success(src_score, edit_score):
         else (edit_score > src_score + 0.05)
 
 
+# Failure-progress buckets (change in judge probability toward the target).
+NEAR_DELTA = 0.20
+STILL_DELTA = 0.05
+
+
 def is_clear(score, low=0.35, high=0.65):
     return score > high or score < low
+
+
+def _interp_at(points, x):
+    """points: [(x, y)]; linear interpolation of y at x, None outside the range."""
+    pts = sorted(points)
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x0 <= x <= x1:
+            return y0 if x1 == x0 else y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+    return None
+
+
+def _accuracy_at_matched_id(all_results, args):
+    targets = getattr(args, 'report_id_at', None) or []
+    scales = [k for k in all_results if isinstance(all_results[k], dict)
+              and 'overall' in all_results[k]]
+    if not targets or len(scales) < 2:
+        return {}
+    attr_names = [ATTR_NAMES.get(i, f'attr{i}') for i in args.attribute_index]
+    judges = (('acc_indep', 'AccInd'), ('acc_clip', 'AccCLIP'), ('acc_celeb', 'AccCeleb'))
+    out = {}
+    print(f'\n  Accuracy at matched ID_ind (interpolated over scales {", ".join(scales)}; '
+          f'-- = outside the evaluated range)')
+    for attr_name in attr_names:
+        for t in targets:
+            cells = []
+            for key, label in judges:
+                pts = []
+                for sc in scales:
+                    row = all_results[sc].get(attr_name) or {}
+                    if row.get('id_indep') and row.get(key):
+                        pts.append((row['id_indep']['mean'], row[key]['mean']))
+                if len(pts) < 2:
+                    continue
+                v = _interp_at(pts, t)
+                out.setdefault(attr_name, {}).setdefault(f'{t:.2f}', {})[key] = v
+                cells.append(f'{label} {v * 100:5.1f}%' if v is not None else f'{label}    --')
+            if cells:
+                print(f'    {attr_name:<12} @ID {t:.2f}:  ' + '   '.join(cells))
+    return out
 
 
 def _summ(values):
@@ -1176,26 +1561,97 @@ def _fmt(summary, pct=False):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def apply_residual_basis(args, direction_bank):
+    """--residual_basis: replace each attribute's learned residual by its
+    projection onto the top --residual_basis_k components that
+    scripts/analyze_residual.py found for that attribute (0 = no residual)."""
+    fixed = getattr(args, 'residual_fixed', None)
+    path = getattr(args, 'residual_basis', None)
+    head_path = getattr(args, 'residual_head', None)
+    if sum(bool(x) for x in (fixed, path, head_path)) > 1:
+        raise SystemExit('--residual_basis, --residual_fixed and --residual_head are alternatives; give one')
+    if head_path and direction_bank is not None:
+        from models.residual_head import ResidualHead
+        saved = torch.load(head_path, map_location='cpu')
+        dev = direction_bank.residual_scale_raw.device
+        for g, entry in saved['attrs'].items():
+            g = int(g)
+            if g not in args.attribute_index:
+                continue
+            head = ResidualHead(entry['in_dim'], entry['basis'], hidden=entry.get('hidden', 256))
+            head.load_state_dict(entry['state_dict'])
+            direction_bank.residual_head[args.attribute_index.index(g)] = head.to(dev).eval()
+            print(f'[ResidualHead] {ATTR_NAMES.get(g, g)}: residual predicted on {entry["basis"].shape[0]} '
+                  f'directions by a small network (val R2 {entry.get("val_r2", float("nan")):.3f}); '
+                  f'the flow\'s residual is not used')
+        return
+    if fixed and direction_bank is not None:
+        from models.direction_bank import parse_attr_spec
+        mult = parse_attr_spec(getattr(args, 'residual_fixed_mult', None))
+        saved = torch.load(fixed, map_location='cpu')
+        for g, entry in saved['attrs'].items():
+            g = int(g)
+            if g not in args.attribute_index:
+                continue
+            if 'mean_aligned' not in entry:
+                raise SystemExit(f'{fixed} has no mean_aligned: rerun scripts/analyze_residual.py '
+                                 f'(the fixed-residual vector was added later)')
+            m = float(mult.get(g, 1.0))
+            direction_bank.residual_fixed[args.attribute_index.index(g)] = (
+                entry['mean_aligned'] * m, max(entry['mean_abs_attr_delta'], 1e-6))
+            print(f'[ResidualFixed] {ATTR_NAMES.get(g, g)}: residual -> one fixed direction '
+                  f'(|v| {float(entry["mean_aligned"].norm()) * m:.2f}'
+                  + (f', x{m:g}' if m != 1.0 else '') +
+                  f') x attr_delta / {entry["mean_abs_attr_delta"]:.3f}; the flow\'s residual is not used')
+        return
+    if not path or direction_bank is None:
+        return
+    saved = torch.load(path, map_location='cpu')
+    k = int(args.residual_basis_k)
+    for g, entry in saved['attrs'].items():
+        g = int(g)
+        if g not in args.attribute_index:
+            continue
+        basis = entry['basis'][:k]
+        direction_bank.residual_basis[args.attribute_index.index(g)] = basis
+        print(f'[ResidualBasis] {ATTR_NAMES.get(g, g)}: residual -> projection onto top {basis.shape[0]} '
+              f'components (energy {entry["energy"][min(k, len(entry["energy"])) - 1] * 100:.1f}% of the '
+              f'sampled residuals)' if k > 0 else
+              f'[ResidualBasis] {ATTR_NAMES.get(g, g)}: residual removed (k=0)')
+
+
+# no_grad: prior, conditioner and direction bank are not frozen, so without it
+# every edit kept an autograd graph (through the 1024px synthesis too) and a
+# 24GB card ran out of memory even at --batch 1. The ODE function enables
+# grad locally for its divergence term, so the flow still runs.
+@torch.no_grad()
 def evaluate(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank, control_encoder = load_models(args)
+    apply_residual_basis(args, direction_bank)
 
     clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
     _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
 
     composite_face_parser = None
-    if args.composite_face_region:
+    if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
         from common.face_parser import FaceParser
         try:
             composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-            print('[Composite] Compositing edited face back onto source-reconstruction '
-                  'background/hair (common/face_parser.py FaceParser.composite) for ALL '
-                  'attributes -- reduces background/hair leakage from global W+ edits, '
-                  'training-free.')
+            if args.composite_face_region:
+                print('[Composite] Compositing edited face back onto source-reconstruction '
+                      'background/hair (composite_faces) for ALL '
+                      'attributes -- reduces background/hair leakage from global W+ edits, '
+                      'training-free.')
+            if getattr(args, 'controlnet_region_cond', False):
+                print('[ControlNet] region_cond checkpoint: feeding a real BiSeNet skin mask '
+                      'for age(39) edits (all-ones fallback for every other attribute).')
         except (FileNotFoundError, RuntimeError) as exc:
-            print(f'[WARN] --composite_face_region requested but face parser unavailable '
-                  f'({exc}); compositing disabled.')
+            composite_face_parser = None
+            print(f'[WARN] face parser unavailable ({exc}); compositing disabled, and any '
+                  f'--controlnet_region_cond checkpoint will fall back to an all-ones region '
+                  f'mask for age(39) too -- numbers from it will not match what training saw.')
 
     if args.bypass_glasses_direction_bank:
         print('[WARN] --bypass_glasses_direction_bank is ON: Eyeglasses is evaluated '
@@ -1215,17 +1671,21 @@ def evaluate(args):
         train=False,
         transform=img_transform,
     )
+    if args.sample_offset:
+        test_dataset = data.Subset(test_dataset, range(args.sample_offset, len(test_dataset)))
     test_loader = data.DataLoader(
         test_dataset, shuffle=False, batch_size=args.batch,
         num_workers=4, drop_last=False,
     )
-    print(f'Test set: {len(test_dataset)} images')
+    print(f'Test set: {len(test_dataset)} images (offset {args.sample_offset}), code version {code_version()}')
 
     all_results = {
         'config': {
             'checkpoint_dir': args.checkpoint_dir,
             'step': args.step,
             'num_samples': args.num_samples,
+            'sample_offset': args.sample_offset,
+            'code_version': code_version(),
             'eval_scales': args.eval_scales,
             'success_margin': args.success_margin,
             'bypass_glasses_direction_bank': args.bypass_glasses_direction_bank,
@@ -1233,6 +1693,41 @@ def evaluate(args):
             'independent_id': indep_id is not None,
             'lpips': lpips_fn is not None,
             'independent_attr_weights': args.independent_attr_weights,
+            'edit_direction': getattr(args, 'edit_direction', 'cond'),
+            'src_cond_clamp': getattr(args, 'src_cond_clamp', None),
+            'preserve_boundaries': getattr(args, 'preserve_boundaries', None),
+            'preserve_strength': (getattr(args, 'preserve_strength', None)
+                                  if getattr(args, 'preserve_boundaries', None) else None),
+            'preserve_min_auc': (getattr(args, 'preserve_min_auc', None)
+                                 if getattr(args, 'preserve_boundaries', None) else None),
+            'residual_basis': getattr(args, 'residual_basis', None),
+            'residual_fixed': getattr(args, 'residual_fixed', None),
+            'residual_fixed_mult': (getattr(args, 'residual_fixed_mult', None)
+                                    if getattr(args, 'residual_fixed', None) else None),
+            'residual_head': getattr(args, 'residual_head', None),
+            'residual_basis_k': (getattr(args, 'residual_basis_k', None)
+                                 if getattr(args, 'residual_basis', None) else None),
+            'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
+            'adaptive_gains': (getattr(args, 'adaptive_gains', None)
+                               if getattr(args, 'adaptive_ladder', None) else None),
+            'edit_gain': getattr(args, 'edit_gain', None),
+            'adaptive_margins': (getattr(args, 'adaptive_margins', None)
+                                 if getattr(args, 'adaptive_ladder', None) else None),
+            # everything else that changes what an edit is, so a results file
+            # can be tied to the pipeline that produced it
+            'train_caps': train_caps(args),
+            'no_train_caps': bool(getattr(args, 'no_train_caps', False)),
+            'edit_target': getattr(args, 'edit_target', 'mirror'),
+            'controlnet_disable_attrs': getattr(args, 'controlnet_disable_attrs', None),
+            'age_fine_layer_scale': getattr(args, 'age_fine_layer_scale', None),
+            'age_fine_layer_start': (getattr(args, 'age_fine_layer_start', None)
+                                     if getattr(args, 'age_fine_layer_scale', None) is not None else None),
+            'glasses_judge': getattr(args, 'glasses_judge', None),
+            'composite_face_region': getattr(args, 'composite_face_region', False),
+            'composite_method': (getattr(args, 'composite_method', None)
+                                 if getattr(args, 'composite_face_region', False) else None),
+            'force_bank_directions': getattr(args, 'force_bank_directions', False),
+            'override_residual_scale': getattr(args, 'override_residual_scale', None),
         },
     }
 
@@ -1241,15 +1736,33 @@ def evaluate(args):
     # every edit inherits before the flow touches anything.
     inv_metrics = defaultdict(list)
 
-    for edit_scale in args.eval_scales:
+    # --adaptive_ladder: each face gets its own edit_scale (see the edit loop);
+    # the outer loop then runs over teacher margins instead of fixed scales,
+    # each margin giving one point on the accuracy-vs-identity curve.
+    adaptive = bool(getattr(args, 'adaptive_ladder', None))
+    rungs = []          # (edit_scale, edit gain) tried in order; chosen value = scale * gain
+    if adaptive:
+        args.adaptive_ladder = sorted(args.adaptive_ladder)
+        base_gain = _EDIT_GAIN
+        rungs = [(sc, base_gain) for sc in args.adaptive_ladder] + \
+            [(args.adaptive_ladder[-1], base_gain * k) for k in sorted(getattr(args, 'adaptive_gains', None) or [])]
+        rung_vals = [sc * k for sc, k in rungs]
+    outer = args.adaptive_margins if adaptive else args.eval_scales
+    for edit_scale in outer:
         print(f'\n{"="*60}')
-        print(f'edit_scale = {edit_scale}')
+        print(f'adaptive edit_scale, teacher margin = {edit_scale} '
+              f'(ladder {args.adaptive_ladder}'
+              + (f', then edit x {args.adaptive_gains}' if getattr(args, 'adaptive_gains', None) else '') + ')'
+              if adaptive else f'edit_scale = {edit_scale}')
         print(f'{"="*60}')
 
         metrics = defaultdict(list)
+        # --leak40: per (edited attribute, direction) list of (delta (40,), flipped (40,),
+        # clear (40,)) from the independent classifier's full 40-attribute output.
+        leak40 = defaultdict(list)
         sample_count = 0
         fid = build_fid(args)
-        first_scale = str(edit_scale) == str(args.eval_scales[0])
+        first_scale = str(edit_scale) == str(outer[0])
 
         for img, latent, pred in tqdm(test_loader, desc=f'scale={edit_scale}'):
             if sample_count >= args.num_samples:
@@ -1272,8 +1785,10 @@ def evaluate(args):
             src_probs_clip = clip_judge.scores(src_face_256) if clip_judge is not None else None
             if glasses_parser is not None and src_probs_clip is not None and _glasses_local is not None:
                 src_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(src_face_256)
-            src_probs_indep = torch.sigmoid(indep_teacher(src_face_256)[0])[:, attribute_index] \
+            src_probs_indep_all = torch.sigmoid(indep_teacher(src_face_256)[0]) \
                 if indep_teacher is not None else None
+            src_probs_indep = src_probs_indep_all[:, attribute_index] \
+                if src_probs_indep_all is not None else None
             src_probs_celeb = celeb_judge.scores(src_face_256)[:, attribute_index] \
                 if celeb_judge is not None else None
             src_id_indep = indep_id.extract(src_face_256) if indep_id is not None else None
@@ -1295,20 +1810,65 @@ def evaluate(args):
                 attr_name = ATTR_NAMES.get(args.attribute_index[local_idx],
                                            f'attr{args.attribute_index[local_idx]}')
 
-                edited_face = edit_single_attribute(
-                    prior, conditioner, G, id_criterion,
-                    img, latent, attr_cond, id_cond,
-                    local_idx, edit_scale, direction_bank,
-                    attr_global_idx=args.attribute_index[local_idx],
-                    bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-                    face_parser=composite_face_parser,
-                    composite_method=args.composite_method,
-                    composite_blur_sigma=args.composite_blur_sigma,
-                    control_encoder=control_encoder,
-                    controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-                    controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
-                    controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
-                )
+                _direction = _eval_direction(args, src_probs_clip, local_idx, src_probs_indep)
+
+                def _edit(scale):
+                    return edit_single_attribute(
+                        prior, conditioner, G, id_criterion,
+                        img, latent, attr_cond, id_cond,
+                        local_idx, scale, direction_bank,
+                        attr_global_idx=args.attribute_index[local_idx],
+                        bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
+                        face_parser=composite_face_parser,
+                        composite_method=args.composite_method,
+                        composite_blur_sigma=args.composite_blur_sigma,
+                        control_encoder=control_encoder,
+                        controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
+                        controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
+                        controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
+                        # composite_face_parser may now exist ONLY because
+                        # --controlnet_region_cond needs it for age's region mask
+                        # -- decoupled from whether compositing was actually
+                        # requested, so it doesn't silently turn on here too.
+                        composite=args.composite_face_region,
+                        direction=_direction,
+                    )
+
+                if adaptive:
+                    # Per-face edit strength: walk up the ladder and keep, for
+                    # each face, the FIRST scale at which the training teacher
+                    # (r34, not the R50 judge that scores the result) sees the
+                    # edit done by `edit_scale` (= the teacher margin here).
+                    # Easy faces stop early and keep their identity; faces a
+                    # fixed scale leaves unedited ("still" failures) get more.
+                    # Faces that never get there keep the largest scale.
+                    _gidx = args.attribute_index[local_idx]
+                    _add = (_direction > 0) if _direction is not None \
+                        else (src_probs_teacher[:, local_idx] < 0.5)
+                    _add = _add.to(img.device)
+                    edited_face, _done = None, torch.zeros(B, dtype=torch.bool, device=img.device)
+                    # Rungs past the ladder (--adaptive_gains) keep the largest
+                    # scale and lengthen its edit instead (see set_edit_gain).
+                    _chosen = torch.full((B,), float(rung_vals[-1]), device=img.device)
+                    try:
+                        for _k, (_sc, _gain) in enumerate(rungs):
+                            set_edit_gain(_gain)
+                            _ef = _edit(_sc)
+                            _pt = torch.sigmoid(attr_teacher(F.interpolate(_ef, (256, 256)))[0])[:, _gidx]
+                            _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
+                            _take = (~_done) & (_ok | (_k == len(rungs) - 1))
+                            if edited_face is None:
+                                edited_face = _ef.clone()
+                            edited_face[_take] = _ef[_take]
+                            _chosen[_take] = float(rung_vals[_k])
+                            _done |= _take
+                            if bool(_done.all()):
+                                break
+                    finally:
+                        set_edit_gain(base_gain)
+                    metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
+                else:
+                    edited_face = _edit(edit_scale)
                 edited_256 = F.interpolate(edited_face, (256, 256))
 
                 edit_id_arc = F.normalize(id_criterion.extract_features(edited_256), dim=1)
@@ -1316,8 +1876,10 @@ def evaluate(args):
                 edit_probs_clip = clip_judge.scores(edited_256) if clip_judge is not None else None
                 if glasses_parser is not None and edit_probs_clip is not None and _glasses_local is not None:
                     edit_probs_clip[:, _glasses_local] = glasses_parser.glasses_prob(edited_256)
-                edit_probs_indep = torch.sigmoid(indep_teacher(edited_256)[0])[:, attribute_index] \
+                edit_probs_indep_all = torch.sigmoid(indep_teacher(edited_256)[0]) \
                     if indep_teacher is not None else None
+                edit_probs_indep = edit_probs_indep_all[:, attribute_index] \
+                    if edit_probs_indep_all is not None else None
                 edit_probs_celeb = celeb_judge.scores(edited_256)[:, attribute_index] \
                     if celeb_judge is not None else None
                 edit_id_indep = indep_id.extract(edited_256) if indep_id is not None else None
@@ -1356,14 +1918,39 @@ def evaluate(args):
                         if jname == 'teacher':
                             metrics[f'acc_lenient_{attr_name}'].append(
                                 float(lenient_success(s, e)))
-                        metrics[f'delta_{jname}_{attr_name}'].append(
-                            (e - s) if s < 0.5 else (s - e))  # signed toward target
+                        _delta = (e - s) if s < 0.5 else (s - e)   # signed toward target
+                        metrics[f'delta_{jname}_{attr_name}'].append(_delta)
+                        # How far the edit got on samples the strict test calls
+                        # failures: "moved but did not cross 0.5" (judge/label
+                        # strictness) vs "did not move" (model/direction).
+                        if not _succ:
+                            metrics[f'fail_delta_{jname}_{attr_name}_{_dir}'].append(_delta)
                         # Leakage on non-target attributes, same judge
                         for other_idx in range(len(args.attribute_index)):
                             if other_idx == local_idx:
                                 continue
                             metrics[f'leak_{jname}_{attr_name}'].append(
                                 abs(ep[b, other_idx].item() - sp[b, other_idx].item()))
+
+                    # ── Side effects on all 40 attributes (--leak40) ─────────
+                    # What ELSE the edit changed, read by the independent
+                    # classifier: signed probability change per attribute, and
+                    # whether an attribute whose source score was clear crossed
+                    # 0.5. Split by direction, since e.g. lipstick rises in
+                    # male->female and falls in female->male and would cancel.
+                    if getattr(args, 'leak40', False) and src_probs_indep_all is not None:
+                        _st = src_probs_indep[b, local_idx].item()
+                        if is_clear(_st):
+                            # The classifier emits more than the 40 CelebA
+                            # attributes (age outputs follow them); keep the 40.
+                            _n40 = len(CELEBA_ALL_ATTRS)
+                            _sa = src_probs_indep_all[b, :_n40].float().cpu()
+                            _ea = edit_probs_indep_all[b, :_n40].float().cpu()
+                            _clr = (_sa > 0.65) | (_sa < 0.35)
+                            _ok = strict_success(_st, edit_probs_indep[b, local_idx].item(),
+                                                 args.success_margin)
+                            leak40[f'{attr_name}_{"add" if _st < 0.5 else "rm"}'].append(
+                                (_ea - _sa, ((_sa > 0.5) != (_ea > 0.5)) & _clr, _clr, bool(_ok)))
 
                     if not any_clear:
                         continue
@@ -1404,6 +1991,8 @@ def evaluate(args):
                 (f'acc_celeb_{attr_name}', True),
                 (f'delta_teacher_{attr_name}', False),
                 (f'delta_clip_{attr_name}', False),
+                (f'delta_indep_{attr_name}', False),
+                (f'delta_celeb_{attr_name}', False),
                 (f'lpips_{attr_name}', False),
                 (f'leak_teacher_{attr_name}', False),
                 (f'leak_clip_{attr_name}', False),
@@ -1437,16 +2026,112 @@ def evaluate(args):
             scale_summary[attr_name]['acc_clip_add'] = _a
             scale_summary[attr_name]['acc_clip_rm'] = _r
 
-        if celeb_judge is not None:
-            print(f'  Direction split (AccCeleb): add = source lacks attr, rm = source has attr')
+        for jname, label, present in (('indep', 'AccInd', indep_teacher is not None),
+                                      ('celeb', 'AccCeleb', celeb_judge is not None)):
+            if not present:
+                continue
+            print(f'  Direction split ({label}): add = source lacks attr, rm = source has attr')
             for attr_name in attr_names:
-                _a = _summ(metrics[f'acc_celeb_{attr_name}_add'])
-                _r = _summ(metrics[f'acc_celeb_{attr_name}_rm'])
+                _a = _summ(metrics[f'acc_{jname}_{attr_name}_add'])
+                _r = _summ(metrics[f'acc_{jname}_{attr_name}_rm'])
                 _a_txt = f'{_a["mean"]*100:5.1f}% (n={_a["n"]})' if _a else '   --'
                 _r_txt = f'{_r["mean"]*100:5.1f}% (n={_r["n"]})' if _r else '   --'
                 print(f'    {attr_name:<12} add: {_a_txt}   rm: {_r_txt}')
-                scale_summary[attr_name]['acc_celeb_add'] = _a
-                scale_summary[attr_name]['acc_celeb_rm'] = _r
+                scale_summary[attr_name][f'acc_{jname}_add'] = _a
+                scale_summary[attr_name][f'acc_{jname}_rm'] = _r
+
+        # ── Progress among failures ───────────────────────────────────────
+        # Strict success needs the judge's probability to CROSS 0.5. A sample
+        # that went 0.05 -> 0.45 is a failure here although the edit visibly
+        # worked, so split the failures by how far they got.
+        for jname, label, present in (('indep', 'AccInd', indep_teacher is not None),
+                                      ('clip', 'AccCLIP', True)):
+            if not present:
+                continue
+            print(f'  Failures by progress ({label}): "near" = moved >= {NEAR_DELTA:.2f} toward '
+                  f'the target without crossing, "still" = moved < {STILL_DELTA:.2f}')
+            for attr_name in attr_names:
+                cells = []
+                for _dir in ('add', 'rm'):
+                    d = metrics[f'fail_delta_{jname}_{attr_name}_{_dir}']
+                    if not d:
+                        cells.append(f'{_dir}: no failures')
+                        continue
+                    arr = np.asarray(d)
+                    prog = {'n_fail': int(arr.size), 'mean_delta': float(arr.mean()),
+                            'near': float((arr >= NEAR_DELTA).mean()),
+                            'still': float((arr < STILL_DELTA).mean())}
+                    scale_summary[attr_name][f'fail_progress_{jname}_{_dir}'] = prog
+                    cells.append(f'{_dir}: n={prog["n_fail"]:<3} dP={prog["mean_delta"]:+.2f} '
+                                 f'near {prog["near"] * 100:4.0f}% still {prog["still"] * 100:4.0f}%')
+                print(f'    {attr_name:<12} ' + '   '.join(cells))
+
+        if leak40:
+            top_n = int(getattr(args, 'leak40_top', 6))
+            print(f'  Side effects on all 40 attributes (AccInd judge): top {top_n} by mean |dP|, '
+                  f'shown as signed mean dP (flip% = clear sources that crossed 0.5)')
+            for attr_name in attr_names:
+                gidx = args.attribute_index[attr_names.index(attr_name)]
+                for _dir in ('add', 'rm'):
+                    rows = leak40.get(f'{attr_name}_{_dir}')
+                    if not rows:
+                        continue
+                    others = [j for j in range(rows[0][0].shape[0]) if j != gidx]
+
+                    def _stats(sel):
+                        D = torch.stack([r[0] for r in sel])
+                        FL = torch.stack([r[1] for r in sel]).float()
+                        CL = torch.stack([r[2] for r in sel]).float()
+                        return D.mean(0), D.abs().mean(0), FL.sum(0) / CL.sum(0).clamp(min=1)
+
+                    mean_d, abs_d, flip = _stats(rows)
+                    ok_rows = [r for r in rows if r[3]]
+                    # Side effects of SUCCESSFUL edits only: a setting that barely
+                    # edits (low success) also barely changes anything else, so
+                    # comparing all-sample averages across settings with different
+                    # success rates rewards doing nothing. Ranked on these when
+                    # there are enough successes.
+                    if len(ok_rows) >= 5:
+                        s_mean, s_abs, s_flip = _stats(ok_rows)
+                    else:
+                        s_mean = s_abs = s_flip = None
+                    rank_mean, rank_abs, rank_flip = (s_mean, s_abs, s_flip) if s_abs is not None \
+                        else (mean_d, abs_d, flip)
+                    order = sorted(others, key=lambda j: -rank_abs[j].item())
+                    cells = ', '.join(f'{CELEBA_ALL_ATTRS[j]} {rank_mean[j]:+.2f} ({rank_flip[j] * 100:.0f}%)'
+                                      for j in order[:top_n])
+                    succ_txt = (f', successful n={len(ok_rows)} mean|dP| others {s_abs[others].mean():.3f}'
+                                if s_abs is not None else f', successful n={len(ok_rows)} (too few)')
+                    print(f'    {attr_name:<12} {_dir} (all n={len(rows)} mean|dP| others '
+                          f'{abs_d[others].mean():.3f}{succ_txt}): '
+                          f'{"[successful] " if s_abs is not None else "[all] "}{cells}')
+
+                    def _per(m, a, f):
+                        return {CELEBA_ALL_ATTRS[j]: {'mean': float(m[j]), 'abs': float(a[j]),
+                                                      'flip': float(f[j])} for j in range(len(m))}
+                    scale_summary.setdefault(attr_name, {})[f'leak40_{_dir}'] = {
+                        'n': len(rows), 'n_success': len(ok_rows),
+                        'mean_abs_others': float(abs_d[others].mean()),
+                        'mean_abs_others_success': (float(s_abs[others].mean())
+                                                    if s_abs is not None else None),
+                        'per_attr': _per(mean_d, abs_d, flip),
+                        'per_attr_success': _per(s_mean, s_abs, s_flip) if s_abs is not None else None,
+                    }
+
+        if adaptive:
+            print('  Chosen edit_scale per face (training-teacher stop rule; '
+                  '"at max" = never reached the margin, kept the largest scale):')
+            for attr_name in attr_names:
+                cs = metrics.get(f'chosen_scale_{attr_name}')
+                if not cs:
+                    continue
+                arr = np.asarray(cs)
+                # chosen scales come back as float32: 0.7 / 0.85 never compare equal
+                hist = '  '.join(f'{sc:g}:{np.isclose(arr, sc, atol=1e-4).mean() * 100:.0f}%'
+                                 for sc in rung_vals)
+                at_max = np.isclose(arr, rung_vals[-1], atol=1e-4).mean() * 100
+                print(f'    {attr_name:<12} mean {arr.mean():.2f}  at max {at_max:4.1f}%   {hist}')
+                scale_summary.setdefault(attr_name, {})['chosen_scale'] = _summ(cs)
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
@@ -1457,18 +2142,24 @@ def evaluate(args):
                               ('lpips_', 'lpips'),
                               ('id_arc_', 'id_arc'),
                               ('acc_teacher_', 'acc_teacher')]:
-            vals = [v for k, vl in metrics.items() if k.startswith(prefix) for v in vl]
+            # the per-attribute key only: '<prefix><attr>_add' / '_rm' hold the same
+            # samples again (they used to be counted twice in 'n')
+            vals = [v for a in args.attribute_index
+                    for v in metrics.get(prefix + ATTR_NAMES.get(a, f'attr{a}'), [])]
             ovr[label] = _summ(vals)
         scale_summary['overall'] = ovr
         id_show = ovr['id_indep'] if ovr['id_indep'] else ovr['id_arc']
-        # Prefer the supervised CelebA classifier over CLIP for the headline
-        # number when available -- it doesn't need per-attribute prompt/
-        # threshold tuning, so it's less likely to be silently miscalibrated.
-        acc_show = ovr['acc_celeb'] if ovr['acc_celeb'] else \
-            (ovr['acc_clip'] if ovr['acc_clip'] else ovr['acc_teacher'])
+        # Headline accuracy: the independent evaluation classifier
+        # (--independent_attr_weights, e.g. the ResNet-50 CelebA-HQ judge the
+        # SDFlow protocol uses) when given, else the CelebA ResNet-18, else
+        # CLIP, else the training teacher.
+        acc_label, acc_show = next(
+            ((lbl, ovr[k]) for k, lbl in (('acc_indep', 'Ind'), ('acc_celeb', 'Celeb'),
+                                          ('acc_clip', 'CLIP'), ('acc_teacher', 'teacher'))
+             if ovr[k]), ('--', None))
         print(f'  {"-" * 55}')
         print(f'  {"Overall":<12} ID(ind or arc): {_fmt(id_show)}  '
-              f'Acc(Celeb/CLIP/teacher): {_fmt(acc_show, pct=True)}')
+              f'Acc({acc_label}): {_fmt(acc_show, pct=True)}')
 
         if fid is not None:
             fid_val = float(fid.compute().item())
@@ -1476,6 +2167,14 @@ def evaluate(args):
             print(f'  FID (edited vs source recon): {fid_val:.2f}')
 
         all_results[str(edit_scale)] = scale_summary
+
+    # ── Accuracy at matched identity ──────────────────────────────────────
+    # Models trained with different edit magnitudes land at different ID for
+    # the same scale, so compare accuracy at the SAME ID_ind, linearly
+    # interpolated between the evaluated scales (never extrapolated).
+    matched = _accuracy_at_matched_id(all_results, args)
+    if matched:
+        all_results['acc_at_id'] = matched
 
     # ── Inversion-gap reference ────────────────────────────────────────────
     if inv_metrics:
@@ -1489,10 +2188,19 @@ def evaluate(args):
               'compare edit metrics against it, not against 1.0/0.0.')
 
     # ── Save JSON ──────────────────────────────────────────────────────────
-    out_path = os.path.join(
+    out_path = args.out_json or os.path.join(
         args.checkpoint_dir,
-        f'eval_v2_step{args.step}_n{args.num_samples}.json',
+        f'eval_v2_step{args.step}_n{args.num_samples}'
+        + (f'_off{args.sample_offset}' if args.sample_offset else '') + '.json',
     )
+    # The default name only encodes step and sample count, so a second eval of
+    # the same checkpoint (other scales, other --edit_direction) used to
+    # overwrite the first. Keep the old file instead of destroying it.
+    if os.path.exists(out_path):
+        stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(os.path.getmtime(out_path)))
+        kept = f'{os.path.splitext(out_path)[0]}_prev{stamp}.json'
+        os.replace(out_path, kept)
+        print(f'(existing {os.path.basename(out_path)} kept as {os.path.basename(kept)})')
     with open(out_path, 'w') as f:
         json.dump(all_results, f, indent=2)
     print(f'\nResults saved → {out_path}')
@@ -1502,7 +2210,9 @@ def evaluate(args):
 # CLI
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+def build_parser():
+    """The evaluate_sdflow.py CLI, also used by scripts that load a checkpoint
+    the same way (scripts/eval_multi_attr.py adds its own options on top)."""
     parser = argparse.ArgumentParser()
 
     # Required
@@ -1553,9 +2263,21 @@ if __name__ == '__main__':
                              'Eyeglasses only. Off by default so every attribute goes through '
                              'the same pipeline; turning it on mixes two different systems '
                              'into one results table.')
-    parser.add_argument('--guided_delta_max_norm', type=float, default=0.0,
-                        help='Shared max norm for the final guided W+ delta, applied uniformly to '
-                             'every attribute. Set <=0 to disable (no cap).')
+    parser.add_argument('--direction_guided_delta_max_norm', '--guided_delta_max_norm',
+                        dest='direction_guided_delta_max_norm', type=float, default=0.0,
+                        help='Max norm of the direction bank\'s guided W+ delta (training\'s '
+                             '--direction_guided_delta_max_norm). Restored from config.json. '
+                             '<=0 = no cap.')
+    parser.add_argument('--residual_max_norm', type=float, default=0.0,
+                        help='Max norm of the bank\'s residual before scaling (training\'s '
+                             '--residual_max_norm, 10 by default there). Restored from config.json; '
+                             '<=0 = no cap (a run whose config predates the flag).')
+    parser.add_argument('--final_delta_max_norm', type=float, default=0.0,
+                        help='Max norm of the whole W+ edit (training\'s --final_delta_max_norm). '
+                             'Restored from config.json. <=0 = no cap.')
+    parser.add_argument('--no_train_caps', action='store_true',
+                        help='Do not apply the three training caps above (eval before they were '
+                             'restored edited without them; use this to reproduce those numbers).')
     parser.add_argument('--use_attr_lora', action='store_true',
                         help='Must match training: whether the checkpoint has a per-attribute '
                              'LoRA adapter (see train_sdflow.py --use_attr_lora). Auto-restored '
@@ -1565,6 +2287,9 @@ if __name__ == '__main__':
     parser.add_argument('--signed_magnitude_input', action='store_true',
                         help='Must match training --signed_magnitude_input. Auto-restored from '
                              'config.json.')
+    parser.add_argument('--magnitude_latent_cond', action='store_true',
+                        help='Must match training --magnitude_latent_cond. Auto-restored from '
+                             'config.json.')
     parser.add_argument('--use_controlnet_injection', action='store_true',
                         help='Load the ControlNet-style AttributeControlEncoder and inject its '
                              'predicted skips into StyleGAN2 at embed_res (see '
@@ -1572,6 +2297,9 @@ if __name__ == '__main__':
                              'Auto-restored from config.json if the checkpoint was trained with it.')
     parser.add_argument('--controlnet_embed_res', type=int, default=64,
                         help='Must match training --controlnet_embed_res if enabled.')
+    parser.add_argument('--controlnet_res', nargs='*', type=int, default=None,
+                        help='Must match training --controlnet_res if enabled (multi-resolution '
+                             'feature injection). Auto-restored from config.json.')
     parser.add_argument('--controlnet_channels', type=int, default=512,
                         help='Must match training --controlnet_channels if enabled.')
     parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
@@ -1579,6 +2307,43 @@ if __name__ == '__main__':
     parser.add_argument('--controlnet_per_direction', action='store_true',
                         help='Must match training --controlnet_per_direction if enabled. '
                              'Auto-restored from config.json.')
+    parser.add_argument('--controlnet_latent_cond', action='store_true',
+                        help='Must match training --controlnet_latent_cond. Changes the control '
+                             'encoder\'s parameter shapes, so a mismatch is a hard checkpoint '
+                             'load error rather than silently wrong numbers. Auto-restored from '
+                             'config.json.')
+    parser.add_argument('--controlnet_region_cond', action='store_true',
+                        help='Must match training --controlnet_region_cond. Changes every stage\'s '
+                             'input channel count (same class of hard load error as '
+                             '--controlnet_latent_cond above), and edit_single_attribute/'
+                             'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
+                             'edits to get a real region mask instead of the all-ones fallback. '
+                             'Auto-restored from config.json.')
+    parser.add_argument('--edit_direction', default='cond', choices=['cond', 'clip', 'indep'],
+                        help="Who decides add vs remove. cond (default, all previous evals): the "
+                             "conditioner's reading of the source. clip: the CLIP judge's add/rm "
+                             "split that AccCLIP scores the edit against. The conditioner reads "
+                             "some CLIP-young faces as old (middle-aged faces, children; 8%% of men "
+                             "vs 2%% of women in v34), so under cond they are edited the wrong way "
+                             "or barely at all, and fail at any scale. clip measures editing "
+                             "ability with the intended direction given, as a user would; report "
+                             "it alongside cond, not instead of it. indep: the same, but the "
+                             "direction comes from the independent classifier "
+                             "(--independent_attr_weights), the judge that scores AccInd. Prefer "
+                             "it to clip whenever CLIP misreads the source (scripts/judge_report.py: "
+                             "CLIP TNR 60%% on Bangs, 44%% on Young), because a wrong direction "
+                             "means no edit and a guaranteed failure.")
+    parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
+                        help="Force these attributes' direction-bank gate uniform at eval (average "
+                             "of the slots instead of the trained gate's pick). Diagnostic on a "
+                             "checkpoint trained without it; auto-restored for one trained with it.")
+    parser.add_argument('--edit_target', default='mirror', choices=['mirror', 'train'],
+                        help="What value an edit of strength s asks the flow for. mirror "
+                             "(default, all previous evals): src*(1-s)+(1-src)*s. train: "
+                             "src+s*(target-src) with training's 0.2/0.8 targets (0.1/0.9 "
+                             "Eyeglasses), which stops ambiguous sources being under-edited "
+                             "relative to what training taught. See edited_attr_value(). Compare "
+                             "checkpoints under the SAME mode.")
     parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
                         help='Must match training --controlnet_init_gain. Only sets the log_gain '
                              'init; the trained value comes from the checkpoint. Auto-restored '
@@ -1590,17 +2355,21 @@ if __name__ == '__main__':
                              'what the feature-map injection contributes. Deliberately NOT in '
                              'RUN_CONFIG_KEYS -- an eval-time override, never restored from config.')
     parser.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
-                        help='ABLATION: keep control_encoder loaded and active, but skip its '
-                             'injection for these ABSOLUTE attribute indices only (e.g. 20 39 for '
-                             'gender/age), letting others (e.g. eyeglasses) keep it. Found via '
+                        help='Keep control_encoder loaded and active, but skip its injection for '
+                             'these ABSOLUTE attribute indices only (e.g. 20 39 for gender/age), '
+                             'letting others (e.g. eyeglasses) keep it. Found via '
                              '--disable_controlnet + visual audit: eyeglasses ADD accuracy '
                              'collapses without ControlNet (93%%->12%%, it synthesizes frame '
                              'structure the W+ direction bank cannot), but gender/age saw no '
                              'measurable accuracy benefit from it (~70.7%% either way) while it '
                              'introduced a hairline/collar sparkle artifact that --scale sweeps '
-                             "(1.0/0.8/0.6) did not change. Use this instead of the all-or-nothing "
-                             '--disable_controlnet once you know which attributes actually need '
-                             'it. Deliberately NOT in RUN_CONFIG_KEYS -- an eval-time override.')
+                             "(1.0/0.8/0.6) did not change. DEFAULT (when this flag is omitted "
+                             'entirely): auto-resolved by resolve_controlnet_disable_attrs() to '
+                             '[20, 39] (whichever are in --attribute_index) so gender/age skip '
+                             'ControlNet by default and eyeglasses keeps it. Pass this flag '
+                             'explicitly (with any list, including none of your attributes) to '
+                             'take control back. Deliberately NOT in RUN_CONFIG_KEYS -- an '
+                             'eval-time override.')
     parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
                         help='Must match training --controlnet_max_norm if it was set (0 = no cap '
                              'was applied at training time either). Auto-restored from config.json.')
@@ -1622,35 +2391,52 @@ if __name__ == '__main__':
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
-    parser.add_argument('--celeba_attr_judge_weights', default=None,
+    parser.add_argument('--celeba_attr_judge_weights',
+                        default='./data/celeba_attr_resnet18.pth',
                         help='Path to a CelebAAttrClassifierJudge checkpoint (ResNet18, '
                              'https://github.com/Hawaii0821/FaceAttr-Analysis format). '
                              'A supervised 40-attribute classifier that generalizes to any '
                              'CelebA attribute without per-attribute CLIP prompt/threshold '
                              'tuning. Adds an "AccCeleb" column and becomes the preferred '
-                             'headline accuracy number when set.')
-    parser.add_argument('--glasses_judge', default='clip', choices=['clip', 'parser'],
+                             'headline accuracy number when set. Defaults to a conventional '
+                             'path under ./data/ so every eval run picks it up automatically '
+                             'once the checkpoint is placed there -- no flag needed on the '
+                             'command line, and nothing changes if that file does not exist '
+                             '(build_judges() catches the missing file and continues without '
+                             'AccCeleb, same as before this default existed). Pass a different '
+                             'path, or an empty string to force it off, to override.')
+    parser.add_argument('--glasses_judge', default='parser', choices=['clip', 'parser'],
                         help="How to score EYEGLASSES (attr 15). 'clip' = CLIP zero-shot "
                              "(under-detects thin frames; a visual audit showed ~44%% of "
                              "glasses-add edits that visibly had glasses were scored as "
                              "failures). 'parser' = BiSeNet face-parser glasses class (label "
                              "6), a purpose-built pixel-level detector that matches the eye "
                              "far better -- REPLACES CLIP for the glasses cell only; gender/age "
-                             "still use CLIP. Recommended: parser. Re-run the dumper to "
-                             "visually confirm calibration after switching.")
+                             "still use CLIP. DEFAULT as of this change: parser, with connected-"
+                             "component noise filtering (see GlassesParserJudge/"
+                             "--glasses_min_component_frac) so stray segmentation pixels can no "
+                             "longer saturate the score. Re-run the dumper to visually confirm "
+                             "calibration; pass --glasses_judge clip to restore the old default.")
     parser.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth',
                         help='BiSeNet weights for --glasses_judge parser and '
                              '--composite_face_region.')
-    parser.add_argument('--composite_face_region', action='store_true',
+    parser.add_argument('--composite_face_region',
+                        action=argparse.BooleanOptionalAction, default=False,
                         help='Training-free post-process: composite the edited face back onto '
                              'the source-RECONSTRUCTION background/hair using the BiSeNet face '
-                             'mask (common/face_parser.py FaceParser.composite), for every '
+                             'mask (composite_faces), for every '
                              'attribute. Targets the long-standing complaint that gender/age '
                              'edits move far more of the image than intended (global W+ edits '
-                             'leak into background/hair). Zero training risk -- pure inference-'
-                             'time compositing -- so try this before any further training-loss '
-                             'changes for identity/leakage.')
-    parser.add_argument('--composite_method', default='alpha', choices=['alpha', 'poisson'],
+                             'leak into background/hair) and directly helps both ID score '
+                             '(background/hair no longer contaminate the crop) and perceived '
+                             'ghosting/artifacts at the face boundary. Zero training risk -- pure '
+                             'inference-time compositing. DEFAULT: off -- the Poisson blend leaves '
+                             'a visible tonal seam at the face boundary that inflates LPIPS/depresses '
+                             'ID scores relative to the raw uncomposited output (confirmed by '
+                             're-evaluating the same checkpoint with and without this flag); pass '
+                             '--composite_face_region to enable (falls back automatically with a '
+                             'warning if --face_parser_weights is unavailable).')
+    parser.add_argument('--composite_method', default='poisson', choices=['alpha', 'poisson'],
                         help="'alpha' (default) feather-blends by mask weight -- fast, but a "
                              "visible seam shows wherever the edited face's brightness/color "
                              "differs from the background at the boundary (a wider "
@@ -1668,6 +2454,13 @@ if __name__ == '__main__':
     parser.add_argument('--glasses_area_sharpness', type=float, default=0.5,
                         help='Relative width of the parser presence sigmoid; smaller = sharper '
                              '(more binary) present/absent decision.')
+    parser.add_argument('--glasses_min_component_frac', type=float, default=0.00015,
+                        help='Connected components of the BiSeNet glasses mask smaller than '
+                             'this fraction of the 512x512 image are dropped before computing '
+                             'the area fraction, so a handful of stray mislabeled pixels cannot '
+                             'saturate the score on their own. Default ~39px; raise if the dumper '
+                             'still shows noise-driven false positives, lower if it is dropping '
+                             'real thin-frame detections.')
     parser.add_argument('--id_indep_pretrained', default='casia-webface',
                         choices=['casia-webface', 'vggface2'],
                         help='Pretrained weights for the facenet-pytorch id_indep judge. '
@@ -1687,32 +2480,125 @@ if __name__ == '__main__':
                              'value (which tends to be frozen near its 0.05 init). Diagnostic only.')
     parser.add_argument('--age_fine_layer_scale', type=float, default=None,
                         help='Scale the age (attr 39) direction layers [age_fine_layer_start:18] '
-                             'by this factor at eval time (e.g. 0.0 to zero them out). '
+                             'by this factor at eval time (e.g. 0.0 to zero them out). Default: '
+                             'not applied (training never damps them; 1.0 is the same). '
                              'Diagnostic for the confirmed color-cast artifact living in the '
                              'age direction fine layers -- but a blanket cut at layer 4 also '
                              'kills real aging signal (500-sample eval: rm-direction AccCLIP '
-                             '76%->17%), so narrow the range with --age_fine_layer_start.')
-    parser.add_argument('--age_fine_layer_start', type=int, default=4,
-                        help='First W+ layer index (0-17) affected by --age_fine_layer_scale. '
-                             'Default 4 matches the reg_loss_fine grouping used elsewhere in '
-                             'this codebase, but that boundary was shown to cut into real '
-                             'aging signal too. Try 10-14 to target only the very last, most '
-                             'texture/color-dominated layers.')
+                             '76%%->17%%), so narrow the range with --age_fine_layer_start.')
+    parser.add_argument('--age_fine_layer_start', type=int, default=10,
+                        help='First W+ layer index (0-17) affected by the age fine-layer '
+                             'color-cast mitigation (see load_models). The reg_loss_fine '
+                             'grouping used elsewhere in this codebase starts at layer 4, but '
+                             'that boundary was shown to also cut into real aging signal '
+                             '(rm-direction AccCLIP 76%%->17%%); default 10 targets only the '
+                             'very last, most texture/color-dominated layers.')
+    parser.add_argument('--report_id_at', nargs='*', type=float, default=[0.80],
+                        help='After all --eval_scales, report each judge\'s accuracy at these '
+                             'ID_ind values, interpolated between scales (needs >=2 scales).')
     parser.add_argument('--success_margin', type=float, default=0.0,
                         help='Strict success requires the edited score to cross 0.5 by this '
                              'margin. 0.0 = just cross the decision boundary.')
-    parser.add_argument('--compute_fid', action='store_true',
-                        help='Compute FID (edited vs source reconstructions). Needs '
-                             'torchmetrics + torch-fidelity.')
+    parser.add_argument('--compute_fid', action=argparse.BooleanOptionalAction, default=True,
+                        help='Compute FID (edited vs source reconstructions). On by default so '
+                             'every eval run reports it without remembering the flag; pass '
+                             '--no-compute_fid to skip (e.g. a quick smoke-test eval). Needs '
+                             'torchmetrics + torch-fidelity -- build_fid() catches ImportError '
+                             'and continues without FID, printing a WARN, so a missing '
+                             'dependency does not crash the rest of eval.')
 
     # Eval config
     parser.add_argument('--batch',        type=int,   default=4)
     parser.add_argument('--num_samples',  type=int,   default=500)
+    parser.add_argument('--sample_offset', type=int, default=0,
+                        help='Skip the first N test faces. The first 500 (offset 0) are the '
+                             'development set every comparison so far used; --sample_offset 500 '
+                             'gives the next 500, held out for the final report only.')
+    parser.add_argument('--leak40', action='store_true',
+                        help='Report what ELSE each edit changed: the independent classifier\'s '
+                             'signed probability change on all 40 CelebA attributes, per edited '
+                             'attribute and direction, with the rate at which clear source '
+                             'attributes crossed 0.5. Needs --independent_attr_weights. Saved '
+                             'as leak40_add / leak40_rm in the JSON.')
+    parser.add_argument('--leak40_top', type=int, default=6,
+                        help='How many of the most-changed other attributes to print per edit.')
+    parser.add_argument('--out_json', default=None,
+                        help='Where to write the results JSON. Default: '
+                             '<checkpoint_dir>/eval_v2_step<N>_n<samples>.json; an existing file '
+                             'there is renamed (..._prev<timestamp>.json), never overwritten. '
+                             'Several runs of the same checkpoint can be combined with '
+                             'scripts/merge_eval_scales.py.')
     parser.add_argument('--eval_scales',  nargs='*',  type=float,
                         default=[0.80, 0.85, 0.90, 0.95])
+    parser.add_argument('--adaptive_ladder', nargs='*', type=float, default=None,
+                        help='Per-face edit strength instead of one fixed scale: for every face '
+                             'and attribute, try these edit_scales from small to large and keep '
+                             'the first edit the TRAINING teacher (--attribute_weights, r34) '
+                             'scores as done by --adaptive_margins; faces that never get there '
+                             'keep the largest. The R50 judge, ID and LPIPS then score the kept '
+                             'edit as usual. Replaces --eval_scales: the results are keyed by '
+                             'margin, one accuracy-vs-identity point per margin, so keep them in '
+                             'their own --out_json. Costs up to len(ladder) generations per edit '
+                             '(stops early once every face in the batch is done). '
+                             'e.g. 0.5 0.7 0.85 1.0 1.25 1.5')
+    parser.add_argument('--adaptive_gains', nargs='*', type=float, default=None,
+                        help='With --adaptive_ladder: extra rungs after the ladder that keep its largest '
+                             'scale and lengthen the edit by these factors along its own direction '
+                             '(--edit_gain), e.g. 1.3 1.6. For faces still unedited at the top of the '
+                             'ladder: a larger edit_scale turns the edit, a longer edit does not. '
+                             'Chosen values are reported as scale x gain.')
+    parser.add_argument('--edit_gain', type=float, default=None,
+                        help='Every W+ edit x this after the final cap (same direction). Default 1.')
+    parser.add_argument('--adaptive_margins', nargs='*', type=float, default=[0.0, 0.15, 0.3],
+                        help='With --adaptive_ladder: stop when the teacher probability is past '
+                             '0.5 by this margin in the edit direction. Larger = stronger edits, '
+                             'lower ID; each margin is one point of the curve.')
+    parser.add_argument('--residual_basis', default=None,
+                        help='A scripts/analyze_residual.py output (.pth). Each attribute\'s learned '
+                             'residual is replaced by its projection onto the top --residual_basis_k '
+                             'principal components found for that attribute. Diagnostic: is the '
+                             'residual a few missing global directions (small k keeps the accuracy) '
+                             'or a per-face correction (needs large k)?')
+    parser.add_argument('--residual_basis_k', type=int, default=4,
+                        help='Components kept with --residual_basis (0 = no residual at all).')
+    parser.add_argument('--residual_fixed', default=None,
+                        help='A scripts/analyze_residual.py output (.pth). Each attribute\'s residual is '
+                             'replaced by ONE fixed W+ vector (its mean residual, signed by the edit '
+                             'direction) scaled by the requested attribute change. Nothing in the edit '
+                             'then depends on the flow: tests whether the flow is only needed to FIND '
+                             'that direction during training.')
+    parser.add_argument('--residual_fixed_mult', default=None,
+                        help="With --residual_fixed: scale one attribute's fixed residual, e.g. '39:3' "
+                             "(Young's residual is capped at 0.05 in training, so it barely contributes; "
+                             "this tests whether more of it helps). Check images for fake texture.")
+    parser.add_argument('--residual_head', default=None,
+                        help='A scripts/distill_residual_head.py output (.pth): each attribute\'s residual is '
+                             'predicted on its top principal directions by a small network instead of '
+                             'taken from the flow (no ODE solve for the residual).')
+    parser.add_argument('--src_cond_clamp', type=float, default=None,
+                        help='With a given edit direction (--edit_direction indep/clip): move the edited '
+                             'attribute\'s source condition to the far side of 0.5 by this margin before the '
+                             'flow runs (add: min(src, 0.5-M), rm: max(src, 0.5+M)). Without it, a source the '
+                             'conditioner already reads on the target side asks for ~no change (Young add: '
+                             '37/51 failures had zero edit). Default off. See consistent_source().')
+    parser.add_argument('--preserve_boundaries', default=None,
+                        help='A scripts/fit_attr_boundaries.py output: remove from each edit\'s W+ delta its '
+                             'component along the linear boundaries of the CelebA attributes it should not '
+                             'change (all 40 minus the edited ones and their PRESERVE40_ALLOW lists), after '
+                             'making those normals orthogonal to the edited attributes\' own. Cuts side '
+                             'effects; the delta gets smaller, so compare at matched ID. Default off.')
+    parser.add_argument('--preserve_strength', type=float, default=1.0,
+                        help='With --preserve_boundaries: share of the protected component removed (0-1).')
+    parser.add_argument('--preserve_min_auc', type=float, default=0.8,
+                        help='With --preserve_boundaries: boundaries with a lower held-out AUC are not used.')
+    return parser
 
+
+if __name__ == '__main__':
+    parser = build_parser()
     args = parser.parse_args()
     args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
 
     # Auto-detect latest step if not specified
     if args.step is None:
