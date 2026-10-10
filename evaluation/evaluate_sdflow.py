@@ -1502,9 +1502,16 @@ def evaluate(args):
               'compare edit metrics against it, not against 1.0/0.0.')
 
     # ── Save JSON ──────────────────────────────────────────────────────────
+    # Tag bank overrides so re-evaluating one checkpoint under several bank
+    # modes does not overwrite the same JSON.
+    tag = ''
+    if getattr(args, 'bank_mode_override', None) is not None:
+        tag += f'_bank{args.bank_mode_override}'
+    if getattr(args, 'bank_mix_override', None) is not None:
+        tag += f'_mix{args.bank_mix_override:g}'
     out_path = os.path.join(
         args.checkpoint_dir,
-        f'eval_v2_step{args.step}_n{args.num_samples}.json',
+        f'eval_v2_step{args.step}_n{args.num_samples}{tag}.json',
     )
     with open(out_path, 'w') as f:
         json.dump(all_results, f, indent=2)
