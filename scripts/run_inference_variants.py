@@ -7,6 +7,9 @@ Variants (all without retraining):
   ema       the EMA weights (save_models_ema)
   pres      --preserve_boundaries (boundaries fitted first if missing)
   adaptive  --adaptive_ladder 0.5 0.7 0.85 1.0
+  gain      --edit_gain 1.3 (every edit 1.3x longer along its own direction)
+  adaptive_gain  the adaptive ladder, then the edit 1.3x / 1.6x longer for
+            faces the teacher still sees unedited at scale 1.0
 
 Every variant writes <name>.log (and .json) into the checkpoint dir, and a
 matched-ID comparison against --base_json as cmp_<name>.txt. A variant whose
@@ -23,7 +26,7 @@ import sys
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-ORDER = ['nocaps', 'male', 'ema', 'pres', 'adaptive']
+ORDER = ['nocaps', 'male', 'ema', 'pres', 'adaptive', 'gain', 'adaptive_gain']
 
 
 def main():
@@ -66,22 +69,28 @@ def main():
         print(f'    -> exit {rc}, log {log}', flush=True)
         return rc
 
-    def compare(name, out):
-        if a.dry_run or not os.path.exists(out) or not os.path.exists(base):
-            if not a.dry_run and not os.path.exists(base):
-                print(f'    (no base eval {base}; comparison skipped)')
+    def compare(name, out, ref=None, ref_name='base'):
+        # adaptive runs are keyed by margin, not scale; the comparison reads
+        # every run off at matched ID, so they compare the same way
+        ref = ref or base
+        if a.dry_run or not os.path.exists(out) or not os.path.exists(ref):
+            if not a.dry_run and not os.path.exists(ref):
+                print(f'    (no reference eval {ref}; comparison skipped)')
             return
-        with open(os.path.join(ck, f'cmp_{name}.txt'), 'w') as f:
-            subprocess.call([py, '-m', 'scripts.compare_runs_matched_id', '--a', base, '--b', out,
-                             '--names', 'base', name, '--points', '3'],
+        txt = f'cmp_{name}.txt' if ref_name == 'base' else f'cmp_{name}_vs_{ref_name}.txt'
+        with open(os.path.join(ck, txt), 'w') as f:
+            subprocess.call([py, '-m', 'scripts.compare_runs_matched_id', '--a', ref, '--b', out,
+                             '--names', ref_name, name[-12:], '--points', '3'],
                             stdout=f, stderr=subprocess.STDOUT)
-        print(f'    -> cmp_{name}.txt')
+        print(f'    -> {txt}')
 
     for name in [n for n in ORDER if n in a.only]:
         out = os.path.join(ck, f'eval_{name}.json')
         if name != 'male' and os.path.exists(out):
             print(f'{name}: {out} exists, skipped')
             compare(name, out)
+            if name == 'adaptive_gain':
+                compare(name, out, os.path.join(ck, 'eval_adaptive.json'), 'adaptive')
             continue
         if name == 'nocaps':
             run('eval_nocaps', ev(ck, out, scales + ['--no_train_caps']))
@@ -115,7 +124,12 @@ def main():
             run('eval_pres', ev(ck, out, scales + ['--preserve_boundaries', a.boundaries]))
         elif name == 'adaptive':
             run('eval_adaptive', ev(ck, out, ['--adaptive_ladder', '0.5', '0.7', '0.85', '1.0']))
-            continue   # results keyed by margin, not scale: compared by hand
+        elif name == 'gain':
+            run('eval_gain', ev(ck, out, scales + ['--edit_gain', '1.3']))
+        elif name == 'adaptive_gain':
+            run('eval_adaptive_gain', ev(ck, out, ['--adaptive_ladder', '0.5', '0.7', '0.85', '1.0',
+                                                   '--adaptive_gains', '1.3', '1.6']))
+            compare(name, out, os.path.join(ck, 'eval_adaptive.json'), 'adaptive')
         compare(name, out)
     print(f'[{time.strftime("%H:%M:%S")}] all done')
 

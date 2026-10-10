@@ -196,11 +196,11 @@ def main():
             for m in args.clamp_margins:
                 out[f'E{m:g}'] = run(acond=consistent_source(attr_cond, li, d, margin=m))
             for k in args.edit_gains:
-                ev._EDIT_GAIN = k
+                ev.set_edit_gain(k)
                 try:
                     out[f'F{k:g}'] = run()
                 finally:
-                    ev._EDIT_GAIN = 1.0
+                    ev.set_edit_gain(1.0)
 
             for b in range(B):
                 if not keep[b]:

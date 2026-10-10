@@ -4,7 +4,8 @@ Waits until every listed run has its final checkpoint (save_models/prior-<step>)
 -- the GPU is shared, so nothing starts while any of them is still training --
 then, for each run:
   eval      evaluate_sdflow at --scales (the development faces, offset 0)
-  adaptive  the per-face adaptive ladder (scripts/run_inference_variants.py)
+  adaptive  the per-face adaptive ladder, and the ladder followed by longer
+            edits (adaptive_gain), via scripts/run_inference_variants.py
   preview   render_preview at scale 1.0
 and finally scripts.compare_runs_matched_id for every --compare a:b pair
 (a run name, or a path to an eval JSON of a run that lives elsewhere).
@@ -72,10 +73,10 @@ def main():
                 [py, 'evaluation/evaluate_sdflow.py', '--checkpoint_dir', d, '--step', str(a.step)]
                 + common + ['--leak40', '--num_samples', str(a.num_samples), '--batch', str(a.batch),
                             '--eval_scales'] + a.scales + ['--out_json', eval_json[r]])
-        if not os.path.exists(os.path.join(d, 'eval_adaptive.json')):
+        if not all(os.path.exists(os.path.join(d, f'eval_{v}.json')) for v in ('adaptive', 'adaptive_gain')):
             run(os.path.join(d, 'post_adaptive.log'),
                 [py, 'scripts/run_inference_variants.py', '--checkpoint_dir', d, '--step', str(a.step),
-                 '--only', 'adaptive', '--base_json', eval_json[r]])
+                 '--only', 'adaptive', 'adaptive_gain', '--base_json', eval_json[r]])
         if not any(f.startswith(f'preview_step{a.step}_scale1.0') for f in os.listdir(d)):
             run(os.path.join(d, 'post_preview.log'),
                 [py, 'scripts/render_preview.py', '--checkpoint_dir', d, '--step', str(a.step),

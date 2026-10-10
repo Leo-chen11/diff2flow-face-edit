@@ -657,6 +657,7 @@ def load_models(args):
     _EDIT_TARGET_MODE = getattr(args, 'edit_target', None) or 'mirror'
     global _SRC_COND_CLAMP, _FINAL_DELTA_MAX_NORM
     _SRC_COND_CLAMP = getattr(args, 'src_cond_clamp', None)
+    set_edit_gain(getattr(args, 'edit_gain', None) or 1.0)
     caps = train_caps(args)
     _FINAL_DELTA_MAX_NORM = caps['final']
     print(f'[Caps] residual max norm {caps["residual"]}, guided delta max norm {caps["guided"]}, '
@@ -939,7 +940,15 @@ def consistent_source(attr_cond, local_idx, direction, margin=None):
 
 _PRESERVE = None            # --preserve_boundaries; set in load_models()
 _FINAL_DELTA_MAX_NORM = None    # training's --final_delta_max_norm; set in load_models()
-_EDIT_GAIN = 1.0            # diagnostic only (scripts/diagnose_attr_edit.py F<k>): W+ edit x k after the cap
+_EDIT_GAIN = 1.0            # --edit_gain / --adaptive_gains: W+ edit x k after the final cap
+
+
+def set_edit_gain(k):
+    """Lengthen every W+ edit by k after the final cap, keeping its direction.
+    Unlike a larger edit_scale (a target value past what training saw, which
+    turns the edit), this only moves further along the learned edit."""
+    global _EDIT_GAIN
+    _EDIT_GAIN = float(k)
 
 
 def train_caps(args):
@@ -1699,6 +1708,9 @@ def evaluate(args):
             'residual_basis_k': (getattr(args, 'residual_basis_k', None)
                                  if getattr(args, 'residual_basis', None) else None),
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
+            'adaptive_gains': (getattr(args, 'adaptive_gains', None)
+                               if getattr(args, 'adaptive_ladder', None) else None),
+            'edit_gain': getattr(args, 'edit_gain', None),
             'adaptive_margins': (getattr(args, 'adaptive_margins', None)
                                  if getattr(args, 'adaptive_ladder', None) else None),
             # everything else that changes what an edit is, so a results file
@@ -1728,13 +1740,20 @@ def evaluate(args):
     # the outer loop then runs over teacher margins instead of fixed scales,
     # each margin giving one point on the accuracy-vs-identity curve.
     adaptive = bool(getattr(args, 'adaptive_ladder', None))
+    rungs = []          # (edit_scale, edit gain) tried in order; chosen value = scale * gain
     if adaptive:
         args.adaptive_ladder = sorted(args.adaptive_ladder)
+        base_gain = _EDIT_GAIN
+        rungs = [(sc, base_gain) for sc in args.adaptive_ladder] + \
+            [(args.adaptive_ladder[-1], base_gain * k) for k in sorted(getattr(args, 'adaptive_gains', None) or [])]
+        rung_vals = [sc * k for sc, k in rungs]
     outer = args.adaptive_margins if adaptive else args.eval_scales
     for edit_scale in outer:
         print(f'\n{"="*60}')
         print(f'adaptive edit_scale, teacher margin = {edit_scale} '
-              f'(ladder {args.adaptive_ladder})' if adaptive else f'edit_scale = {edit_scale}')
+              f'(ladder {args.adaptive_ladder}'
+              + (f', then edit x {args.adaptive_gains}' if getattr(args, 'adaptive_gains', None) else '') + ')'
+              if adaptive else f'edit_scale = {edit_scale}')
         print(f'{"="*60}')
 
         metrics = defaultdict(list)
@@ -1828,19 +1847,25 @@ def evaluate(args):
                         else (src_probs_teacher[:, local_idx] < 0.5)
                     _add = _add.to(img.device)
                     edited_face, _done = None, torch.zeros(B, dtype=torch.bool, device=img.device)
-                    _chosen = torch.full((B,), float(args.adaptive_ladder[-1]), device=img.device)
-                    for _k, _sc in enumerate(args.adaptive_ladder):
-                        _ef = _edit(_sc)
-                        _pt = torch.sigmoid(attr_teacher(F.interpolate(_ef, (256, 256)))[0])[:, _gidx]
-                        _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
-                        _take = (~_done) & (_ok | (_k == len(args.adaptive_ladder) - 1))
-                        if edited_face is None:
-                            edited_face = _ef.clone()
-                        edited_face[_take] = _ef[_take]
-                        _chosen[_take] = float(_sc)
-                        _done |= _take
-                        if bool(_done.all()):
-                            break
+                    # Rungs past the ladder (--adaptive_gains) keep the largest
+                    # scale and lengthen its edit instead (see set_edit_gain).
+                    _chosen = torch.full((B,), float(rung_vals[-1]), device=img.device)
+                    try:
+                        for _k, (_sc, _gain) in enumerate(rungs):
+                            set_edit_gain(_gain)
+                            _ef = _edit(_sc)
+                            _pt = torch.sigmoid(attr_teacher(F.interpolate(_ef, (256, 256)))[0])[:, _gidx]
+                            _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
+                            _take = (~_done) & (_ok | (_k == len(rungs) - 1))
+                            if edited_face is None:
+                                edited_face = _ef.clone()
+                            edited_face[_take] = _ef[_take]
+                            _chosen[_take] = float(rung_vals[_k])
+                            _done |= _take
+                            if bool(_done.all()):
+                                break
+                    finally:
+                        set_edit_gain(base_gain)
                     metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
                 else:
                     edited_face = _edit(edit_scale)
@@ -2103,8 +2128,8 @@ def evaluate(args):
                 arr = np.asarray(cs)
                 # chosen scales come back as float32: 0.7 / 0.85 never compare equal
                 hist = '  '.join(f'{sc:g}:{np.isclose(arr, sc, atol=1e-4).mean() * 100:.0f}%'
-                                 for sc in args.adaptive_ladder)
-                at_max = np.isclose(arr, args.adaptive_ladder[-1], atol=1e-4).mean() * 100
+                                 for sc in rung_vals)
+                at_max = np.isclose(arr, rung_vals[-1], atol=1e-4).mean() * 100
                 print(f'    {attr_name:<12} mean {arr.mean():.2f}  at max {at_max:4.1f}%   {hist}')
                 scale_summary.setdefault(attr_name, {})['chosen_scale'] = _summ(cs)
 
@@ -2516,6 +2541,14 @@ def build_parser():
                              'their own --out_json. Costs up to len(ladder) generations per edit '
                              '(stops early once every face in the batch is done). '
                              'e.g. 0.5 0.7 0.85 1.0 1.25 1.5')
+    parser.add_argument('--adaptive_gains', nargs='*', type=float, default=None,
+                        help='With --adaptive_ladder: extra rungs after the ladder that keep its largest '
+                             'scale and lengthen the edit by these factors along its own direction '
+                             '(--edit_gain), e.g. 1.3 1.6. For faces still unedited at the top of the '
+                             'ladder: a larger edit_scale turns the edit, a longer edit does not. '
+                             'Chosen values are reported as scale x gain.')
+    parser.add_argument('--edit_gain', type=float, default=None,
+                        help='Every W+ edit x this after the final cap (same direction). Default 1.')
     parser.add_argument('--adaptive_margins', nargs='*', type=float, default=[0.0, 0.15, 0.3],
                         help='With --adaptive_ladder: stop when the teacher probability is past '
                              '0.5 by this margin in the edit direction. Larger = stronger edits, '
