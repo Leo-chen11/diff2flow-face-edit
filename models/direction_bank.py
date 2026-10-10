@@ -8,6 +8,13 @@ def _inverse_softplus(x):
     return torch.log(torch.expm1(x))
 
 
+# How the bank combines with the flow's own delta (see AttributeDirectionBank).
+# Stored as an int buffer so every checkpoint carries its mode and editor /
+# evaluation scripts reproduce it without extra flags; checkpoints saved before
+# this existed load as 'replace', the original behavior.
+BANK_MODES = ('replace', 'anneal', 'prior', 'flow_magnitude')
+
+
 class AttributeDirectionBank(nn.Module):
     """Dataset-level W+ attribute directions used to filter raw flow deltas.
 
@@ -17,6 +24,20 @@ class AttributeDirectionBank(nn.Module):
 
     With num_k=1 (default) behavior is identical to the original single-direction bank.
     Old bank files (direction_units.ndim==3) are loaded automatically as K=1.
+
+    bank_mode decides who actually produces the edit:
+      replace        guided = bank_dir_delta + rs * residual (original). The
+                     flow only contributes the small orthogonal residual.
+      anneal         guided = mix * replace_output + (1 - mix) * flow_delta.
+                     mix is a buffer the trainer lowers over time (curriculum:
+                     start identical to 'replace', end as the pure flow).
+      prior          guided = flow_delta. The bank never touches the output;
+                     its prediction is only a training target via prior_loss().
+      flow_magnitude guided = flow_delta's own projection onto the EDITED
+                     attribute's directions + rs * residual. The bank fixes the
+                     axes, the flow decides how far along them each sample and
+                     layer moves; components along other attributes' axes are
+                     dropped.
     """
 
     def __init__(
@@ -38,6 +59,8 @@ class AttributeDirectionBank(nn.Module):
         use_attr_lora=False,
         attr_lora_rank=4,
         signed_magnitude_input=False,
+        bank_mode="replace",
+        bank_mix=1.0,
     ):
         super().__init__()
         self.num_attrs = int(num_attrs)
@@ -227,8 +250,46 @@ class AttributeDirectionBank(nn.Module):
         self.guided_delta_max_norm = (
             float(guided_delta_max_norm) if guided_delta_max_norm is not None else None
         )
+        self.register_buffer("bank_mode_id", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("bank_mix", torch.tensor(1.0))
+        self.set_mode(bank_mode)
+        self.set_mix(bank_mix)
+
         self.last_logs = {}
+        self._last_dir_delta = None   # bank's own prediction, target for prior_loss()
         self._last_alpha = None   # (B, num_attrs, K) — set each forward, used for selection loss
+
+    @property
+    def bank_mode(self):
+        return BANK_MODES[int(self.bank_mode_id)]
+
+    def set_mode(self, mode):
+        if mode not in BANK_MODES:
+            raise ValueError(f"bank_mode must be one of {BANK_MODES}, got {mode!r}")
+        self.bank_mode_id.fill_(BANK_MODES.index(mode))
+
+    def set_mix(self, value):
+        self.bank_mix.fill_(float(min(max(value, 0.0), 1.0)))
+
+    def prior_loss(self, flow_delta, margin=0.5):
+        """Hinge on cos(flow_delta, bank prediction) over the flattened W+ delta.
+
+        The bank's prediction is detached: it is a dataset-level teacher, so the
+        flow is pulled toward it but stays free to deviate per sample as long as
+        the cosine clears `margin`. Flattening across layers also carries the
+        bank's per-layer magnitudes, so energy in layers the bank leaves alone
+        lowers the cosine.
+        """
+        if self._last_dir_delta is None:
+            return flow_delta.new_zeros([])
+        B = flow_delta.size(0)
+        target = self._last_dir_delta.detach().reshape(B, -1)
+        cos = F.cosine_similarity(flow_delta.reshape(B, -1), target, dim=1, eps=1e-8)
+        # Samples with no requested edit have a zero target; skip them.
+        valid = target.norm(dim=1) > 1e-8
+        if not valid.any():
+            return flow_delta.new_zeros([])
+        return F.relu(margin - cos[valid]).mean()
 
     def current_residual_scale(self):
         """(num_attrs,) learned residual_scale values, always positive."""
@@ -323,7 +384,30 @@ class AttributeDirectionBank(nn.Module):
             rs = scales[attr_idx_long].view(B, 1, 1)
         else:
             rs = scales.mean()
-        guided_delta = dir_delta + rs * residual
+
+        self._last_dir_delta = dir_delta
+        mode = self.bank_mode
+        mix = self.bank_mix.to(device=device, dtype=dtype)
+        if mode == "replace":
+            guided_delta = dir_delta + rs * residual
+            bank_only = dir_delta
+        elif mode == "anneal":
+            guided_delta = mix * (dir_delta + rs * residual) + (1.0 - mix) * flow_delta
+            bank_only = mix * dir_delta
+        elif mode == "prior":
+            guided_delta = flow_delta
+            bank_only = torch.zeros_like(flow_delta)
+        else:  # flow_magnitude
+            if attr_idx is not None:
+                # Keep only the coefficients on the edited attribute's K
+                # directions; column m of D belongs to attribute m // num_k.
+                col_attr = torch.arange(M, device=device) // self.num_k
+                keep = (col_attr.view(1, M) == attr_idx.view(-1, 1).long()).to(dtype)
+                edit_proj = torch.einsum('lsm,blm->bls', D, coeff * keep.unsqueeze(1))
+            else:
+                edit_proj = proj
+            guided_delta = edit_proj + rs * residual
+            bank_only = torch.zeros_like(flow_delta)
 
         guided_delta_pre_clip = guided_delta
         active_direction_scale = self.direction_scale.to(device=device, dtype=dtype).mean()
@@ -367,7 +451,18 @@ class AttributeDirectionBank(nn.Module):
             residual_norm = residual.reshape(B, -1).norm(dim=1).mean()
             guided_pre_clip_norm = guided_delta_pre_clip.reshape(B, -1).norm(dim=1).mean()
             guided_norm = guided_delta.reshape(B, -1).norm(dim=1).mean()
+            # How much of the (pre-cap) edit comes from the flow rather than the
+            # bank's own prediction: 1.0 = all flow, ~0 = the flow is decoration.
+            flow_part = (guided_delta_pre_clip - bank_only).reshape(B, -1).norm(dim=1)
+            flow_share = (flow_part / guided_delta_pre_clip.reshape(B, -1).norm(dim=1)
+                          .clamp(min=1e-8)).mean()
+            flow_bank_cos = F.cosine_similarity(
+                flow_delta.reshape(B, -1), dir_delta.reshape(B, -1), dim=1, eps=1e-8
+            ).mean()
             logs = {
+                "dir_bank_flow_share": flow_share.detach(),
+                "dir_bank_flow_bank_cos": flow_bank_cos.detach(),
+                "dir_bank_mix": self.bank_mix.detach().clone(),
                 "dir_bank_flow_delta_norm": flow_norm.detach(),
                 "dir_bank_dir_delta_norm": dir_norm.detach(),
                 "dir_bank_residual_norm": residual_norm.detach(),

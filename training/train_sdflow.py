@@ -446,6 +446,15 @@ def save_best_checkpoints(save_root, step, logger, ema_modules, metric, metric_n
     print(f'** new best {metric_name}={metric:.4f} at step {step} -> {best_root}')
 
 
+def bank_mix_at(step, args):
+    """Linear bank->flow curriculum for --bank_mode anneal."""
+    if args.bank_anneal_steps <= 0:
+        return args.bank_mix_end
+    frac = (step - args.bank_anneal_start_step) / float(args.bank_anneal_steps)
+    frac = min(max(frac, 0.0), 1.0)
+    return args.bank_mix_start + frac * (args.bank_mix_end - args.bank_mix_start)
+
+
 def cap_delta_norm(delta, max_norm):
     if max_norm is None or max_norm <= 0:
         clip = torch.ones(delta.shape[0], device=delta.device, dtype=delta.dtype)
@@ -908,6 +917,34 @@ if __name__ == '__main__':
                              "moves the compensation inside the model so edit_scale stays at 1.0. "
                              "Parameter shapes are unchanged, so an existing checkpoint can be "
                              "fine-tuned with --resume_dir rather than retrained from scratch.")
+    parser.add_argument('--bank_mode', default='replace',
+                        choices=['replace', 'anneal', 'prior', 'flow_magnitude'],
+                        help="Who produces the edit when --direction_bank_path is set. "
+                             "replace: bank direction x MLP magnitude + small flow residual "
+                             "(original behavior; the flow is mostly bypassed). "
+                             "anneal: mix*replace + (1-mix)*flow_delta, mix scheduled by "
+                             "--bank_mix_start/--bank_mix_end over --bank_anneal_steps. "
+                             "prior: the output is the pure flow_delta; the bank only acts as "
+                             "a cosine-hinge training target (--bank_prior_weight). "
+                             "flow_magnitude: bank axes, but the flow's own projection onto the "
+                             "edited attribute's axes sets the per-sample/per-layer magnitude. "
+                             "Saved inside the direction_bank checkpoint, so eval/editor follow it.")
+    parser.add_argument('--bank_mix_start', type=float, default=1.0,
+                        help='anneal mode: bank weight at --bank_anneal_start_step.')
+    parser.add_argument('--bank_mix_end', type=float, default=0.0,
+                        help='anneal mode: bank weight after the anneal; also the value used '
+                             'at inference since it is what the checkpoint stores.')
+    parser.add_argument('--bank_anneal_start_step', type=int, default=0)
+    parser.add_argument('--bank_anneal_steps', type=int, default=20000,
+                        help='anneal mode: number of steps for the linear mix decay.')
+    parser.add_argument('--bank_prior_weight', type=float, default=0.1,
+                        help='Weight of the cosine-hinge pull of flow_delta toward the bank '
+                             'prediction. prior mode: applied at full weight. anneal mode: '
+                             'scaled by (1-mix) so the soft prior fades in as the hard bank '
+                             'mixing fades out. Ignored in replace/flow_magnitude.')
+    parser.add_argument('--bank_prior_margin', type=float, default=0.5,
+                        help='Cosine the flow must reach before the prior stops pulling; '
+                             'below 1 so each sample can keep its own non-linear direction.')
     parser.add_argument('--use_controlnet_injection', action='store_true',
                         help='ControlNet-style additive injection into an INTERMEDIATE StyleGAN2 '
                              'feature map (models/stylegan2/model.py Generator\'s dormant `skips` '
@@ -1386,6 +1423,8 @@ if __name__ == '__main__':
             use_attr_lora=args.use_attr_lora,
             attr_lora_rank=args.attr_lora_rank,
             signed_magnitude_input=args.signed_magnitude_input,
+            bank_mode=args.bank_mode,
+            bank_mix=args.bank_mix_start if args.bank_mode == 'anneal' else 1.0,
         ).cuda()
         if args.freeze_direction_bank_nets:
             for p in direction_bank.parameters():
@@ -1395,7 +1434,7 @@ if __name__ == '__main__':
             p for p in direction_bank.parameters()
             if p.requires_grad and p is not direction_bank.residual_scale_raw
         ]
-        print(f'** Direction Bank enabled: {args.direction_bank_path}')
+        print(f'** Direction Bank enabled: {args.direction_bank_path} (bank_mode={args.bank_mode})')
     else:
         direction_bank = None
     trainable_params += list(attr_scales.parameters())
@@ -1502,6 +1541,9 @@ if __name__ == '__main__':
             print('[Resume] reg_loss_weights checkpoint not found; using default init weights.')
         if direction_bank is not None and args.resume_direction_bank:
             load_module_checkpoint(direction_bank, resume_save_dir, 'direction_bank', start_step, strict=False)
+            # The checkpoint carries the mode it was trained with; this run's
+            # --bank_mode wins (e.g. resuming a 'replace' run into 'anneal').
+            direction_bank.set_mode(args.bank_mode)
         elif direction_bank is not None:
             print('[Resume] direction_bank checkpoint not loaded; using current bank path and safety controls.')
         if control_encoder is not None:
@@ -1722,9 +1764,20 @@ if __name__ == '__main__':
             elif direction_bank is not None:
                 attr_delta = new_attr_cond - attr_cond.detach()
                 direction_bank_applied = True
+                if args.bank_mode == 'anneal':
+                    direction_bank.set_mix(bank_mix_at(n_iter, args))
                 guided_delta = direction_bank(flow_delta, attr_delta, attr_idx=mid_idx, latent=latent)
             else:
                 guided_delta = flow_delta
+
+            loss_bank_prior = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            bank_prior_weight = 0.0
+            if direction_bank_applied and args.bank_mode in ('prior', 'anneal'):
+                bank_prior_weight = args.bank_prior_weight
+                if args.bank_mode == 'anneal':
+                    bank_prior_weight *= 1.0 - float(direction_bank.bank_mix)
+                if bank_prior_weight > 0:
+                    loss_bank_prior = direction_bank.prior_loss(flow_delta, margin=args.bank_prior_margin)
 
             final_delta_norm_pre_clip = guided_delta.reshape(guided_delta.shape[0], -1).norm(dim=1).mean().detach()
             guided_delta, final_delta_clip = cap_delta_norm(guided_delta, args.final_delta_max_norm)
@@ -2140,7 +2193,8 @@ if __name__ == '__main__':
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
                 args.color_shift_loss_weight * color_shift_loss +\
-                args.controlnet_reg_weight * loss_control_reg
+                args.controlnet_reg_weight * loss_control_reg +\
+                bank_prior_weight * loss_bank_prior
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -2261,6 +2315,11 @@ if __name__ == '__main__':
                 'control_skip_norm': control_skip_norm,
                 'loss_control_reg': loss_control_reg.detach(),
                 'dir_orth': dir_orth_loss,
+                'loss_bank_prior': loss_bank_prior.detach(),
+                'bank_prior_weight': torch.tensor(bank_prior_weight),
+                'dir_bank_flow_share': dir_logs.get('dir_bank_flow_share', _zero.detach().clone()),
+                'dir_bank_flow_bank_cos': dir_logs.get('dir_bank_flow_bank_cos', _zero.detach().clone()),
+                'dir_bank_mix': dir_logs.get('dir_bank_mix', _zero.detach().clone()),
                 'dir_bank_flow_delta_norm': dir_logs.get('dir_bank_flow_delta_norm', _zero.detach().clone()),
                 'dir_bank_dir_delta_norm': dir_logs.get('dir_bank_dir_delta_norm', _zero.detach().clone()),
                 'dir_bank_residual_norm': dir_logs.get('dir_bank_residual_norm', _zero.detach().clone()),

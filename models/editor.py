@@ -91,6 +91,7 @@ class SDFlow(object):
                  direction_residual_scale=0.05, direction_freeze=True,
                  ckpt_step=None,
                  guided_delta_max_norm=None,
+                 bank_mode=None,
                  use_run_config=True) -> None:
         # When the run saved a config.json (train_sdflow.py writes one), treat
         # it as the source of truth for model structure: the constructor
@@ -251,6 +252,11 @@ class SDFlow(object):
                 print(f'Loaded direction_bank from {filename}')
             else:
                 print(f'Loaded direction_bank initialization from {direction_bank_path}')
+            # The mode is a buffer restored from the checkpoint above; pass
+            # bank_mode only to evaluate the same weights under another rule.
+            if bank_mode is not None:
+                self.direction_bank.set_mode(bank_mode)
+            print(f'Direction bank mode: {self.direction_bank.bank_mode}')
             self.direction_bank.eval()
 
     def samples(self, targets):

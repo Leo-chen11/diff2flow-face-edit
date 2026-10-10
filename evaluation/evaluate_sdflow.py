@@ -653,6 +653,19 @@ def load_models(args):
                   f'{args.override_residual_scale} for ALL attributes '
                   f'(trained value ignored)')
 
+        # The bank's mode/mix are restored from the checkpoint (old checkpoints
+        # load as 'replace'). Overriding them evaluates the SAME trained weights
+        # under a different combination rule -- e.g. --bank_mode_override prior
+        # on a 'replace' checkpoint measures what the flow alone can do.
+        if getattr(args, 'bank_mode_override', None) is not None:
+            direction_bank.set_mode(args.bank_mode_override)
+            print(f'[Override] bank_mode forced to {args.bank_mode_override}')
+        if getattr(args, 'bank_mix_override', None) is not None:
+            direction_bank.set_mix(args.bank_mix_override)
+            print(f'[Override] bank_mix forced to {args.bank_mix_override}')
+        print(f'Direction bank mode: {direction_bank.bank_mode} '
+              f'(mix={float(direction_bank.bank_mix):.3f})')
+
         if getattr(args, 'age_fine_layer_scale', None) is not None and 39 in args.attribute_index:
             # Diagnostic knob: render_preview.py with --override_residual_scale 0
             # showed the color-cast artifact on age edits comes 100% from the
@@ -1685,6 +1698,14 @@ if __name__ == '__main__':
                         help='Force the direction-bank residual_scale to this value for all '
                              'attributes at eval time (e.g. 0.15 or 0.3), overriding the trained '
                              'value (which tends to be frozen near its 0.05 init). Diagnostic only.')
+    parser.add_argument('--bank_mode_override', default=None,
+                        choices=['replace', 'anneal', 'prior', 'flow_magnitude'],
+                        help='Evaluate with this direction-bank combination rule instead of the '
+                             'one stored in the checkpoint. "prior" = pure flow_delta, so on a '
+                             'replace-trained checkpoint it measures the flow on its own.')
+    parser.add_argument('--bank_mix_override', type=float, default=None,
+                        help='Bank weight for --bank_mode anneal at eval time (1=all bank, '
+                             '0=all flow); overrides the value stored in the checkpoint.')
     parser.add_argument('--age_fine_layer_scale', type=float, default=None,
                         help='Scale the age (attr 39) direction layers [age_fine_layer_start:18] '
                              'by this factor at eval time (e.g. 0.0 to zero them out). '
