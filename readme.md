@@ -30,3 +30,24 @@ python training/train_sdflow.py --direction_bank_path <bank.pt> --bank_mode anne
 python training/train_sdflow.py --direction_bank_path <bank.pt> --bank_mode prior --bank_prior_weight 0.1 --bank_prior_margin 0.5
 python training/train_sdflow.py --direction_bank_path <bank.pt> --bank_mode flow_magnitude
 ```
+
+## Consensus Metric (`evaluate_sdflow.py --consensus`)
+
+Every judge splits add/rm from its own reading of the source, and the model edits in the direction its conditioner reads. When those readings disagree, a correct edit is scored as a failure (e.g. short-haired women that CelebA calls male are put in Male-rm, while the conditioner reads them as female and edits toward male).
+
+`--consensus` additionally scores each edit on the subset of sources that CLIP (the BiSeNet parser for Eyeglasses) and the CelebA classifier both read clearly (outside 0.35-0.65) and the same way. The subset depends only on the source image and the two external judges, never on the model, so every checkpoint is scored on the same faces. It needs both judges (`./data/celeba_attr_resnet18.pth`).
+
+Reported per attribute under `"consensus"` and pooled under `"consensus_overall"` (existing fields are unchanged; the output name gets a `_cons` suffix):
+
+| Field | Meaning |
+| --- | --- |
+| `cover` | Share of sources kept. The kept faces are the less ambiguous ones, so always report it next to the full-set numbers. |
+| `acc_clip`, `acc_celeb`, `acc_both` | Strict success by CLIP, by CelebA, and by both. |
+| `acc_both_add`, `acc_both_rm` | `acc_both` split by the consensus direction. |
+| `dir_agree` | How often the model was asked to edit the consensus way (its conditioner's reading under `--edit_direction cond`). |
+| `acc_both_dir_agree`, `acc_both_dir_disagree` | `acc_both` split by that: failures in the second are caused by the model's reading of the source, not by its edit. |
+| `id_indep`, `id_arc`, `lpips` | Identity and perceptual distance on the same subset. |
+
+```bash
+python evaluation/evaluate_sdflow.py --checkpoint_dir <run> --step <N> --consensus
+```

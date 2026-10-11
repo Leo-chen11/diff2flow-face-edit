@@ -1517,6 +1517,99 @@ def is_clear(score, low=0.35, high=0.65):
     return score > high or score < low
 
 
+# ── Consensus sources (--consensus) ─────────────────────────────────────────
+# Every judge above splits add/rm and decides "clear" from ITS OWN reading of
+# the source, and the model edits in the direction ITS conditioner reads. When
+# those readings disagree (CLIP vs CelebA on Young: 39 vs 123 "old" sources;
+# Male rm montages: short-haired women CelebA calls male, edited toward male
+# because the conditioner reads them as female), a correct edit is scored as
+# a failure. The consensus subset keeps only sources that CLIP (the parser for
+# Eyeglasses) and the CelebA classifier BOTH read clearly and the same way.
+# It is chosen from the source image and the two external judges only -- never
+# from the model's own conditioner -- so every checkpoint is scored on the
+# same faces. Report it next to the full-set numbers, with its coverage: the
+# kept faces are the less ambiguous ones, so it reads higher by construction.
+CONSENSUS_KEYS = ('acc_clip', 'acc_celeb', 'acc_both', 'acc_celeb_add', 'acc_celeb_rm',
+                  'acc_both_add', 'acc_both_rm', 'dir_agree', 'acc_both_dir_agree',
+                  'acc_both_dir_disagree', 'id_indep', 'id_arc', 'lpips')
+
+
+def consensus_label(s_clip, s_celeb):
+    """'add' / 'rm' when both source readings are clear and agree, else None."""
+    if not (is_clear(s_clip) and is_clear(s_celeb)):
+        return None
+    if (s_clip < 0.5) != (s_celeb < 0.5):
+        return None
+    return 'add' if s_clip < 0.5 else 'rm'
+
+
+def record_consensus(metrics, attr_name, s_clip, e_clip, s_celeb, e_celeb, model_adds,
+                     margin, id_indep=None, id_arc=None, lpips=None):
+    """Per-sample bookkeeping for --consensus. model_adds: whether the model
+    was asked to ADD the attribute (the conditioner's reading under
+    --edit_direction cond, else the given direction)."""
+    label = consensus_label(s_clip, s_celeb)
+    metrics[f'cons_cover_{attr_name}'].append(float(label is not None))
+    if label is None:
+        return
+    ok_clip = bool(strict_success(s_clip, e_clip, margin))
+    ok_celeb = bool(strict_success(s_celeb, e_celeb, margin))
+    both = ok_clip and ok_celeb
+    metrics[f'cons_acc_clip_{attr_name}'].append(float(ok_clip))
+    metrics[f'cons_acc_celeb_{attr_name}'].append(float(ok_celeb))
+    metrics[f'cons_acc_both_{attr_name}'].append(float(both))
+    metrics[f'cons_acc_celeb_{label}_{attr_name}'].append(float(ok_celeb))
+    metrics[f'cons_acc_both_{label}_{attr_name}'].append(float(both))
+    # Was the model even asked to go the consensus way? A "disagree" sample
+    # fails because of the model's own reading of the source, not its edit.
+    agree = bool(model_adds) == (label == 'add')
+    metrics[f'cons_dir_agree_{attr_name}'].append(float(agree))
+    metrics[f'cons_acc_both_dir_{"agree" if agree else "disagree"}_{attr_name}'].append(float(both))
+    for key, val in (('id_indep', id_indep), ('id_arc', id_arc), ('lpips', lpips)):
+        if val is not None:
+            metrics[f'cons_{key}_{attr_name}'].append(float(val))
+
+
+def summarize_consensus(metrics, attr_names):
+    """Per-attribute and pooled consensus summaries; prints a table and
+    returns ({attr_name: {...}}, overall) for the results JSON."""
+    per_attr = {}
+    print('  Consensus sources (CLIP/parser and CelebA both clear and agreeing on the source; '
+          'the same faces for every model). cover = share of faces kept; '
+          'dir=cons = model was asked to edit the consensus way.')
+    print(f'    {"Attribute":<12} {"cover":>6} {"n":>4} {"AccCLIP":>8} {"AccCeleb":>9} '
+          f'{"AccBoth":>8}   {"Both add":>9} {"Both rm":>9}   {"dir=cons":>8} '
+          f'{"Both|dir=cons":>13} {"Both|dir!=cons":>14}')
+    for attr_name in attr_names:
+        row = {'cover': _summ(metrics.get(f'cons_cover_{attr_name}', []))}
+        for k in CONSENSUS_KEYS:
+            row[k] = _summ(metrics.get(f'cons_{k}_{attr_name}', []))
+        per_attr[attr_name] = row
+        n = row['acc_both']['n'] if row['acc_both'] else 0
+        print(f'    {attr_name:<12} {_fmt(row["cover"], pct=True)} {n:>4} '
+              f'{_fmt(row["acc_clip"], pct=True)} {_fmt(row["acc_celeb"], pct=True)}  '
+              f'{_fmt(row["acc_both"], pct=True)}   {_fmt(row["acc_both_add"], pct=True)} '
+              f'{_fmt(row["acc_both_rm"], pct=True)}   {_fmt(row["dir_agree"], pct=True)} '
+              f'{_fmt(row["acc_both_dir_agree"], pct=True)}      '
+              f'{_fmt(row["acc_both_dir_disagree"], pct=True)}')
+    overall = {}
+    for k in ('cover', 'acc_clip', 'acc_celeb', 'acc_both', 'dir_agree', 'id_indep', 'id_arc', 'lpips'):
+        vals = [v for a in attr_names for v in metrics.get(f'cons_{k}_{a}', [])]
+        overall[k] = _summ(vals)
+    # Mean over attributes as well (the pooled numbers weight attributes by how
+    # many of their sources are clear, which differs a lot across attributes).
+    for k in ('acc_clip', 'acc_celeb', 'acc_both'):
+        means = [per_attr[a][k]['mean'] for a in attr_names if per_attr[a][k]]
+        overall[f'{k}_attr_mean'] = float(np.mean(means)) if means else None
+    print(f'    {"Overall":<12} {_fmt(overall["cover"], pct=True)} '
+          f'{(overall["acc_both"] or {}).get("n", 0):>4} '
+          f'{_fmt(overall["acc_clip"], pct=True)} {_fmt(overall["acc_celeb"], pct=True)}  '
+          f'{_fmt(overall["acc_both"], pct=True)}   (pooled; attribute mean of AccBoth: '
+          + (f'{overall["acc_both_attr_mean"] * 100:.1f}%' if overall['acc_both_attr_mean'] is not None
+             else '--') + ')')
+    return per_attr, overall
+
+
 def _interp_at(points, x):
     """points: [(x, y)]; linear interpolation of y at x, None outside the range."""
     pts = sorted(points)
@@ -1653,6 +1746,11 @@ def evaluate(args):
     clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
     _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
+    consensus_on = bool(getattr(args, 'consensus', False))
+    if consensus_on and (clip_judge is None or celeb_judge is None):
+        raise SystemExit('--consensus needs both the CLIP judge and the CelebA judge '
+                         '(--celeba_attr_judge_weights, default ./data/celeba_attr_resnet18.pth); '
+                         f'loaded: CLIP={clip_judge is not None}, CelebA={celeb_judge is not None}.')
 
     composite_face_parser = None
     if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
@@ -1750,6 +1848,7 @@ def evaluate(args):
             'override_residual_scale': getattr(args, 'override_residual_scale', None),
             'bank_mode': getattr(args, 'bank_mode', 'replace'),
             'bank_mix': getattr(args, 'bank_mix', None),
+            'consensus': consensus_on,
         },
     }
 
@@ -1954,6 +2053,19 @@ def evaluate(args):
                             metrics[f'leak_{jname}_{attr_name}'].append(
                                 abs(ep[b, other_idx].item() - sp[b, other_idx].item()))
 
+                    if consensus_on:
+                        _model_adds = (attr_cond[b, local_idx].item() < 0.5) if _direction is None \
+                            else (_direction[b].item() > 0)
+                        record_consensus(
+                            metrics, attr_name,
+                            src_probs_clip[b, local_idx].item(), edit_probs_clip[b, local_idx].item(),
+                            src_probs_celeb[b, local_idx].item(), edit_probs_celeb[b, local_idx].item(),
+                            _model_adds, args.success_margin,
+                            id_indep=((src_id_indep[b] * edit_id_indep[b]).sum().item()
+                                      if edit_id_indep is not None else None),
+                            id_arc=F.cosine_similarity(src_id_arc[b:b+1], edit_id_arc[b:b+1]).item(),
+                            lpips=lpips_d[b].item() if lpips_d is not None else None)
+
                     # ── Side effects on all 40 attributes (--leak40) ─────────
                     # What ELSE the edit changed, read by the independent
                     # classifier: signed probability change per attribute, and
@@ -2088,6 +2200,12 @@ def evaluate(args):
                                  f'near {prog["near"] * 100:4.0f}% still {prog["still"] * 100:4.0f}%')
                 print(f'    {attr_name:<12} ' + '   '.join(cells))
 
+        if consensus_on:
+            _cons_attr, _cons_overall = summarize_consensus(metrics, attr_names)
+            for attr_name in attr_names:
+                scale_summary[attr_name]['consensus'] = _cons_attr[attr_name]
+            scale_summary['consensus_overall'] = _cons_overall
+
         if leak40:
             top_n = int(getattr(args, 'leak40_top', 6))
             print(f'  Side effects on all 40 attributes (AccInd judge): top {top_n} by mean |dP|, '
@@ -2216,6 +2334,7 @@ def evaluate(args):
         + (f'_off{args.sample_offset}' if args.sample_offset else '')
         + (f'_bank{args.bank_mode}' if getattr(args, 'bank_mode', 'replace') != 'replace' else '')
         + (f'_mix{args.bank_mix:g}' if getattr(args, 'bank_mix', None) is not None else '')
+        + ('_cons' if getattr(args, 'consensus', False) else '')
         + '.json',
     )
     # The default name only encodes step and sample count, so a second eval of
@@ -2556,6 +2675,16 @@ def build_parser():
                         help='Skip the first N test faces. The first 500 (offset 0) are the '
                              'development set every comparison so far used; --sample_offset 500 '
                              'gives the next 500, held out for the final report only.')
+    parser.add_argument('--consensus', action='store_true',
+                        help='Also score every edit on the CONSENSUS subset: sources that CLIP '
+                             '(the parser for Eyeglasses) and the CelebA classifier both read '
+                             'clearly (outside 0.35-0.65) and the same way. Chosen without the '
+                             'model, so all checkpoints are scored on the same faces. Reports '
+                             'coverage, AccCLIP / AccCeleb / AccBoth (both judges agree the edit '
+                             'worked), how often the model was asked to edit the consensus way, '
+                             'and AccBoth split by that. Needs both judges. Saved under '
+                             '"consensus" per attribute and "consensus_overall"; existing fields '
+                             'are unchanged. Output name gets a _cons suffix.')
     parser.add_argument('--leak40', action='store_true',
                         help='Report what ELSE each edit changed: the independent classifier\'s '
                              'signed probability change on all 40 CelebA attributes, per edited '
