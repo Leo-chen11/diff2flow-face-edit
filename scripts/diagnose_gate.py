@@ -342,6 +342,9 @@ def main():
     p.add_argument('--diag_bins', type=int, default=5, help='ODE-time bins')
     p.add_argument('--out_dir', default=None)
     args = p.parse_args()
+    if not os.path.isdir(args.checkpoint_dir):
+        raise SystemExit(f'checkpoint_dir does not exist on this machine: {args.checkpoint_dir}\n'
+                         f'(a /mnt/c/... path only exists inside WSL)')
     args = apply_run_config(args)
     args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
