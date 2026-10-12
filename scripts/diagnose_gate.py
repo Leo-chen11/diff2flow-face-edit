@@ -102,13 +102,24 @@ class GateTap:
         self.prior.forward = self._prior_fwd
 
 
+STATS = {'t_total': 0, 't_bad': 0, 't_max': 0.0}   # ODE-time bookkeeping across passes
+
+
 def time_binned(rec, reverse, n_bins):
     """(B, n_bins, L) mean gate per normalised-ODE-time bin (NaN for empty bins)."""
     rs = [r for r in rec if r[1] == reverse]
     if not rs:
         raise RuntimeError('no gate evaluations were recorded for this pass')
     t = np.array([r[2] for r in rs], dtype=np.float64)
-    idx = np.minimum((t / max(t.max(), 1e-8) * n_bins).astype(int), n_bins - 1)
+    ok = np.isfinite(t)
+    STATS['t_total'] += len(t)
+    STATS['t_bad'] += int((~ok).sum())
+    if not ok.any():
+        raise RuntimeError('every recorded ODE time in this pass is non-finite')
+    t_max = float(t[ok].max())
+    STATS['t_max'] = max(STATS['t_max'], t_max)
+    idx = np.full(len(t), -1)
+    idx[ok] = np.clip((t[ok] / max(t_max, 1e-8) * n_bins).astype(int), 0, n_bins - 1)
     G = torch.stack([r[3] for r in rs])                 # (E, B, L)
     out = torch.full((G.size(1), n_bins, G.size(2)), float('nan'))
     for b in range(n_bins):
@@ -131,6 +142,7 @@ def _unit(v):
 def run_diagnostic(prior, batches, names, global_idx, scale, target_fn, n_bins=5, log=print):
     """batches: list of (latent (B,L,512), id_cond (B,id), attr_cond (B,K)) tensors on
     the flow's device. target_fn(src (B,), scale, attr_global_idx) -> target value."""
+    STATS.update(t_total=0, t_bad=0, t_max=0.0)
     tap = GateTap(prior)
     K = len(names)
     try:
@@ -199,6 +211,7 @@ def run_diagnostic(prior, batches, names, global_idx, scale, target_fn, n_bins=5
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)     # a time bin may have no solver step
         time_profile = np.nanmean(np.stack(bdec), axis=(0, 1, 3)).tolist()
+        time_layer = np.nanmean(np.concatenate(bdec), axis=0)          # (n_bins, L)
         time_spread = [float(np.nanstd(np.nanmean(np.stack(bdec)[:, :, b], axis=(0, 1))))
                        for b in range(bdec[0].shape[1])]
     out = {
@@ -216,6 +229,9 @@ def run_diagnostic(prior, batches, names, global_idx, scale, target_fn, n_bins=5
         'frac_closed': float(np.mean([(g < 0.1).mean() for g in gdec])),
         'time_profile': time_profile,                              # per bin
         'time_layer_spread': time_spread,
+        'time_layer_profile': time_layer.tolist(),                 # for --gate_freeze schedule
+        't_max': STATS['t_max'],
+        't_nonfinite': [STATS['t_bad'], STATS['t_total']],
     }
     norm = [_unit(d).norm(dim=1) for d in delta]
     out['delta_norm'] = [float(n.mean()) for n in norm]
@@ -266,8 +282,12 @@ def report(o, prof, sens, log=print):
     log('\n2. Does the gate react to the edit? mean |gate(edit) - gate(no edit)|  '
         f'(overall {o["edit_response"]:.4f})')
     log('   ' + '  '.join(f'{n} {v:.4f}' for n, v in zip(names, o['edit_response_per_attr'])))
-    log('\n3. Gate by ODE time (decode pass; bin 0 = start of the pass)')
+    log('\n3. Gate by ODE time, decode pass. Decoding runs t = T -> 0, so the LAST bin is where '
+        'it starts (latent end) and bin 0 is where it finishes (W+ end)')
     log('   ' + '  '.join(f'bin{b} {v:.3f}' for b, v in enumerate(o['time_profile'])))
+    bad, tot = o['t_nonfinite']
+    if bad:
+        log(f'   ({bad} of {tot} solver steps had a non-finite time and were left out of this table)')
     log('\n4. Where the flow edits W+ (share of squared edit norm) and edit size')
     log(f'   {"":<12}' + ''.join(f'{g:>14}' for g in LAYER_GROUPS) + '   |dW|  round-trip err/|dW|')
     for a, n in enumerate(names):

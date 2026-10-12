@@ -1742,6 +1742,16 @@ def evaluate(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank, control_encoder = load_models(args)
     apply_residual_basis(args, direction_bank)
+    gate_freeze = getattr(args, 'gate_freeze', None)
+    gate_profile = None
+    if gate_freeze:
+        from models.flows.gate_freeze import freeze_layer_gates
+        if gate_freeze != 'open':
+            gate_profile = args.gate_profile_json or os.path.join(
+                args.checkpoint_dir, f'gate_diag_s{args.step}', 'gate_diag.json')
+        n = freeze_layer_gates(prior, gate_freeze, gate_profile)
+        print(f'[Ablation] --gate_freeze {gate_freeze}: {n} LayerGate(s) replaced'
+              + (f' by the table in {gate_profile}' if gate_profile else ' by 1.0'))
 
     clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
@@ -1849,6 +1859,9 @@ def evaluate(args):
             'bank_mode': getattr(args, 'bank_mode', 'replace'),
             'bank_mix': getattr(args, 'bank_mix', None),
             'consensus': consensus_on,
+            'disable_controlnet': bool(getattr(args, 'disable_controlnet', False)),
+            'gate_freeze': gate_freeze,
+            'gate_profile_json': gate_profile,
         },
     }
 
@@ -2334,6 +2347,7 @@ def evaluate(args):
         + (f'_off{args.sample_offset}' if args.sample_offset else '')
         + (f'_bank{args.bank_mode}' if getattr(args, 'bank_mode', 'replace') != 'replace' else '')
         + (f'_mix{args.bank_mix:g}' if getattr(args, 'bank_mix', None) is not None else '')
+        + (f'_gate{args.gate_freeze}' if getattr(args, 'gate_freeze', None) else '')
         + ('_cons' if getattr(args, 'consensus', False) else '')
         + '.json',
     )
@@ -2675,6 +2689,15 @@ def build_parser():
                         help='Skip the first N test faces. The first 500 (offset 0) are the '
                              'development set every comparison so far used; --sample_offset 500 '
                              'gives the next 500, held out for the final report only.')
+    parser.add_argument('--gate_freeze', choices=['mean', 'schedule', 'open'], default=None,
+                        help='Ablation of the LAG-DOF LayerGate (velocity_field lag/lag_dof): '
+                             'replace the learned gate by a fixed table. mean = per-layer '
+                             'constant; schedule = per (ODE-time bin, layer), shared by every '
+                             'face and attribute; open = 1 everywhere. mean/schedule read '
+                             'gate_diag.json from scripts/diagnose_gate.py.')
+    parser.add_argument('--gate_profile_json', default=None,
+                        help='gate_diag.json for --gate_freeze mean/schedule. Default: '
+                             '<checkpoint_dir>/gate_diag_s<step>/gate_diag.json')
     parser.add_argument('--consensus', action='store_true',
                         help='Also score every edit on the CONSENSUS subset: sources that CLIP '
                              '(the parser for Eyeglasses) and the CelebA classifier both read '
