@@ -407,6 +407,9 @@ class AttributeDirectionBank(nn.Module):
         self.set_mode(bank_mode)
         self.set_mix(bank_mix)
         self._last_dir_delta = None   # bank's own prediction, target of prior_loss()
+        # Per-attribute EMA of cos(flow_delta, dir_delta) for logging. A plain
+        # tensor, NOT a buffer: keeps the state_dict (and old checkpoints) unchanged.
+        self._flow_bank_cos_ema = torch.full((self.num_attrs,), float('nan'))
         self.last_logs = {}
         self._last_alpha = None   # (B, num_attrs, K) — set each forward, used for selection loss
 
@@ -867,9 +870,20 @@ class AttributeDirectionBank(nn.Module):
             flow_part = (guided_delta_pre_clip - bank_only).reshape(B, -1).norm(dim=1)
             flow_share = (flow_part / guided_delta_pre_clip.reshape(B, -1).norm(dim=1)
                           .clamp(min=1e-8)).mean()
-            flow_bank_cos = F.cosine_similarity(
+            cos_per_sample = F.cosine_similarity(
                 flow_delta.reshape(B, -1), dir_delta.reshape(B, -1), dim=1, eps=1e-8
-            ).mean()
+            )
+            flow_bank_cos = cos_per_sample.mean()
+            # The batch-mean above mixes whichever attributes this step edits;
+            # this EMA keeps one value per attribute (same decay as gate_usage_ema).
+            if attr_idx is not None:
+                ema = self._flow_bank_cos_ema
+                d = self.gate_usage_ema_decay
+                idx_cpu = attr_idx.view(-1).long().cpu()
+                cos_cpu = cos_per_sample.float().cpu()
+                for a in idx_cpu.unique().tolist():
+                    m = cos_cpu[idx_cpu == a].mean()
+                    ema[a] = m if torch.isnan(ema[a]) else d * ema[a] + (1.0 - d) * m
             logs = {
                 "dir_bank_flow_share": flow_share.detach(),
                 "dir_bank_flow_bank_cos": flow_bank_cos.detach(),
@@ -882,6 +896,7 @@ class AttributeDirectionBank(nn.Module):
                 "dir_bank_guided_delta_norm_pre_clip": guided_pre_clip_norm.detach(),
                 "dir_bank_guided_delta_norm": guided_norm.detach(),
                 "dir_bank_residual_scale": scales.detach(),
+                "dir_bank_flow_bank_cos_per_attr": self._flow_bank_cos_ema.clone(),
             }
             if self.num_k > 1:
                 # Raw current-step entropy, kept for backward compat -- averages

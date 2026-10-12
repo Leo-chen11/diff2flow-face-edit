@@ -3414,6 +3414,11 @@ if __name__ == '__main__':
                 current_residual_scales = direction_bank.current_residual_scale().detach()
                 for _i, _attr_abs_idx in enumerate(args.attribute_index):
                     _log_dict[f'residual_scale/attr_{_attr_abs_idx}'] = current_residual_scales[_i]
+                _cos_per_attr = dir_logs.get('dir_bank_flow_bank_cos_per_attr')
+                if _cos_per_attr is not None:
+                    for _i, _attr_abs_idx in enumerate(args.attribute_index):
+                        if not torch.isnan(_cos_per_attr[_i]):
+                            _log_dict[f'flow_bank_cos_ema/attr_{_attr_abs_idx}'] = _cos_per_attr[_i]
                 _gate_entropy_per_attr = dir_logs.get('dir_gate_entropy_per_attr')
                 if _gate_entropy_per_attr is not None:
                     for _i, _attr_abs_idx in enumerate(args.attribute_index):
