@@ -93,7 +93,6 @@ def main():
                    help='checkpoint steps to measure (default: --step, else the latest)')
     p.add_argument('--align_faces', type=int, default=128)
     p.add_argument('--align_scale', type=float, default=0.9)
-    p.add_argument('--out_json', default=None)
     args = p.parse_args()
     if not os.path.isdir(args.checkpoint_dir):
         raise SystemExit(f'checkpoint_dir does not exist on this machine: {args.checkpoint_dir}')
