@@ -160,6 +160,33 @@ def evaluate(model, ref, loader, attrs, eval_eps, args, device, amp):
     return out
 
 
+@torch.no_grad()
+def calibrate_bias(model, ref, loader, attrs, n_max, device, amp):
+    """Shift the output bias of each head in `attrs` so the model calls the
+    same share of images positive as the original teacher does. Same rule for
+    every attribute; it moves only the decision point, so it repairs a
+    threshold shift but cannot bring back lost information."""
+    lm, lr, n = [], [], 0
+    for x, _ in loader:
+        if n >= n_max:
+            break
+        x = x.to(device, non_blocking=True)
+        lm.append(attr_logits(model, x, amp)[:, attrs].cpu())
+        lr.append(attr_logits(ref, x, amp)[:, attrs].cpu())
+        n += x.size(0)
+    lm, lr = torch.cat(lm), torch.cat(lr)
+    shifts = {}
+    for j, a in enumerate(attrs):
+        q = (lr[:, j] > 0).float().mean().item()
+        if not 0.0 < q < 1.0:
+            continue
+        b = -torch.quantile(lm[:, j], 1.0 - q).item()
+        model.attr_heads[a][-1].bias.add_(b)
+        shifts[CELEBA_ATTRS[a]] = {'logit_shift': b, 'pos_ref': q,
+                                   'pos_before': (lm[:, j] > 0).float().mean().item()}
+    return shifts, n
+
+
 def print_report(tag, rep, attrs, eval_eps):
     names = [CELEBA_ATTRS[a] for a in attrs] + ['mean']
     cols = ['bal', 'tpr', 'tnr', 'pos', 'pos_ref', 'agree'] + [f'flip@{e:g}' for e in eval_eps]
@@ -201,6 +228,11 @@ def main():
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--no_amp', action='store_true')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--calibrate', action='store_true',
+                   help='with --eval_ckpt: also shift each edited head\'s output bias so its '
+                        'positive rate on --train_dir images matches the original teacher\'s, '
+                        'report it and save it as <eval_ckpt>_cal.pth')
+    p.add_argument('--calib_images', type=int, default=8000)
     p.add_argument('--eval_ckpt', default=None,
                    help='only report on this saved checkpoint (e.g. an _ep*.pth) against '
                         '--weights, no training; --train_dir is still read but not used')
@@ -247,6 +279,27 @@ def main():
         model.load_state_dict(load_network(args.eval_ckpt))
         print_report(args.eval_ckpt, evaluate(model, ref, val_loader, attrs, eval_eps,
                                               args, device, amp), attrs, eval_eps)
+        if args.calibrate:
+            # train images, no augmentation, a fixed random subset
+            cal_set = AttrDataset(args.train_dir, args.attr_file, args.image_subdir,
+                                  args.img_size, False, 'bilinear')
+            g = torch.Generator().manual_seed(args.seed)
+            cal_loader = DataLoader(cal_set, batch_size=args.batch, shuffle=True, generator=g,
+                                    num_workers=args.workers, pin_memory=True)
+            shifts, n = calibrate_bias(model, ref, cal_loader, attrs, args.calib_images,
+                                       device, amp)
+            print(f'\ncalibrated on {n} train images:')
+            for name, v in shifts.items():
+                print(f'   {name:<20} positive rate {v["pos_before"]:6.1%} -> {v["pos_ref"]:6.1%}'
+                      f'   (logit shift {v["logit_shift"]:+.3f})')
+            cal_rep = evaluate(model, ref, val_loader, attrs, eval_eps, args, device, amp)
+            print_report('calibrated', cal_rep, attrs, eval_eps)
+            out = os.path.splitext(args.eval_ckpt)[0] + '_cal.pth'
+            torch.save(model.state_dict(), out)
+            with open(os.path.splitext(out)[0] + '_val.json', 'w') as f:
+                json.dump({'source': args.eval_ckpt, 'calibrated_on': n, 'shifts': shifts,
+                           'val': cal_rep}, f, indent=2)
+            print(f'  saved {out}')
         return
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
