@@ -38,6 +38,9 @@ self-grading.
 Report (before training = the original r34, then after every epoch), on the
 val split, for each edited attribute:
   bal    balanced accuracy against the CelebA labels (clean images)
+  tpr/tnr  the two halves of bal; pos = share predicted positive, pos_ref
+         the original r34's share (a bal drop with high agree is usually a
+         threshold shift: pos moving away from pos_ref)
   agree  agreement with the original r34 on clean images
   flip@e share of images whose prediction an L2 attack of radius e flips
          (attack aimed at the model's own clean prediction). This is how easy
@@ -118,6 +121,7 @@ def evaluate(model, ref, loader, attrs, eval_eps, args, device, amp):
     tp = torch.zeros(n_attr); pos = torch.zeros(n_attr)
     tn = torch.zeros(n_attr); neg = torch.zeros(n_attr)
     agree = torch.zeros(n_attr)
+    pred_pos = torch.zeros(n_attr); ref_pos = torch.zeros(n_attr)
     flips = {e: torch.zeros(n_attr) for e in eval_eps}
     n = 0
     for x, y in loader:
@@ -132,7 +136,9 @@ def evaluate(model, ref, loader, attrs, eval_eps, args, device, amp):
         pa = pred[:, attrs].cpu()
         tp += (pa * y).sum(0); pos += y.sum(0)
         tn += ((1 - pa) * (1 - y)).sum(0); neg += (1 - y).sum(0)
-        agree += (pa == (p_ref[:, attrs] > 0.5).float().cpu()).sum(0)
+        ra = (p_ref[:, attrs] > 0.5).float().cpu()
+        agree += (pa == ra).sum(0)
+        pred_pos += pa.sum(0); ref_pos += ra.sum(0)
         for e in eval_eps:
             xa = pgd_l2(model, x, pred, attrs, e, args.eval_pgd_steps,
                         2.5 * e / args.eval_pgd_steps, amp)
@@ -144,7 +150,11 @@ def evaluate(model, ref, loader, attrs, eval_eps, args, device, amp):
     bal = 0.5 * (tp / pos.clamp(min=1) + tn / neg.clamp(min=1))
     out = {'n': n}
     for i, name in enumerate(names):
-        out[name] = {'bal': bal[i].item(), 'agree': (agree[i] / n).item(),
+        out[name] = {'bal': bal[i].item(),
+                     'tpr': (tp[i] / pos[i].clamp(min=1)).item(),
+                     'tnr': (tn[i] / neg[i].clamp(min=1)).item(),
+                     'pos': (pred_pos[i] / n).item(), 'pos_ref': (ref_pos[i] / n).item(),
+                     'agree': (agree[i] / n).item(),
                      **{f'flip@{e:g}': (flips[e][i] / n).item() for e in eval_eps}}
     out['mean'] = {k: sum(out[nm][k] for nm in names) / n_attr for k in out[names[0]]}
     return out
@@ -152,7 +162,7 @@ def evaluate(model, ref, loader, attrs, eval_eps, args, device, amp):
 
 def print_report(tag, rep, attrs, eval_eps):
     names = [CELEBA_ATTRS[a] for a in attrs] + ['mean']
-    cols = ['bal', 'agree'] + [f'flip@{e:g}' for e in eval_eps]
+    cols = ['bal', 'tpr', 'tnr', 'pos', 'pos_ref', 'agree'] + [f'flip@{e:g}' for e in eval_eps]
     print(f'\n[{tag}] val ({rep["n"]} images)')
     print(f'   {"":<20}' + ''.join(f'{c:>11}' for c in cols))
     for nm in names:
@@ -191,6 +201,9 @@ def main():
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--no_amp', action='store_true')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--eval_ckpt', default=None,
+                   help='only report on this saved checkpoint (e.g. an _ep*.pth) against '
+                        '--weights, no training; --train_dir is still read but not used')
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -226,6 +239,15 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
+
+    if args.eval_ckpt:
+        if args.eval_ckpt != args.weights:
+            print_report('original teacher', evaluate(ref, ref, val_loader, attrs, eval_eps,
+                                                      args, device, amp), attrs, eval_eps)
+        model.load_state_dict(load_network(args.eval_ckpt))
+        print_report(args.eval_ckpt, evaluate(model, ref, val_loader, attrs, eval_eps,
+                                              args, device, amp), attrs, eval_eps)
+        return
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     log = {'args': vars(args), 'epochs': {}}
