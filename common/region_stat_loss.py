@@ -22,9 +22,11 @@ mirror for the add direction. Both are hinge losses (only penalize the
 wrong side), so a sample that already satisfies the target costs nothing.
 
 outside_region_preservation_loss() holds the pixels outside a region to the
-source reconstruction (the eyeglasses locality loss).
+source reconstruction (the eyeglasses locality loss, and
+--background_preserve_loss_weight for everything outside face+hair).
 """
 import torch
+import torch.nn.functional as F
 
 
 def region_mean_saturation(img_pm1, mask):
@@ -109,6 +111,22 @@ def directional_region_area_loss(src_prob, edit_prob, push, relative_change, bou
         return torch.relu(target - edit_a).mean()
     target = (src_a * (1.0 - relative_change)).clamp(min=bound)
     return torch.relu(edit_a - target).mean()
+
+
+def dilate_mask(mask, radius):
+    """Morphological dilation of a (B,1,H,W) mask by `radius` pixels.
+
+    Separable max-pool (a (1,k) pass then a (k,1) pass): exact for a square
+    structuring element and O(k) per pixel. Unlike FaceParser.get_region_mask's
+    blur_sigma (a Gaussian softening, which lowers values just inside the
+    boundary as much as it raises them just outside), this actually GROWS the
+    region, which is what a "leave room around the face" margin needs.
+    """
+    if radius <= 0:
+        return mask
+    k = 2 * int(radius) + 1
+    mask = F.max_pool2d(mask, kernel_size=(1, k), stride=1, padding=(0, int(radius)))
+    return F.max_pool2d(mask, kernel_size=(k, 1), stride=1, padding=(int(radius), 0))
 
 
 def outside_region_preservation_loss(edit_img, ref_img, allowed):
