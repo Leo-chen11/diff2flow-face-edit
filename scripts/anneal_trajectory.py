@@ -21,6 +21,9 @@ attribute it prints, per step:
 and an attribute-mean row (the i-th ID point of each attribute, averaged).
 Nothing is extrapolated; -- means the step does not reach that ID.
 
+With --labels the rows are labelled files instead of steps, so two runs'
+checkpoints (e.g. min 80k vs min_robust 80k) can be compared at matched ID.
+
 Usage:
     python -m scripts.anneal_trajectory \
         $R/eval_anneal_s60000_cons.json $R/eval_anneal_s65000_cons.json ... \
@@ -113,6 +116,10 @@ def main():
     p.add_argument('--scale', type=float, default=0.9, help='scale for ID / LPIPS / FID columns')
     p.add_argument('--points', type=int, default=3, help='matched-ID points per attribute')
     p.add_argument('--judges', nargs='+', default=['both', 'celeb', 'clip'], choices=list(JUDGES))
+    p.add_argument('--labels', nargs='+', default=None,
+                   help='one label per file, in the order given, instead of the checkpoint step '
+                        '(and no sorting): use it to compare checkpoints of DIFFERENT runs at the '
+                        'same ID points, e.g. --labels min min_robust')
     p.add_argument('--anneal_start', type=int, default=50000,
                    help='schedule fallback when the run has no config.json on this machine')
     p.add_argument('--anneal_steps', type=int, default=20000)
@@ -125,8 +132,13 @@ def main():
         if not cfg.get('consensus'):
             raise SystemExit(f'{f} was not run with --consensus')
         runs.append((cfg.get('step'), run_mix(cfg, args), cfg, scales, f))
-    runs.sort(key=lambda r: (r[0] is None, r[0]))
-    for key in ('checkpoint_dir', 'num_samples', 'sample_offset', 'edit_direction',
+    if args.labels:
+        if len(args.labels) != len(runs):
+            raise SystemExit('--labels needs one label per file')
+        runs = [(lab,) + r[1:] for lab, r in zip(args.labels, runs)]
+    else:
+        runs.sort(key=lambda r: (r[0] is None, r[0]))
+    for key in (() if args.labels else ('checkpoint_dir',)) + ('num_samples', 'sample_offset', 'edit_direction',
                 'no_train_caps', 'independent_attr_weights'):
         vals = {str(r[2].get(key)) for r in runs}
         if len(vals) > 1:
@@ -136,7 +148,7 @@ def main():
         print(f'[warn] files use different bank_mode {sorted(map(str, modes))}')
 
     attrs = [a for a in attr_names(runs[0][3]) if all(a in attr_names(r[3]) for r in runs)]
-    print(f'steps: {", ".join(str(r[0]) for r in runs)}   bank_mode: {sorted(map(str, modes))}'
+    print(f'rows: {", ".join(str(r[0]) for r in runs)}   bank_mode: {sorted(map(str, modes))}'
           f'   scale for ID/LPIPS/FID: {args.scale:g}')
 
     report = {}
@@ -156,7 +168,7 @@ def main():
             continue
         grid = [lo + (hi - lo) * (k + 0.5) / args.points for k in range(args.points)]
         print(f'\n{a}   matched ID_ind points: ' + ', '.join(f'{g:.3f}' for g in grid))
-        head = f'   {"step":>7} {"mix":>5} {"ID":>7} {"LPIPS":>7} {"FID":>7}'
+        head = f'   {"step":>10} {"mix":>5} {"ID":>7} {"LPIPS":>7} {"FID":>7}'
         for j in args.judges:
             head += '   ' + f'{JUDGES[j]:<8}' + ' ' * (8 * (args.points - 1))
         print(head)
@@ -164,7 +176,7 @@ def main():
         for step, mix, cfg, sc, _ in runs:
             row = {'mix': mix, 'id': at_scale(sc, a, 'id_indep', args.scale),
                    'lpips': at_scale(sc, a, 'lpips', args.scale), 'fid': fid_at(sc, args.scale)}
-            line = f'   {step:>7} {"--" if mix is None else f"{mix:.2f}":>5} {fmt(row["id"])} ' \
+            line = f'   {str(step):>10} {"--" if mix is None else f"{mix:.2f}":>5} {fmt(row["id"])} ' \
                    f'{fmt(row["lpips"])} {fmt(fid_at(sc, args.scale), nd=2)}'
             for j in args.judges:
                 vals = [interp(points(sc, a, f'acc_{j}'), g) for g in grid]
@@ -177,13 +189,13 @@ def main():
             report[a]['steps'][str(step)] = row
 
     print('\nAttribute mean (i-th ID point of each attribute, averaged)')
-    head = f'   {"step":>7} {"mix":>5}'
+    head = f'   {"step":>10} {"mix":>5}'
     for j in args.judges:
         head += '   ' + f'{JUDGES[j]:<8}' + ' ' * (8 * (args.points - 1))
     print(head)
     summary = {}
     for step, mix, _, _, _ in runs:
-        line = f'   {step:>7} {"--" if mix is None else f"{mix:.2f}":>5}'
+        line = f'   {str(step):>10} {"--" if mix is None else f"{mix:.2f}":>5}'
         summary[str(step)] = {'mix': mix}
         for j in args.judges:
             cells = []
