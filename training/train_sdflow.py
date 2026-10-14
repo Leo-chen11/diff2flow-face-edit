@@ -251,7 +251,6 @@ def _mechanism_report(args):
         ('age_dds', age_dds_w if dds_on else 0),
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
-        ('background_preserve', args.background_preserve_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
@@ -963,29 +962,27 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
-    parser.add_argument('--background_preserve_loss_weight', type=float, default=0.0,
-                        help='Output-side preservation of everything that is not the head: pixels '
-                             'outside the face+hair region (BiSeNet FACE_CLASSES, so background, '
-                             'clothing and hat) must match the source reconstruction. Same formula '
-                             'as --local_region_loss_weight, generalized from "outside the eye '
-                             'region" to "outside the head", and one rule for every edited '
-                             'attribute (--background_preserve_attrs narrows it). Previews of the '
-                             'min/robust runs show Young and Male edits recoloring clothing and '
-                             'background, which ID ignores but LPIPS/FID and the judges see. The '
-                             'allowed region is the UNION of the face+hair masks of the source and '
-                             'of the edited image, dilated by --background_preserve_dilate, so an '
-                             'edit that grows hair into the background is not penalized for it. '
-                             'Known loophole: the model could make background look like hair; '
-                             'check a preview grid. One extra BiSeNet forward (no backward) per '
-                             'step. Default 0 (off): training is unchanged.')
-    parser.add_argument('--background_preserve_attrs', nargs='*', type=int, default=None,
-                        help='Absolute attribute ids --background_preserve_loss_weight applies to. '
-                             'Default (unset): every attribute in --attribute_index.')
-    parser.add_argument('--background_preserve_dilate', type=int, default=16,
+    parser.add_argument('--local_region_head', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Extend --local_region_loss_weight to the attributes that have no '
+                             'tight region of their own (every edited attribute not in '
+                             'LOCAL_REGION_CLASSES: Male, Young, Smiling, Bangs here). Their '
+                             'allowed region is the head: BiSeNet face+hair (FACE_CLASSES), the '
+                             'UNION of the source and the edited image, dilated by '
+                             '--local_region_head_dilate. Outside it -- background, clothing, '
+                             'hat -- the edited image must match the source reconstruction, the '
+                             'same formula and weight as the eyeglasses locality term. Previews '
+                             'of the min/robust runs show Male and Young recoloring clothing and '
+                             'background, which ID and the attribute-preservation loss cannot '
+                             'see. The union keeps hair an edit grows into the background '
+                             'allowed. Known loophole: making background look like hair; check '
+                             'a preview grid. One extra BiSeNet forward (no backward) per step. '
+                             'Default off: training is unchanged.')
+    parser.add_argument('--local_region_head_dilate', type=int, default=16,
                         help='Dilation radius in pixels (at the generator output resolution the '
-                             'loss sees) of the allowed face+hair region, a true dilation via '
-                             'max-pool. Leaves a margin so the loss does not fight legitimate '
-                             'changes right at the face boundary (jawline, hairline).')
+                             'loss sees) of the --local_region_head region, a true dilation via '
+                             'max-pool, so the loss does not fight changes right at the jawline '
+                             'and hairline.')
     parser.add_argument('--hair_gray_loss_weight', type=float, default=0.0,
                         help='Age(39) REMOVAL-direction only (src already Young -> aging edit): '
                              'push the HAIR region (BiSeNet class 17, see HAIR_REGION_CLASS) '
@@ -2324,25 +2321,22 @@ if __name__ == '__main__':
     face_parser = None
     if args.local_region_loss_weight > 0 or args.dds_face_mask \
             or args.hair_gray_loss_weight > 0 or args.hair_extent_loss_weight > 0 \
-            or args.controlnet_region_cond or args.background_preserve_loss_weight > 0:
+            or args.controlnet_region_cond:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
             if args.controlnet_region_cond:
                 print('** ControlNet region conditioning enabled: age(39) edits feed a BiSeNet '
                       'skin-region prior into AttributeControlEncoder\'s upsampling ladder.')
-            if args.background_preserve_loss_weight > 0:
-                _bp = (args.background_preserve_attrs if args.background_preserve_attrs is not None
-                       else list(args.attribute_index))
-                print(f'** Background-preservation loss enabled (weight='
-                      f'{args.background_preserve_loss_weight}, dilate='
-                      f'{args.background_preserve_dilate}px) for attrs {_bp}: pixels outside '
-                      f'face+hair (union of source and edited masks) must match the source '
-                      f'reconstruction.')
             if args.local_region_loss_weight > 0:
                 local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
                 print(f'** Face-parser locality loss enabled (weight='
                       f'{args.local_region_loss_weight}) for local attrs {local_attrs}')
+                if args.local_region_head:
+                    print(f'   ... and, with --local_region_head, for '
+                          f'{[a for a in args.attribute_index if a not in LOCAL_REGION_CLASSES]}: '
+                          f'nothing outside face+hair (dilate '
+                          f'{args.local_region_head_dilate}px) may change.')
             if args.dds_face_mask:
                 print('** DDS face mask enabled: diffusion-guidance gradient restricted to '
                       'the region each attribute is allowed to touch.')
@@ -2802,7 +2796,7 @@ if __name__ == '__main__':
             #     (--local_region_add_blur) as a geometric prior for where a
             #     frame may appear; hair/mouth/background stay forbidden.
             local_region_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
-            background_preserve_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            local_region_head_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
@@ -2837,28 +2831,29 @@ if __name__ == '__main__':
                     if _terms:
                         local_region_loss = torch.stack(_terms).mean()
 
-                # ── Background preservation (outside face+hair) ───────────────
-                # See --background_preserve_loss_weight. The same constraint for
-                # every edited attribute: background, clothing and hat stay as in
-                # the source reconstruction.
-                if args.background_preserve_loss_weight > 0:
-                    _bp_attrs = (set(args.background_preserve_attrs)
-                                 if args.background_preserve_attrs is not None
-                                 else set(args.attribute_index))
-                    _bp_sel = torch.tensor([a in _bp_attrs for a in _mid_abs],
-                                           device=latent.device)
-                    if _bp_sel.any():
+                # ── Head locality (--local_region_head) ──────────────────────
+                # The same output-side constraint for attributes with no tight
+                # region: nothing outside face+hair may change. Folded into
+                # local_region_loss (one locality loss, one weight).
+                if args.local_region_head and args.local_region_loss_weight > 0:
+                    _head_sel = ~_is_local
+                    if _head_sel.any():
                         with torch.no_grad():
                             # union of source and EDITED face+hair: hair that an
                             # edit grows into the background stays allowed
                             _src_face = face_parser.get_region_mask(
-                                src_recon[_bp_sel], FACE_CLASSES, blur_sigma=0)
+                                src_recon[_head_sel], FACE_CLASSES, blur_sigma=0)
                             _edit_face = face_parser.get_region_mask(
-                                new_face_tensors[_bp_sel].detach(), FACE_CLASSES, blur_sigma=0)
+                                new_face_tensors[_head_sel].detach(), FACE_CLASSES, blur_sigma=0)
                             _allowed = dilate_mask(torch.maximum(_src_face, _edit_face),
-                                                   args.background_preserve_dilate)
-                        background_preserve_loss = outside_region_preservation_loss(
-                            new_face_tensors[_bp_sel], src_recon[_bp_sel], _allowed)
+                                                   args.local_region_head_dilate)
+                        local_region_head_loss = outside_region_preservation_loss(
+                            new_face_tensors[_head_sel], src_recon[_head_sel], _allowed)
+                        # weight the two parts by how many samples each covers
+                        _n_loc = int(_is_local.sum())
+                        _n_head = int(_head_sel.sum())
+                        local_region_loss = (local_region_loss * _n_loc
+                                             + local_region_head_loss * _n_head) / (_n_loc + _n_head)
 
                 # ── Hair-graying (age/39 removal direction only) ────────────
                 # See --hair_gray_loss_weight help for the failure-audit evidence
@@ -3280,7 +3275,6 @@ if __name__ == '__main__':
                 _age_dds_w * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
-                args.background_preserve_loss_weight * background_preserve_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
                 args.hair_extent_loss_weight * hair_extent_loss +\
                 args.controlnet_reg_weight * loss_control_reg +\
@@ -3437,7 +3431,7 @@ if __name__ == '__main__':
                 'loss_age_diffusion_dds': age_diffusion_loss,
                 'loss_clip_prompt':   clip_semantic_loss,
                 'loss_local_region':  local_region_loss,
-                'loss_background_preserve': background_preserve_loss,
+                'loss_local_region_head': local_region_head_loss,
                 'loss_hair_gray':     hair_gray_loss,
                 'loss_hair_extent':   hair_extent_loss,
                 'loss_disc_realism':  disc_realism_loss,

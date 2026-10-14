@@ -23,7 +23,7 @@ wrong side), so a sample that already satisfies the target costs nothing.
 
 outside_region_preservation_loss() holds the pixels outside a region to the
 source reconstruction (the eyeglasses locality loss, and
---background_preserve_loss_weight for everything outside face+hair).
+--local_region_head for everything outside face+hair).
 """
 import torch
 import torch.nn.functional as F
