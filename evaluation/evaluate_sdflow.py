@@ -1330,11 +1330,17 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     return edited_face
 
 
-def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None):
+def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None,
+                    src_probs_teacher=None):
     """--edit_direction clip / indep: tell the model the direction the eval
     scores it on, taken from the source score of that judge (CLIP, or the
     independent classifier; the BiSeNet parser overrides CLIP for Eyeglasses).
     None = conditioner-chosen direction (the old behaviour).
+
+    teacher: the TRAINING teacher's (--attribute_weights, r34) reading of the
+    source -- the direction --train_edit_direction teacher trains with. It
+    uses no evaluation judge, so it is a fair way to give the model a
+    direction (and with --src_cond_clamp, a consistent source) at eval.
 
     A direction taken from a judge that mislabels the SOURCE sends the edit
     the wrong way (CLIP calls 40% of bang-less faces "has bangs", so they are
@@ -1343,7 +1349,8 @@ def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None):
     mode = getattr(args, 'edit_direction', 'cond')
     if mode == 'cond':
         return None
-    src = {'clip': src_probs_clip, 'indep': src_probs_indep}.get(mode)
+    src = {'clip': src_probs_clip, 'indep': src_probs_indep,
+           'teacher': src_probs_teacher}.get(mode)
     if src is None:
         # used to fall back to the conditioner's direction silently while the
         # results still said edit_direction=<mode>
@@ -1944,7 +1951,8 @@ def evaluate(args):
                 attr_name = ATTR_NAMES.get(args.attribute_index[local_idx],
                                            f'attr{args.attribute_index[local_idx]}')
 
-                _direction = _eval_direction(args, src_probs_clip, local_idx, src_probs_indep)
+                _direction = _eval_direction(args, src_probs_clip, local_idx, src_probs_indep,
+                                             src_probs_teacher)
 
                 def _edit(scale):
                     return edit_single_attribute(
@@ -2477,7 +2485,7 @@ def build_parser():
                              'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
                              'edits to get a real region mask instead of the all-ones fallback. '
                              'Auto-restored from config.json.')
-    parser.add_argument('--edit_direction', default='cond', choices=['cond', 'clip', 'indep'],
+    parser.add_argument('--edit_direction', default='cond', choices=['cond', 'clip', 'indep', 'teacher'],
                         help="Who decides add vs remove. cond (default, all previous evals): the "
                              "conditioner's reading of the source. clip: the CLIP judge's add/rm "
                              "split that AccCLIP scores the edit against. The conditioner reads "
@@ -2490,7 +2498,9 @@ def build_parser():
                              "(--independent_attr_weights), the judge that scores AccInd. Prefer "
                              "it to clip whenever CLIP misreads the source (scripts/judge_report.py: "
                              "CLIP TNR 60%% on Bangs, 44%% on Young), because a wrong direction "
-                             "means no edit and a guaranteed failure.")
+                             "means no edit and a guaranteed failure. teacher: the training r34's "
+                             "reading of the source; uses no evaluation judge, so it is the fair "
+                             "pairing for --src_cond_clamp.")
     parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
                         help="Force these attributes' direction-bank gate uniform at eval (average "
                              "of the slots instead of the trained gate's pick). Diagnostic on a "
@@ -2770,7 +2780,7 @@ def build_parser():
                              'predicted on its top principal directions by a small network instead of '
                              'taken from the flow (no ODE solve for the residual).')
     parser.add_argument('--src_cond_clamp', type=float, default=None,
-                        help='With a given edit direction (--edit_direction indep/clip): move the edited '
+                        help='With a given edit direction (--edit_direction teacher/indep/clip): move the edited '
                              'attribute\'s source condition to the far side of 0.5 by this margin before the '
                              'flow runs (add: min(src, 0.5-M), rm: max(src, 0.5+M)). Without it, a source the '
                              'conditioner already reads on the target side asks for ~no change (Young add: '
