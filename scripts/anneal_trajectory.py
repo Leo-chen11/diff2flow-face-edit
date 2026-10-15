@@ -98,6 +98,13 @@ def at_scale(scales, attr, key, scale):
     return interp(pts, scale)
 
 
+def bg_at(scales, attr, scale):
+    """evaluate_sdflow.py --bg_metric (all faces, not only consensus ones)."""
+    pts = [(float(s), v[attr]['bg_mse']['mean']) for s, v in scales.items()
+           if isinstance(v.get(attr), dict) and (v[attr].get('bg_mse') or {}).get('mean') is not None]
+    return interp(pts, scale)
+
+
 def fid_at(scales, scale):
     pts = [(float(s), v['fid_edit_vs_recon']) for s, v in scales.items()
            if v.get('fid_edit_vs_recon') is not None]
@@ -168,16 +175,17 @@ def main():
             continue
         grid = [lo + (hi - lo) * (k + 0.5) / args.points for k in range(args.points)]
         print(f'\n{a}   matched ID_ind points: ' + ', '.join(f'{g:.3f}' for g in grid))
-        head = f'   {"step":>10} {"mix":>5} {"ID":>7} {"LPIPS":>7} {"FID":>7}'
+        head = f'   {"step":>10} {"mix":>5} {"ID":>7} {"LPIPS":>7} {"BG":>7} {"FID":>7}'
         for j in args.judges:
             head += '   ' + f'{JUDGES[j]:<8}' + ' ' * (8 * (args.points - 1))
         print(head)
         report[a] = {'id_grid': grid, 'steps': {}}
         for step, mix, cfg, sc, _ in runs:
             row = {'mix': mix, 'id': at_scale(sc, a, 'id_indep', args.scale),
-                   'lpips': at_scale(sc, a, 'lpips', args.scale), 'fid': fid_at(sc, args.scale)}
+                   'lpips': at_scale(sc, a, 'lpips', args.scale), 'fid': fid_at(sc, args.scale),
+                   'bg_mse': bg_at(sc, a, args.scale)}
             line = f'   {str(step):>10} {"--" if mix is None else f"{mix:.2f}":>5} {fmt(row["id"])} ' \
-                   f'{fmt(row["lpips"])} {fmt(fid_at(sc, args.scale), nd=2)}'
+                   f'{fmt(row["lpips"])} {fmt(row["bg_mse"], nd=4)} {fmt(fid_at(sc, args.scale), nd=2)}'
             for j in args.judges:
                 vals = [interp(points(sc, a, f'acc_{j}'), g) for g in grid]
                 row[f'acc_{j}'] = vals

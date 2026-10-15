@@ -1769,6 +1769,12 @@ def evaluate(args):
                          '(--celeba_attr_judge_weights, default ./data/celeba_attr_resnet18.pth); '
                          f'loaded: CLIP={clip_judge is not None}, CelebA={celeb_judge is not None}.')
 
+    bg_parser = None
+    if getattr(args, 'bg_metric', False):
+        from common.face_parser import FaceParser
+        bg_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+        print('[Metric] bg_mse: pixel change outside face+hair (background, clothing, hat)')
+
     composite_face_parser = None
     if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
         from common.face_parser import FaceParser
@@ -1866,6 +1872,7 @@ def evaluate(args):
             'bank_mode': getattr(args, 'bank_mode', 'replace'),
             'bank_mix': getattr(args, 'bank_mix', None),
             'consensus': consensus_on,
+            'bg_metric': bool(getattr(args, 'bg_metric', False)),
             'disable_controlnet': bool(getattr(args, 'disable_controlnet', False)),
             'gate_freeze': gate_freeze,
             'gate_profile_json': gate_profile,
@@ -2027,6 +2034,16 @@ def evaluate(args):
                 edit_id_indep = indep_id.extract(edited_256) if indep_id is not None else None
                 lpips_d = lpips_fn(src_face_256, edited_256).flatten() \
                     if lpips_fn is not None else None
+                bg_d = None
+                if bg_parser is not None:
+                    from common.face_parser import FACE_CLASSES
+                    from common.region_stat_loss import dilate_mask
+                    _head = dilate_mask(torch.maximum(
+                        bg_parser.get_region_mask(src_face_256, FACE_CLASSES, blur_sigma=0),
+                        bg_parser.get_region_mask(edited_256, FACE_CLASSES, blur_sigma=0)), 4)
+                    _out = 1.0 - _head
+                    bg_d = (((edited_256 - src_face_256).pow(2) * _out).sum((1, 2, 3))
+                            / (_out.sum((1, 2, 3)) * 3).clamp(min=1e-6))
 
                 if fid is not None:
                     fid.update(((edited_256 + 1) * 0.5).clamp(0, 1), real=False)
@@ -2120,6 +2137,8 @@ def evaluate(args):
                     # ── Perceptual distance recon -> edit ─────────────────────
                     if lpips_d is not None:
                         metrics[f'lpips_{attr_name}'].append(lpips_d[b].item())
+                    if bg_d is not None:
+                        metrics[f'bg_mse_{attr_name}'].append(bg_d[b].item())
 
             sample_count += B
 
@@ -2151,6 +2170,7 @@ def evaluate(args):
                 (f'lpips_{attr_name}', False),
                 (f'leak_teacher_{attr_name}', False),
                 (f'leak_clip_{attr_name}', False),
+                (f'bg_mse_{attr_name}', False),
             ]:
                 row[key.replace(f'_{attr_name}', '')] = _summ(metrics[key])
             scale_summary[attr_name] = row
@@ -2166,6 +2186,10 @@ def evaluate(args):
 
         print(f'  (* = same model as the training loss; reference only, '
               f'inflated by construction)')
+        if bg_parser is not None:
+            print('  Background change (bg_mse, outside face+hair, lower = untouched): ' + '  '.join(
+                f'{a} {scale_summary[a]["bg_mse"]["mean"]:.4f}' for a in attr_names
+                if scale_summary[a].get('bg_mse')))
 
         # ── Add/remove direction breakdown (CLIP judge) ────────────────────
         # The aggregate accuracy can hide a big asymmetry between adding an
@@ -2779,6 +2803,13 @@ def build_parser():
                         help='A scripts/distill_residual_head.py output (.pth): each attribute\'s residual is '
                              'predicted on its top principal directions by a small network instead of '
                              'taken from the flow (no ODE solve for the residual).')
+    parser.add_argument('--bg_metric', action='store_true',
+                        help='Also report how much each edit changes what is NOT the head: mean '
+                             'squared pixel change (images in [-1, 1], 256x256) outside the BiSeNet '
+                             'face+hair region (union of source reconstruction and edit, dilated '
+                             '4px), per attribute, as "bg_mse". The quantity train_sdflow.py '
+                             '--local_region_head penalizes; LPIPS/FID only see it mixed with the '
+                             'face change. One extra BiSeNet pass per edited batch.')
     parser.add_argument('--src_cond_clamp', type=float, default=None,
                         help='With a given edit direction (--edit_direction teacher/indep/clip): move the edited '
                              'attribute\'s source condition to the far side of 0.5 by this margin before the '
