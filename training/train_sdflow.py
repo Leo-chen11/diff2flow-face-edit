@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import math
 import os,shutil,sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -252,6 +253,8 @@ def _mechanism_report(args):
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
         ('hard_example_gamma', args.hard_example_gamma),
+        ('hard_example_crosscheck', 1.0 if args.hard_example_crosscheck else 0),
+        ('shortcut_clip_boost', args.shortcut_clip_boost),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
@@ -914,6 +917,26 @@ if __name__ == '__main__':
                         help='Cap on a single sample\'s --hard_example_gamma weight.')
     parser.add_argument('--hard_example_ema', type=float, default=0.99,
                         help='Decay of the running mean error --hard_example_gamma normalizes by.')
+    parser.add_argument('--hard_example_crosscheck', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Second opinion for --hard_example_gamma. Hardness comes from the r34 '
+                             'training teacher, so up-weighting it also up-weights whatever shortcut '
+                             'fools r34 (the robust-teacher run aged Young by whitening hair). With '
+                             'this on, a sample keeps a weight > 1 only if the frozen training CLIP '
+                             '(--clip_prompt_model, ViT-B/32, not the L/14 judge) ALSO rates its edit '
+                             'at or below the median progress of the same-attribute samples in the '
+                             'batch; otherwise its weight is capped at 1. One rule for every '
+                             'attribute that has a CLIP prompt; an attribute without one (Bangs) '
+                             'keeps the r34-only weight. Needs the CLIP prompt loss computed on '
+                             'that step (--clip_prompt_interval 1); on other steps nothing changes.')
+    parser.add_argument('--shortcut_clip_boost', type=float, default=0.0,
+                        help='Extra weight on the CLIP prompt loss of "shortcut suspects": samples '
+                             'the r34 teacher already scores on the target side of 0.5 while the '
+                             'training CLIP says the edit is NOT on the target side (directional '
+                             'cosine <= 0, or absolute score on the wrong side). Their CLIP loss is '
+                             'multiplied by (1 + boost), so the pressure on a sample r34 calls done '
+                             'comes from the second model instead of stopping. 0 = off. The '
+                             'suspect fraction is logged either way (shortcut_suspect_frac).')
     parser.add_argument('--seed', type=int, default=0,
                         help='Seeds torch and the training batch sampler. Rerun one config with '
                              'another seed to measure run-to-run variation. Default 0 (the '
@@ -1839,6 +1862,14 @@ if __name__ == '__main__':
         json.dump(vars(args), _f, indent=2, default=str)
     print(f'** run config saved to {os.path.join(save_root, "config.json")}')
     _mechanism_report(args)
+    _clip_on = args.use_clip_prompt_loss and args.clip_prompt_weight > 0
+    if args.hard_example_crosscheck and not (args.hard_example_gamma > 0 and _clip_on):
+        print('[warn] --hard_example_crosscheck does nothing without --hard_example_gamma > 0 '
+              'and the CLIP prompt loss')
+    if (args.hard_example_crosscheck or args.shortcut_clip_boost > 0) and _clip_on \
+            and args.clip_prompt_interval > 1:
+        print(f'[warn] the CLIP second opinion only acts on every {args.clip_prompt_interval}th '
+              f'step (--clip_prompt_interval)')
     attribute_index = torch.tensor(args.attribute_index,dtype=int)
     # Local column of src_probs (ordered by attribute_index)
     # that holds the source image's Male probability, for the age DDS
@@ -3026,6 +3057,7 @@ if __name__ == '__main__':
             # matched identity and was removed)
             changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
             hard_w_max = torch.zeros([], device=latent.device)
+            _hard_w = None
             if args.hard_example_gamma > 0:
                 # see --hard_example_gamma: weight by error relative to the
                 # running mean over all attributes; the weight carries no gradient
@@ -3037,6 +3069,7 @@ if __name__ == '__main__':
                 _w = _w.clamp(max=args.hard_example_max_weight)
                 changed_loss = (_w * changed_mse_per_sample).mean()
                 hard_w_max = _w.max()
+                _hard_w = _w
             else:
                 changed_loss = changed_mse_per_sample.mean()
 
@@ -3081,6 +3114,8 @@ if __name__ == '__main__':
             # ── Frozen CLIP semantic target loss ──────────────────────
             clip_semantic_loss = _zero.clone()
             clip_logs = {}
+            shortcut_suspect_frac = _zero.clone()
+            hard_veto_frac = _zero.clone()
             if (
                 clip_prompt_loss_fn is not None
                 and args.clip_prompt_weight > 0
@@ -3114,6 +3149,38 @@ if __name__ == '__main__':
                 clip_sample_weight[_clip_abs_idx == 39] = args.clip_prompt_age_weight
                 clip_sample_weight[_clip_abs_idx == 20] = args.clip_prompt_gender_weight
                 clip_sample_weight[_clip_abs_idx == 15] = args.clip_prompt_glasses_weight
+
+                # Second opinion on the r34 teacher (--hard_example_crosscheck,
+                # --shortcut_clip_boost). Lower CLIP loss = more progress toward
+                # the prompt; attributes without a prompt fall back to generic
+                # text and are left out.
+                _clip_loss_d = clip_loss_each.detach()
+                _has_prompt = torch.tensor(
+                    [(int(a), 'pos') in clip_prompt_loss_fn._text_buf_names
+                     for a in _clip_abs_idx.tolist()], device=latent.device)
+                # "CLIP: not on the target side": directional cosine <= 0, or
+                # absolute score on the wrong side (softplus >= ln 2)
+                _clip_wrong = _clip_loss_d >= (1.0 if args.clip_prompt_mode == 'directional'
+                                               else math.log(2.0))
+                _r34_done = (edited_probs.detach() > 0.5) == (edit_end >= 0.5)
+                _suspect = _has_prompt & _r34_done & _clip_wrong
+                shortcut_suspect_frac = _suspect.float().mean()
+                if args.shortcut_clip_boost > 0:
+                    clip_sample_weight = torch.where(
+                        _suspect, clip_sample_weight * (1.0 + args.shortcut_clip_boost),
+                        clip_sample_weight)
+                if args.hard_example_crosscheck and _hard_w is not None:
+                    _clip_hard = torch.ones_like(_has_prompt)
+                    for _a in _clip_abs_idx[_has_prompt].unique():
+                        _g = _clip_abs_idx == _a
+                        if int(_g.sum()) >= 2:
+                            _clip_hard[_g] = _clip_loss_d[_g] >= _clip_loss_d[_g].median()
+                    _vetoed = (_hard_w > 1) & ~_clip_hard
+                    hard_veto_frac = _vetoed.float().mean()
+                    _hard_w = torch.where(_vetoed, torch.ones_like(_hard_w), _hard_w)
+                    hard_w_max = _hard_w.max()
+                    changed_loss = (_hard_w * changed_mse_per_sample).mean()
+                    counter_attr_loss = changed_loss + args.preserve_attr_weight * preserve_loss
                 clip_semantic_loss = (clip_sample_weight * clip_loss_each).mean()
 
             if lag_dof_losses is None:
@@ -3423,6 +3490,8 @@ if __name__ == '__main__':
                 'loss_nll': log_p2,
                 'loss_target': changed_loss,
                 'hard_example_w_max': hard_w_max,
+                'hard_example_veto_frac': hard_veto_frac,
+                'shortcut_suspect_frac': shortcut_suspect_frac,
                 'loss_coupled': coupled_loss,
                 'loss_leakage': preserve_loss,
                 'loss_reg': reg_loss,
