@@ -1029,6 +1029,68 @@ def bank_edit(prior, direction_bank, latent, attr_cond, id_cond, local_idx, scal
     return delta, direction_bank._last_residual, (new_attr - attr_cond)[:, local_idx]
 
 
+@torch.no_grad()
+def closed_loop_edit(prior, conditioner, G, direction_bank, attr_teacher, latent, attr_cond, id_cond,
+                     local_idx, global_idx, add, step, max_steps, margin, img_size):
+    """Feedback-controlled flow editing (--closed_loop_steps): edit in small
+    steps and, after each one, tell the flow where the face now is.
+
+    Splitting one edit into steps with the flow's OWN running condition
+    changes nothing: f^-1(f(w; c0); c1) followed by f^-1(f(w1; c1); c2) is
+    f^-1(f(w; c0); c2) exactly, since f(w1; c1) is the same base point. The
+    only thing a loop can add is feedback. Each step therefore re-reads the
+    rendered edit: the conditioner for every attribute (as at the source),
+    and, for the EDITED attribute, the training teacher's (r34) probability
+    -- the flow and its conditioner read their own edits as done
+    (scripts/flow_attr_likelihood.py: edits score beyond real faces of the
+    target class), so they would ask for no further change. The next step then
+    moves from that reading toward the target end by `step`:
+        a_next = a_now + step * (end - a_now)
+    A face stops at the first step where the teacher crosses 0.5 by `margin`
+    (the --adaptive_ladder rule); faces that never do keep the last step.
+    The identity condition stays the source's. Returns (edited faces,
+    steps used per face)."""
+    B = latent.size(0)
+    dev = latent.device
+    direction = torch.where(add, torch.ones(B, device=dev), -torch.ones(B, device=dev))
+    w, ac = latent.clone(), attr_cond.clone()
+    done = torch.zeros(B, dtype=torch.bool, device=dev)
+    used = torch.full((B,), float(max_steps), device=dev)
+    out = None
+    zero_pad = torch.zeros(B, 18, 1, device=dev)
+    for k in range(max_steps):
+        if direction_bank is not None:
+            delta, _, _ = bank_edit(prior, direction_bank, w, ac, id_cond, local_idx, step,
+                                    global_idx, direction)
+        else:
+            mid, _ = prior(w, torch.cat([id_cond, ac], 1), zero_pad)
+            new = ac.clone()
+            new[:, local_idx] = edited_attr_value(ac[:, local_idx], step, global_idx,
+                                                  direction=direction)
+            raw, _ = prior(mid, torch.cat([id_cond, new], 1), zero_pad, reverse=True)
+            delta = cap_delta_norm(raw - w, _FINAL_DELTA_MAX_NORM) * _EDIT_GAIN
+        w_new = w + delta
+        face = G([w_new], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+        p_t = torch.sigmoid(attr_teacher(F.interpolate(face, (256, 256)))[0])[:, global_idx]
+        ok = torch.where(add, p_t > 0.5 + margin, p_t < 0.5 - margin)
+        take = (~done) & (ok | (k == max_steps - 1))
+        if out is None:
+            out = face.clone()
+        out[take] = face[take]
+        used[take] = float(k + 1)
+        done |= take
+        if bool(done.all()):
+            break
+        # feedback for the faces still going
+        go = ~done
+        w[go] = w_new[go]
+        read = conditioner.attr_estimator(F.interpolate(face, (img_size, img_size)))
+        read = read[0] if isinstance(read, tuple) else read
+        ac[go] = read[go].to(ac.dtype)
+        ac[go, local_idx] = p_t[go].to(ac.dtype)
+    return out, used
+
+
 def set_preserve_boundaries(path, strength=1.0, min_auc=0.8):
     """Load scripts/fit_attr_boundaries.py normals for project_preserve(); None = off."""
     global _PRESERVE
@@ -1853,7 +1915,11 @@ def evaluate(args):
                                if getattr(args, 'adaptive_ladder', None) else None),
             'edit_gain': getattr(args, 'edit_gain', None),
             'adaptive_margins': (getattr(args, 'adaptive_margins', None)
-                                 if getattr(args, 'adaptive_ladder', None) else None),
+                                 if (getattr(args, 'adaptive_ladder', None)
+                                     or getattr(args, 'closed_loop_steps', 0)) else None),
+            'closed_loop_steps': getattr(args, 'closed_loop_steps', 0) or None,
+            'closed_loop_step': (getattr(args, 'closed_loop_step', None)
+                                 if getattr(args, 'closed_loop_steps', 0) else None),
             # everything else that changes what an edit is, so a results file
             # can be tied to the pipeline that produced it
             'train_caps': train_caps(args),
@@ -1887,21 +1953,30 @@ def evaluate(args):
     # --adaptive_ladder: each face gets its own edit_scale (see the edit loop);
     # the outer loop then runs over teacher margins instead of fixed scales,
     # each margin giving one point on the accuracy-vs-identity curve.
+    closed_loop = int(getattr(args, 'closed_loop_steps', 0) or 0)
+    if closed_loop and getattr(args, 'adaptive_ladder', None):
+        raise SystemExit('--closed_loop_steps replaces --adaptive_ladder; pass one of them')
+    if closed_loop and control_encoder is not None:
+        print('[ClosedLoop] note: edits are rendered without the ControlNet injection')
     adaptive = bool(getattr(args, 'adaptive_ladder', None))
     rungs = []          # (edit_scale, edit gain) tried in order; chosen value = scale * gain
+    if closed_loop:
+        rung_vals = [float(k) for k in range(1, closed_loop + 1)]   # steps used
     if adaptive:
         args.adaptive_ladder = sorted(args.adaptive_ladder)
         base_gain = _EDIT_GAIN
         rungs = [(sc, base_gain) for sc in args.adaptive_ladder] + \
             [(args.adaptive_ladder[-1], base_gain * k) for k in sorted(getattr(args, 'adaptive_gains', None) or [])]
         rung_vals = [sc * k for sc, k in rungs]
-    outer = args.adaptive_margins if adaptive else args.eval_scales
+    outer = args.adaptive_margins if (adaptive or closed_loop) else args.eval_scales
     for edit_scale in outer:
         print(f'\n{"="*60}')
         print(f'adaptive edit_scale, teacher margin = {edit_scale} '
               f'(ladder {args.adaptive_ladder}'
               + (f', then edit x {args.adaptive_gains}' if getattr(args, 'adaptive_gains', None) else '') + ')'
-              if adaptive else f'edit_scale = {edit_scale}')
+              if adaptive else
+              (f'closed-loop edit, teacher margin = {edit_scale} (up to {closed_loop} steps of '
+               f'{args.closed_loop_step:g})' if closed_loop else f'edit_scale = {edit_scale}'))
         print(f'{"="*60}')
 
         metrics = defaultdict(list)
@@ -1983,7 +2058,16 @@ def evaluate(args):
                         direction=_direction,
                     )
 
-                if adaptive:
+                if closed_loop:
+                    _gidx = args.attribute_index[local_idx]
+                    _add = (_direction > 0) if _direction is not None \
+                        else (src_probs_teacher[:, local_idx] < 0.5)
+                    edited_face, _used = closed_loop_edit(
+                        prior, conditioner, G, direction_bank, attr_teacher, latent, attr_cond,
+                        id_cond, local_idx, _gidx, _add.to(img.device), args.closed_loop_step,
+                        closed_loop, edit_scale, args.img_size)
+                    metrics[f'chosen_scale_{attr_name}'].extend(_used.cpu().tolist())
+                elif adaptive:
                     # Per-face edit strength: walk up the ladder and keep, for
                     # each face, the FIRST scale at which the training teacher
                     # (r34, not the R50 judge that scores the result) sees the
@@ -2303,9 +2387,11 @@ def evaluate(args):
                         'per_attr_success': _per(s_mean, s_abs, s_flip) if s_abs is not None else None,
                     }
 
-        if adaptive:
-            print('  Chosen edit_scale per face (training-teacher stop rule; '
-                  '"at max" = never reached the margin, kept the largest scale):')
+        if adaptive or closed_loop:
+            print(('  Closed-loop steps used per face (training-teacher stop rule; '
+                   '"at max" = never reached the margin, kept the last step):') if closed_loop else
+                  ('  Chosen edit_scale per face (training-teacher stop rule; '
+                   '"at max" = never reached the margin, kept the largest scale):'))
             for attr_name in attr_names:
                 cs = metrics.get(f'chosen_scale_{attr_name}')
                 if not cs:
@@ -2777,6 +2863,17 @@ def build_parser():
                              'Chosen values are reported as scale x gain.')
     parser.add_argument('--edit_gain', type=float, default=None,
                         help='Every W+ edit x this after the final cap (same direction). Default 1.')
+    parser.add_argument('--closed_loop_steps', type=int, default=0,
+                        help='Feedback-controlled editing instead of one edit (see closed_loop_edit): up '
+                             'to this many steps of --closed_loop_step each, re-reading the rendered '
+                             'edit after every step (the training teacher r34 for the edited '
+                             'attribute, the conditioner for the rest) and stopping a face once the '
+                             'teacher crosses 0.5 by the margin. Like --adaptive_ladder the results are '
+                             'keyed by --adaptive_margins (one accuracy-vs-identity point each). '
+                             'Replaces --eval_scales and --adaptive_ladder. 0 = off.')
+    parser.add_argument('--closed_loop_step', type=float, default=0.35,
+                        help='With --closed_loop_steps: share of the remaining way to the target end '
+                             'each step asks for (a_next = a_now + step * (end - a_now)).')
     parser.add_argument('--adaptive_margins', nargs='*', type=float, default=[0.0, 0.15, 0.3],
                         help='With --adaptive_ladder: stop when the teacher probability is past '
                              '0.5 by this margin in the edit direction. Larger = stronger edits, '
