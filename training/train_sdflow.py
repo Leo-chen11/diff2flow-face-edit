@@ -251,6 +251,7 @@ def _mechanism_report(args):
         ('age_dds', age_dds_w if dds_on else 0),
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
+        ('hard_example_gamma', args.hard_example_gamma),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
         ('controlnet_reg', args.controlnet_reg_weight),
@@ -898,6 +899,21 @@ if __name__ == '__main__':
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
+    parser.add_argument('--hard_example_gamma', type=float, default=0.0,
+                        help='Focal-style weighting of the target-attribute loss toward hard edits. '
+                             'Each sample\'s squared error to its soft target is weighted by '
+                             '(err / running mean err) ** gamma (err = |teacher prob of the edit - '
+                             'soft target|, no gradient through the weight), capped at '
+                             '--hard_example_max_weight. The running mean is ONE number over all '
+                             'attributes, so harder attributes (Young, Bangs) and harder faces within '
+                             'an attribute both get more weight -- one rule, no per-attribute '
+                             'setting. Motivation: the per-face adaptive eval leaves 52%% of Young and '
+                             '32%% of Bangs edits short of the teacher margin even at scale 1.2. '
+                             '0 = off (uniform mean, the old behaviour).')
+    parser.add_argument('--hard_example_max_weight', type=float, default=3.0,
+                        help='Cap on a single sample\'s --hard_example_gamma weight.')
+    parser.add_argument('--hard_example_ema', type=float, default=0.99,
+                        help='Decay of the running mean error --hard_example_gamma normalizes by.')
     parser.add_argument('--seed', type=int, default=0,
                         help='Seeds torch and the training batch sampler. Rerun one config with '
                              'another seed to measure run-to-run variation. Default 0 (the '
@@ -2483,6 +2499,7 @@ if __name__ == '__main__':
         print('[WARN] --reset_bank_magnitude does nothing without --resume_dir + '
               '--resume_direction_bank (a fresh bank already starts at the prior).')
     _stop_training = False
+    _hard_err_ema = None          # --hard_example_gamma: running mean target error
     for epoch in range(_n_epochs):
         if _stop_training:
             break
@@ -3008,7 +3025,20 @@ if __name__ == '__main__':
             # squared error to the soft target (a hinge variant had no effect at
             # matched identity and was removed)
             changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
-            changed_loss = changed_mse_per_sample.mean()
+            hard_w_max = torch.zeros([], device=latent.device)
+            if args.hard_example_gamma > 0:
+                # see --hard_example_gamma: weight by error relative to the
+                # running mean over all attributes; the weight carries no gradient
+                _err = (edited_probs - soft_target_for_loss).abs().detach()
+                _m = float(_err.mean())
+                _hard_err_ema = _m if _hard_err_ema is None else \
+                    args.hard_example_ema * _hard_err_ema + (1 - args.hard_example_ema) * _m
+                _w = (_err / max(_hard_err_ema, 1e-6)).pow(args.hard_example_gamma)
+                _w = _w.clamp(max=args.hard_example_max_weight)
+                changed_loss = (_w * changed_mse_per_sample).mean()
+                hard_w_max = _w.max()
+            else:
+                changed_loss = changed_mse_per_sample.mean()
 
             _zero = torch.zeros([], device=latent.device, dtype=latent.dtype)
             # Vectorized: build a boolean mask [B, num_attrs] where True = non-target attr.
@@ -3392,6 +3422,7 @@ if __name__ == '__main__':
                 'loss_kd': kd_loss,
                 'loss_nll': log_p2,
                 'loss_target': changed_loss,
+                'hard_example_w_max': hard_w_max,
                 'loss_coupled': coupled_loss,
                 'loss_leakage': preserve_loss,
                 'loss_reg': reg_loss,
