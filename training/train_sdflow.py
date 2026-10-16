@@ -257,6 +257,8 @@ def _mechanism_report(args):
         ('shortcut_clip_boost', args.shortcut_clip_boost),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
+        ('local_region_true_dilate', 1.0 if args.local_region_true_dilate else 0),
+        ('target_src_from_recon', 1.0 if args.target_src_from_recon else 0),
         ('clip_prompt_bangs', args.clip_prompt_bangs_weight if args.clip_prompt_bangs else 0),
         ('controlnet_reg', args.controlnet_reg_weight),
         ('disc_realism', args.disc_realism_weight),
@@ -1002,6 +1004,28 @@ if __name__ == '__main__':
                              'geometric prior for the frame footprint while still '
                              'forbidding hair/mouth/background changes. Removal edits '
                              'keep the precise mask (sigma 5).')
+    parser.add_argument('--local_region_true_dilate', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Grow the Eyeglasses region masks by a real max-pool dilation instead of '
+                             'get_region_mask\'s gaussian blur. The blur is normalized, so on the '
+                             'small eye/brow region --local_region_add_blur 15 LOWERS the mask inside '
+                             '(peak about 0.5) rather than extending it: adding glasses was penalized '
+                             'at the eyes about half as much as anywhere else, and more than removing '
+                             'them. Off by default so earlier runs reproduce.')
+    parser.add_argument('--local_region_add_dilate_frac', type=float, default=0.06,
+                        help='Under --local_region_true_dilate: dilation radius for ADD edits as a '
+                             'fraction of the image width (0.06 = 15 px at 256), room for a frame.')
+    parser.add_argument('--local_region_rm_dilate_frac', type=float, default=0.015,
+                        help='Under --local_region_true_dilate: dilation radius for REMOVE edits.')
+    parser.add_argument('--target_src_from_recon', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Start the target-attribute loss from the teacher\'s reading of the '
+                             'source RECONSTRUCTION instead of the real photo (with --losses_vs_recon). '
+                             'The flow edits G(latent) and eval scores the source on the '
+                             'reconstruction, but src_attr (soft-target start, and the target '
+                             'direction unless --target_direction_from_cond) came from the real '
+                             'photo, so it carried the inversion gap. Off by default so earlier runs '
+                             'reproduce.')
     parser.add_argument('--local_region_head', action=argparse.BooleanOptionalAction,
                         default=False,
                         help='Extend --local_region_loss_weight to the attributes that have no '
@@ -2872,18 +2896,32 @@ if __name__ == '__main__':
                     for _abs_idx in set(a for a in _mid_abs if a in LOCAL_REGION_CLASSES):
                         _attr_sel = torch.tensor([a == _abs_idx for a in _mid_abs],
                                                  device=latent.device)
-                        for _dir_sel, _sigma in [
-                            (_attr_sel & _is_removal, 5),
-                            (_attr_sel & ~_is_removal, int(args.local_region_add_blur)),
+                        for _dir_sel, _sigma, _frac in [
+                            (_attr_sel & _is_removal, 5, args.local_region_rm_dilate_frac),
+                            (_attr_sel & ~_is_removal, int(args.local_region_add_blur),
+                             args.local_region_add_dilate_frac),
                         ]:
                             if not _dir_sel.any():
                                 continue
                             with torch.no_grad():
-                                region = face_parser.get_region_mask(
-                                    src_recon[_dir_sel],
-                                    LOCAL_REGION_CLASSES[_abs_idx],
-                                    blur_sigma=_sigma,
-                                )
+                                if args.local_region_true_dilate:
+                                    # get_region_mask's blur is a NORMALIZED
+                                    # gaussian: on a region as small as the
+                                    # eyes it lowers the inside (~0.5 at sigma
+                                    # 15) instead of growing the outside, so
+                                    # the add-glasses mask allowed LESS change
+                                    # at the eyes than the removal one. A
+                                    # max-pool dilation grows it as intended.
+                                    region = face_parser.get_region_mask(
+                                        src_recon[_dir_sel], LOCAL_REGION_CLASSES[_abs_idx],
+                                        blur_sigma=0)
+                                    region = dilate_mask(region, max(1, round(_frac * region.shape[-1])))
+                                else:
+                                    region = face_parser.get_region_mask(
+                                        src_recon[_dir_sel],
+                                        LOCAL_REGION_CLASSES[_abs_idx],
+                                        blur_sigma=_sigma,
+                                    )
                             _terms.append(outside_region_preservation_loss(
                                 new_face_tensors[_dir_sel], src_recon[_dir_sel], region))
                     if _terms:
@@ -3042,6 +3080,10 @@ if __name__ == '__main__':
             src_probs = torch.sigmoid(src_logits)[:, attribute_index].detach()
             gen_probs = torch.sigmoid(gen_logits)[:, attribute_index]
             src_attr = src_probs[batch_indices, mid_idx]
+            if args.target_src_from_recon and recon_face_256 is not None:
+                with torch.no_grad():
+                    src_attr = torch.sigmoid(attr_teacher(recon_face_256)[0])[:, attribute_index][
+                        batch_indices, mid_idx]
             # The FLOW was told which way to go by edit_is_rm (above: the
             # conditioner's reading, or the precomputed teacher reading with
             # --train_edit_direction teacher); this loss picks its direction
