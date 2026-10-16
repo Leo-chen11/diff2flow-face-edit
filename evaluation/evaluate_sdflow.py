@@ -1598,7 +1598,11 @@ def is_clear(score, low=0.35, high=0.65):
 # from the model's own conditioner -- so every checkpoint is scored on the
 # same faces. Report it next to the full-set numbers, with its coverage: the
 # kept faces are the less ambiguous ones, so it reads higher by construction.
-CONSENSUS_KEYS = ('acc_clip', 'acc_celeb', 'acc_both', 'acc_celeb_add', 'acc_celeb_rm',
+# The judge paired with CelebA (--consensus_second): 'clip' (CLIP / glasses
+# parser, the default) or 'indep' (--independent_attr_weights). Results keep
+# that judge's own key (acc_clip / acc_indep) so files never mislabel it.
+_CONS_SECOND = {'key': 'clip', 'label': 'CLIP', 'desc': 'CLIP/parser'}
+CONSENSUS_KEYS = ('acc_celeb', 'acc_both', 'acc_celeb_add', 'acc_celeb_rm',
                   'acc_both_add', 'acc_both_rm', 'dir_agree', 'acc_both_dir_agree',
                   'acc_both_dir_disagree', 'id_indep', 'id_arc', 'lpips')
 
@@ -1624,7 +1628,7 @@ def record_consensus(metrics, attr_name, s_clip, e_clip, s_celeb, e_celeb, model
     ok_clip = bool(strict_success(s_clip, e_clip, margin))
     ok_celeb = bool(strict_success(s_celeb, e_celeb, margin))
     both = ok_clip and ok_celeb
-    metrics[f'cons_acc_clip_{attr_name}'].append(float(ok_clip))
+    metrics[f'cons_acc_{_CONS_SECOND["key"]}_{attr_name}'].append(float(ok_clip))
     metrics[f'cons_acc_celeb_{attr_name}'].append(float(ok_celeb))
     metrics[f'cons_acc_both_{attr_name}'].append(float(both))
     metrics[f'cons_acc_celeb_{label}_{attr_name}'].append(float(ok_celeb))
@@ -1643,36 +1647,37 @@ def summarize_consensus(metrics, attr_names):
     """Per-attribute and pooled consensus summaries; prints a table and
     returns ({attr_name: {...}}, overall) for the results JSON."""
     per_attr = {}
-    print('  Consensus sources (CLIP/parser and CelebA both clear and agreeing on the source; '
-          'the same faces for every model). cover = share of faces kept; '
+    sk, sl = _CONS_SECOND['key'], 'Acc' + _CONS_SECOND['label']
+    print(f'  Consensus sources ({_CONS_SECOND["desc"]} and CelebA both clear and agreeing on the '
+          f'source; the same faces for every model). cover = share of faces kept; '
           'dir=cons = model was asked to edit the consensus way.')
-    print(f'    {"Attribute":<12} {"cover":>6} {"n":>4} {"AccCLIP":>8} {"AccCeleb":>9} '
+    print(f'    {"Attribute":<12} {"cover":>6} {"n":>4} {sl:>8} {"AccCeleb":>9} '
           f'{"AccBoth":>8}   {"Both add":>9} {"Both rm":>9}   {"dir=cons":>8} '
           f'{"Both|dir=cons":>13} {"Both|dir!=cons":>14}')
     for attr_name in attr_names:
         row = {'cover': _summ(metrics.get(f'cons_cover_{attr_name}', []))}
-        for k in CONSENSUS_KEYS:
+        for k in (f'acc_{sk}',) + CONSENSUS_KEYS:
             row[k] = _summ(metrics.get(f'cons_{k}_{attr_name}', []))
         per_attr[attr_name] = row
         n = row['acc_both']['n'] if row['acc_both'] else 0
         print(f'    {attr_name:<12} {_fmt(row["cover"], pct=True)} {n:>4} '
-              f'{_fmt(row["acc_clip"], pct=True)} {_fmt(row["acc_celeb"], pct=True)}  '
+              f'{_fmt(row[f"acc_{sk}"], pct=True)} {_fmt(row["acc_celeb"], pct=True)}  '
               f'{_fmt(row["acc_both"], pct=True)}   {_fmt(row["acc_both_add"], pct=True)} '
               f'{_fmt(row["acc_both_rm"], pct=True)}   {_fmt(row["dir_agree"], pct=True)} '
               f'{_fmt(row["acc_both_dir_agree"], pct=True)}      '
               f'{_fmt(row["acc_both_dir_disagree"], pct=True)}')
     overall = {}
-    for k in ('cover', 'acc_clip', 'acc_celeb', 'acc_both', 'dir_agree', 'id_indep', 'id_arc', 'lpips'):
+    for k in ('cover', f'acc_{sk}', 'acc_celeb', 'acc_both', 'dir_agree', 'id_indep', 'id_arc', 'lpips'):
         vals = [v for a in attr_names for v in metrics.get(f'cons_{k}_{a}', [])]
         overall[k] = _summ(vals)
     # Mean over attributes as well (the pooled numbers weight attributes by how
     # many of their sources are clear, which differs a lot across attributes).
-    for k in ('acc_clip', 'acc_celeb', 'acc_both'):
+    for k in (f'acc_{sk}', 'acc_celeb', 'acc_both'):
         means = [per_attr[a][k]['mean'] for a in attr_names if per_attr[a][k]]
         overall[f'{k}_attr_mean'] = float(np.mean(means)) if means else None
     print(f'    {"Overall":<12} {_fmt(overall["cover"], pct=True)} '
           f'{(overall["acc_both"] or {}).get("n", 0):>4} '
-          f'{_fmt(overall["acc_clip"], pct=True)} {_fmt(overall["acc_celeb"], pct=True)}  '
+          f'{_fmt(overall[f"acc_{sk}"], pct=True)} {_fmt(overall["acc_celeb"], pct=True)}  '
           f'{_fmt(overall["acc_both"], pct=True)}   (pooled; attribute mean of AccBoth: '
           + (f'{overall["acc_both_attr_mean"] * 100:.1f}%' if overall['acc_both_attr_mean'] is not None
              else '--') + ')')
@@ -1841,10 +1846,27 @@ def evaluate(args):
         print(f'[Adaptive] stop rule: the training teacher AND {args.adaptive_stop_weights} '
               f'({args.adaptive_stop_backbone}) must both see the edit done')
     consensus_on = bool(getattr(args, 'consensus', False))
-    if consensus_on and (clip_judge is None or celeb_judge is None):
-        raise SystemExit('--consensus needs both the CLIP judge and the CelebA judge '
-                         '(--celeba_attr_judge_weights, default ./data/celeba_attr_resnet18.pth); '
-                         f'loaded: CLIP={clip_judge is not None}, CelebA={celeb_judge is not None}.')
+    cons_second = getattr(args, 'consensus_second', 'clip')
+    _CONS_SECOND.update({'key': 'clip', 'label': 'CLIP', 'desc': 'CLIP/parser'} if cons_second == 'clip'
+                        else {'key': 'indep', 'label': 'Ind',
+                              'desc': f'the independent classifier ({args.independent_attr_backbone})'})
+    _second_judge = clip_judge if cons_second == 'clip' else indep_teacher
+    if consensus_on and (_second_judge is None or celeb_judge is None):
+        raise SystemExit(f'--consensus needs the CelebA judge (--celeba_attr_judge_weights, default '
+                         f'./data/celeba_attr_resnet18.pth) and its partner '
+                         + ('the CLIP judge' if cons_second == 'clip' else '--independent_attr_weights')
+                         + f'; loaded: partner={_second_judge is not None}, CelebA={celeb_judge is not None}.')
+    if getattr(args, 'adaptive_stop_clip', False):
+        if not getattr(args, 'adaptive_ladder', None):
+            raise SystemExit('--adaptive_stop_clip only acts on --adaptive_ladder')
+        if clip_judge is None:
+            raise SystemExit('--adaptive_stop_clip needs the CLIP judge loaded')
+        if consensus_on and cons_second == 'clip':
+            raise SystemExit('--adaptive_stop_clip with --consensus: CLIP would grade the edits it '
+                             'chose; pass --consensus_second indep')
+        print('[Adaptive] stop rule: the training teacher AND the CLIP judge (parser for '
+              'Eyeglasses) must both see the edit done -- every AccCLIP below is therefore '
+              'NOT an independent score')
 
     bg_parser = None
     if getattr(args, 'bg_metric', False):
@@ -1928,6 +1950,8 @@ def evaluate(args):
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
             'adaptive_stop_weights': getattr(args, 'adaptive_stop_weights', None),
             'adaptive_stop_margin': getattr(args, 'adaptive_stop_margin', None),
+            'adaptive_stop_clip': getattr(args, 'adaptive_stop_clip', False),
+            'consensus_second': getattr(args, 'consensus_second', 'clip'),
             'adaptive_gains': (getattr(args, 'adaptive_gains', None)
                                if getattr(args, 'adaptive_ladder', None) else None),
             'edit_gain': getattr(args, 'edit_gain', None),
@@ -2115,10 +2139,17 @@ def evaluate(args):
                             _new_t = _ok & ~_t_seen
                             _t_first[_new_t] = float(rung_vals[_k])
                             _t_seen |= _ok
+                            _p2 = None
                             if stop_teacher is not None:
+                                _p2 = torch.sigmoid(stop_teacher(_ef_256)[0])[:, _gidx]
+                            elif getattr(args, 'adaptive_stop_clip', False):
+                                if local_idx == _glasses_local and glasses_parser is not None:
+                                    _p2 = glasses_parser.glasses_prob(_ef_256)
+                                else:
+                                    _p2 = clip_judge.scores(_ef_256)[:, local_idx]
+                            if _p2 is not None:
                                 _m2 = edit_scale if args.adaptive_stop_margin is None \
                                     else args.adaptive_stop_margin
-                                _p2 = torch.sigmoid(stop_teacher(_ef_256)[0])[:, _gidx]
                                 _ok = _ok & torch.where(_add, _p2 > 0.5 + _m2, _p2 < 0.5 - _m2)
                             _take = (~_done) & (_ok | (_k == len(rungs) - 1))
                             if edited_face is None:
@@ -2131,7 +2162,7 @@ def evaluate(args):
                     finally:
                         set_edit_gain(base_gain)
                     metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
-                    if stop_teacher is not None:
+                    if stop_teacher is not None or getattr(args, 'adaptive_stop_clip', False):
                         metrics[f'stop_delay_{attr_name}'].extend((_chosen - _t_first).cpu().tolist())
                 else:
                     edited_face = _edit(edit_scale)
@@ -2211,9 +2242,11 @@ def evaluate(args):
                     if consensus_on:
                         _model_adds = (attr_cond[b, local_idx].item() < 0.5) if _direction is None \
                             else (_direction[b].item() > 0)
+                        _s2, _e2 = (src_probs_clip, edit_probs_clip) if cons_second == 'clip' \
+                            else (src_probs_indep, edit_probs_indep)
                         record_consensus(
                             metrics, attr_name,
-                            src_probs_clip[b, local_idx].item(), edit_probs_clip[b, local_idx].item(),
+                            _s2[b, local_idx].item(), _e2[b, local_idx].item(),
                             src_probs_celeb[b, local_idx].item(), edit_probs_celeb[b, local_idx].item(),
                             _model_adds, args.success_margin,
                             id_indep=((src_id_indep[b] * edit_id_indep[b]).sum().item()
@@ -2857,6 +2890,11 @@ def build_parser():
     parser.add_argument('--gate_profile_json', default=None,
                         help='gate_diag.json for --gate_freeze mean/schedule. Default: '
                              '<checkpoint_dir>/gate_diag_s<step>/gate_diag.json')
+    parser.add_argument('--consensus_second', default='clip', choices=['clip', 'indep'],
+                        help='The judge --consensus pairs with the CelebA classifier: clip (CLIP / '
+                             'glasses parser, default, all previous evals) or indep '
+                             '(--independent_attr_weights, e.g. the R50). AccBoth then means CelebA '
+                             'AND that judge; results keep its own key (acc_clip / acc_indep).')
     parser.add_argument('--consensus', action='store_true',
                         help='Also score every edit on the CONSENSUS subset: sources that CLIP '
                              '(the parser for Eyeglasses) and the CelebA classifier both read '
@@ -2903,6 +2941,12 @@ def build_parser():
                              '50-80%%); a classifier the training never saw is not fooled the same way. '
                              'It must not be a judge of this eval (refused if it equals '
                              '--independent_attr_weights or --celeba_attr_judge_weights).')
+    parser.add_argument('--adaptive_stop_clip', action='store_true',
+                        help='With --adaptive_ladder: the second opinion of the stop rule is the CLIP '
+                             'judge model (--clip_judge_model, ViT-L/14; the glasses parser for '
+                             'Eyeglasses) instead of a classifier checkpoint. Training uses ViT-B/32, so '
+                             'the editor never saw L/14. CLIP then stops being a judge: AccCLIP is no '
+                             'longer independent, and --consensus needs --consensus_second indep.')
     parser.add_argument('--adaptive_stop_backbone', default='r50',
                         help='Backbone of --adaptive_stop_weights.')
     parser.add_argument('--adaptive_stop_margin', type=float, default=None,

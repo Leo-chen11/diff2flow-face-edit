@@ -39,7 +39,7 @@ SERIES = {
     'adaptive': dict(label='Per-face adaptive (ours)', color='#eb6834', marker='s'),
 }
 ATTRS = ['Eyeglasses', 'Male', 'Young', 'Smiling', 'Bangs']
-METRICS = {'both': 'AccBoth', 'celeb': 'AccCeleb', 'clip': 'AccCLIP'}
+METRICS = {'both': 'AccBoth', 'celeb': 'AccCeleb', 'clip': 'AccCLIP', 'indep': 'AccInd'}
 
 
 def _mean(d, k):

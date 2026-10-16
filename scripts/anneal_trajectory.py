@@ -39,7 +39,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from models.direction_bank import bank_mix_at
 from scripts.merge_eval_scales import interp, mean
 
-JUDGES = {'both': 'AccBoth', 'celeb': 'AccCeleb', 'clip': 'AccCLIP'}
+JUDGES = {'both': 'AccBoth', 'celeb': 'AccCeleb', 'clip': 'AccCLIP', 'indep': 'AccInd'}
 
 
 def run_mix(cfg, args):
