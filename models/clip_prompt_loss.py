@@ -31,6 +31,18 @@ _ATTR_PROMPTS = {
     ),
 }
 
+# Opt-in (FrozenCLIPPromptLoss(extra_attrs=[5])): Bangs had no pair and fell
+# back to the generic one below, so its CLIP loss pushed toward "not
+# distorted" instead of toward or away from bangs. Worded differently from the
+# evaluation judge's pair (evaluate_sdflow.py) so training does not optimize
+# the judge's exact text.
+_OPTIONAL_PROMPTS = {
+    5: (
+        "a face with a fringe of hair hanging down over the forehead",
+        "a face with the hair swept back off the forehead",
+    ),
+}
+
 _GENERIC_PROMPTS = ("a face photo", "a distorted face photo")
 
 _CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
@@ -81,6 +93,7 @@ class FrozenCLIPPromptLoss(nn.Module):
         mode: str = "absolute",
         num_augs: int = 4,
         aug_min_scale: float = 0.75,
+        extra_attrs=(),
     ):
         """
         num_augs: number of randomly cropped/flipped views to average the CLIP
@@ -129,6 +142,7 @@ class FrozenCLIPPromptLoss(nn.Module):
         self.image_size = int(image_size)
         self.temperature = float(temperature)
         self._tokenize = openai_clip.tokenize
+        self.extra_attrs = [int(a) for a in extra_attrs]
 
         # Register CLIP normalisation constants as buffers so .cuda() moves them.
         self.register_buffer(
@@ -152,6 +166,8 @@ class FrozenCLIPPromptLoss(nn.Module):
         all_prompts = {}
         for attr_idx, (pos, neg) in _ATTR_PROMPTS.items():
             all_prompts[attr_idx] = (pos, neg)
+        for attr_idx in self.extra_attrs:
+            all_prompts[attr_idx] = _OPTIONAL_PROMPTS[attr_idx]
         gen_pos, gen_neg = _GENERIC_PROMPTS
 
         flat_texts = []

@@ -257,6 +257,7 @@ def _mechanism_report(args):
         ('shortcut_clip_boost', args.shortcut_clip_boost),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
+        ('clip_prompt_bangs', args.clip_prompt_bangs_weight if args.clip_prompt_bangs else 0),
         ('controlnet_reg', args.controlnet_reg_weight),
         ('disc_realism', args.disc_realism_weight),
     ]
@@ -1784,6 +1785,14 @@ if __name__ == '__main__':
                         help='Per-sample weight multiplier for age (attr 39) in CLIP loss.')
     parser.add_argument('--clip_prompt_gender_weight', type=float, default=1.0,
                         help='Per-sample weight multiplier for gender (attr 20) in CLIP loss.')
+    parser.add_argument('--clip_prompt_bangs', action=argparse.BooleanOptionalAction, default=False,
+                        help='Give Bangs (5) its own CLIP prompt pair in the training CLIP loss '
+                             '(models/clip_prompt_loss.py _OPTIONAL_PROMPTS). Without it Bangs falls '
+                             'back to the generic "a face photo" / "a distorted face photo" pair, so '
+                             'its CLIP loss has no bangs signal at all. Off by default so earlier '
+                             'runs reproduce.')
+    parser.add_argument('--clip_prompt_bangs_weight', type=float, default=1.0,
+                        help='Per-sample CLIP loss weight for Bangs under --clip_prompt_bangs.')
     parser.add_argument('--clip_prompt_glasses_weight', type=float, default=3.0,
                         help='Per-sample weight multiplier for eyeglasses (attr 15) in CLIP '
                              'loss. Eyeglasses-add is the biggest independent-judge gap (r34 '
@@ -2478,6 +2487,7 @@ if __name__ == '__main__':
             mode=args.clip_prompt_mode,
             num_augs=args.clip_prompt_num_augs,
             aug_min_scale=args.clip_prompt_aug_min_scale,
+            extra_attrs=[5] if args.clip_prompt_bangs else [],
         ).cuda().eval()
         for p in clip_prompt_loss_fn.parameters():
             p.requires_grad_(False)
@@ -3149,6 +3159,8 @@ if __name__ == '__main__':
                 clip_sample_weight[_clip_abs_idx == 39] = args.clip_prompt_age_weight
                 clip_sample_weight[_clip_abs_idx == 20] = args.clip_prompt_gender_weight
                 clip_sample_weight[_clip_abs_idx == 15] = args.clip_prompt_glasses_weight
+                if args.clip_prompt_bangs:
+                    clip_sample_weight[_clip_abs_idx == 5] = args.clip_prompt_bangs_weight
 
                 # Second opinion on the r34 teacher (--hard_example_crosscheck,
                 # --shortcut_clip_boost). Lower CLIP loss = more progress toward
