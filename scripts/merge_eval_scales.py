@@ -59,14 +59,15 @@ def main():
         raise SystemExit('need at least two distinct scales to interpolate')
 
     for key in ('checkpoint_dir', 'step', 'num_samples', 'independent_attr_weights',
-                'edit_direction'):
+                'edit_direction', 'adaptive_ladder', 'closed_loop_steps', 'consensus',
+                'consensus_second'):
         vals = {str(c.get(key)) for _, c in cfgs}
         if len(vals) > 1:
             print(f'[warn] files differ in {key}: {sorted(vals)} -- pooling them is not like-for-like')
 
     order = sorted(scales, key=float)
     attrs = [a for a in scales[order[0]] if isinstance(scales[order[0]][a], dict)
-             and a not in ('overall', 'num_samples')]
+             and a not in ('overall', 'num_samples', 'consensus_overall')]
     jk, jl = f'acc_{args.judge}', JUDGES[args.judge]
     print(f'scales pooled: {", ".join(order)}   judge: {jl}')
 

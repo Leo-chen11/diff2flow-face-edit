@@ -2099,10 +2099,17 @@ def evaluate(args):
                         direction=_direction,
                     )
 
+                # Direction the edit actually takes: the given one, else the
+                # conditioner's reading of the source (edit_single_attribute's
+                # is_rm = src > 0.5). The stop rule and the closed loop must
+                # wait for THIS crossing; reading r34 here instead sent every
+                # face on which r34 and the conditioner disagree to the last
+                # rung, waiting for a crossing the edit was never heading for.
+                _add_edit = (_direction > 0) if _direction is not None \
+                    else ~(attr_cond[:, local_idx] > 0.5)
                 if closed_loop:
                     _gidx = args.attribute_index[local_idx]
-                    _add = (_direction > 0) if _direction is not None \
-                        else (src_probs_teacher[:, local_idx] < 0.5)
+                    _add = _add_edit
                     edited_face, _used = closed_loop_edit(
                         prior, conditioner, G, direction_bank, attr_teacher, latent, attr_cond,
                         id_cond, local_idx, _gidx, _add.to(img.device), args.closed_loop_step,
@@ -2117,9 +2124,7 @@ def evaluate(args):
                     # fixed scale leaves unedited ("still" failures) get more.
                     # Faces that never get there keep the largest scale.
                     _gidx = args.attribute_index[local_idx]
-                    _add = (_direction > 0) if _direction is not None \
-                        else (src_probs_teacher[:, local_idx] < 0.5)
-                    _add = _add.to(img.device)
+                    _add = _add_edit.to(img.device)
                     edited_face, _done = None, torch.zeros(B, dtype=torch.bool, device=img.device)
                     # Rungs past the ladder (--adaptive_gains) keep the largest
                     # scale and lengthen its edit instead (see set_edit_gain).
@@ -2164,6 +2169,9 @@ def evaluate(args):
                     metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
                     if stop_teacher is not None or getattr(args, 'adaptive_stop_clip', False):
                         metrics[f'stop_delay_{attr_name}'].extend((_chosen - _t_first).cpu().tolist())
+                        # held back = r34 accepted some rung, the final choice is later
+                        metrics[f'stop_held_{attr_name}'].extend(
+                            (_chosen - _t_first)[_t_seen].gt(1e-4).float().cpu().tolist())
                 else:
                     edited_face = _edit(edit_scale)
                 edited_256 = F.interpolate(edited_face, (256, 256))
@@ -2240,8 +2248,7 @@ def evaluate(args):
                                 abs(ep[b, other_idx].item() - sp[b, other_idx].item()))
 
                     if consensus_on:
-                        _model_adds = (attr_cond[b, local_idx].item() < 0.5) if _direction is None \
-                            else (_direction[b].item() > 0)
+                        _model_adds = bool(_add_edit[b])
                         _s2, _e2 = (src_probs_clip, edit_probs_clip) if cons_second == 'clip' \
                             else (src_probs_indep, edit_probs_indep)
                         record_consensus(
@@ -2472,8 +2479,10 @@ def evaluate(args):
                 sd = metrics.get(f'stop_delay_{attr_name}')
                 if sd:
                     sd = np.asarray(sd)
-                    print(f'    {"":<12} second classifier held back {np.mean(sd > 1e-4) * 100:4.1f}% '
-                          f'of faces the teacher alone would have stopped (mean +{sd.mean():.2f} scale)')
+                    held = metrics.get(f'stop_held_{attr_name}') or [0.0]
+                    print(f'    {"":<12} second classifier held back {np.mean(held) * 100:4.1f}% '
+                          f'of the {len(held)} faces the teacher alone would have stopped '
+                          f'(mean +{sd.mean():.2f} scale over all faces)')
                     scale_summary[attr_name]['stop_delay'] = _summ(sd.tolist())
 
         # Overall (independent judges only, so the headline number is honest)

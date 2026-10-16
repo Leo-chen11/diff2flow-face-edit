@@ -145,6 +145,14 @@ def main():
         runs = [(lab,) + r[1:] for lab, r in zip(args.labels, runs)]
     else:
         runs.sort(key=lambda r: (r[0] is None, r[0]))
+    partner = {str(r[2].get('consensus_second') or 'clip') for r in runs}
+    if len(partner) > 1:
+        raise SystemExit(f'files pair CelebA with different judges (consensus_second: {sorted(partner)}): '
+                         f'AccBoth means something different in each')
+    other = {'clip': 'indep', 'indep': 'clip'}[partner.pop()]
+    if other in args.judges:
+        print(f'[note] these files have no consensus acc_{other}; dropping that column')
+        args.judges = [j for j in args.judges if j != other]
     for key in (() if args.labels else ('checkpoint_dir',)) + ('num_samples', 'sample_offset', 'edit_direction',
                 'no_train_caps', 'independent_attr_weights'):
         vals = {str(r[2].get(key)) for r in runs}

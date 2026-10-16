@@ -47,26 +47,35 @@ def _mean(d, k):
     return v['mean'] if isinstance(v, dict) and v.get('mean') is not None else None
 
 
+partners = set()
+
+
 def load(paths, adaptive, metric):
     """{key: {'kind', 'x': {attr|'mean': id}, 'y': {...}}} keyed by scale/margin."""
     pts, moved = {}, {}
     for p in paths:
         r = json.load(open(p))
         cfg = r.get('config', {})
-        top = max(cfg.get('adaptive_ladder') or [0.0])
+        # the last rung every face ends on: ladder top x the largest extra gain
+        top = max(cfg.get('adaptive_ladder') or [0.0]) * max(cfg.get('adaptive_gains') or [1.0]) \
+            * (cfg.get('edit_gain') or 1.0)
+        partners.add(cfg.get('consensus_second') or 'clip')
         for k, v in r.items():
             if not (isinstance(v, dict) and 'overall' in v):
                 continue
             kind, key = ('adaptive', float(k)) if adaptive else ('fixed', float(k))
             if adaptive and float(k) >= 0.5:      # unreachable margin == fixed at the ladder top
                 kind, key = 'fixed', top
+            # x and y over the SAME faces: the consensus subset the accuracy
+            # is scored on (the all-face ID would mix in non-consensus faces)
             x, y = {}, {}
             for a in ATTRS:
-                row = v.get(a) or {}
-                cons = row.get('consensus') or {}
-                x[a], y[a] = _mean(row, 'id_indep'), _mean(cons, f'acc_{metric}')
+                cons = (v.get(a) or {}).get('consensus') or {}
+                x[a], y[a] = _mean(cons, 'id_indep'), _mean(cons, f'acc_{metric}')
             co = v.get('consensus_overall') or {}
-            x['mean'] = _mean(v['overall'], 'id_indep')
+            xs = [x[a] for a in ATTRS if x[a] is not None]
+            # unweighted attribute mean on both axes, like acc_*_attr_mean
+            x['mean'] = sum(xs) / len(xs) if len(xs) == len(ATTRS) else None
             y['mean'] = co.get(f'acc_{metric}_attr_mean')
             target = moved if kind != ('adaptive' if adaptive else 'fixed') else pts
             target.setdefault(key, {'kind': kind, 'x': x, 'y': y, 'src': os.path.basename(p)})
@@ -111,6 +120,9 @@ def main():
 
     fixed, _ = load(args.fixed, False, args.metric)
     adaptive, moved = load(args.adaptive, True, args.metric)
+    if len(partners) > 1:
+        raise SystemExit(f'files pair CelebA with different judges (consensus_second: {sorted(partners)}): '
+                         f'AccBoth means something different in each, re-run them with one --consensus_second')
     for k, v in moved.items():
         if k not in fixed:
             print(f'[note] adaptive margin >= 0.5 is unreachable: plotted as fixed scale {k:g}')
