@@ -22,7 +22,6 @@ from PIL import Image, ImageDraw
 from torch.utils import data
 
 from evaluation.evaluate_sdflow import (
-    resolve_controlnet_disable_attrs,
     ATTR_NAMES, CLIPAttributeJudge, CelebAAttrClassifierJudge, _latest_step,
     apply_run_config, edit_multi_attribute, load_models, parse_clip_calibration,
 )
@@ -60,7 +59,7 @@ def build_score_fn(args, attrs):
 def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     prior, conditioner, G, id_criterion, attr_teacher, \
-        attribute_index, direction_bank, control_encoder = load_models(args)
+        attribute_index, direction_bank = load_models(args)
 
     local_idxs = []
     for a in args.attrs:
@@ -108,9 +107,6 @@ def main(args):
             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
             local_idxs, args.edit_scale, direction_bank,
             attr_global_idxs=args.attrs, compose=args.compose,
-            control_encoder=control_encoder,
-            controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-            controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
         )
 
         src_face_256 = F.interpolate(src_face, (256, 256))
@@ -201,12 +197,8 @@ if __name__ == '__main__':
     p.add_argument('--glasses_residual_scale', type=float, default=0.05)
     p.add_argument('--bypass_glasses_direction_bank', action='store_true')
     p.add_argument('--guided_delta_max_norm', type=float, default=0.0)
-    p.add_argument('--override_residual_scale', type=float, default=None)
     p.add_argument('--age_fine_layer_scale', type=float, default=None)
     p.add_argument('--age_fine_layer_start', type=int, default=10)
-    p.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
-                    help='Same knob/default as evaluate_sdflow.py: omitted -> auto-resolved '
-                         'to gender/age (20, 39) via resolve_controlnet_disable_attrs().')
     p.add_argument('--force_bank_directions', action='store_true')
     p.add_argument('--ignore_run_config', action='store_true')
     p.add_argument('--celeba_attr_judge_weights', default=None,
@@ -217,7 +209,6 @@ if __name__ == '__main__':
 
     args = p.parse_args()
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
         if args.step is None:

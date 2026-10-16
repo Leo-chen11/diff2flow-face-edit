@@ -43,7 +43,7 @@ def main():
     os.chdir(ROOT)
     py = sys.executable
     run_dir = {r: os.path.join(a.output_root, r) for r in a.runs}
-    eval_json = {r: os.path.join(d, f'eval_s{a.step}_clamp02.json') for r, d in run_dir.items()}
+    eval_json = {r: os.path.join(d, f'eval_s{a.step}_indep.json') for r, d in run_dir.items()}
 
     def ready(d):
         return os.path.exists(os.path.join(d, 'save_models', f'prior-{a.step:07d}'))
@@ -56,7 +56,7 @@ def main():
 
     common = ['--edit_direction', 'indep', '--independent_attr_weights', a.judge,
               '--independent_attr_backbone', 'r50', '--celeba_attr_judge_weights', '',
-              '--age_fine_layer_scale', '1.0', '--src_cond_clamp', '0.2']
+              '--age_fine_layer_scale', '1.0']
 
     def run(log, cmd):
         print(f'[{time.strftime("%m-%d %H:%M")}] {os.path.basename(log)}', flush=True)
@@ -69,7 +69,7 @@ def main():
             print(f'{r}: no step-{a.step} checkpoint, skipped')
             continue
         if not os.path.exists(eval_json[r]):
-            run(os.path.join(d, f'eval_s{a.step}_clamp02.log'),
+            run(os.path.join(d, f'eval_s{a.step}_indep.log'),
                 [py, 'evaluation/evaluate_sdflow.py', '--checkpoint_dir', d, '--step', str(a.step)]
                 + common + ['--leak40', '--num_samples', str(a.num_samples), '--batch', str(a.batch),
                             '--eval_scales'] + a.scales + ['--out_json', eval_json[r]])
@@ -82,7 +82,7 @@ def main():
                 [py, 'scripts/render_preview.py', '--checkpoint_dir', d, '--step', str(a.step),
                  '--scale', '1.0', '--num_faces', '10', '--edit_direction', 'indep',
                  '--independent_attr_weights', a.judge, '--independent_attr_backbone', 'r50',
-                 '--src_cond_clamp', '0.2', '--age_fine_layer_scale', '1.0'])
+                 '--age_fine_layer_scale', '1.0'])
 
     for pair in a.compare:
         x, y = pair.split(':')

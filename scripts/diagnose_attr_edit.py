@@ -19,7 +19,7 @@ barely move (R50 dP < 0.05), while "rm" (young -> old) succeeds ~93%.
                           skin may need 11-17.  D: layers 0-17 for this edit.
   fix candidate           E<m> (--clamp_margins): the source condition moved to
                           the far side of 0.5 by m from the requested direction
-                          (evaluate_sdflow --src_cond_clamp m); needs no judge.
+                          (evaluate_sdflow.consistent_source); needs no judge.
   H5 same edit, too short the edit already points where the successful ones
                           do but is held at the final norm cap, and a larger
                           scale changes its direction (out-of-range target).
@@ -62,7 +62,7 @@ from tqdm import tqdm
 
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_run_config, bank_edit, build_optional_judges, build_parser,
-    consistent_source, edit_single_attribute, load_models, resolve_controlnet_disable_attrs,
+    consistent_source, edit_single_attribute, load_models,
 )
 from models.dataset import SDFlowDataset
 
@@ -99,7 +99,7 @@ def main():
     p.add_argument('--scales_extra', nargs='*', type=float, default=[1.5, 2.0, 3.0])
     p.add_argument('--clamp_margins', nargs='*', type=float, default=[],
                    help='Extra conditions E<m>: the source condition moved to the far side of 0.5 by m '
-                        '(evaluate_sdflow --src_cond_clamp m), e.g. 0.2 0.35 0.5.')
+                        '(evaluate_sdflow.consistent_source), e.g. 0.2 0.35 0.5.')
     p.add_argument('--edit_gains', nargs='*', type=float, default=[],
                    help='Extra conditions F<k>: the scale-1.0 W+ edit (after the final cap) times k, '
                         'e.g. 1.3 1.6 2.0.')
@@ -107,7 +107,6 @@ def main():
     p.add_argument('--out_dir', default=None)
     args = p.parse_args()
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
     if not args.independent_attr_weights:
@@ -120,12 +119,8 @@ def main():
     out_dir = args.out_dir or os.path.join(args.checkpoint_dir, f'diagnose_{name}_s{args.step}')
     os.makedirs(out_dir, exist_ok=True)
 
-    prior, conditioner, G, id_criterion, attr_teacher, _, direction_bank, control_encoder = load_models(args)
+    prior, conditioner, G, id_criterion, attr_teacher, _, direction_bank = load_models(args)
     _, indep_id, _, indep_teacher, _, _ = build_optional_judges(args, args.attribute_index, id_criterion)
-    ce_kw = dict(control_encoder=control_encoder,
-                 controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-                 controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
-                 controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64))
     b2 = (2.0 if 2.0 in args.scales_extra else args.scales_extra[-1]) if args.scales_extra else None
     extra = [f'E{m:g}' for m in args.clamp_margins] + [f'F{k:g}' for k in args.edit_gains]
     conds = ['A'] + [f'B{s:g}' for s in args.scales_extra] + ['C', "C'", 'D'] + extra
@@ -168,7 +163,7 @@ def main():
                     prior, conditioner, G, id_criterion, img, latent, acond, id_cond, li, scale,
                     direction_bank, attr_global_idx=g,
                     bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-                    composite=False, direction=d, **ce_kw)
+                    composite=False, direction=d)
                 f256 = F.interpolate(face, (256, 256))
                 ep = torch.sigmoid(indep_teacher(f256)[0])[:, g]
                 idv = (src_id * indep_id.extract(f256)).sum(1) if src_id is not None else torch.zeros(B)
@@ -286,8 +281,8 @@ def main():
               f'{row["rm"]["id"]:6.3f} {resc(row["add"]):>18} {resc(row["rm"]):>17}')
     print('\nA = scale 1.0; B<s> = scale s; C = condition set to the R50 reading (diagnostic: R50 is the '
           'judge); C\' = condition set to the training r34 reading (usable at inference); D = W+ layers '
-          '0-17 unlocked; E<m> = source condition moved to the far side of 0.5 by m (--src_cond_clamp m, '
-          'uses only the direction); F<k> = the scale-1.0 W+ edit times k after the cap (same direction).'
+          '0-17 unlocked; E<m> = source condition moved to the far side of 0.5 by m (uses only '
+          'the direction); F<k> = the scale-1.0 W+ edit times k after the cap (same direction).'
           '\n"cond wrong side" = the conditioner reads the source on the target side already '
           '(add: > 0.5), so the flow is asked for a small change.\n|resid| = norm of the learned residual in the '
           'scale-1.0 edit (|edit| is the whole W+ edit, after the final cap); edit cos = cosine of the whole '

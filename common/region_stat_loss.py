@@ -135,8 +135,8 @@ def outside_region_preservation_loss(edit_img, ref_img, allowed):
     has always used for eyeglasses, factored out so it can be applied to
     attributes that have no tight region of their own.
 
-    WHY THIS EXISTS. DC-ControlNet, the method --controlnet_region_cond
-    adapts, is a GENERATION method: it composes an image from layout and
+    WHY THIS EXISTS. DC-ControlNet, the method the (since removed)
+    ControlNet region conditioning adapted, is a GENERATION method: it composes an image from layout and
     content conditions and has no notion of "leave everything else as it
     was", because generation never needs one. Editing does. The adaptation
     brought over the input side (WHERE the network may act, via the region

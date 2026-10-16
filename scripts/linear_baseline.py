@@ -2,8 +2,8 @@
 their own, under the SAME protocol evaluate_sdflow.py scores the model with?
 
 The trained editor is, in essence, the bank's dataset directions weighted per
-face by a learned gate and magnitude (plus a bounded residual, ControlNet and
-the flow). This script keeps the directions and drops everything learned:
+face by a learned gate and magnitude (plus a bounded residual and the
+flow). This script keeps the directions and drops everything learned:
 
     w' = w + sign * alpha * d
 
@@ -13,7 +13,7 @@ the flow). This script keeps the directions and drops everything learned:
              age / glasses, whatever the bank was built with). Hard routing, no
              learned gate. The gap single -> strata is what stratifying the
              directions is worth; strata -> the trained model is what the learned
-             gate, magnitude, flow and ControlNet add.
+             gate, magnitude and flow add.
 
 Protocol (so numbers line up with evaluate_sdflow.py --edit_direction indep):
   * same sources: the loader order and the num_samples / batch break are the

@@ -55,8 +55,8 @@ from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
 
-from common.attr_tables import (AGE_TEXTURE_REGION_CLASS, CELEBA_ALL_ATTRS, DEFAULT_SOFT_TARGET,
-                                PRESERVE40_ALLOW, SOFT_TARGET_TABLE, bank_num_k)
+from common.attr_tables import (CELEBA_ALL_ATTRS, DEFAULT_SOFT_TARGET, PRESERVE40_ALLOW,
+                                SOFT_TARGET_TABLE, bank_num_k)
 from common.id_loss import IDLoss
 from common.ops import load_network
 from common.version import code_version
@@ -64,7 +64,6 @@ from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
-from models.control_encoder import add_skips, clip_skips
 from models.stylegan2.model import Generator
 
 
@@ -486,10 +485,6 @@ RUN_CONFIG_KEYS = [
     'img_size', 'direction_residual_scale', 'direction_bank_path',
     'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input',
     'magnitude_latent_cond',
-    'use_controlnet_injection', 'controlnet_embed_res', 'controlnet_channels',
-    'controlnet_hidden_dim', 'controlnet_max_norm', 'controlnet_init_gain',
-    'controlnet_per_direction', 'controlnet_latent_cond', 'controlnet_res',
-    'controlnet_region_cond', 'region_saliency_path',
     'age_gate_by_strata', 'residual_scale_cap', 'bank_dir_layers', 'gate_uniform_attrs',
     # training's caps on the edit (the eval applies them as training did;
     # --no_train_caps turns them off to reproduce numbers from before)
@@ -518,10 +513,13 @@ def apply_run_config(args):
         return args
     with open(cfg_path) as f:
         cfg = json.load(f)
+    # Only RUN_CONFIG_KEYS are read below; any other key in an old config.json
+    # (flags training no longer has) is ignored.
     if cfg.get('content_bank_path') or cfg.get('content_film'):
         raise SystemExit(f'{args.checkpoint_dir} was trained with content conditioning '
                          f'(--content_bank_path), which this code no longer has; evaluate it '
                          f'with a checkout from before content conditioning was removed.')
+    check_removed_mechanisms(args.checkpoint_dir, cfg)
     explicit = set()
     for tok in sys.argv[1:]:
         if tok.startswith('--'):
@@ -538,47 +536,24 @@ def apply_run_config(args):
     return args
 
 
-def resolve_controlnet_disable_attrs(args):
-    """Auto-default for --controlnet_disable_attrs: when ControlNet injection
-    is active and the caller did not explicitly choose which attributes get
-    it (the flag is left at its argparse default of None), skip gender/age
-    (20, 39) and keep the injection only for eyeglasses.
+def check_removed_mechanisms(checkpoint_dir, cfg=None, step=None):
+    """Refuse to evaluate a run that depends on a mechanism this branch no
+    longer has, instead of silently evaluating a different model.
 
-    WHY as a default and not just a documented flag: the finding (see
-    edit_single_attribute) is that ControlNet is load-bearing for eyeglasses
-    structure (AccCeleb add 93%->12% without it) but measured NO accuracy
-    benefit for gender/age (~70.7% either way) while it DOES introduce a
-    hairline/collar sparkle artifact that scale sweeps don't remove. Leaving
-    that as an opt-in flag means every eval/render run pays the artifact cost
-    for attributes that get nothing from it, unless the user remembers to
-    pass the flag by hand. Call this once right after argument parsing (and
-    after apply_run_config, so config.json's use_controlnet_injection has
-    already been applied) in every entry point that edits attributes.
-    """
-    using_controlnet = (getattr(args, 'use_controlnet_injection', False)
-                         and not getattr(args, 'disable_controlnet', False))
-    if using_controlnet and getattr(args, 'controlnet_disable_attrs', None) is None:
-        # The "no benefit for age/gender" measurement that motivates this
-        # default was taken with SINGLE-resolution (64x64) injection, and
-        # 64x64 is the band where mid-level structure lives, not the 128-512
-        # bands that carry wrinkles and skin texture. A multi-resolution run
-        # reaches a band the old finding never tested, so applying the old
-        # default there would silently switch off exactly the thing the run
-        # was built to measure. Keep the default only for single-resolution.
-        multi_res = len(getattr(args, 'controlnet_res', None) or []) > 1
-        auto = [i for i in (20, 39) if i in args.attribute_index]
-        if multi_res:
-            print('[Default] ControlNet injection kept for ALL attributes: this checkpoint '
-                  f'injects at {sorted(args.controlnet_res)}, and the gender/age auto-disable '
-                  'was measured on 64x64-only injection (which cannot reach fine texture). '
-                  'Pass --controlnet_disable_attrs 20 39 to restore the old behaviour.')
-        elif auto:
-            args.controlnet_disable_attrs = auto
-            print(f'[Default] ControlNet injection auto-disabled for {auto} (gender/age) -- '
-                  f'no measured accuracy benefit at 64x64, causes a hairline/collar sparkle '
-                  f'artifact; kept for eyeglasses. Pass --controlnet_disable_attrs explicitly '
-                  f'to override.')
-    return args
+    ControlNet-style feature injection (train --use_controlnet_injection, the
+    control_encoder checkpoint) was removed: an old ControlNet run evaluated
+    here would render the W+ edit alone, never what it was trained to do.
+    Detected from config.json and, so --ignore_run_config / a missing
+    config.json cannot hide it, from a control_encoder checkpoint file."""
+    if cfg is not None and cfg.get('use_controlnet_injection'):
+        raise SystemExit(f'{checkpoint_dir} was trained with ControlNet feature injection '
+                         f'(use_controlnet_injection: true in config.json). ControlNet support '
+                         f'was removed in this branch; evaluate it with a checkout from before '
+                         f'ControlNet was removed.')
+    if step is not None and os.path.exists(_ckpt_path(checkpoint_dir, 'control_encoder', step)):
+        raise SystemExit(f'{checkpoint_dir} has a control_encoder checkpoint at step {step} (a '
+                         f'ControlNet run). ControlNet support was removed in this branch; '
+                         f'evaluate it with a checkout from before ControlNet was removed.')
 
 
 def _check_load(result, name):
@@ -624,41 +599,11 @@ def _latest_step(checkpoint_dir, module_name='prior'):
 # Model loading
 # ---------------------------------------------------------------------------
 
-def _attach_region_parser(args, control_encoder, device):
-    """A --controlnet_region_cond encoder was trained with a BiSeNet skin mask
-    as its region input for EVERY age(39) edit. edit_single_attribute /
-    edit_multi_attribute only built that mask when the CALLER passed a
-    face_parser, and several scripts never do (e.g. calibrate_clip_thresh,
-    dump_multi_attr_edit).
-    Their age edits silently got the all-ones mask instead: a different input
-    from training, so a different edit from the one evaluate_sdflow.py scores.
-    Attaching the parser here gives every caller the training-time mask.
-
-    Stored with object.__setattr__ so it is NOT registered as a submodule of
-    control_encoder (it must stay out of its parameters() / state_dict())."""
-    if not getattr(control_encoder, 'region_cond', False):
-        return
-    if getattr(args, 'region_saliency_path', None):
-        print(f'[WARN] this run trained with --region_saliency_path '
-              f'({args.region_saliency_path}): non-age attributes saw per-sample saliency '
-              f'maps as their region input, but eval has no saliency lookup and feeds them '
-              f'the all-ones mask. Their numbers do NOT reflect what was trained.')
-    from common.face_parser import FaceParser
-    weights = getattr(args, 'face_parser_weights', None) or './data/parsing_bisenet.pth'
-    try:
-        parser = FaceParser(weights_path=weights).to(device).eval()
-    except (FileNotFoundError, RuntimeError) as exc:
-        print(f'[WARN] region_cond checkpoint but face parser unavailable ({exc}); age(39) '
-              f'edits fall back to an all-ones region mask, which training never used.')
-        return
-    object.__setattr__(control_encoder, 'region_parser', parser)
-
-
 def load_models(args):
     global _EDIT_TARGET_MODE
     _EDIT_TARGET_MODE = getattr(args, 'edit_target', None) or 'mirror'
-    global _SRC_COND_CLAMP, _FINAL_DELTA_MAX_NORM
-    _SRC_COND_CLAMP = getattr(args, 'src_cond_clamp', None)
+    global _FINAL_DELTA_MAX_NORM
+    check_removed_mechanisms(args.checkpoint_dir, step=getattr(args, 'step', None))
     set_edit_gain(getattr(args, 'edit_gain', None) or 1.0)
     caps = train_caps(args)
     _FINAL_DELTA_MAX_NORM = caps['final']
@@ -669,10 +614,6 @@ def load_models(args):
     set_preserve_boundaries(getattr(args, 'preserve_boundaries', None),
                             getattr(args, 'preserve_strength', 1.0),
                             getattr(args, 'preserve_min_auc', 0.8))
-    if _SRC_COND_CLAMP is not None:
-        print(f'[SrcCondClamp] {_SRC_COND_CLAMP}: an edit with a given direction starts from a source '
-              f'value on the far side of 0.5 (add <= {0.5 - _SRC_COND_CLAMP:.2f}, '
-              f'rm >= {0.5 + _SRC_COND_CLAMP:.2f}).')
     if _EDIT_TARGET_MODE != 'mirror':
         print(f'[EditTarget] {_EDIT_TARGET_MODE}: edits aim at the training targets '
               f'(0.2/0.8, Eyeglasses 0.1/0.9) -- not comparable with mirror-mode numbers.')
@@ -810,20 +751,6 @@ def load_models(args):
         print(f'[Bank] mode={direction_bank.bank_mode}'
               + (f' mix={direction_bank.bank_mix:.3f}' if direction_bank.bank_mode == 'anneal' else ''))
 
-        if args.override_residual_scale is not None:
-            # Diagnostic knob: the trained residual_scale is typically frozen
-            # near its 0.05 init (low-lr param group + softplus reparam), which
-            # makes the final delta ~95% dataset-level direction. This override
-            # lets you probe at eval time how much per-sample flow contribution
-            # helps, without retraining or editing checkpoints.
-            ov = torch.full_like(direction_bank.residual_scale_raw,
-                                 float(args.override_residual_scale))
-            with torch.no_grad():
-                direction_bank.residual_scale_raw.copy_(torch.log(torch.expm1(ov.clamp(min=1e-6))))
-            print(f'[Override] direction bank residual_scale forced to '
-                  f'{args.override_residual_scale} for ALL attributes '
-                  f'(trained value ignored)')
-
         if 39 in args.attribute_index and getattr(args, 'age_fine_layer_scale', None) is not None:
             # Off unless --age_fine_layer_scale is given: training never damps
             # these layers, so the default eval edits as training did.
@@ -844,62 +771,6 @@ def load_models(args):
                     direction_bank.layer_scale[_age_local, _start:] = float(_scale)
                 print(f'[Override] age (attr 39) direction layer scale forced to '
                       f'{_scale} for layers [{_start}:18] (layers [0:{_start}] untouched).')
-
-    # ── ControlNet-style attribute control encoder (optional) ─────────────
-    control_encoder = None
-    if getattr(args, 'disable_controlnet', False):
-        print('[Ablation] --disable_controlnet: control_encoder NOT loaded; the edit runs '
-              'through the W+ path (flow + Direction Bank) only, even though this run was '
-              'trained with the injection active.')
-    elif getattr(args, 'use_controlnet_injection', False):
-        from models.control_encoder import (AttributeControlEncoder,
-                                            LegacySingleResControlEncoder,
-                                            is_legacy_state_dict)
-        _cn_res = getattr(args, 'controlnet_res', None) or [args.controlnet_embed_res]
-        ce_ckpt_path = _ckpt_path(args.checkpoint_dir, 'control_encoder', args.step)
-        # Which architecture to build is decided by the CHECKPOINT, not by the
-        # flags: a single-resolution baseline and a multi-resolution challenger
-        # are by construction on opposite sides of this change, and comparing
-        # them is the whole point. Building the wrong one turns every metric
-        # into noise (or, with strict loading, a hard error mid-eval).
-        _ce_state = load_network(ce_ckpt_path) if os.path.exists(ce_ckpt_path) else None
-        if _ce_state is not None and is_legacy_state_dict(_ce_state):
-            if len(_cn_res) > 1:
-                print(f'[Compat] control_encoder checkpoint predates multi-resolution '
-                      f'injection; building the single-resolution architecture at '
-                      f'{args.controlnet_embed_res} and ignoring --controlnet_res {_cn_res}.')
-            control_encoder = LegacySingleResControlEncoder(
-                num_attrs=num_attrs,
-                out_channels=args.controlnet_channels,
-                out_res=args.controlnet_embed_res,
-                hidden_dim=args.controlnet_hidden_dim,
-                init_gain=getattr(args, 'controlnet_init_gain', 1.0),
-                per_direction=getattr(args, 'controlnet_per_direction', False),
-                latent_cond=getattr(args, 'controlnet_latent_cond', False),
-            ).to(device).eval()
-        else:
-            control_encoder = AttributeControlEncoder(
-                num_attrs=num_attrs,
-                out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
-                out_res=_cn_res,
-                hidden_dim=args.controlnet_hidden_dim,
-                init_gain=getattr(args, 'controlnet_init_gain', 1.0),
-                per_direction=getattr(args, 'controlnet_per_direction', False),
-                latent_cond=getattr(args, 'controlnet_latent_cond', False),
-                region_cond=getattr(args, 'controlnet_region_cond', False),
-            ).to(device).eval()
-        if _ce_state is not None:
-            result = control_encoder.load_state_dict(_ce_state, strict=False)
-            if result.missing_keys:
-                print(f'[WARN] control_encoder missing keys: {result.missing_keys[:8]}')
-            if result.unexpected_keys:
-                print(f'[WARN] control_encoder unexpected keys: {result.unexpected_keys[:8]}')
-            print(f'Loading ctrl   ← {ce_ckpt_path}')
-        else:
-            print(f'Control encoder init (no trained weights at {ce_ckpt_path})')
-        for p in control_encoder.parameters():
-            p.requires_grad_(False)
-        _attach_region_parser(args, control_encoder, device)
 
     # ── StyleGAN2 ─────────────────────────────────────────────────────────
     ckpt = torch.load(args.stygan2_weights, map_location='cpu')
@@ -922,7 +793,7 @@ def load_models(args):
         p.requires_grad_(False)
 
     return prior, conditioner, G, id_criterion, attr_teacher, \
-           attribute_index, direction_bank, control_encoder
+           attribute_index, direction_bank
 
 
 # ---------------------------------------------------------------------------
@@ -932,14 +803,14 @@ def load_models(args):
 # --edit_target, set once by load_models() so every script that edits through
 # edit_single_attribute / edit_multi_attribute follows it without passing it.
 _EDIT_TARGET_MODE = 'mirror'
-_SRC_COND_CLAMP = None      # --src_cond_clamp; set in load_models()
 
 
-def consistent_source(attr_cond, local_idx, direction, margin=None):
+def consistent_source(attr_cond, local_idx, direction, margin):
     """attr_cond with the edited attribute's SOURCE value moved to the far side
     of 0.5 from the requested direction: add -> min(src, 0.5 - m), rm ->
     max(src, 0.5 + m). Off (attr_cond unchanged) without a margin or a
-    direction.
+    direction. Not part of any edit path: only scripts/diagnose_attr_edit.py's
+    E<m> condition uses it.
 
     Why: with a given direction the flow is asked for src + s*(end - src). When
     the conditioner already reads the source on the target side (Young: a face
@@ -948,17 +819,16 @@ def consistent_source(attr_cond, local_idx, direction, margin=None):
     scripts/diagnose_attr_edit.py had |edit| = 0. Only the direction is used,
     which an edit request has anyway; values already on the right side and
     at least m from 0.5 are untouched."""
-    m = _SRC_COND_CLAMP if margin is None else margin
-    if m is None or direction is None:
+    if margin is None or direction is None:
         return attr_cond
     out = attr_cond.clone()
     src = out[:, local_idx]
     add = direction.to(src.device) > 0
-    out[:, local_idx] = torch.where(add, src.clamp(max=0.5 - m), src.clamp(min=0.5 + m))
+    out[:, local_idx] = torch.where(add, src.clamp(max=0.5 - margin), src.clamp(min=0.5 + margin))
     return out
 
 
-_PRESERVE = None            # --preserve_boundaries; set in load_models()
+_PRESERVE = None           # --preserve_boundaries; set in load_models()
 _FINAL_DELTA_MAX_NORM = None    # training's --final_delta_max_norm; set in load_models()
 _EDIT_GAIN = 1.0            # --edit_gain / --adaptive_gains: W+ edit x k after the final cap
 
@@ -1005,7 +875,6 @@ def bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent,
     edit_multi_attribute and bank_edit."""
     B = latent.size(0)
     idx = torch.full((B,), local_idx, device=latent.device, dtype=torch.long)
-    direction_bank._id_cond = id_cond      # read only by a --residual_head
     delta = direction_bank(flow_delta, attr_delta, attr_idx=idx, latent=latent, route_scores=attr_cond)
     delta = delta[0] if isinstance(delta, tuple) else delta
     delta = cap_delta_norm(delta, _FINAL_DELTA_MAX_NORM) * _EDIT_GAIN
@@ -1014,12 +883,11 @@ def bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent,
 
 @torch.no_grad()
 def bank_edit(prior, direction_bank, latent, attr_cond, id_cond, local_idx, scale, global_idx, direction):
-    """edit_single_attribute up to the W+ edit (no rendering, no ControlNet):
+    """edit_single_attribute up to the W+ edit (no rendering):
     returns the applied W+ delta, the bank's residual part of it and the
     requested attribute change. Used by the analysis scripts."""
     B = latent.size(0)
     zero_pad = torch.zeros(B, 18, 1, device=latent.device)
-    attr_cond = consistent_source(attr_cond, local_idx, direction)
     mid, _ = prior(latent, torch.cat([id_cond, attr_cond], 1), zero_pad)
     new_attr = attr_cond.clone()
     new_attr[:, local_idx] = edited_attr_value(attr_cond[:, local_idx], scale, global_idx, direction=direction)
@@ -1146,7 +1014,7 @@ def preserve_basis(edited_globals):
 def project_preserve(delta, edited_globals):
     """delta (B, L, D) minus strength x its projection on preserve_basis().
     Unchanged when --preserve_boundaries is off or the edited attributes are
-    unknown. Only the W+ delta; ControlNet feature injection is not affected."""
+    unknown."""
     if _PRESERVE is None or edited_globals is None or any(g is None for g in edited_globals):
         return delta
     Q = preserve_basis(edited_globals)
@@ -1275,8 +1143,6 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                           attr_local_idx, edit_scale, direction_bank=None,
                           attr_global_idx=None, bypass_glasses_direction_bank=False,
                           face_parser=None, composite_method='alpha', composite_blur_sigma=15,
-                          control_encoder=None, controlnet_max_norm=0.0,
-                          controlnet_disable_attrs=None, controlnet_embed_res=64,
                           composite=True, direction=None):
     """
     direction: optional (B,) tensor, +1 = add the attribute, -1 = remove it.
@@ -1298,35 +1164,21 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     composite_method='poisson' fixes that via gradient-domain blending
     instead of a wider feather.
 
-    composite: set False to pass a face_parser WITHOUT compositing -- needed
-    when face_parser is only there to build a --controlnet_region_cond
-    region mask (see below) and the caller did not separately ask for
-    --composite_face_region. Defaults True so every existing caller (which
-    only ever passed face_parser when it wanted compositing) is unaffected.
+    composite: set False to pass a face_parser WITHOUT compositing. Defaults
+    True so every existing caller (which only ever passed face_parser when it
+    wanted compositing) is unaffected.
     """
     B = img.size(0)
     device = img.device
     zero_pad = torch.zeros(B, 18, 1, device=device)
 
-    # Hoisted above the control_encoder call (rather than computed only for
-    # compositing at the end, as before): a --controlnet_region_cond encoder
-    # needs a region prior built from the UNEDITED source before it runs, for
-    # the same inversion-gap reason compositing already used src_recon for.
-    # Computed once, reused by both consumers.
-    # region_parser: the caller's face_parser if given, else the one
-    # load_models() attached for a region_cond encoder (_attach_region_parser)
-    # -- used ONLY for the region mask; compositing still needs face_parser.
-    region_parser = face_parser if face_parser is not None else \
-        getattr(control_encoder, 'region_parser', None)
-    need_region = (region_parser is not None and attr_global_idx == 39
-                   and getattr(control_encoder, 'region_cond', False))
+    # Source reconstruction, the compositing background (see face_parser).
     src_recon = None
-    if face_parser is not None or need_region:
+    if face_parser is not None:
         with torch.no_grad():
             src_recon = G([latent], input_is_latent=True,
                           randomize_noise=False)[0].clamp(-1, 1)
 
-    attr_cond = consistent_source(attr_cond, attr_local_idx, direction)
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
@@ -1334,7 +1186,6 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
     src = attr_cond[:, attr_local_idx]
     new_attr_cond[:, attr_local_idx] = edited_attr_value(src, edit_scale, attr_global_idx,
                                                          direction=direction)
-    is_rm = (src > 0.5) if direction is None else (direction.to(src.device) < 0)
     new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
     new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
@@ -1343,46 +1194,18 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
         bypass_glasses_direction_bank
         and attr_global_idx == 15
     )
-    control_skips = None
     if direction_bank is not None and not bypass_bank:
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
-        batch_attr_idx = torch.full((B,), attr_local_idx, device=device, dtype=torch.long)
         guided_delta = bank_guided_delta(direction_bank, flow_delta, attr_delta, attr_local_idx,
                                          latent, attr_cond, id_cond, [attr_global_idx])
         new_latents = latent + guided_delta
-        # controlnet_disable_attrs: some attributes (e.g. eyeglasses) need the
-        # ControlNet feature-map injection to synthesize structure the W+
-        # direction bank alone can't (AccCeleb add 93%->12% when disabled
-        # globally); others (gender/age) got no measurable accuracy benefit
-        # from it (~70.7% either way) while it introduced a hairline/collar
-        # sparkle artifact -- render_preview visual audit confirmed the
-        # artifact tracks with control_encoder being active, not with
-        # --scale. Rather than an all-or-nothing --disable_controlnet, this
-        # keeps it ONLY for the attributes it actually earns its keep on.
-        if control_encoder is not None and (
-                controlnet_disable_attrs is None
-                or attr_global_idx not in controlnet_disable_attrs):
-            region_mask = None
-            if getattr(control_encoder, 'region_cond', False):
-                # Same convention as training: all-ones (uninformative) for
-                # any attribute without a defined region, a real BiSeNet
-                # mask for age(39) when face_parser is available.
-                region_mask = torch.ones(B, 1, *img.shape[-2:], device=device, dtype=img.dtype)
-                if need_region:
-                    with torch.no_grad():
-                        region_mask = region_parser.get_region_mask(
-                            src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
-            control_skips = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
-                                            latent=latent, region_mask=region_mask)
-            control_skips = clip_skips(control_skips, controlnet_max_norm)
     elif direction_bank is None:
         new_latents = latent + cap_delta_norm(new_latents_raw - latent, _FINAL_DELTA_MAX_NORM)
     else:
         new_latents = new_latents_raw      # --bypass_glasses_direction_bank (eval-only)
 
-    edited_face = G([new_latents], skips=control_skips, embed_res=controlnet_embed_res,
-                    input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+    edited_face = G([new_latents], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
 
     if composite and face_parser is not None:
         edited_face = composite_faces(face_parser, src_recon, edited_face,
@@ -1402,7 +1225,7 @@ def _eval_direction(args, src_probs_clip, local_idx, src_probs_indep=None,
     teacher: the TRAINING teacher's (--attribute_weights, r34) reading of the
     source -- the direction --train_edit_direction teacher trains with. It
     uses no evaluation judge, so it is a fair way to give the model a
-    direction (and with --src_cond_clamp, a consistent source) at eval.
+    direction at eval.
 
     A direction taken from a judge that mislabels the SOURCE sends the edit
     the wrong way (CLIP calls 40% of bang-less faces "has bangs", so they are
@@ -1441,9 +1264,7 @@ def remove_span(v, others, eps=1e-8):
 def edit_multi_attribute(prior, conditioner, G, id_criterion,
                          img, latent, attr_cond, id_cond,
                          attr_local_idxs, edit_scales, direction_bank,
-                         attr_global_idxs=None, control_encoder=None, controlnet_max_norm=0.0,
-                         controlnet_embed_res=64, controlnet_disable_attrs=None,
-                         face_parser=None, directions=None, compose='sum', return_parts=False):
+                         attr_global_idxs=None, directions=None, compose='sum', return_parts=False):
     """Edit several attributes on the same face at once.
 
     Composes N independently-computed single-attribute guided deltas by
@@ -1464,17 +1285,8 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     attr_local_idxs: list of local indices (into args.attribute_index) to edit.
     edit_scales: float, or list of floats matching attr_local_idxs.
     attr_global_idxs: optional list of absolute CelebA indices, same order
-        as attr_local_idxs. Needed for controlnet_disable_attrs (below) to know
-        which of these edits are gender/age vs eyeglasses; direction_bank
-        itself is always used per attribute regardless.
-    controlnet_disable_attrs: absolute attribute indices to skip ControlNet
-        injection for, same semantics as edit_single_attribute.
-    face_parser: needed only for a --controlnet_region_cond control_encoder
-        to get a real region mask for age(39) edits within this composite
-        (see edit_single_attribute); every other attribute in the loop gets
-        the same all-ones fallback regardless. None (the default) is safe --
-        region_cond=True samples then fall back to all-ones for every
-        attribute, same as region_cond=False's behavior.
+        as attr_local_idxs (edit targets / --preserve_boundaries);
+        direction_bank itself is always used per attribute regardless.
     directions: optional list (same order as attr_local_idxs) of (B,) tensors,
         +1 = add, -1 = remove, or None entries -- as edit_single_attribute's
         `direction` (--edit_direction). None = the conditioner's own reading.
@@ -1484,10 +1296,10 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
                the span of the OTHER attributes' deltas, then adds. Shared
                components (two edits pushing the same latent direction, e.g.
                male and old both thickening the jaw) are then not applied
-               twice. Training-free; ControlNet skips are still added as-is.
-    return_parts: also return the edited W+ latent and the combined ControlNet
-        skips, as (edited_face, new_latents, combined_skips) -- for callers
-        that keep editing from the result (sequential composition).
+               twice. Training-free.
+    return_parts: also return the edited W+ latent, as (edited_face,
+        new_latents) -- for callers that keep editing from the result
+        (sequential composition).
     """
     if isinstance(edit_scales, (int, float)):
         edit_scales = [edit_scales] * len(attr_local_idxs)
@@ -1501,62 +1313,32 @@ def edit_multi_attribute(prior, conditioner, G, id_criterion,
     device = img.device
     zero_pad = torch.zeros(B, 18, 1, device=device)
 
-    region_cond = getattr(control_encoder, 'region_cond', False) if control_encoder is not None else False
-    if face_parser is None and control_encoder is not None:
-        face_parser = getattr(control_encoder, 'region_parser', None)   # see _attach_region_parser
-    src_recon = None
-    if region_cond and face_parser is not None:
-        with torch.no_grad():
-            src_recon = G([latent], input_is_latent=True,
-                          randomize_noise=False)[0].clamp(-1, 1)
-
-    for local_idx, dr in zip(attr_local_idxs, directions):
-        attr_cond = consistent_source(attr_cond, local_idx, dr)
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
     deltas = []
-    combined_skips = None
     for i, (local_idx, scale) in enumerate(zip(attr_local_idxs, edit_scales)):
         new_attr_cond = attr_cond.clone()
         src = attr_cond[:, local_idx]
         new_attr_cond[:, local_idx] = edited_attr_value(
             src, scale, attr_global_idxs[i] if attr_global_idxs is not None else None,
             direction=directions[i])
-        is_rm = (src > 0.5) if directions[i] is None else (directions[i].to(src.device) < 0)
         new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
 
         new_latents_raw, _ = prior(mid_latent, new_cond, zero_pad, reverse=True)
         flow_delta = new_latents_raw - latent
         attr_delta = new_attr_cond - attr_cond
-        batch_attr_idx = torch.full((B,), local_idx, device=device, dtype=torch.long)
         guided_delta = bank_guided_delta(direction_bank, flow_delta, attr_delta, local_idx, latent,
                                          attr_cond, id_cond, attr_global_idxs)
         deltas.append(guided_delta)
-        this_global_idx = attr_global_idxs[i] if attr_global_idxs is not None else None
-        use_controlnet_here = (control_encoder is not None and not (
-            controlnet_disable_attrs is not None and this_global_idx in controlnet_disable_attrs))
-        if use_controlnet_here:
-            region_mask = None
-            if region_cond:
-                region_mask = torch.ones(B, 1, *img.shape[-2:], device=device, dtype=img.dtype)
-                if face_parser is not None and this_global_idx == 39:
-                    with torch.no_grad():
-                        region_mask = face_parser.get_region_mask(
-                            src_recon, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
-            skip = control_encoder(attr_delta, batch_attr_idx, is_rm=is_rm,
-                                   latent=latent, region_mask=region_mask)
-            skip = clip_skips(skip, controlnet_max_norm)
-            combined_skips = add_skips(combined_skips, skip)
 
     if compose == 'orth' and len(deltas) > 1:
         deltas = [remove_span(d, [o for j, o in enumerate(deltas) if j != i])
                   for i, d in enumerate(deltas)]
     new_latents = latent + torch.stack(deltas, 0).sum(0)
-    edited_face = G([new_latents], skips=combined_skips, embed_res=controlnet_embed_res,
-                    input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+    edited_face = G([new_latents], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
     if return_parts:
-        return edited_face, new_latents, combined_skips
+        return edited_face, new_latents
     return edited_face
 
 
@@ -1747,66 +1529,6 @@ def _fmt(summary, pct=False):
 # Main evaluation
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def apply_residual_basis(args, direction_bank):
-    """--residual_basis: replace each attribute's learned residual by its
-    projection onto the top --residual_basis_k components that
-    scripts/analyze_residual.py found for that attribute (0 = no residual)."""
-    fixed = getattr(args, 'residual_fixed', None)
-    path = getattr(args, 'residual_basis', None)
-    head_path = getattr(args, 'residual_head', None)
-    if sum(bool(x) for x in (fixed, path, head_path)) > 1:
-        raise SystemExit('--residual_basis, --residual_fixed and --residual_head are alternatives; give one')
-    if head_path and direction_bank is not None:
-        from models.residual_head import ResidualHead
-        saved = torch.load(head_path, map_location='cpu')
-        dev = direction_bank.residual_scale_raw.device
-        for g, entry in saved['attrs'].items():
-            g = int(g)
-            if g not in args.attribute_index:
-                continue
-            head = ResidualHead(entry['in_dim'], entry['basis'], hidden=entry.get('hidden', 256))
-            head.load_state_dict(entry['state_dict'])
-            direction_bank.residual_head[args.attribute_index.index(g)] = head.to(dev).eval()
-            print(f'[ResidualHead] {ATTR_NAMES.get(g, g)}: residual predicted on {entry["basis"].shape[0]} '
-                  f'directions by a small network (val R2 {entry.get("val_r2", float("nan")):.3f}); '
-                  f'the flow\'s residual is not used')
-        return
-    if fixed and direction_bank is not None:
-        from models.direction_bank import parse_attr_spec
-        mult = parse_attr_spec(getattr(args, 'residual_fixed_mult', None))
-        saved = torch.load(fixed, map_location='cpu')
-        for g, entry in saved['attrs'].items():
-            g = int(g)
-            if g not in args.attribute_index:
-                continue
-            if 'mean_aligned' not in entry:
-                raise SystemExit(f'{fixed} has no mean_aligned: rerun scripts/analyze_residual.py '
-                                 f'(the fixed-residual vector was added later)')
-            m = float(mult.get(g, 1.0))
-            direction_bank.residual_fixed[args.attribute_index.index(g)] = (
-                entry['mean_aligned'] * m, max(entry['mean_abs_attr_delta'], 1e-6))
-            print(f'[ResidualFixed] {ATTR_NAMES.get(g, g)}: residual -> one fixed direction '
-                  f'(|v| {float(entry["mean_aligned"].norm()) * m:.2f}'
-                  + (f', x{m:g}' if m != 1.0 else '') +
-                  f') x attr_delta / {entry["mean_abs_attr_delta"]:.3f}; the flow\'s residual is not used')
-        return
-    if not path or direction_bank is None:
-        return
-    saved = torch.load(path, map_location='cpu')
-    k = int(args.residual_basis_k)
-    for g, entry in saved['attrs'].items():
-        g = int(g)
-        if g not in args.attribute_index:
-            continue
-        basis = entry['basis'][:k]
-        direction_bank.residual_basis[args.attribute_index.index(g)] = basis
-        print(f'[ResidualBasis] {ATTR_NAMES.get(g, g)}: residual -> projection onto top {basis.shape[0]} '
-              f'components (energy {entry["energy"][min(k, len(entry["energy"])) - 1] * 100:.1f}% of the '
-              f'sampled residuals)' if k > 0 else
-              f'[ResidualBasis] {ATTR_NAMES.get(g, g)}: residual removed (k=0)')
-
-
 # no_grad: prior, conditioner and direction bank are not frozen, so without it
 # every edit kept an autograd graph (through the 1024px synthesis too) and a
 # 24GB card ran out of memory even at --batch 1. The ODE function enables
@@ -1814,37 +1536,11 @@ def apply_residual_basis(args, direction_bank):
 @torch.no_grad()
 def evaluate(args):
     prior, conditioner, G, id_criterion, attr_teacher, \
-        attribute_index, direction_bank, control_encoder = load_models(args)
-    apply_residual_basis(args, direction_bank)
-    gate_freeze = getattr(args, 'gate_freeze', None)
-    gate_profile = None
-    if gate_freeze:
-        from models.flows.gate_freeze import freeze_layer_gates
-        if gate_freeze != 'open':
-            gate_profile = args.gate_profile_json or os.path.join(
-                args.checkpoint_dir, f'gate_diag_s{args.step}', 'gate_diag.json')
-        n = freeze_layer_gates(prior, gate_freeze, gate_profile)
-        print(f'[Ablation] --gate_freeze {gate_freeze}: {n} LayerGate(s) replaced'
-              + (f' by the table in {gate_profile}' if gate_profile else ' by 1.0'))
+        attribute_index, direction_bank = load_models(args)
 
     clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
     _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
-    stop_teacher = None
-    if getattr(args, 'adaptive_stop_weights', None):
-        if not getattr(args, 'adaptive_ladder', None):
-            raise SystemExit('--adaptive_stop_weights only acts on --adaptive_ladder')
-        for judge_path in (args.independent_attr_weights, getattr(args, 'celeba_attr_judge_weights', None)):
-            if judge_path and os.path.abspath(judge_path) == os.path.abspath(args.adaptive_stop_weights):
-                raise SystemExit(f'--adaptive_stop_weights {args.adaptive_stop_weights} is also a judge '
-                                 f'that scores this eval: the stop rule would be graded by itself')
-        stop_teacher = AttributeClassifier(backbone=args.adaptive_stop_backbone)
-        stop_teacher.load_state_dict(load_network(args.adaptive_stop_weights))
-        stop_teacher.cuda().eval()
-        for p in stop_teacher.parameters():
-            p.requires_grad_(False)
-        print(f'[Adaptive] stop rule: the training teacher AND {args.adaptive_stop_weights} '
-              f'({args.adaptive_stop_backbone}) must both see the edit done')
     consensus_on = bool(getattr(args, 'consensus', False))
     cons_second = getattr(args, 'consensus_second', 'clip')
     _CONS_SECOND.update({'key': 'clip', 'label': 'CLIP', 'desc': 'CLIP/parser'} if cons_second == 'clip'
@@ -1856,18 +1552,6 @@ def evaluate(args):
                          f'./data/celeba_attr_resnet18.pth) and its partner '
                          + ('the CLIP judge' if cons_second == 'clip' else '--independent_attr_weights')
                          + f'; loaded: partner={_second_judge is not None}, CelebA={celeb_judge is not None}.')
-    if getattr(args, 'adaptive_stop_clip', False):
-        if not getattr(args, 'adaptive_ladder', None):
-            raise SystemExit('--adaptive_stop_clip only acts on --adaptive_ladder')
-        if clip_judge is None:
-            raise SystemExit('--adaptive_stop_clip needs the CLIP judge loaded')
-        if consensus_on and cons_second == 'clip':
-            raise SystemExit('--adaptive_stop_clip with --consensus: CLIP would grade the edits it '
-                             'chose; pass --consensus_second indep')
-        print('[Adaptive] stop rule: the training teacher AND the CLIP judge (parser for '
-              'Eyeglasses) must both see the edit done -- every AccCLIP below is therefore '
-              'NOT an independent score')
-
     bg_parser = None
     if getattr(args, 'bg_metric', False):
         from common.face_parser import FaceParser
@@ -1875,23 +1559,17 @@ def evaluate(args):
         print('[Metric] bg_mse: pixel change outside face+hair (background, clothing, hat)')
 
     composite_face_parser = None
-    if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
+    if args.composite_face_region:
         from common.face_parser import FaceParser
         try:
             composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-            if args.composite_face_region:
-                print('[Composite] Compositing edited face back onto source-reconstruction '
-                      'background/hair (composite_faces) for ALL '
-                      'attributes -- reduces background/hair leakage from global W+ edits, '
-                      'training-free.')
-            if getattr(args, 'controlnet_region_cond', False):
-                print('[ControlNet] region_cond checkpoint: feeding a real BiSeNet skin mask '
-                      'for age(39) edits (all-ones fallback for every other attribute).')
+            print('[Composite] Compositing edited face back onto source-reconstruction '
+                  'background/hair (composite_faces) for ALL '
+                  'attributes -- reduces background/hair leakage from global W+ edits, '
+                  'training-free.')
         except (FileNotFoundError, RuntimeError) as exc:
             composite_face_parser = None
-            print(f'[WARN] face parser unavailable ({exc}); compositing disabled, and any '
-                  f'--controlnet_region_cond checkpoint will fall back to an all-ones region '
-                  f'mask for age(39) too -- numbers from it will not match what training saw.')
+            print(f'[WARN] face parser unavailable ({exc}); compositing disabled.')
 
     if args.bypass_glasses_direction_bank:
         print('[WARN] --bypass_glasses_direction_bank is ON: Eyeglasses is evaluated '
@@ -1934,23 +1612,12 @@ def evaluate(args):
             'lpips': lpips_fn is not None,
             'independent_attr_weights': args.independent_attr_weights,
             'edit_direction': getattr(args, 'edit_direction', 'cond'),
-            'src_cond_clamp': getattr(args, 'src_cond_clamp', None),
             'preserve_boundaries': getattr(args, 'preserve_boundaries', None),
             'preserve_strength': (getattr(args, 'preserve_strength', None)
                                   if getattr(args, 'preserve_boundaries', None) else None),
             'preserve_min_auc': (getattr(args, 'preserve_min_auc', None)
                                  if getattr(args, 'preserve_boundaries', None) else None),
-            'residual_basis': getattr(args, 'residual_basis', None),
-            'residual_fixed': getattr(args, 'residual_fixed', None),
-            'residual_fixed_mult': (getattr(args, 'residual_fixed_mult', None)
-                                    if getattr(args, 'residual_fixed', None) else None),
-            'residual_head': getattr(args, 'residual_head', None),
-            'residual_basis_k': (getattr(args, 'residual_basis_k', None)
-                                 if getattr(args, 'residual_basis', None) else None),
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
-            'adaptive_stop_weights': getattr(args, 'adaptive_stop_weights', None),
-            'adaptive_stop_margin': getattr(args, 'adaptive_stop_margin', None),
-            'adaptive_stop_clip': getattr(args, 'adaptive_stop_clip', False),
             'consensus_second': getattr(args, 'consensus_second', 'clip'),
             'adaptive_gains': (getattr(args, 'adaptive_gains', None)
                                if getattr(args, 'adaptive_ladder', None) else None),
@@ -1966,7 +1633,6 @@ def evaluate(args):
             'train_caps': train_caps(args),
             'no_train_caps': bool(getattr(args, 'no_train_caps', False)),
             'edit_target': getattr(args, 'edit_target', 'mirror'),
-            'controlnet_disable_attrs': getattr(args, 'controlnet_disable_attrs', None),
             'age_fine_layer_scale': getattr(args, 'age_fine_layer_scale', None),
             'age_fine_layer_start': (getattr(args, 'age_fine_layer_start', None)
                                      if getattr(args, 'age_fine_layer_scale', None) is not None else None),
@@ -1975,14 +1641,10 @@ def evaluate(args):
             'composite_method': (getattr(args, 'composite_method', None)
                                  if getattr(args, 'composite_face_region', False) else None),
             'force_bank_directions': getattr(args, 'force_bank_directions', False),
-            'override_residual_scale': getattr(args, 'override_residual_scale', None),
             'bank_mode': getattr(args, 'bank_mode', 'replace'),
             'bank_mix': getattr(args, 'bank_mix', None),
             'consensus': consensus_on,
             'bg_metric': bool(getattr(args, 'bg_metric', False)),
-            'disable_controlnet': bool(getattr(args, 'disable_controlnet', False)),
-            'gate_freeze': gate_freeze,
-            'gate_profile_json': gate_profile,
         },
     }
 
@@ -1997,8 +1659,6 @@ def evaluate(args):
     closed_loop = int(getattr(args, 'closed_loop_steps', 0) or 0)
     if closed_loop and getattr(args, 'adaptive_ladder', None):
         raise SystemExit('--closed_loop_steps replaces --adaptive_ladder; pass one of them')
-    if closed_loop and control_encoder is not None:
-        print('[ClosedLoop] note: edits are rendered without the ControlNet injection')
     adaptive = bool(getattr(args, 'adaptive_ladder', None))
     rungs = []          # (edit_scale, edit gain) tried in order; chosen value = scale * gain
     if closed_loop:
@@ -2087,14 +1747,6 @@ def evaluate(args):
                         face_parser=composite_face_parser,
                         composite_method=args.composite_method,
                         composite_blur_sigma=args.composite_blur_sigma,
-                        control_encoder=control_encoder,
-                        controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-                        controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
-                        controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
-                        # composite_face_parser may now exist ONLY because
-                        # --controlnet_region_cond needs it for age's region mask
-                        # -- decoupled from whether compositing was actually
-                        # requested, so it doesn't silently turn on here too.
                         composite=args.composite_face_region,
                         direction=_direction,
                     )
@@ -2129,11 +1781,6 @@ def evaluate(args):
                     # Rungs past the ladder (--adaptive_gains) keep the largest
                     # scale and lengthen its edit instead (see set_edit_gain).
                     _chosen = torch.full((B,), float(rung_vals[-1]), device=img.device)
-                    # --adaptive_stop_weights: the rung where r34 ALONE would
-                    # have stopped, to report how much later the second
-                    # classifier lets a face stop
-                    _t_first = torch.full((B,), float(rung_vals[-1]), device=img.device)
-                    _t_seen = torch.zeros(B, dtype=torch.bool, device=img.device)
                     try:
                         for _k, (_sc, _gain) in enumerate(rungs):
                             set_edit_gain(_gain)
@@ -2141,21 +1788,6 @@ def evaluate(args):
                             _ef_256 = F.interpolate(_ef, (256, 256))
                             _pt = torch.sigmoid(attr_teacher(_ef_256)[0])[:, _gidx]
                             _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
-                            _new_t = _ok & ~_t_seen
-                            _t_first[_new_t] = float(rung_vals[_k])
-                            _t_seen |= _ok
-                            _p2 = None
-                            if stop_teacher is not None:
-                                _p2 = torch.sigmoid(stop_teacher(_ef_256)[0])[:, _gidx]
-                            elif getattr(args, 'adaptive_stop_clip', False):
-                                if local_idx == _glasses_local and glasses_parser is not None:
-                                    _p2 = glasses_parser.glasses_prob(_ef_256)
-                                else:
-                                    _p2 = clip_judge.scores(_ef_256)[:, local_idx]
-                            if _p2 is not None:
-                                _m2 = edit_scale if args.adaptive_stop_margin is None \
-                                    else args.adaptive_stop_margin
-                                _ok = _ok & torch.where(_add, _p2 > 0.5 + _m2, _p2 < 0.5 - _m2)
                             _take = (~_done) & (_ok | (_k == len(rungs) - 1))
                             if edited_face is None:
                                 edited_face = _ef.clone()
@@ -2167,11 +1799,6 @@ def evaluate(args):
                     finally:
                         set_edit_gain(base_gain)
                     metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
-                    if stop_teacher is not None or getattr(args, 'adaptive_stop_clip', False):
-                        metrics[f'stop_delay_{attr_name}'].extend((_chosen - _t_first).cpu().tolist())
-                        # held back = r34 accepted some rung, the final choice is later
-                        metrics[f'stop_held_{attr_name}'].extend(
-                            (_chosen - _t_first)[_t_seen].gt(1e-4).float().cpu().tolist())
                 else:
                     edited_face = _edit(edit_scale)
                 edited_256 = F.interpolate(edited_face, (256, 256))
@@ -2476,14 +2103,6 @@ def evaluate(args):
                 at_max = np.isclose(arr, rung_vals[-1], atol=1e-4).mean() * 100
                 print(f'    {attr_name:<12} mean {arr.mean():.2f}  at max {at_max:4.1f}%   {hist}')
                 scale_summary.setdefault(attr_name, {})['chosen_scale'] = _summ(cs)
-                sd = metrics.get(f'stop_delay_{attr_name}')
-                if sd:
-                    sd = np.asarray(sd)
-                    held = metrics.get(f'stop_held_{attr_name}') or [0.0]
-                    print(f'    {"":<12} second classifier held back {np.mean(held) * 100:4.1f}% '
-                          f'of the {len(held)} faces the teacher alone would have stopped '
-                          f'(mean +{sd.mean():.2f} scale over all faces)')
-                    scale_summary[attr_name]['stop_delay'] = _summ(sd.tolist())
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
@@ -2546,7 +2165,6 @@ def evaluate(args):
         + (f'_off{args.sample_offset}' if args.sample_offset else '')
         + (f'_bank{args.bank_mode}' if getattr(args, 'bank_mode', 'replace') != 'replace' else '')
         + (f'_mix{args.bank_mix:g}' if getattr(args, 'bank_mix', None) is not None else '')
-        + (f'_gate{args.gate_freeze}' if getattr(args, 'gate_freeze', None) else '')
         + ('_cons' if getattr(args, 'consensus', False) else '')
         + '.json',
     )
@@ -2647,35 +2265,6 @@ def build_parser():
     parser.add_argument('--magnitude_latent_cond', action='store_true',
                         help='Must match training --magnitude_latent_cond. Auto-restored from '
                              'config.json.')
-    parser.add_argument('--use_controlnet_injection', action='store_true',
-                        help='Load the ControlNet-style AttributeControlEncoder and inject its '
-                             'predicted skips into StyleGAN2 at embed_res (see '
-                             'models/control_encoder.py, train_sdflow.py --use_controlnet_injection). '
-                             'Auto-restored from config.json if the checkpoint was trained with it.')
-    parser.add_argument('--controlnet_embed_res', type=int, default=64,
-                        help='Must match training --controlnet_embed_res if enabled.')
-    parser.add_argument('--controlnet_res', nargs='*', type=int, default=None,
-                        help='Must match training --controlnet_res if enabled (multi-resolution '
-                             'feature injection). Auto-restored from config.json.')
-    parser.add_argument('--controlnet_channels', type=int, default=512,
-                        help='Must match training --controlnet_channels if enabled.')
-    parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
-                        help='Must match training --controlnet_hidden_dim if enabled.')
-    parser.add_argument('--controlnet_per_direction', action='store_true',
-                        help='Must match training --controlnet_per_direction if enabled. '
-                             'Auto-restored from config.json.')
-    parser.add_argument('--controlnet_latent_cond', action='store_true',
-                        help='Must match training --controlnet_latent_cond. Changes the control '
-                             'encoder\'s parameter shapes, so a mismatch is a hard checkpoint '
-                             'load error rather than silently wrong numbers. Auto-restored from '
-                             'config.json.')
-    parser.add_argument('--controlnet_region_cond', action='store_true',
-                        help='Must match training --controlnet_region_cond. Changes every stage\'s '
-                             'input channel count (same class of hard load error as '
-                             '--controlnet_latent_cond above), and edit_single_attribute/'
-                             'edit_multi_attribute need --face_parser_weights to resolve for age(39) '
-                             'edits to get a real region mask instead of the all-ones fallback. '
-                             'Auto-restored from config.json.')
     parser.add_argument('--edit_direction', default='cond', choices=['cond', 'clip', 'indep', 'teacher'],
                         help="Who decides add vs remove. cond (default, all previous evals): the "
                              "conditioner's reading of the source. clip: the CLIP judge's add/rm "
@@ -2690,8 +2279,7 @@ def build_parser():
                              "it to clip whenever CLIP misreads the source (scripts/judge_report.py: "
                              "CLIP TNR 60%% on Bangs, 44%% on Young), because a wrong direction "
                              "means no edit and a guaranteed failure. teacher: the training r34's "
-                             "reading of the source; uses no evaluation judge, so it is the fair "
-                             "pairing for --src_cond_clamp.")
+                             "reading of the source; uses no evaluation judge.")
     parser.add_argument('--gate_uniform_attrs', nargs='+', type=int, default=None,
                         help="Force these attributes' direction-bank gate uniform at eval (average "
                              "of the slots instead of the trained gate's pick). Diagnostic on a "
@@ -2703,36 +2291,6 @@ def build_parser():
                              "Eyeglasses), which stops ambiguous sources being under-edited "
                              "relative to what training taught. See edited_attr_value(). Compare "
                              "checkpoints under the SAME mode.")
-    parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
-                        help='Must match training --controlnet_init_gain. Only sets the log_gain '
-                             'init; the trained value comes from the checkpoint. Auto-restored '
-                             'from config.json.')
-    parser.add_argument('--disable_controlnet', action='store_true',
-                        help='ABLATION: skip loading control_encoder even for a run trained with '
-                             '--use_controlnet_injection, so the edit goes through the W+ path '
-                             'alone. Run against the same checkpoint as a normal eval to isolate '
-                             'what the feature-map injection contributes. Deliberately NOT in '
-                             'RUN_CONFIG_KEYS -- an eval-time override, never restored from config.')
-    parser.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
-                        help='Keep control_encoder loaded and active, but skip its injection for '
-                             'these ABSOLUTE attribute indices only (e.g. 20 39 for gender/age), '
-                             'letting others (e.g. eyeglasses) keep it. Found via '
-                             '--disable_controlnet + visual audit: eyeglasses ADD accuracy '
-                             'collapses without ControlNet (93%%->12%%, it synthesizes frame '
-                             'structure the W+ direction bank cannot), but gender/age saw no '
-                             'measurable accuracy benefit from it (~70.7%% either way) while it '
-                             'introduced a hairline/collar sparkle artifact that --scale sweeps '
-                             "(1.0/0.8/0.6) did not change. DEFAULT (when this flag is omitted "
-                             'entirely): auto-resolved by resolve_controlnet_disable_attrs() to '
-                             '[20, 39] (whichever are in --attribute_index) so gender/age skip '
-                             'ControlNet by default and eyeglasses keeps it. Pass this flag '
-                             'explicitly (with any list, including none of your attributes) to '
-                             'take control back. Deliberately NOT in RUN_CONFIG_KEYS -- an '
-                             'eval-time override.')
-    parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
-                        help='Must match training --controlnet_max_norm if it was set (0 = no cap '
-                             'was applied at training time either). Auto-restored from config.json.')
-
     # Independent judges
     parser.add_argument('--clip_judge_model', default='ViT-L/14',
                         help='CLIP model for the zero-shot attribute judge. Keep it different '
@@ -2850,10 +2408,6 @@ def build_parser():
                         help='anneal schedule, restored from config.json.')
     parser.add_argument('--bank_anneal_steps', type=int, default=20000,
                         help='anneal schedule, restored from config.json.')
-    parser.add_argument('--override_residual_scale', type=float, default=None,
-                        help='Force the direction-bank residual_scale to this value for all '
-                             'attributes at eval time (e.g. 0.15 or 0.3), overriding the trained '
-                             'value (which tends to be frozen near its 0.05 init). Diagnostic only.')
     parser.add_argument('--age_fine_layer_scale', type=float, default=None,
                         help='Scale the age (attr 39) direction layers [age_fine_layer_start:18] '
                              'by this factor at eval time (e.g. 0.0 to zero them out). Default: '
@@ -2890,15 +2444,6 @@ def build_parser():
                         help='Skip the first N test faces. The first 500 (offset 0) are the '
                              'development set every comparison so far used; --sample_offset 500 '
                              'gives the next 500, held out for the final report only.')
-    parser.add_argument('--gate_freeze', choices=['mean', 'schedule', 'open'], default=None,
-                        help='Ablation of the LAG-DOF LayerGate (velocity_field lag/lag_dof): '
-                             'replace the learned gate by a fixed table. mean = per-layer '
-                             'constant; schedule = per (ODE-time bin, layer), shared by every '
-                             'face and attribute; open = 1 everywhere. mean/schedule read '
-                             'gate_diag.json from scripts/diagnose_gate.py.')
-    parser.add_argument('--gate_profile_json', default=None,
-                        help='gate_diag.json for --gate_freeze mean/schedule. Default: '
-                             '<checkpoint_dir>/gate_diag_s<step>/gate_diag.json')
     parser.add_argument('--consensus_second', default='clip', choices=['clip', 'indep'],
                         help='The judge --consensus pairs with the CelebA classifier: clip (CLIP / '
                              'glasses parser, default, all previous evals) or indep '
@@ -2941,26 +2486,6 @@ def build_parser():
                              'their own --out_json. Costs up to len(ladder) generations per edit '
                              '(stops early once every face in the batch is done). '
                              'e.g. 0.5 0.7 0.85 1.0 1.25 1.5')
-    parser.add_argument('--adaptive_stop_weights', default=None,
-                        help='With --adaptive_ladder: a second attribute classifier the stop rule also '
-                             'asks. A face stops at the first rung where the training teacher (r34) AND '
-                             'this classifier both see the edit past 0.5 by the margin. r34 is the model '
-                             'the editor was trained against, so it calls edits done that the judges '
-                             'reject (it reads 93-94%% success on every attribute while the judges read '
-                             '50-80%%); a classifier the training never saw is not fooled the same way. '
-                             'It must not be a judge of this eval (refused if it equals '
-                             '--independent_attr_weights or --celeba_attr_judge_weights).')
-    parser.add_argument('--adaptive_stop_clip', action='store_true',
-                        help='With --adaptive_ladder: the second opinion of the stop rule is the CLIP '
-                             'judge model (--clip_judge_model, ViT-L/14; the glasses parser for '
-                             'Eyeglasses) instead of a classifier checkpoint. Training uses ViT-B/32, so '
-                             'the editor never saw L/14. CLIP then stops being a judge: AccCLIP is no '
-                             'longer independent, and --consensus needs --consensus_second indep.')
-    parser.add_argument('--adaptive_stop_backbone', default='r50',
-                        help='Backbone of --adaptive_stop_weights.')
-    parser.add_argument('--adaptive_stop_margin', type=float, default=None,
-                        help='Margin for --adaptive_stop_weights. Default: the same as the teacher '
-                             '(each --adaptive_margins value).')
     parser.add_argument('--adaptive_gains', nargs='*', type=float, default=None,
                         help='With --adaptive_ladder: extra rungs after the ladder that keep its largest '
                              'scale and lengthen the edit by these factors along its own direction '
@@ -2984,28 +2509,6 @@ def build_parser():
                         help='With --adaptive_ladder: stop when the teacher probability is past '
                              '0.5 by this margin in the edit direction. Larger = stronger edits, '
                              'lower ID; each margin is one point of the curve.')
-    parser.add_argument('--residual_basis', default=None,
-                        help='A scripts/analyze_residual.py output (.pth). Each attribute\'s learned '
-                             'residual is replaced by its projection onto the top --residual_basis_k '
-                             'principal components found for that attribute. Diagnostic: is the '
-                             'residual a few missing global directions (small k keeps the accuracy) '
-                             'or a per-face correction (needs large k)?')
-    parser.add_argument('--residual_basis_k', type=int, default=4,
-                        help='Components kept with --residual_basis (0 = no residual at all).')
-    parser.add_argument('--residual_fixed', default=None,
-                        help='A scripts/analyze_residual.py output (.pth). Each attribute\'s residual is '
-                             'replaced by ONE fixed W+ vector (its mean residual, signed by the edit '
-                             'direction) scaled by the requested attribute change. Nothing in the edit '
-                             'then depends on the flow: tests whether the flow is only needed to FIND '
-                             'that direction during training.')
-    parser.add_argument('--residual_fixed_mult', default=None,
-                        help="With --residual_fixed: scale one attribute's fixed residual, e.g. '39:3' "
-                             "(Young's residual is capped at 0.05 in training, so it barely contributes; "
-                             "this tests whether more of it helps). Check images for fake texture.")
-    parser.add_argument('--residual_head', default=None,
-                        help='A scripts/distill_residual_head.py output (.pth): each attribute\'s residual is '
-                             'predicted on its top principal directions by a small network instead of '
-                             'taken from the flow (no ODE solve for the residual).')
     parser.add_argument('--bg_metric', action='store_true',
                         help='Also report how much each edit changes what is NOT the head: mean '
                              'squared pixel change (images in [-1, 1], 256x256) outside the BiSeNet '
@@ -3013,12 +2516,6 @@ def build_parser():
                              '4px), per attribute, as "bg_mse". The quantity train_sdflow.py '
                              '--local_region_head penalizes; LPIPS/FID only see it mixed with the '
                              'face change. One extra BiSeNet pass per edited batch.')
-    parser.add_argument('--src_cond_clamp', type=float, default=None,
-                        help='With a given edit direction (--edit_direction teacher/indep/clip): move the edited '
-                             'attribute\'s source condition to the far side of 0.5 by this margin before the '
-                             'flow runs (add: min(src, 0.5-M), rm: max(src, 0.5+M)). Without it, a source the '
-                             'conditioner already reads on the target side asks for ~no change (Young add: '
-                             '37/51 failures had zero edit). Default off. See consistent_source().')
     parser.add_argument('--preserve_boundaries', default=None,
                         help='A scripts/fit_attr_boundaries.py output: remove from each edit\'s W+ delta its '
                              'component along the linear boundaries of the CelebA attributes it should not '
@@ -3036,7 +2533,6 @@ if __name__ == '__main__':
     parser = build_parser()
     args = parser.parse_args()
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
 
     # Auto-detect latest step if not specified
     if args.step is None:

@@ -34,7 +34,7 @@ def main():
     p.add_argument('--checkpoint_dir', required=True)
     p.add_argument('--step', type=int, default=50000)
     p.add_argument('--base_json', default=None,
-                   help='Default: <checkpoint_dir>/eval_s<step>_clamp02.json')
+                   help='Default: <checkpoint_dir>/eval_s<step>_indep.json')
     p.add_argument('--only', nargs='+', choices=ORDER, default=ORDER)
     p.add_argument('--num_samples', type=int, default=500)
     p.add_argument('--batch', type=int, default=4)
@@ -45,12 +45,12 @@ def main():
 
     os.chdir(ROOT)
     ck = os.path.abspath(a.checkpoint_dir)
-    base = a.base_json or os.path.join(ck, f'eval_s{a.step}_clamp02.json')
+    base = a.base_json or os.path.join(ck, f'eval_s{a.step}_indep.json')
     py = sys.executable
     judge = ['--independent_attr_weights', a.judge, '--independent_attr_backbone', 'r50',
              '--celeba_attr_judge_weights', '', '--age_fine_layer_scale', '1.0']
     common = ['--edit_direction', 'indep'] + judge + [
-        '--src_cond_clamp', '0.2', '--leak40', '--num_samples', str(a.num_samples),
+        '--leak40', '--num_samples', str(a.num_samples),
         '--batch', str(a.batch)]
     scales = ['--eval_scales', '0.7', '0.85', '1.0']
 

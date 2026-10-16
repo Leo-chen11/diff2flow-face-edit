@@ -85,7 +85,7 @@ def main():
     from tqdm import tqdm
     from evaluation.evaluate_sdflow import (
         ATTR_NAMES, _latest_step, apply_run_config, build_parser, edited_attr_value,
-        load_models, resolve_controlnet_disable_attrs)
+        load_models)
     from models.dataset import SDFlowDataset
 
     p = build_parser()
@@ -97,7 +97,6 @@ def main():
     if not os.path.isdir(args.checkpoint_dir):
         raise SystemExit(f'checkpoint_dir does not exist on this machine: {args.checkpoint_dir}')
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
     steps = args.steps or [args.step if args.step is not None else _latest_step(args.checkpoint_dir)]
 
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
@@ -116,7 +115,7 @@ def main():
     results = {}
     for step in steps:
         args.step = step
-        prior, conditioner, _G, id_criterion, _t, _ai, bank, _ctrl = load_models(args)
+        prior, conditioner, _G, id_criterion, _t, _ai, bank = load_models(args)
         if bank is None:
             raise SystemExit('this run has no direction bank; nothing to compare against')
         batches = []
@@ -135,7 +134,7 @@ def main():
             r = res[n]
             print(f'   {n:<12}{r["cos"]:7.3f}{r["cos2"]:7.3f}{r["face_flow"]:11.3f}'
                   f'{r["face_bank"]:11.3f}{r["flow_norm"]:8.2f}')
-        del prior, conditioner, _G, id_criterion, _t, bank, _ctrl
+        del prior, conditioner, _G, id_criterion, _t, bank
         torch.cuda.empty_cache()
 
     path = args.out_json or os.path.join(args.checkpoint_dir, 'flow_bank_alignment.json')

@@ -47,10 +47,6 @@ SOFT_TARGET_TABLE = {
 }
 DEFAULT_SOFT_TARGET = (0.20, 0.80)
 
-# BiSeNet skin class: the region a --controlnet_region_cond checkpoint reads
-# for age (39) edits, in training and in eval.
-AGE_TEXTURE_REGION_CLASS = [1]
-
 
 def bank_num_k(bank, default=1):
     """Directions per attribute (K) of a direction-bank file: its 'num_k' (or the

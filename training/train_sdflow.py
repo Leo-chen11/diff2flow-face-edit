@@ -1,7 +1,6 @@
 import argparse
 import copy
 import json
-import math
 import os,shutil,sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -18,8 +17,7 @@ from torch.utils import data
 from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
 
-from common.attr_tables import (AGE_TEXTURE_REGION_CLASS, DEFAULT_SOFT_TARGET, SOFT_TARGET_TABLE,
-                                bank_num_k)
+from common.attr_tables import DEFAULT_SOFT_TARGET, SOFT_TARGET_TABLE, bank_num_k
 from common.loggerx import WANDBLoggerX
 from common.id_loss import IDLoss
 from common.ops import load_network
@@ -33,7 +31,6 @@ from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
-from models.control_encoder import clip_skips, skips_norm_per_sample, skips_reg_per_sample
 from models.direction_bank import AttributeDirectionBank, _inverse_softplus, bank_mix_at, parse_attr_spec
 from models.stylegan2.model import Generator, Discriminator
     
@@ -175,8 +172,6 @@ LOCAL_REGION_CLASSES = {
 # BiSeNet hair class, used by --hair_gray_loss_weight (see that flag's help).
 HAIR_REGION_CLASS = [17]
 
-# AGE_TEXTURE_REGION_CLASS (BiSeNet skin): common/attr_tables.py
-
 
 # Startup mechanism report. 144 CLI flags is far more surface than any single
 # run uses (a typical command sets ~19), and the ones left at their defaults
@@ -209,24 +204,9 @@ def _mechanism_report(args):
         ('  residual_scale', f'{args.direction_residual_scale:g} (learned from here)', None),
         ('velocity_field', args.velocity_field, None),
         ('train_edit_direction', args.train_edit_direction, None),
-        ('train_src_cond_clamp', 'off' if args.train_src_cond_clamp is None
-         else f'{args.train_src_cond_clamp:g}', None),
         ('soft_target_override', args.soft_target_override or 'off', None),
         ('coupled_targets', args.coupled_targets or 'off', None),
     ]
-
-    inject = [
-        ('controlnet', onoff(args.use_controlnet_injection), None),
-    ]
-    if args.use_controlnet_injection:
-        inject += [
-            ('  resolutions', str(args.controlnet_res or [args.controlnet_embed_res]), None),
-            ('  per_direction', onoff(args.controlnet_per_direction), None),
-            ('  latent_cond', onoff(args.controlnet_latent_cond), None),
-            ('  warmup_steps', f'{args.controlnet_warmup_steps}',
-             'injection is exactly 0 until this step' if args.controlnet_warmup_steps else None),
-            ('  region_cond (layout)', onoff(args.controlnet_region_cond), None),
-        ]
 
     realism = [
         ('disc_realism', onoff(args.disc_realism_weight > 0), None),
@@ -252,15 +232,11 @@ def _mechanism_report(args):
         ('age_dds', age_dds_w if dds_on else 0),
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
-        ('hard_example_gamma', args.hard_example_gamma),
-        ('hard_example_crosscheck', 1.0 if args.hard_example_crosscheck else 0),
-        ('shortcut_clip_boost', args.shortcut_clip_boost),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
         ('local_region_true_dilate', 1.0 if args.local_region_true_dilate else 0),
         ('target_src_from_recon', 1.0 if args.target_src_from_recon else 0),
         ('clip_prompt_bangs', args.clip_prompt_bangs_weight if args.clip_prompt_bangs else 0),
-        ('controlnet_reg', args.controlnet_reg_weight),
         ('disc_realism', args.disc_realism_weight),
     ]
 
@@ -273,7 +249,7 @@ def _mechanism_report(args):
     print('\n' + '=' * 62)
     print('ACTIVE MECHANISMS')
     print('=' * 62)
-    for title, rows in (('W+ EDITING PATH', edit), ('GENERATOR INJECTION', inject),
+    for title, rows in (('W+ EDITING PATH', edit),
                         ('REALISM PRIOR', realism), ('LOSS SHAPE', shape)):
         print(f'-- {title}')
         for label, val, note in rows:
@@ -489,15 +465,7 @@ def generate_test_image(flow_model:torch.nn.Module,
                         img_size=256,
                         direction_bank=None,
                         preview_scale=0.6,
-                        args=None,
-                        control_encoder=None,
-                        face_parser=None):
-    """control_encoder: pass it (once past --controlnet_warmup_steps) so the
-    preview shows the model's REAL output. Before this argument existed the
-    preview never ran the ControlNet injection at all: every wandb 'test'
-    image of a --use_controlnet_injection run showed the W+ edit alone, not
-    what training optimised or what evaluate_sdflow.py renders. The region
-    mask follows the same rule as training / edit_single_attribute."""
+                        args=None):
     batchsize = ori_img.shape[0]
     
     #ori_img = F.interpolate(ori_img,(1024,1024))
@@ -533,26 +501,8 @@ def generate_test_image(flow_model:torch.nn.Module,
         else:
             new_latents = new_latents_raw
 
-        skips = None
-        if control_encoder is not None and direction_bank is not None:
-            _abs = args.attribute_index[i]
-            attr_idx = torch.full((batchsize,), i, device=origin_latent.device, dtype=torch.long)
-            attr_delta = new_attr_cond - test_attr_cond
-            region_mask = None
-            if getattr(control_encoder, 'region_cond', False):
-                region_mask = torch.ones(batchsize, 1, *img_recon_full.shape[-2:],
-                                         device=origin_latent.device, dtype=origin_latent.dtype)
-                if face_parser is not None and _abs == 39:
-                    region_mask = face_parser.get_region_mask(
-                        img_recon_full, AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
-            skips = control_encoder(attr_delta, attr_idx, is_rm=(src > 0.5),
-                                    latent=source_latent, region_mask=region_mask)
-            skips = clip_skips(skips, args.controlnet_max_norm)
-
         #tmp = stylegan2_model(new_latents).clamp(-1,1)
-        tmp = stylegan2_model([new_latents], skips=skips,
-                              embed_res=(args.controlnet_embed_res if args is not None else 64),
-                              input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+        tmp = stylegan2_model([new_latents], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         tmp = F.interpolate(tmp, ori_img.shape[2:])
         tmp = torchvision.utils.make_grid(tmp,nrow=1,normalize=True,value_range=(-1,1))
         images.append(tmp)
@@ -875,7 +825,6 @@ if __name__ == '__main__':
                         help='cycle trains attributes in a balanced round-robin order.')
     parser.add_argument('--score_balanced_sampling', dest='score_balanced_sampling', action='store_true', default=True,
                         help='Use low/high source-score balanced batches for each cycled attribute.')
-    parser.add_argument('--disable_score_balanced_sampling', dest='score_balanced_sampling', action='store_false')
     parser.add_argument('--score_balance_low', type=float, default=0.35)
     parser.add_argument('--score_balance_high', type=float, default=0.65)
     parser.add_argument('--align_sampler_global_step', action=argparse.BooleanOptionalAction,
@@ -905,41 +854,6 @@ if __name__ == '__main__':
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
-    parser.add_argument('--hard_example_gamma', type=float, default=0.0,
-                        help='Focal-style weighting of the target-attribute loss toward hard edits. '
-                             'Each sample\'s squared error to its soft target is weighted by '
-                             '(err / running mean err) ** gamma (err = |teacher prob of the edit - '
-                             'soft target|, no gradient through the weight), capped at '
-                             '--hard_example_max_weight. The running mean is ONE number over all '
-                             'attributes, so harder attributes (Young, Bangs) and harder faces within '
-                             'an attribute both get more weight -- one rule, no per-attribute '
-                             'setting. Motivation: the per-face adaptive eval leaves 52%% of Young and '
-                             '32%% of Bangs edits short of the teacher margin even at scale 1.2. '
-                             '0 = off (uniform mean, the old behaviour).')
-    parser.add_argument('--hard_example_max_weight', type=float, default=3.0,
-                        help='Cap on a single sample\'s --hard_example_gamma weight.')
-    parser.add_argument('--hard_example_ema', type=float, default=0.99,
-                        help='Decay of the running mean error --hard_example_gamma normalizes by.')
-    parser.add_argument('--hard_example_crosscheck', action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help='Second opinion for --hard_example_gamma. Hardness comes from the r34 '
-                             'training teacher, so up-weighting it also up-weights whatever shortcut '
-                             'fools r34 (the robust-teacher run aged Young by whitening hair). With '
-                             'this on, a sample keeps a weight > 1 only if the frozen training CLIP '
-                             '(--clip_prompt_model, ViT-B/32, not the L/14 judge) ALSO rates its edit '
-                             'at or below the median progress of the same-attribute samples in the '
-                             'batch; otherwise its weight is capped at 1. One rule for every '
-                             'attribute that has a CLIP prompt; an attribute without one (Bangs) '
-                             'keeps the r34-only weight. Needs the CLIP prompt loss computed on '
-                             'that step (--clip_prompt_interval 1); on other steps nothing changes.')
-    parser.add_argument('--shortcut_clip_boost', type=float, default=0.0,
-                        help='Extra weight on the CLIP prompt loss of "shortcut suspects": samples '
-                             'the r34 teacher already scores on the target side of 0.5 while the '
-                             'training CLIP says the edit is NOT on the target side (directional '
-                             'cosine <= 0, or absolute score on the wrong side). Their CLIP loss is '
-                             'multiplied by (1 + boost), so the pressure on a sample r34 calls done '
-                             'comes from the second model instead of stopping. 0 = off. The '
-                             'suspect fraction is logged either way (shortcut_suspect_frac).')
     parser.add_argument('--seed', type=int, default=0,
                         help='Seeds torch and the training batch sampler. Rerun one config with '
                              'another seed to measure run-to-run variation. Default 0 (the '
@@ -1264,7 +1178,7 @@ if __name__ == '__main__':
                         help='Separate INITIAL residual_scale for eyeglasses (attr 15) at TRAINING '
                              'time, same mechanism as --age_residual_scale. scripts/'
                              'validate_direction_bank.py measures the eyeglasses direction ALONE '
-                             '(no residual, no ControlNet, no local_region_loss) reaching only '
+                             '(no residual, no local_region_loss) reaching only '
                              '~12%% AccCLIP even at 1.5x its natural magnitude -- markedly weaker '
                              'than gender or age\'s response curve at the same alphas. This is '
                              'architectural, not a calibration bug: eyeglasses is a discrete, '
@@ -1278,7 +1192,7 @@ if __name__ == '__main__':
                              'shared 0.15) hands the trainable flow residual more of the budget '
                              'for glasses specifically, instead of leaning on a frozen direction '
                              'that is confirmed too weak to carry the edit alone -- the flow, '
-                             'local_region_loss, ControlNet (if enabled) and '
+                             'local_region_loss and '
                              '--clip_prompt_glasses_weight do the real work; the direction only '
                              'needs to point roughly the right way. Still just an INIT value, '
                              'learned further via gradient descent from there. <0 falls back to '
@@ -1420,163 +1334,6 @@ if __name__ == '__main__':
                              "magnitude_net keeps its shape: safe to enable on an existing "
                              "checkpoint via --resume_dir. Watch dir_bank_dir_delta_norm_cv to "
                              "confirm it actually trains away from face-independence.")
-    parser.add_argument('--use_controlnet_injection', action='store_true',
-                        help='ControlNet-style additive injection into an INTERMEDIATE StyleGAN2 '
-                             'feature map (models/stylegan2/model.py Generator\'s dormant `skips` '
-                             'hook at embed_res resolution), instead of only at the W+ input like '
-                             'every other mechanism (Direction Bank, flow residual, LoRA). Each '
-                             'attribute gets its own small decoder head (models/control_encoder.py'
-                             '), zero-initialized so this is a no-op at step 0. Requires '
-                             '--direction_bank_path. See models/control_encoder.py module '
-                             'docstring for the motivation.')
-    parser.add_argument('--controlnet_embed_res', type=int, default=64,
-                        help='Single-resolution injection target; must match '
-                             'Generator.forward()\'s embed_res (default 64). Superseded by '
-                             '--controlnet_res when that is given.')
-    parser.add_argument('--controlnet_res', nargs='*', type=int, default=None,
-                        help='Inject at SEVERAL StyleGAN2 feature-map resolutions instead of '
-                             'only --controlnet_embed_res, e.g. --controlnet_res 64 128. '
-                             'WHY: StyleGAN2 puts mid-level STRUCTURE around 64x64 and fine '
-                             'TEXTURE at 128-512. The two worst edits in eval are the two that '
-                             'must SYNTHESIZE what the source lacks -- Eyeglasses add (58.0%%, '
-                             'needs a frame) and Young rm (58.8%%, needs wrinkles) -- while '
-                             'every edit that only removes or displaces existing structure '
-                             'scores 72-96%%. A frame is mid-level structure so 64x64 can carry '
-                             'it, which is why injection measured load-bearing for eyeglasses '
-                             '(AccCeleb add 93%%->12%% with it off) and useless for age (~70.7%% '
-                             'either way): wrinkles live in a band a 64x64 injection never '
-                             'reaches. Channel width per resolution is forced to the '
-                             'generator\'s own (512 at 64, 256 at 128, 128 at 256) so the add '
-                             'broadcasts; --controlnet_channels is then ignored. Costs '
-                             'activation memory that grows with the finest band, so start at '
-                             '64 128 and add 256 only if the fine-texture edits still lag. '
-                             'CHANGES MODEL SHAPE -- needs a fresh run, cannot --resume_dir '
-                             'into a single-resolution checkpoint.')
-    parser.add_argument('--controlnet_channels', type=int, default=512,
-                        help='Must match StyleGAN2\'s channel count at --controlnet_embed_res '
-                             '(512 for the default channel_multiplier=2 at 64x64).')
-    parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
-                        help='Hidden width of the shared trunk in AttributeControlEncoder.')
-    parser.add_argument('--controlnet_reg_weight', type=float, default=0.01,
-                        help='L2 penalty weight on the per-sample norm of control_skips (the '
-                             'AttributeControlEncoder output actually added into the StyleGAN2 '
-                             'feature map). Unlike the W+ guided_delta, control_skips has NO loss '
-                             'term constraining its magnitude directly -- it is only shaped '
-                             'indirectly through downstream classifier/CLIP losses, which reward '
-                             'moving attribute scores but never penalize HOW that movement looks. '
-                             'Over long fine-tunes this let the injected signal grow large enough '
-                             'to visibly corrupt images (LPIPS blew up, AccCeleb collapsed, while '
-                             'ID stayed misleadingly high) with no warning in any other loss curve. '
-                             'DEFAULT raised from 0.001 to 0.01: eval found ControlNet injection '
-                             'earns its keep on eyeglasses but gives gender/age no measured '
-                             'accuracy benefit while adding a sparkle artifact -- the stronger '
-                             'penalty lets training itself shrink the injection toward zero for '
-                             'attributes that do not need it, rather than a hard eval-time '
-                             '--controlnet_disable_attrs override. Set 0 to disable.')
-    parser.add_argument('--controlnet_max_norm', type=float, default=0.0,
-                        help='Hard per-sample cap on control_skips norm (like guided_delta_max_norm '
-                             'for the W+ path). 0 disables the cap; only the L2 penalty above still '
-                             'applies. Use this if the L2 penalty alone does not keep training stable.')
-    parser.add_argument('--controlnet_warmup_steps', type=int, default=0,
-                        help='Hold the injection off for this many steps so the W+ path (flow + '
-                             'Direction Bank) learns to edit on its own first. Training both from '
-                             'scratch lets the control branch win the work outright: it reaches '
-                             'the losses more easily and the W+ path then stops developing -- a '
-                             'measured run had W+ delta norm peak early and DECLINE to ~8 while '
-                             'the same recipe without injection climbed to ~15, and disabling the '
-                             'branch at eval dropped accuracy from 71.8% to 28.1%. That hurts '
-                             'exactly the attributes the branch cannot handle: the injection sits '
-                             'at embed_res, downstream of the coarse layers where face geometry is '
-                             'decided, so it is strong on spatially-local attributes and cannot do '
-                             'the jaw/skull/hairline changes age and gender need.')
-    parser.add_argument('--controlnet_init_gain', type=float, default=1.0,
-                        help='Starting norm of the injected control_skips signal (the encoder '
-                             'output is L2-normalized, then scaled by a learnable per-attribute '
-                             'gain initialized here). This IS control_skip_norm at step 0, so set '
-                             'it against the measured magnitude of the feature map it is added to '
-                             '-- run scripts/measure_feature_norm.py rather than guessing.')
-    parser.add_argument('--controlnet_lr_mult', type=float, default=1.0,
-                        help='LR multiplier for control_encoder only (own Adam param group).')
-    parser.add_argument('--controlnet_latent_cond', action='store_true',
-                        help='Condition the injected feature map on the SOURCE LATENT, not just '
-                             'on attr_delta. WITHOUT this, AttributeControlEncoder.forward() sees '
-                             'only a (B, num_attrs) vector that is effectively identical for every '
-                             'sample editing the same attribute in the same direction -- so it '
-                             'adds ONE fixed, face-agnostic 512x64x64 pattern to a generator '
-                             'feature map that differs for every identity, pose and framing. For '
-                             'eyeglasses that means the perturbation lands at fixed spatial '
-                             'coordinates instead of on THIS face\'s eyes: enough glasses-like '
-                             'texture for a detector to fire, never a correctly placed frame. The '
-                             'real ControlNet is conditioned on a spatial input for exactly this '
-                             'reason. RECOMMENDED for new runs. Off by default because it changes '
-                             'the module\'s parameter shapes -- a checkpoint trained without it '
-                             'cannot be loaded into a model built with it, or vice versa.')
-    parser.add_argument('--controlnet_per_direction',
-                        action=argparse.BooleanOptionalAction, default=False,
-                        help="Give add and rm their own decoder head and their own learnable gain "
-                             "per attribute, instead of sharing one of each per attribute. Sharing "
-                             "forces the SAME weights to learn two very different tasks -- e.g. "
-                             "eyeglasses add must synthesize frame structure from nothing while rm "
-                             "only erases an existing one. A 128x128 run (--controlnet_embed_res "
-                             "128) showed the predicted failure: judge_celeb_acc/attr_15_add "
-                             "climbed slowly from ~0 while judge_celeb_acc/attr_15_rm drifted down "
-                             "over the same steps -- the harder add task pulling shared capacity "
-                             "away from rm, the same entanglement --per_direction already fixed for "
-                             "AttributeDirectionBank and never fixed here. Off by default: changes "
-                             "control_encoder's parameter shapes, so a checkpoint saved with the "
-                             "old (shared) layout cannot --resume_dir into a run with this flag set.")
-    parser.add_argument('--controlnet_region_cond',
-                        action=argparse.BooleanOptionalAction, default=False,
-                        help="Feed a per-pixel region prior into AttributeControlEncoder's "
-                             "upsampling ladder as an extra input channel at every stage (see that "
-                             "class's region_cond docstring in models/control_encoder.py), instead "
-                             "of only supervising the existing spatial gate after the fact. "
-                             "Currently only age(39) has a defined "
-                             "region (BiSeNet skin, AGE_TEXTURE_REGION_CLASS); other attributes get "
-                             "an all-ones (uninformative) mask, unchanged from having no region prior "
-                             "at all. This is the closer match to how the published ControlNet "
-                             "conditions (edges, depth, pose) work -- fed into the network as it "
-                             "decodes, not supervised into being discovered -- and to DC-ControlNet's "
-                             "(ICCV 2025) per-element region-aware decoupling. "
-                             "Requires --use_controlnet_injection. Off by default: CHANGES EVERY "
-                             "STAGE'S INPUT CHANNEL COUNT, so --resume_dir into a checkpoint saved "
-                             "with this flag at a different setting will raise a shape-mismatch error "
-                             "loading control_encoder (same class of incompatibility as "
-                             "--controlnet_per_direction -- see that flag's help). Train a new "
-                             "control_encoder from scratch to turn this on: drop --resume_dir/"
-                             "--resume_step entirely, or resume everything else from a checkpoint "
-                             "and delete just its control_encoder-* files first so load_module_"
-                             "checkpoint's FileNotFoundError path takes over (control_encoder starts "
-                             "from zero-init, same as a run that never had ControlNet before).")
-    parser.add_argument('--region_saliency_path', type=str, default=None,
-                        help="Path to a saliency index from scripts/precompute_attr_saliency.py "
-                             "--dump. Requires --controlnet_region_cond; no-op otherwise (with a "
-                             "warning). Replaces the all-ones fallback --controlnet_region_cond "
-                             "feeds every attribute WITHOUT a hand-specified region (currently "
-                             "everything except age(39), which keeps its BiSeNet mask regardless -- "
-                             "the two are not compared against each other here, only age's known "
-                             "gap is left alone) with a per-sample classifier-attribution map: "
-                             "relu(+cam) for the removal direction (erase where evidence FOR the "
-                             "attribute sits), relu(-cam) for add (build where evidence AGAINST it "
-                             "sits) -- see that script's SIGNED, NOT RECTIFIED note. "
-                             "WHY THE ALL-ONES FALLBACK IS WORTH REPLACING: a conv layer's weighted "
-                             "sum over an input channel that is the SAME CONSTANT at every spatial "
-                             "position collapses to a fixed per-output-channel bias -- mathematically, "
-                             "a uniform input cannot carry location information no matter what the "
-                             "conv learns, so an attribute stuck on all-ones (Male(20) foremost: "
-                             "BiSeNet's 19 classes have no jaw/brow/hairline to point at) gets a "
-                             "learnable offset from this channel, never a WHERE. "
-                             "Default (unset): identical behavior to before this flag existed. "
-                             "Samples whose file the index does not cover (a stale --dump, or an "
-                             "attribute the index was not run with --attrs on) silently keep the "
-                             "all-ones fallback for that sample -- checked per (sample, attribute), "
-                             "not gated globally, so a partial index degrades gracefully instead of "
-                             "erroring. CHANGES THE MEANING of an already-warm region_cond channel: "
-                             "resuming a run that trained on all-ones for an attribute into a run "
-                             "using this flag for that same attribute is a real distribution shift "
-                             "for that channel (see this flag's discussion in the session history), "
-                             "not a strict no-op -- treat a switch as a fresh experimental condition, "
-                             "not a free continuation.")
     parser.add_argument('--target_direction_from_cond', action='store_true', default=False,
                         help="Pick the target-attribute loss's direction (add vs rm, i.e. which "
                              "SOFT_TARGET_TABLE end it pulls toward) from the conditioner's source "
@@ -1592,17 +1349,7 @@ if __name__ == '__main__':
                              "the frozen r34 teacher's precomputed reading (--preds_file), the "
                              "direction the target loss already uses, so the flow is also asked to "
                              "edit faces the conditioner misreads -- as at eval, where the "
-                             "direction is given (evaluate_sdflow.py --edit_direction indep). Pair "
-                             "with --train_src_cond_clamp.")
-    parser.add_argument('--train_src_cond_clamp', type=float, default=None,
-                        help="Training counterpart of evaluate_sdflow.py --src_cond_clamp: the "
-                             "edited attribute's SOURCE condition is moved to the far side of 0.5 "
-                             "from the edit direction (add -> min(src, 0.5 - M), rm -> max(src, "
-                             "0.5 + M)) before the flow sees it, so a misread source no longer "
-                             "makes the requested change src + s*(end - src) ~ 0. The NLL term is "
-                             "computed on the same moved condition (one flow pass). kd still "
-                             "fits the unmoved reading. Default off. Evaluate a run trained with "
-                             "it using the same --src_cond_clamp.")
+                             "direction is given (evaluate_sdflow.py --edit_direction indep).")
     parser.add_argument('--celeba_attr_judge_weights', default=None,
                         help='Optional independent CelebA attribute classifier (the same weights '
                              'evaluate_sdflow.py scores AccCeleb with). Used for LOGGING ONLY -- it '
@@ -1656,7 +1403,7 @@ if __name__ == '__main__':
                         help="Per-attribute upper bound on the direction bank's learned "
                              "residual_scale, e.g. '39:0.05'. The residual is the part of the "
                              "flow's edit OUTSIDE every data direction. For v30, removing it at "
-                             "eval (--override_residual_scale 0) made Young stop changing entirely, "
+                             "eval (residual_scale forced to 0) made Young stop changing entirely, "
                              "so the trained aging lived almost wholly in that free-form component "
                              "(the 'fake' texture / lipstick look), not in the real-data age "
                              "directions that look right when applied raw. Capping it forces the "
@@ -1869,7 +1616,7 @@ if __name__ == '__main__':
     if args.age_gender_balance:
         if not (args.score_balanced_sampling and args.attribute_sampling == 'cycle'):
             raise ValueError('--age_gender_balance needs score-balanced cycle sampling '
-                             '(--attribute_sampling cycle, without --disable_score_balanced_sampling)')
+                             '(--attribute_sampling cycle with --score_balanced_sampling, the default)')
         if 39 not in [int(a) for a in args.attribute_index] or 20 not in [int(a) for a in args.attribute_index]:
             raise ValueError('--age_gender_balance needs both 39 (Young) and 20 (Male) in --attribute_index')
         args.align_sampler_global_step = True
@@ -1895,14 +1642,6 @@ if __name__ == '__main__':
         json.dump(vars(args), _f, indent=2, default=str)
     print(f'** run config saved to {os.path.join(save_root, "config.json")}')
     _mechanism_report(args)
-    _clip_on = args.use_clip_prompt_loss and args.clip_prompt_weight > 0
-    if args.hard_example_crosscheck and not (args.hard_example_gamma > 0 and _clip_on):
-        print('[warn] --hard_example_crosscheck does nothing without --hard_example_gamma > 0 '
-              'and the CLIP prompt loss')
-    if (args.hard_example_crosscheck or args.shortcut_clip_boost > 0) and _clip_on \
-            and args.clip_prompt_interval > 1:
-        print(f'[warn] the CLIP second opinion only acts on every {args.clip_prompt_interval}th '
-              f'step (--clip_prompt_interval)')
     attribute_index = torch.tensor(args.attribute_index,dtype=int)
     # Local column of src_probs (ordered by attribute_index)
     # that holds the source image's Male probability, for the age DDS
@@ -2110,75 +1849,6 @@ if __name__ == '__main__':
     trainable_params += list(attr_scales.parameters())
     trainable_params += list(reg_loss_weights.parameters())
 
-    control_encoder = None
-    if args.use_controlnet_injection:
-        if direction_bank is None:
-            raise ValueError('--use_controlnet_injection requires --direction_bank_path -- '
-                              'attr_delta, needed to condition the control encoder, is only '
-                              'computed on that branch.')
-        from models.control_encoder import (AttributeControlEncoder,
-                                            LegacySingleResControlEncoder,
-                                            is_legacy_state_dict)
-        _cn_res = args.controlnet_res or [args.controlnet_embed_res]
-        # When resuming, the checkpoint decides the architecture -- otherwise a
-        # run resumed from a pre-multi-resolution checkpoint would build the new
-        # module, fail to match a single key, and silently start its control
-        # encoder from scratch while every other module carried on. That looks
-        # like "the injection stopped working after resuming" and is invisible
-        # except in one non-strict-load line.
-        _legacy_resume = False
-        if args.resume_dir is not None and args.resume_step is not None:
-            _ce_path = os.path.join(resolve_resume_save_dir(args.resume_dir),
-                                    'control_encoder-{}'.format(str(int(args.resume_step)).zfill(7)))
-            if os.path.exists(_ce_path):
-                _legacy_resume = is_legacy_state_dict(torch.load(_ce_path, map_location='cpu'))
-        if _legacy_resume:
-            if args.controlnet_res and len(_cn_res) > 1:
-                raise ValueError(
-                    f'--controlnet_res {_cn_res} cannot be applied to a resumed run: the '
-                    f'checkpoint at {_ce_path} was trained with single-resolution injection, '
-                    f'and adding resolutions changes the module shape. Train multi-resolution '
-                    f'from scratch (drop --resume_dir/--resume_step), or drop --controlnet_res '
-                    f'to continue this run at {args.controlnet_embed_res} only.')
-            if args.controlnet_region_cond:
-                raise ValueError(
-                    f'--controlnet_region_cond cannot be applied to a resumed run: the '
-                    f'checkpoint at {_ce_path} predates multi-resolution injection and would '
-                    f'build LegacySingleResControlEncoder, which does not implement region_cond. '
-                    f'Train from scratch (drop --resume_dir/--resume_step), or delete '
-                    f'control_encoder-* under {resolve_resume_save_dir(args.resume_dir)} so this '
-                    f'run builds a fresh AttributeControlEncoder instead of loading the legacy one.')
-            print(f'[Resume] control_encoder checkpoint predates multi-resolution injection; '
-                  f'building the single-resolution architecture at {args.controlnet_embed_res}.')
-            control_encoder = LegacySingleResControlEncoder(
-                num_attrs=len(args.attribute_index),
-                out_channels=args.controlnet_channels,
-                out_res=args.controlnet_embed_res,
-                hidden_dim=args.controlnet_hidden_dim,
-                init_gain=args.controlnet_init_gain,
-                per_direction=args.controlnet_per_direction,
-                latent_cond=args.controlnet_latent_cond,
-            ).cuda()
-        else:
-            control_encoder = AttributeControlEncoder(
-                num_attrs=len(args.attribute_index),
-                out_channels=args.controlnet_channels if len(_cn_res) == 1 else None,
-                out_res=_cn_res,
-                hidden_dim=args.controlnet_hidden_dim,
-                init_gain=args.controlnet_init_gain,
-                per_direction=args.controlnet_per_direction,
-                latent_cond=args.controlnet_latent_cond,
-                region_cond=args.controlnet_region_cond,
-            ).cuda()
-        trainable_params += list(control_encoder.parameters())
-        _warm = args.controlnet_warmup_steps
-        _cn_chans = ', '.join(f'{r}:{c}ch' for r, c in control_encoder.res_channels.items())
-        print(f'** ControlNet-style feature injection enabled at {len(_cn_res)} '
-              f'resolution(s) [{_cn_chans}], '
-              f'init_gain={args.controlnet_init_gain} (= per-band control_skip_norm once active)'
-              + (f'; held off until step {_warm} so the W+ path matures first'
-                 if _warm > 0 else '; active from step 0'))
-
     # Magnitude-controlling meta-parameters (edit-strength center, direction-bank
     # residual trust, reg_loss layer-group weights). The old hardcoded 0.1x lr,
     # combined with the softplus/exp reparam shrinking gradients near small
@@ -2195,22 +1865,11 @@ if __name__ == '__main__':
     _tp_ids = {id(p) for p in trainable_params}
     clip_params = trainable_params + [p for p in low_lr_params if id(p) not in _tp_ids]
 
-    # control_encoder gets its own group so --controlnet_lr_mult can move the
-    # branch independently of the W+ path it runs alongside.
-    control_params = list(control_encoder.parameters()) if control_encoder is not None else []
-    control_ids = {id(p) for p in control_params}
-
     param_groups = [
-        {'params': [p for p in trainable_params
-                    if id(p) not in low_lr_ids and id(p) not in control_ids],
+        {'params': [p for p in trainable_params if id(p) not in low_lr_ids],
          'lr': args.lr},
         {'params': low_lr_params, 'lr': args.lr * args.meta_lr_mult, 'weight_decay': 0.0},
     ]
-    if control_params:
-        param_groups.append({'params': control_params,
-                             'lr': args.lr * args.controlnet_lr_mult})
-        print(f'** control_encoder lr = {args.lr * args.controlnet_lr_mult:g} '
-              f'({args.controlnet_lr_mult}x base lr)')
 
     optimizer = optim.Adam(param_groups)
     # --max_steps: the cosine spans exactly this run, so its last checkpoint
@@ -2242,10 +1901,6 @@ if __name__ == '__main__':
             direction_bank_ema = make_ema_copy(direction_bank)
             ema_pairs.append((direction_bank, direction_bank_ema, 'direction_bank'))
             ema_modules_for_save['direction_bank'] = direction_bank_ema
-        if control_encoder is not None:
-            control_encoder_ema = make_ema_copy(control_encoder)
-            ema_pairs.append((control_encoder, control_encoder_ema, 'control_encoder'))
-            ema_modules_for_save['control_encoder'] = control_encoder_ema
         print(f'** EMA enabled (decay={args.ema_decay}); shadow weights saved to '
               f'save_models_ema/, point --ckpt_dir there at eval time to use them.')
 
@@ -2296,11 +1951,6 @@ if __name__ == '__main__':
                           f'units: {_cos:.3f}); other attributes keep the checkpoint\'s.')
         elif direction_bank is not None:
             print('[Resume] direction_bank checkpoint not loaded; using current bank path and safety controls.')
-        if control_encoder is not None:
-            try:
-                load_module_checkpoint(control_encoder, resume_save_dir, 'control_encoder', start_step, strict=False)
-            except FileNotFoundError:
-                print('[Resume] control_encoder checkpoint not found; starting from zero-init (no-op).')
         if args.resume_optimizer:
             opt_path = os.path.join(resume_save_dir, 'optimizer-{}'.format(str(start_step).zfill(7)))
             if not os.path.exists(opt_path):
@@ -2334,8 +1984,6 @@ if __name__ == '__main__':
     log_modules = [prior, conditioner, attr_scales, reg_loss_weights, optimizer]
     if direction_bank is not None:
         log_modules.insert(-1, direction_bank)
-    if control_encoder is not None:
-        log_modules.insert(-1, control_encoder)
 
     # Best-checkpoint tracking. The metric is the AccCeleb monitor, smoothed --
     # the raw value scores one small batch and lands on 0/0.5/1, so selecting on
@@ -2400,14 +2048,10 @@ if __name__ == '__main__':
 
     face_parser = None
     if args.local_region_loss_weight > 0 or args.dds_face_mask \
-            or args.hair_gray_loss_weight > 0 or args.hair_extent_loss_weight > 0 \
-            or args.controlnet_region_cond:
+            or args.hair_gray_loss_weight > 0 or args.hair_extent_loss_weight > 0:
         from common.face_parser import FaceParser
         try:
             face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-            if args.controlnet_region_cond:
-                print('** ControlNet region conditioning enabled: age(39) edits feed a BiSeNet '
-                      'skin-region prior into AttributeControlEncoder\'s upsampling ladder.')
             if args.local_region_loss_weight > 0:
                 local_attrs = [a for a in args.attribute_index if a in LOCAL_REGION_CLASSES]
                 print(f'** Face-parser locality loss enabled (weight='
@@ -2433,43 +2077,14 @@ if __name__ == '__main__':
         except (FileNotFoundError, RuntimeError) as exc:
             face_parser = None
             _needs = [n for n, on in (('--hair_gray_loss_weight', args.hair_gray_loss_weight > 0),
-                                      ('--hair_extent_loss_weight', args.hair_extent_loss_weight > 0),
-                                      ('--controlnet_region_cond', args.controlnet_region_cond))
+                                      ('--hair_extent_loss_weight', args.hair_extent_loss_weight > 0))
                       if on]
             if _needs:
-                # region_cond would train on an all-ones age mask the eval never
-                # uses, and the hair losses would silently be 0
+                # the hair losses would silently be 0
                 raise RuntimeError(f'BiSeNet face parser failed to load ({exc}) but '
                                    f'{", ".join(_needs)} need(s) it.') from exc
             print(f'[WARN] Face parser unavailable ({exc}); DISABLED: local_region_loss '
                   f'(Eyeglasses locality) and the DDS face mask.')
-
-    # region_saliency: replaces --controlnet_region_cond's all-ones fallback
-    # (see the region_mask construction below) with a precomputed
-    # classifier-attribution map, for whichever attributes
-    # scripts/precompute_attr_saliency.py --dump was run on. See
-    # --region_saliency_path help for why the all-ones fallback is worth
-    # replacing at all -- a constant input channel is mathematically
-    # equivalent to a bias term, so a conv can never learn ANY location
-    # from it, only a fixed per-attribute offset.
-    region_saliency = None
-    if args.region_saliency_path:
-        if not args.controlnet_region_cond:
-            print('[WARN] --region_saliency_path set without --controlnet_region_cond -- '
-                  'ignored (region_mask is never built, so there is nothing to fill in).')
-        else:
-            _sal = torch.load(args.region_saliency_path, map_location='cpu')
-            region_saliency = {
-                'maps': _sal['maps'],                                    # (N, K, h, w) fp16, signed [-1,1]
-                'attr_to_col': {a: i for i, a in enumerate(_sal['attrs'])},
-                'file_to_row': {f: i for i, f in enumerate(_sal['files'])},
-            }
-            print(f'** Region saliency index loaded ({args.region_saliency_path}): '
-                  f'{region_saliency["maps"].shape[0]} images, attrs='
-                  f'{sorted(region_saliency["attr_to_col"])} -- replaces the all-ones '
-                  f'region_cond fallback for these attributes (age(39) keeps its BiSeNet '
-                  f'mask regardless, if --local_region_loss_weight-style face_parser is '
-                  f'active).')
 
     diffusion_guidance = None
     if args.use_diffusion_guidance:
@@ -2564,7 +2179,6 @@ if __name__ == '__main__':
         print('[WARN] --reset_bank_magnitude does nothing without --resume_dir + '
               '--resume_direction_bank (a fresh bank already starts at the prior).')
     _stop_training = False
-    _hard_err_ema = None          # --hard_example_gamma: running mean target error
     for epoch in range(_n_epochs):
         if _stop_training:
             break
@@ -2583,11 +2197,8 @@ if __name__ == '__main__':
                 _stop_training = True
                 break
 
-            # sample_idx: index into train_dataset (see IndexedDataset in
-            # models/dataset.py), not moved to cuda -- it's only used as a
-            # CPU-side key into train_dataset.image_list for
-            # --region_saliency_path lookups below, never in a tensor op.
-            img,latent,pred,sample_idx = datas
+            # 4th item: the dataset index IndexedDataset appends (unused here).
+            img,latent,pred,_ = datas
             img = img.cuda()
             latent = latent.cuda()
             pred = pred.cuda()
@@ -2611,25 +2222,15 @@ if __name__ == '__main__':
             mid_idx = modify_idx.to(latent.device).view(-1)
             if mid_idx.numel() == 1:
                 mid_idx = mid_idx.expand(args.batch)
-            # Edit direction (True = remove) and the source condition the flow
-            # edits from: see --train_edit_direction / --train_src_cond_clamp.
-            # Off, both reduce to the conditioner's own reading.
+            # Edit direction (True = remove): see --train_edit_direction. The
+            # flow edits from the conditioner's own reading of the source.
             _cond_src = attr_cond[batch_indices, mid_idx].detach()
             if args.train_edit_direction == 'teacher':
                 edit_is_rm = attributes[batch_indices, mid_idx] > 0.5
             else:
                 edit_is_rm = _cond_src > 0.5
-            if args.train_src_cond_clamp is not None:
-                _m = args.train_src_cond_clamp
-                _moved = torch.where(edit_is_rm, _cond_src.clamp(min=0.5 + _m),
-                                     _cond_src.clamp(max=0.5 - _m))
-                # additive, so the conditioner keeps its gradient through this entry
-                _shift = torch.zeros_like(attr_cond)
-                _shift[batch_indices, mid_idx] = _moved - _cond_src
-                attr_cond = attr_cond + _shift
             src_cond = torch.cat([id_cond_train, attr_cond], dim=1)
             src_attr_flow = attr_cond[batch_indices, mid_idx].detach()
-            cond_clamp_frac = (src_attr_flow != _cond_src).float().mean().detach()
             approx21, delta_log_p2 = prior(latent, src_cond, zero_pad)
 
             # make base distribution standard normal distibution
@@ -2684,18 +2285,10 @@ if __name__ == '__main__':
             new_latents = latent + safe_delta
 
             # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
-            # Hoisted here (rather than right before the face-parser losses
-            # that used to be its only consumer) so it exists BEFORE
-            # control_encoder runs too: --controlnet_region_cond needs a
-            # region prior computed from the UNEDITED source, the same
-            # locality argument --local_region_loss_weight relies on below --
-            # using `img`, the real photo, would charge e4e/StyleGAN's own
-            # inversion error to the region mask. Computed at most once per
-            # step and reused by every consumer (--losses_vs_recon, the
-            # face-parser losses, region conditioning).
+            # Computed at most once per step and reused by every consumer
+            # (--losses_vs_recon, the face-parser losses).
             src_recon = None
-            if (args.losses_vs_recon or face_parser is not None
-                    or args.controlnet_region_cond):
+            if args.losses_vs_recon or face_parser is not None:
                 with torch.no_grad():
                     src_recon = G([latent], input_is_latent=True,
                                   randomize_noise=False)[0].clamp(-1, 1)
@@ -2703,127 +2296,8 @@ if __name__ == '__main__':
             # Reference image for id_loss / directional CLIP / DDS.
             loss_ref_img = src_recon if (args.losses_vs_recon and src_recon is not None) else img
 
-            control_skips = None
-            control_skip_norm = torch.zeros([], device=latent.device, dtype=latent.dtype)
-            control_band_logs = {}
-            loss_control_reg = torch.zeros([], device=latent.device, dtype=latent.dtype)
-            controlnet_active = (control_encoder is not None
-                                 and n_iter >= args.controlnet_warmup_steps)
-            if controlnet_active:
-                # ControlNet-style injection: an additive correction at an
-                # INTERMEDIATE StyleGAN2 feature map (embed_res, default
-                # 64x64), not at the W+ input like every other mechanism in
-                # this project. attr_delta is only defined on the
-                # direction_bank branch above; control_encoder requires
-                # direction_bank to be enabled (checked at arg-parse time).
-                #
-                # region_mask: only built when --controlnet_region_cond is on
-                # (AttributeControlEncoder.forward raises if region_cond=True
-                # and this is None; ignored otherwise). All-ones by default --
-                # age(39) is the only attribute with a defined texture region
-                # right now (AGE_TEXTURE_REGION_CLASS), everything else gets
-                # an uninformative constant mask, same as having no region
-                # prior at all.
-                region_mask = None
-                if args.controlnet_region_cond:
-                    region_mask = torch.ones(latent.size(0), 1, args.img_size, args.img_size,
-                                             device=latent.device, dtype=latent.dtype)
-                    _mid_abs_rc = [args.attribute_index[int(j)]
-                                  for j in mid_idx.detach().cpu().tolist()]
-                    _is_age_rc = None
-                    if face_parser is not None:
-                        _is_age_rc = torch.tensor([a == 39 for a in _mid_abs_rc],
-                                                  device=latent.device)
-                        if _is_age_rc.any():
-                            with torch.no_grad():
-                                region_mask[_is_age_rc] = face_parser.get_region_mask(
-                                    src_recon[_is_age_rc], AGE_TEXTURE_REGION_CLASS, blur_sigma=5)
-                    # region_saliency: fills the all-ones default for attributes
-                    # WITHOUT a hand-specified region (age above is the only
-                    # exception, and is never overwritten here) with a per-sample
-                    # classifier-attribution map. See --region_saliency_path help.
-                    # A per-sample Python loop, not vectorized: mid_idx (and
-                    # therefore _mid_abs_rc / direction) varies PER SAMPLE, so
-                    # which attribute's column to read -- or whether this sample
-                    # has an entry at all -- cannot be expressed as one gather.
-                    # Batch sizes in this project are small (--batch 4-8), so the
-                    # CPU-GPU sync per sample is not a meaningful cost, and only
-                    # runs when --region_saliency_path is actually set.
-                    if region_saliency is not None:
-                        with torch.no_grad():
-                            _is_removal_rc = edit_is_rm.detach().cpu().tolist()
-                            for _b in range(latent.size(0)):
-                                _a = _mid_abs_rc[_b]
-                                if _is_age_rc is not None and bool(_is_age_rc[_b]):
-                                    continue   # age already set above -- never overridden
-                                _col = region_saliency['attr_to_col'].get(_a)
-                                if _col is None:
-                                    continue   # index was not dumped for this attribute
-                                _file = train_dataset.image_list[int(sample_idx[_b])]
-                                _row = region_saliency['file_to_row'].get(_file)
-                                if _row is None:
-                                    continue   # sample outside the dumped index (stale dump)
-                                _cam = region_saliency['maps'][_row, _col].to(
-                                    device=latent.device, dtype=latent.dtype)
-                                # push=+1 (removal): erase where evidence FOR the
-                                # attribute sits -> relu(+cam). push=-1 (add): build
-                                # where evidence AGAINST it sits -> relu(-cam). See
-                                # precompute_attr_saliency.py's SIGNED, NOT RECTIFIED
-                                # note for why the map keeps both signs.
-                                _signed = _cam if _is_removal_rc[_b] else -_cam
-                                _mask = F.relu(_signed)[None, None]
-                                region_mask[_b:_b + 1] = F.interpolate(
-                                    _mask, (args.img_size, args.img_size),
-                                    mode='bilinear', align_corners=False)
-                control_skips = control_encoder(attr_delta, mid_idx,
-                                                is_rm=edit_is_rm,
-                                                latent=latent, region_mask=region_mask)
-                # control_skips has no OTHER loss term constraining its
-                # magnitude -- it's only shaped indirectly through downstream
-                # classifier/CLIP losses, which reward moving attribute
-                # scores but never penalize how that movement looks. Long
-                # fine-tunes let this grow unbounded (LPIPS spiked, AccCeleb
-                # collapsed, while ID stayed misleadingly high because the
-                # corruption didn't destroy ArcFace's coarse face embedding).
-                # An explicit L2 penalty plus optional hard cap closes that
-                # gap, mirroring guided_delta_max_norm on the W+ path.
-                skip_norm_per_sample = skips_norm_per_sample(control_skips)
-                # Mean squared norm PER BAND, not the total: summing would make
-                # this penalty grow with the number of injected resolutions, so
-                # adding a band would itself push every gain down. See
-                # skips_reg_per_sample. Identical to the old value when there is
-                # one band, so --controlnet_reg_weight keeps its calibration.
-                loss_control_reg = skips_reg_per_sample(control_skips).mean()
-                control_skips = clip_skips(control_skips, args.controlnet_max_norm)
-                control_skip_norm = skip_norm_per_sample.mean().detach()
-                # Per-band norms too: with several resolutions the combined
-                # number above hides which band the model actually leans on,
-                # and that is the whole question this change exists to answer.
-                with torch.no_grad():
-                    for _r, _t in control_skips.items():
-                        control_band_logs[f'control_skip_norm_r{_r}'] = (
-                            _t.reshape(_t.shape[0], -1).norm(dim=1).mean().detach())
-                    # Spatial-gate coverage per band (see AttributeControlEncoder
-                    # heads' +1-channel comment): starts ~0.98 (near-full-coverage
-                    # init) everywhere. A local attribute (eyeglasses) should drift
-                    # down over training as local_region_loss's gradient teaches it
-                    # to close outside the allowed region; a global attribute
-                    # (Male/Young), which local_region_loss never touches, has no
-                    # reason to move and should stay near its init.
-                    for _r, _g in getattr(control_encoder, 'last_gate_mean', {}).items():
-                        control_band_logs[f'control_gate_mean_r{_r}'] = _g
-                    # --controlnet_region_cond only: the region channel's own
-                    # weight norm, the direct "is this being learned at all"
-                    # signal for that mechanism (see
-                    # region_channel_weight_norm's own docstring -- nothing
-                    # else in these logs reacts to it, unlike the gate above).
-                    if hasattr(control_encoder, 'region_channel_weight_norm'):
-                        for _r, _w in control_encoder.region_channel_weight_norm().items():
-                            control_band_logs[f'control_region_ch_norm_r{_r}'] = torch.tensor(_w)
-
-            new_face_tensors = G([new_latents], skips=control_skips,
-                                 embed_res=args.controlnet_embed_res,
-                                 input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+            new_face_tensors = G([new_latents], input_is_latent=True,
+                                 randomize_noise=False)[0].clamp(-1, 1)
             new_face_tensors = F.interpolate(new_face_tensors, (args.img_size, args.img_size))
 
             # ── Realism regularizer (frozen StyleGAN2 discriminator) ─────────
@@ -2882,9 +2356,8 @@ if __name__ == '__main__':
             hair_gray_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
             hair_extent_loss = torch.zeros([], device=latent.device, dtype=latent.dtype)
 
-            # src_recon / loss_ref_img: computed earlier now, right before the
-            # controlnet_active block above (region conditioning needs it
-            # before control_encoder runs) -- reused here unchanged.
+            # src_recon / loss_ref_img: computed earlier (right after the edit),
+            # reused here unchanged.
 
             if face_parser is not None:
                 _mid_abs = [args.attribute_index[int(j)] for j in mid_idx.detach().cpu().tolist()]
@@ -3108,22 +2581,7 @@ if __name__ == '__main__':
             # squared error to the soft target (a hinge variant had no effect at
             # matched identity and was removed)
             changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
-            hard_w_max = torch.zeros([], device=latent.device)
-            _hard_w = None
-            if args.hard_example_gamma > 0:
-                # see --hard_example_gamma: weight by error relative to the
-                # running mean over all attributes; the weight carries no gradient
-                _err = (edited_probs - soft_target_for_loss).abs().detach()
-                _m = float(_err.mean())
-                _hard_err_ema = _m if _hard_err_ema is None else \
-                    args.hard_example_ema * _hard_err_ema + (1 - args.hard_example_ema) * _m
-                _w = (_err / max(_hard_err_ema, 1e-6)).pow(args.hard_example_gamma)
-                _w = _w.clamp(max=args.hard_example_max_weight)
-                changed_loss = (_w * changed_mse_per_sample).mean()
-                hard_w_max = _w.max()
-                _hard_w = _w
-            else:
-                changed_loss = changed_mse_per_sample.mean()
+            changed_loss = changed_mse_per_sample.mean()
 
             _zero = torch.zeros([], device=latent.device, dtype=latent.dtype)
             # Vectorized: build a boolean mask [B, num_attrs] where True = non-target attr.
@@ -3166,8 +2624,6 @@ if __name__ == '__main__':
             # ── Frozen CLIP semantic target loss ──────────────────────
             clip_semantic_loss = _zero.clone()
             clip_logs = {}
-            shortcut_suspect_frac = _zero.clone()
-            hard_veto_frac = _zero.clone()
             if (
                 clip_prompt_loss_fn is not None
                 and args.clip_prompt_weight > 0
@@ -3204,37 +2660,6 @@ if __name__ == '__main__':
                 if args.clip_prompt_bangs:
                     clip_sample_weight[_clip_abs_idx == 5] = args.clip_prompt_bangs_weight
 
-                # Second opinion on the r34 teacher (--hard_example_crosscheck,
-                # --shortcut_clip_boost). Lower CLIP loss = more progress toward
-                # the prompt; attributes without a prompt fall back to generic
-                # text and are left out.
-                _clip_loss_d = clip_loss_each.detach()
-                _has_prompt = torch.tensor(
-                    [(int(a), 'pos') in clip_prompt_loss_fn._text_buf_names
-                     for a in _clip_abs_idx.tolist()], device=latent.device)
-                # "CLIP: not on the target side": directional cosine <= 0, or
-                # absolute score on the wrong side (softplus >= ln 2)
-                _clip_wrong = _clip_loss_d >= (1.0 if args.clip_prompt_mode == 'directional'
-                                               else math.log(2.0))
-                _r34_done = (edited_probs.detach() > 0.5) == (edit_end >= 0.5)
-                _suspect = _has_prompt & _r34_done & _clip_wrong
-                shortcut_suspect_frac = _suspect.float().mean()
-                if args.shortcut_clip_boost > 0:
-                    clip_sample_weight = torch.where(
-                        _suspect, clip_sample_weight * (1.0 + args.shortcut_clip_boost),
-                        clip_sample_weight)
-                if args.hard_example_crosscheck and _hard_w is not None:
-                    _clip_hard = torch.ones_like(_has_prompt)
-                    for _a in _clip_abs_idx[_has_prompt].unique():
-                        _g = _clip_abs_idx == _a
-                        if int(_g.sum()) >= 2:
-                            _clip_hard[_g] = _clip_loss_d[_g] >= _clip_loss_d[_g].median()
-                    _vetoed = (_hard_w > 1) & ~_clip_hard
-                    hard_veto_frac = _vetoed.float().mean()
-                    _hard_w = torch.where(_vetoed, torch.ones_like(_hard_w), _hard_w)
-                    hard_w_max = _hard_w.max()
-                    changed_loss = (_hard_w * changed_mse_per_sample).mean()
-                    counter_attr_loss = changed_loss + args.preserve_attr_weight * preserve_loss
                 clip_semantic_loss = (clip_sample_weight * clip_loss_each).mean()
 
             if lag_dof_losses is None:
@@ -3325,8 +2750,7 @@ if __name__ == '__main__':
                             new_latents[:, :fine_start, :],
                             new_latents[:, fine_start:, :].detach(),
                         ], dim=1)
-                        _ft = G([_nl], skips=control_skips, embed_res=args.controlnet_embed_res,
-                               input_is_latent=True,
+                        _ft = G([_nl], input_is_latent=True,
                                randomize_noise=False)[0].clamp(-1, 1)
                         return F.interpolate(_ft, (args.img_size, args.img_size))
                     return new_face_tensors
@@ -3428,7 +2852,6 @@ if __name__ == '__main__':
                 args.local_region_loss_weight * local_region_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
                 args.hair_extent_loss_weight * hair_extent_loss +\
-                args.controlnet_reg_weight * loss_control_reg +\
                 args.disc_realism_weight * disc_realism_loss +\
                 bank_prior_weight * loss_bank_prior
 
@@ -3465,7 +2888,7 @@ if __name__ == '__main__':
                 # Preview in eval mode: in train mode the bank updated its
                 # gate-usage EMA (and any BatchNorm its running stats) from the
                 # preview batch. Modes are restored afterwards.
-                _modes = [(m, m.training) for m in (prior, conditioner, direction_bank, control_encoder)
+                _modes = [(m, m.training) for m in (prior, conditioner, direction_bank)
                           if m is not None]
                 for _mod, _ in _modes:
                     _mod.eval()
@@ -3480,10 +2903,6 @@ if __name__ == '__main__':
                             test_mid_latent, direction_bank=direction_bank,
                             preview_scale=args.preview_scale,
                             args=args,
-                            control_encoder=(control_encoder
-                                             if control_encoder is not None
-                                             and n_iter >= args.controlnet_warmup_steps else None),
-                            face_parser=face_parser,
                         )
                         logger.save_image(grid_img,n_iter,'test')
                 finally:
@@ -3543,9 +2962,6 @@ if __name__ == '__main__':
                 'loss_kd': kd_loss,
                 'loss_nll': log_p2,
                 'loss_target': changed_loss,
-                'hard_example_w_max': hard_w_max,
-                'hard_example_veto_frac': hard_veto_frac,
-                'shortcut_suspect_frac': shortcut_suspect_frac,
                 'loss_coupled': coupled_loss,
                 'loss_leakage': preserve_loss,
                 'loss_reg': reg_loss,
@@ -3563,8 +2979,6 @@ if __name__ == '__main__':
                 'final_delta_norm': final_delta_norm,
                 'final_delta_clip_factor': final_delta_clip_factor,
                 'final_delta_max_norm': torch.tensor(args.final_delta_max_norm),
-                'control_skip_norm': control_skip_norm,
-                'loss_control_reg': loss_control_reg.detach(),
                 'dir_bank_flow_delta_norm': dir_logs.get('dir_bank_flow_delta_norm', _zero.detach().clone()),
                 'dir_bank_dir_delta_norm': dir_logs.get('dir_bank_dir_delta_norm', _zero.detach().clone()),
                 'dir_bank_flow_share': dir_logs.get('dir_bank_flow_share', _zero.detach().clone()),
@@ -3590,7 +3004,6 @@ if __name__ == '__main__':
                 'loss_hair_extent':   hair_extent_loss,
                 'loss_disc_realism':  disc_realism_loss,
                 'dir_disagree_frac':  dir_disagree.mean(),
-                'cond_clamp_frac':    cond_clamp_frac,
                 'target_out_of_range_frac': target_out_of_range,
                 'clip_prompt_weight':  torch.tensor(args.clip_prompt_weight),
             }
@@ -3598,7 +3011,6 @@ if __name__ == '__main__':
             # directional mode, clip_score_* in absolute mode, clip_direction_mean
             # in both. (They used to be logged as constant 0 in the other mode.)
             _log_dict.update(clip_logs)
-            _log_dict.update(control_band_logs)
             # Sampler check, from the same dataset preds the sampler pools on:
             # with the sampler aligned, sampler_src_high_frac is exactly 0.5
             # on every step (half low, half high for the attribute being

@@ -26,7 +26,7 @@ so several methods go on one figure:
 
 Methods (--method):
   model    the checkpoint's edits (evaluate_sdflow.edit_single_attribute), with
-           any evaluate_sdflow option, e.g. --residual_fixed / --residual_head
+           any evaluate_sdflow option, e.g. --edit_gain / --preserve_boundaries
   linear   w + sign * alpha * d with d the mean of the attribute's bank slots
            (the InterFaceGAN-style baseline of scripts/linear_baseline.py);
            --scales are then alphas
@@ -60,8 +60,8 @@ from tqdm import tqdm
 
 from common.attr_tables import bank_num_k
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, _latest_step, apply_residual_basis, apply_run_config, build_optional_judges,
-    build_parser, edit_single_attribute, load_models, resolve_controlnet_disable_attrs,
+    ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges,
+    build_parser, edit_single_attribute, load_models,
 )
 from models.dataset import SDFlowDataset
 
@@ -100,14 +100,12 @@ def main():
                    help='Default <checkpoint_dir>/curves_<method>_s<step>.csv (a .json beside it).')
     args = p.parse_args()
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
     if not args.independent_attr_weights:
         raise SystemExit('--independent_attr_weights is required (R50 judge).')
 
-    prior, conditioner, G, id_criterion, _, _, direction_bank, control_encoder = load_models(args)
-    apply_residual_basis(args, direction_bank)
+    prior, conditioner, G, id_criterion, _, _, direction_bank = load_models(args)
     _, indep_id, _, indep_teacher, _, _ = build_optional_judges(args, args.attribute_index, id_criterion)
     if indep_id is None:
         raise SystemExit('the independent face-ID model (facenet-pytorch) is required')
@@ -147,10 +145,6 @@ def main():
                             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
                             li, sc, direction_bank, attr_global_idx=g,
                             bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-                            control_encoder=control_encoder,
-                            controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-                            controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
-                            controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
                             composite=False, direction=d)
                     f256 = F.interpolate(face, (256, 256))
                     ep = torch.sigmoid(indep_teacher(f256)[0])[:, :40]
@@ -184,8 +178,7 @@ def main():
                             for k in ('target_success', 'effective_success', 'id_sim_real', 'preserve_acc')},
                          'n': sum(x['n'] for x in per)})
 
-    label = f'{args.method}' + ('' if args.method == 'linear' else ' (residual variant)' if any(
-        getattr(args, k, None) for k in ('residual_basis', 'residual_fixed', 'residual_head')) else '')
+    label = f'{args.method}'
     print(f'\n{label}, {seen} faces, preserve_set={args.preserve_set}')
     print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"ID cos":>7} {"AttrPres":>9} {"n":>5}')
     for x in rows:
@@ -199,10 +192,7 @@ def main():
         w.writerows(rows)
     with open(os.path.splitext(path)[0] + '.json', 'w') as f:
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'method': args.method,
-                              'scales': args.scales, 'num_samples': seen, 'preserve_set': args.preserve_set,
-                              'residual_basis': getattr(args, 'residual_basis', None),
-                              'residual_fixed': getattr(args, 'residual_fixed', None),
-                              'residual_head': getattr(args, 'residual_head', None)},
+                              'scales': args.scales, 'num_samples': seen, 'preserve_set': args.preserve_set},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
           f'[--run OTHER=...] --attributes All --output_dir ./output/curves')

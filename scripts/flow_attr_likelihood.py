@@ -157,7 +157,7 @@ def main():
     from evaluation.evaluate_sdflow import (
         ATTR_NAMES, _latest_step, apply_run_config, bank_edit, build_optional_judges,
         build_parser, cap_delta_norm, consensus_label, load_models,
-        resolve_controlnet_disable_attrs, strict_success, edited_attr_value)
+        strict_success, edited_attr_value)
     import evaluation.evaluate_sdflow as ev
     from models.dataset import SDFlowDataset
 
@@ -170,14 +170,10 @@ def main():
     if not os.path.isdir(args.checkpoint_dir):
         raise SystemExit(f'checkpoint_dir does not exist on this machine: {args.checkpoint_dir}')
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
 
-    prior, conditioner, G, id_criterion, attr_teacher, _ai, bank, ctrl = load_models(args)
-    if ctrl is not None:
-        print('[note] this run has a ControlNet; edits here are rendered WITHOUT it '
-              '(the flow score only reads the W+ latent)')
+    prior, conditioner, G, id_criterion, attr_teacher, _ai, bank = load_models(args)
     clip_judge, _iid, _lp, _it, glasses_parser, celeb_judge = build_optional_judges(
         args, args.attribute_index, id_criterion)
     if clip_judge is None or celeb_judge is None:

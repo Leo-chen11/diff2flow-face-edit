@@ -108,13 +108,14 @@ def check_data(run=None, step=None):
                 steps = sorted({int(n.rsplit('-', 1)[1]) for n in names if '-' in n and n.rsplit('-', 1)[1].isdigit()})
                 step = steps[-1] if steps else None
             line('OK', f'{save}', f'{len(names)} files; latest step {step}')
-            for mod in ('prior', 'conditioner', 'direction_bank', 'control_encoder'):
+            for mod in ('prior', 'conditioner', 'direction_bank'):
                 f = f'{mod}-{int(step):07d}' if step is not None else None
                 present = f and f in names
-                if mod == 'control_encoder' and not present:
-                    line('SKIP', f, '(only needed if the run used ControlNet)')
-                else:
-                    ok &= line('OK' if present else 'MISSING', f or f'{mod}-<step>')
+                ok &= line('OK' if present else 'MISSING', f or f'{mod}-<step>')
+            # an old ControlNet run: evaluate_sdflow.py refuses it (support removed)
+            f = f'control_encoder-{int(step):07d}' if step is not None else None
+            if f and f in names:
+                ok &= line('UNSUPP', f, '(ControlNet run; ControlNet support was removed in this branch)')
     return ok
 
 

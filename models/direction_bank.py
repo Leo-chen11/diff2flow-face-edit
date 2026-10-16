@@ -263,8 +263,7 @@ class AttributeDirectionBank(nn.Module):
         # component (the StyleGAN W mean) would otherwise dominate the signal
         # and make this learn a constant offset instead of a per-face one. The
         # projection is zero-initialized, so this is a strict no-op until
-        # trained -- same convention as attr_lora_B above and the ControlNet
-        # injection heads.
+        # trained -- same convention as attr_lora_B above.
         self.magnitude_latent_cond = bool(magnitude_latent_cond)
         if self.magnitude_latent_cond:
             hidden_dim = self.magnitude_net[0].out_features   # 64
@@ -338,25 +337,9 @@ class AttributeDirectionBank(nn.Module):
             scales = torch.full((self.num_attrs,), float(residual_scale))
         self.residual_scale_raw = nn.Parameter(_inverse_softplus(scales))   # (num_attrs,)
         self.residual_max_norm = float(residual_max_norm) if residual_max_norm is not None else None
-        # Analysis hooks (scripts/analyze_residual.py, evaluate_sdflow.py
-        # --residual_basis); neither changes the edit unless set.
-        #   residual_basis: {local attr idx: (k, num_layers*latent_dim) orthonormal
-        #     rows}; that attribute's residual is replaced by its projection onto
-        #     the rows (k=0 -> no residual).
+        # Analysis hook (evaluate_sdflow.bank_edit); never changes the edit.
         #   _last_residual: the residual actually added by the last forward
         #     (after the norm clip and the residual scale), detached.
-        self.residual_basis = {}
-        #   residual_fixed: {local attr idx: (vec (num_layers*latent_dim), ref)};
-        #     that attribute's residual term becomes attr_delta / ref * vec, i.e.
-        #     one fixed direction scaled by the requested edit (ref = the mean
-        #     |attr_delta| vec was measured at) -- the flow's output is unused.
-        self.residual_fixed = {}
-        #   residual_head: {local attr idx: models.residual_head.ResidualHead};
-        #     that attribute's residual term is predicted from the latent, the
-        #     attribute change, route_scores and _id_cond (set by the caller)
-        #     instead of taken from the flow.
-        self.residual_head = {}
-        self._id_cond = None
         self._last_residual = None
 
         # Optional safety controls applied to the final guided delta. These are
@@ -440,23 +423,6 @@ class AttributeDirectionBank(nn.Module):
         cos = F.cosine_similarity(flow_delta.reshape(B, -1), target, dim=1, eps=1e-8)
         return F.relu(margin - cos[valid]).mean()
 
-    def _project_residual(self, residual, attr_idx):
-        """Replace each sample's residual by its projection onto the basis
-        set for its attribute in self.residual_basis (others unchanged)."""
-        B = residual.size(0)
-        flat = residual.reshape(B, -1)
-        out = flat.clone()
-        for a, basis in self.residual_basis.items():
-            m = attr_idx == int(a)
-            if not m.any():
-                continue
-            if basis is None or basis.numel() == 0:
-                out[m] = 0.0
-                continue
-            Bm = basis.to(device=flat.device, dtype=flat.dtype)             # (k, L*D)
-            out[m] = (flat[m] @ Bm.t()) @ Bm
-        return out.view_as(residual)
-
     def current_residual_scale(self):
         """(num_attrs,) learned residual_scale values, always positive, capped
         per attribute by set_residual_cap()."""
@@ -471,7 +437,7 @@ class AttributeDirectionBank(nn.Module):
     def set_residual_cap(self, attr_local_idx, cap):
         """Upper bound on one attribute's residual_scale. The residual is the
         part of the flow's edit OUTSIDE every bank direction. An eval ablation
-        (--override_residual_scale 0) showed the trained age edit lives almost
+        (residual_scale forced to 0) showed the trained age edit lives almost
         entirely there: with it removed, Young stopped changing at all. The
         real-data age directions, which look right when applied raw, were
         barely used. Capping the residual forces the age edit back onto them."""
@@ -748,8 +714,6 @@ class AttributeDirectionBank(nn.Module):
         coeff = torch.einsum('lms,bls->blm', pinv_D, flow_delta)       # (B, 18, M)
         proj = torch.einsum('lsm,blm->bls', D, coeff)                  # (B, 18, 512)
         residual = flow_delta - proj
-        if self.residual_basis and attr_idx is not None:
-            residual = self._project_residual(residual, attr_idx.view(-1).long())
 
         # Clip per-sample residual norm to prevent explosion from large DDS gradients.
         if self.residual_max_norm is not None:
@@ -768,26 +732,6 @@ class AttributeDirectionBank(nn.Module):
         else:
             rs = scales.mean()
         res_term = rs * residual
-        if self.residual_head and attr_idx is not None:
-            res_term = res_term.clone()
-            attr_idx_long = attr_idx.view(-1).long()
-            idc = self._id_cond if (self._id_cond is not None and self._id_cond.size(0) == B) else None
-            for a, head in self.residual_head.items():
-                m = attr_idx_long == int(a)
-                if m.any():
-                    pred = head(latent[m], attr_delta[m, int(a)],
-                                route_scores[m] if route_scores is not None else None,
-                                idc[m] if idc is not None else None)
-                    res_term[m] = pred.to(dtype).view(-1, self.num_layers, self.latent_dim)
-        if self.residual_fixed and attr_idx is not None:
-            res_term = res_term.clone()
-            attr_idx_long = attr_idx.view(-1).long()
-            for a, (vec, ref) in self.residual_fixed.items():
-                m = attr_idx_long == int(a)
-                if m.any():
-                    v = vec.to(device=device, dtype=dtype).view(self.num_layers, self.latent_dim)
-                    coef = attr_delta[m, int(a)] / float(ref)
-                    res_term[m] = coef.view(-1, 1, 1) * v
         self._last_residual = res_term.detach()
 
         self._last_dir_delta = dir_delta

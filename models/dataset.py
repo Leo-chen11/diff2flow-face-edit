@@ -63,10 +63,10 @@ class IndexedDataset(Dataset):
     """Wraps any Dataset and appends the sample's INDEX to what __getitem__
     returns, without touching the wrapped class's own return signature.
 
-    WHY: a per-sample lookup keyed by filename (e.g.
-    --region_saliency_path's precomputed attribution maps in
-    training/train_sdflow.py) needs to know which file each batch element
-    came from. SDFlowDataset.__getitem__ returns (img, latent, pred) only --
+    WHY: a per-sample lookup keyed by filename needs to know which file each
+    batch element came from (it was added for a precomputed saliency lookup
+    in training/train_sdflow.py, since removed; the wrapper is kept so the
+    training DataLoader stays exactly as it was). SDFlowDataset.__getitem__ returns (img, latent, pred) only --
     no index, no path -- and every caller in this project (train_sdflow.py's
     training loop, evaluate_sdflow.py, render_preview.py, the probe scripts)
     unpacks that exact 3-tuple, so changing SDFlowDataset itself would break

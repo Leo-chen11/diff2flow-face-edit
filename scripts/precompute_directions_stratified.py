@@ -769,7 +769,7 @@ def compute_age_k1_stratified(latents, preds, continuous, min_samples=50,
 # ---------------------------------------------------------------------------
 #
 # Diagnosis (verified at inference time with two direction-agnostic checks):
-#   1. --override_residual_scale 0.0 (pure Direction Bank output, zero flow
+#   1. residual_scale forced to 0.0 at eval (pure Direction Bank output, zero flow
 #      contribution) on a trained checkpoint reproduced the exact same
 #      age-edit color-cast artifact (skin turning blue / orange / magenta at
 #      high edit strength) as every training configuration tested -- proving

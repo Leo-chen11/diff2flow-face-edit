@@ -33,11 +33,9 @@ import torchvision.transforms as T
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES,
     _latest_step,
-    apply_residual_basis,
     apply_run_config,
     edit_single_attribute,
     load_models,
-    resolve_controlnet_disable_attrs,
 )
 from models.dataset import SDFlowDataset
 
@@ -72,27 +70,20 @@ def pick_balanced_faces(dataset, attribute_index, num_faces):
 @torch.no_grad()
 def main(args):
     prior, conditioner, G, id_criterion, attr_teacher, attribute_index, \
-        direction_bank, control_encoder = load_models(args)
-    apply_residual_basis(args, direction_bank)
+        direction_bank = load_models(args)
 
     composite_face_parser = None
-    if args.composite_face_region or getattr(args, 'controlnet_region_cond', False):
+    if args.composite_face_region:
         from common.face_parser import FaceParser
         try:
             composite_face_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
-            if args.composite_face_region:
-                print('[Composite] Compositing edited face back onto source-reconstruction '
-                      'background/hair -- same mitigation as evaluate_sdflow.py '
-                      '--composite_face_region, applied here too since this script (not the eval '
-                      'loop) is what produced the artifact-heavy preview grids.')
-            if getattr(args, 'controlnet_region_cond', False):
-                print('[ControlNet] region_cond checkpoint: feeding a real BiSeNet skin mask '
-                      'for age(39) edits (all-ones fallback for every other attribute).')
+            print('[Composite] Compositing edited face back onto source-reconstruction '
+                  'background/hair -- same mitigation as evaluate_sdflow.py '
+                  '--composite_face_region, applied here too since this script (not the eval '
+                  'loop) is what produced the artifact-heavy preview grids.')
         except (FileNotFoundError, RuntimeError) as exc:
             composite_face_parser = None
-            print(f'[WARN] face parser unavailable ({exc}); compositing disabled, and any '
-                  f'--controlnet_region_cond checkpoint will fall back to an all-ones region '
-                  f'mask for age(39) too -- output will not match what training saw.')
+            print(f'[WARN] face parser unavailable ({exc}); compositing disabled.')
 
     img_transform = T.Compose([
         T.ToTensor(),
@@ -146,13 +137,6 @@ def main(args):
                 face_parser=composite_face_parser,
                 composite_method=args.composite_method,
                 composite_blur_sigma=args.composite_blur_sigma,
-                control_encoder=control_encoder,
-                controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-                controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
-                controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64),
-                # composite_face_parser may exist only because
-                # --controlnet_region_cond needed it for age's region mask --
-                # decoupled from whether compositing was actually requested.
                 composite=args.composite_face_region,
                 direction=(torch.tensor([-1.0 if src_p[args.attribute_index[local_idx]] > 0.5
                                          else 1.0], device='cuda')
@@ -171,7 +155,6 @@ def main(args):
         out = os.path.join(
             args.checkpoint_dir,
             f'preview_step{args.step}_scale{args.scale}_{names}'
-            + (f'_clamp{args.src_cond_clamp:g}' if args.src_cond_clamp is not None else '')
             + (f'_pres{args.preserve_strength:g}' if args.preserve_boundaries else '') + '.png',
         )
     torchvision.utils.save_image(grid, out)
@@ -194,8 +177,6 @@ if __name__ == '__main__':
                         help="cond: the conditioner's own add/rm (old behaviour). indep: from "
                              "--independent_attr_weights on the source, as the eval's "
                              "--edit_direction indep.")
-    parser.add_argument('--src_cond_clamp', type=float, default=None,
-                        help='Same as evaluate_sdflow.py --src_cond_clamp (needs --edit_direction indep).')
     parser.add_argument('--preserve_boundaries', default=None,
                         help='Same as evaluate_sdflow.py --preserve_boundaries.')
     parser.add_argument('--preserve_strength', type=float, default=1.0)
@@ -239,23 +220,6 @@ if __name__ == '__main__':
     parser.add_argument('--bypass_glasses_direction_bank',
                         action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--guided_delta_max_norm', type=float, default=0.0)
-    parser.add_argument('--controlnet_embed_res', type=int, default=64,
-                        help='Must match training --controlnet_embed_res if enabled.')
-    parser.add_argument('--controlnet_channels', type=int, default=512,
-                        help='Must match training --controlnet_channels if enabled.')
-    parser.add_argument('--controlnet_hidden_dim', type=int, default=256,
-                        help='Must match training --controlnet_hidden_dim if enabled.')
-    parser.add_argument('--disable_controlnet', action='store_true',
-                        help='ABLATION: skip control_encoder even if the run was trained with '
-                             'it, to render the same faces through the W+ path alone.')
-    parser.add_argument('--controlnet_disable_attrs', nargs='*', type=int, default=None,
-                        help='Same knob as evaluate_sdflow.py: skip ControlNet injection for '
-                             'these absolute attribute indices only. DEFAULT (omitted): '
-                             'auto-resolved to gender/age (20, 39) by resolve_controlnet_disable_'
-                             'attrs() -- see evaluate_sdflow.py for why.')
-    parser.add_argument('--override_residual_scale', type=float, default=None,
-                        help='Force direction-bank residual_scale at render time '
-                             '(same diagnostic knob as evaluate_sdflow.py).')
     parser.add_argument('--age_fine_layer_scale', type=float, default=None,
                         help='Scale the age direction fine-layer components at render time. '
                              'DEFAULT (omitted): load_models() applies a graduated 1.0->0.6 '
@@ -279,16 +243,9 @@ if __name__ == '__main__':
     parser.add_argument('--composite_blur_sigma', type=float, default=15,
                         help='Feather width for --composite_method alpha. Ignored for poisson.')
     parser.add_argument('--ignore_run_config', action='store_true')
-    # Residual variants, same as evaluate_sdflow.py (see its --help)
-    parser.add_argument('--residual_basis', default=None)
-    parser.add_argument('--residual_basis_k', type=int, default=4)
-    parser.add_argument('--residual_fixed', default=None)
-    parser.add_argument('--residual_fixed_mult', default=None)
-    parser.add_argument('--residual_head', default=None)
 
     args = parser.parse_args()
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
         if args.step is None:

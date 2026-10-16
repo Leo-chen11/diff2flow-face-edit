@@ -8,13 +8,12 @@ attribute clearly on the source (< 0.35 or > 0.65).
 
 Composition rules (--compose, several allowed):
   sum   one flow pass per attribute from the same source, calibrated W+ deltas
-        and ControlNet skips added (evaluate_sdflow.edit_multi_attribute).
+        added (evaluate_sdflow.edit_multi_attribute).
   orth  as sum, but each delta first loses, per W+ layer, its component in the
         span of the other attributes' deltas (shared directions applied once).
   seq   one attribute after the other: edit, regenerate, re-read the
-        conditions from the edited face, edit the next. ControlNet skips
-        accumulate. The usual "sequential editing" of StyleFlow / Latent
-        Transformer; errors can accumulate.
+        conditions from the edited face, edit the next. The usual "sequential
+        editing" of StyleFlow / Latent Transformer; errors can accumulate.
 
 Reported per combination and rule:
   Acc       R50 success rate of each edited attribute
@@ -53,9 +52,7 @@ from tqdm import tqdm
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges, build_parser,
     edit_multi_attribute, edit_single_attribute, load_models,
-    resolve_controlnet_disable_attrs,
 )
-from models.control_encoder import add_skips
 from models.dataset import SDFlowDataset
 
 DEFAULT_TRIPLES = [(15, 31, 5), (20, 39, 31), (20, 15, 39)]   # local x local, global x global x expression, mixed
@@ -105,7 +102,6 @@ def main():
                    help='edit_scale of every attribute in a combination (and of the single-edit reference).')
     args = p.parse_args()
     args = apply_run_config(args)
-    args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
     if not args.independent_attr_weights:
@@ -115,15 +111,11 @@ def main():
         print('[WARN] --composite_face_region is ignored here (stacked edits are not composited).')
 
     prior, conditioner, G, id_criterion, attr_teacher, \
-        attribute_index, direction_bank, control_encoder = load_models(args)
+        attribute_index, direction_bank = load_models(args)
     _, indep_id, lpips_fn, indep_teacher, _, _ = \
         build_optional_judges(args, args.attribute_index, id_criterion)
     combos = parse_combos(args.combos, list(args.attribute_index))
     local = {g: args.attribute_index.index(g) for g in args.attribute_index}
-    ce_kw = dict(control_encoder=control_encoder,
-                 controlnet_max_norm=getattr(args, 'controlnet_max_norm', 0.0),
-                 controlnet_disable_attrs=getattr(args, 'controlnet_disable_attrs', None),
-                 controlnet_embed_res=getattr(args, 'controlnet_embed_res', 64))
     print(f'{len(combos)} combinations x compose {args.compose} at scale {args.multi_scale}: '
           + ', '.join('+'.join(name(a) for a in c) for c in combos))
 
@@ -163,7 +155,7 @@ def main():
                     prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
                     local[g], args.multi_scale, direction_bank, attr_global_idx=g,
                     bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-                    composite=False, direction=direction[g], **ce_kw)
+                    composite=False, direction=direction[g])
                 ep, _, _ = score(face)
                 single_ok[g] = success(sp[:, g], ep[:, g], args.success_margin)
 
@@ -174,22 +166,20 @@ def main():
                 dirs = [direction[g] for g in combo]
                 for mode in args.compose:
                     if mode == 'seq':
-                        cur_img, cur_lat, skips, face = img, latent, None, None
+                        cur_img, cur_lat, face = img, latent, None
                         for g, d in zip(combo, dirs):
                             _, idc, atc = conditioner.make_condition(cur_img, cur_lat, id_criterion)
-                            _, cur_lat, sk = edit_multi_attribute(
+                            # face = G(cur_lat), rendered by edit_multi_attribute
+                            face, cur_lat = edit_multi_attribute(
                                 prior, conditioner, G, id_criterion, cur_img, cur_lat, atc, idc,
                                 [local[g]], [args.multi_scale], direction_bank, attr_global_idxs=[g],
-                                directions=[d], return_parts=True, **ce_kw)
-                            skips = add_skips(skips, sk)
-                            face = G([cur_lat], skips=skips, embed_res=ce_kw['controlnet_embed_res'],
-                                     input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                                directions=[d], return_parts=True)
                             cur_img = F.interpolate(face, (args.img_size, args.img_size))
                     else:
                         face = edit_multi_attribute(
                             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
                             [local[g] for g in combo], [args.multi_scale] * len(combo), direction_bank,
-                            attr_global_idxs=list(combo), directions=dirs, compose=mode, **ce_kw)
+                            attr_global_idxs=list(combo), directions=dirs, compose=mode)
                     ep, idv, lp = score(face)
                     r = rec[(combo, mode)]
                     oks = []

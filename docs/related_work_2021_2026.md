@@ -79,7 +79,7 @@
 
 | 方式 | 做法 | 對應的文獻做法 |
 |---|---|---|
-| `sum` | 每個屬性從同一張原圖各算一次，把校準過的 W+ delta 和 ControlNet skips 相加 | 直接相加（Latent-to-Latent 指出的干擾問題） |
+| `sum` | 每個屬性從同一張原圖各算一次，把校準過的 W+ delta 相加 | 直接相加（Latent-to-Latent 指出的干擾問題） |
 | `orth` | 相加前，逐層把每個 delta 在「其他屬性 delta 張成的空間」上的分量去掉 | 不用訓練的去干擾做法 |
 | `seq` | 改一個屬性、重新生成、從新的臉重新讀條件，再改下一個 | StyleFlow、Latent Transformer、AdaTrans 的依序編輯（DyStyle 指出的誤差累積） |
 
