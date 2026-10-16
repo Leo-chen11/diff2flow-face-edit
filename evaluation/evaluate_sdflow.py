@@ -1825,6 +1825,21 @@ def evaluate(args):
     clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
     _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
+    stop_teacher = None
+    if getattr(args, 'adaptive_stop_weights', None):
+        if not getattr(args, 'adaptive_ladder', None):
+            raise SystemExit('--adaptive_stop_weights only acts on --adaptive_ladder')
+        for judge_path in (args.independent_attr_weights, getattr(args, 'celeba_attr_judge_weights', None)):
+            if judge_path and os.path.abspath(judge_path) == os.path.abspath(args.adaptive_stop_weights):
+                raise SystemExit(f'--adaptive_stop_weights {args.adaptive_stop_weights} is also a judge '
+                                 f'that scores this eval: the stop rule would be graded by itself')
+        stop_teacher = AttributeClassifier(backbone=args.adaptive_stop_backbone)
+        stop_teacher.load_state_dict(load_network(args.adaptive_stop_weights))
+        stop_teacher.cuda().eval()
+        for p in stop_teacher.parameters():
+            p.requires_grad_(False)
+        print(f'[Adaptive] stop rule: the training teacher AND {args.adaptive_stop_weights} '
+              f'({args.adaptive_stop_backbone}) must both see the edit done')
     consensus_on = bool(getattr(args, 'consensus', False))
     if consensus_on and (clip_judge is None or celeb_judge is None):
         raise SystemExit('--consensus needs both the CLIP judge and the CelebA judge '
@@ -1911,6 +1926,8 @@ def evaluate(args):
             'residual_basis_k': (getattr(args, 'residual_basis_k', None)
                                  if getattr(args, 'residual_basis', None) else None),
             'adaptive_ladder': getattr(args, 'adaptive_ladder', None),
+            'adaptive_stop_weights': getattr(args, 'adaptive_stop_weights', None),
+            'adaptive_stop_margin': getattr(args, 'adaptive_stop_margin', None),
             'adaptive_gains': (getattr(args, 'adaptive_gains', None)
                                if getattr(args, 'adaptive_ladder', None) else None),
             'edit_gain': getattr(args, 'edit_gain', None),
@@ -2083,12 +2100,26 @@ def evaluate(args):
                     # Rungs past the ladder (--adaptive_gains) keep the largest
                     # scale and lengthen its edit instead (see set_edit_gain).
                     _chosen = torch.full((B,), float(rung_vals[-1]), device=img.device)
+                    # --adaptive_stop_weights: the rung where r34 ALONE would
+                    # have stopped, to report how much later the second
+                    # classifier lets a face stop
+                    _t_first = torch.full((B,), float(rung_vals[-1]), device=img.device)
+                    _t_seen = torch.zeros(B, dtype=torch.bool, device=img.device)
                     try:
                         for _k, (_sc, _gain) in enumerate(rungs):
                             set_edit_gain(_gain)
                             _ef = _edit(_sc)
-                            _pt = torch.sigmoid(attr_teacher(F.interpolate(_ef, (256, 256)))[0])[:, _gidx]
+                            _ef_256 = F.interpolate(_ef, (256, 256))
+                            _pt = torch.sigmoid(attr_teacher(_ef_256)[0])[:, _gidx]
                             _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
+                            _new_t = _ok & ~_t_seen
+                            _t_first[_new_t] = float(rung_vals[_k])
+                            _t_seen |= _ok
+                            if stop_teacher is not None:
+                                _m2 = edit_scale if args.adaptive_stop_margin is None \
+                                    else args.adaptive_stop_margin
+                                _p2 = torch.sigmoid(stop_teacher(_ef_256)[0])[:, _gidx]
+                                _ok = _ok & torch.where(_add, _p2 > 0.5 + _m2, _p2 < 0.5 - _m2)
                             _take = (~_done) & (_ok | (_k == len(rungs) - 1))
                             if edited_face is None:
                                 edited_face = _ef.clone()
@@ -2100,6 +2131,8 @@ def evaluate(args):
                     finally:
                         set_edit_gain(base_gain)
                     metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
+                    if stop_teacher is not None:
+                        metrics[f'stop_delay_{attr_name}'].extend((_chosen - _t_first).cpu().tolist())
                 else:
                     edited_face = _edit(edit_scale)
                 edited_256 = F.interpolate(edited_face, (256, 256))
@@ -2403,6 +2436,12 @@ def evaluate(args):
                 at_max = np.isclose(arr, rung_vals[-1], atol=1e-4).mean() * 100
                 print(f'    {attr_name:<12} mean {arr.mean():.2f}  at max {at_max:4.1f}%   {hist}')
                 scale_summary.setdefault(attr_name, {})['chosen_scale'] = _summ(cs)
+                sd = metrics.get(f'stop_delay_{attr_name}')
+                if sd:
+                    sd = np.asarray(sd)
+                    print(f'    {"":<12} second classifier held back {np.mean(sd > 1e-4) * 100:4.1f}% '
+                          f'of faces the teacher alone would have stopped (mean +{sd.mean():.2f} scale)')
+                    scale_summary[attr_name]['stop_delay'] = _summ(sd.tolist())
 
         # Overall (independent judges only, so the headline number is honest)
         ovr = {}
@@ -2855,6 +2894,20 @@ def build_parser():
                              'their own --out_json. Costs up to len(ladder) generations per edit '
                              '(stops early once every face in the batch is done). '
                              'e.g. 0.5 0.7 0.85 1.0 1.25 1.5')
+    parser.add_argument('--adaptive_stop_weights', default=None,
+                        help='With --adaptive_ladder: a second attribute classifier the stop rule also '
+                             'asks. A face stops at the first rung where the training teacher (r34) AND '
+                             'this classifier both see the edit past 0.5 by the margin. r34 is the model '
+                             'the editor was trained against, so it calls edits done that the judges '
+                             'reject (it reads 93-94%% success on every attribute while the judges read '
+                             '50-80%%); a classifier the training never saw is not fooled the same way. '
+                             'It must not be a judge of this eval (refused if it equals '
+                             '--independent_attr_weights or --celeba_attr_judge_weights).')
+    parser.add_argument('--adaptive_stop_backbone', default='r50',
+                        help='Backbone of --adaptive_stop_weights.')
+    parser.add_argument('--adaptive_stop_margin', type=float, default=None,
+                        help='Margin for --adaptive_stop_weights. Default: the same as the teacher '
+                             '(each --adaptive_margins value).')
     parser.add_argument('--adaptive_gains', nargs='*', type=float, default=None,
                         help='With --adaptive_ladder: extra rungs after the ladder that keep its largest '
                              'scale and lengthen the edit by these factors along its own direction '
