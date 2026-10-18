@@ -496,6 +496,10 @@ RUN_CONFIG_KEYS = [
     'residual_max_norm', 'direction_guided_delta_max_norm', 'final_delta_max_norm',
     # how the bank combines with the flow (--bank_mode) and anneal's schedule
     'bank_mode', 'bank_mix_start', 'bank_mix_end', 'bank_anneal_start_step', 'bank_anneal_steps',
+    # the training teacher(s): the adaptive stop rule and AccT* read the same
+    # teacher(s) the run was trained against
+    'attribute_weights', 'attribute_backbone', 'extra_teacher_weights', 'extra_teacher_backbone',
+    'teacher_combine',
 ]
 
 # Old eval flag names -> the training name they now share (apply_run_config
@@ -915,11 +919,21 @@ def load_models(args):
         p.requires_grad_(False)
 
     # ── Attribute teacher (training judge, kept as reference) ─────────────
-    attr_teacher = AttributeClassifier(backbone='r34')
+    attr_teacher = AttributeClassifier(backbone=getattr(args, 'attribute_backbone', 'r34'))
     attr_teacher.load_state_dict(load_network(args.attribute_weights))
     attr_teacher.to(device).eval()
     for p in attr_teacher.parameters():
         p.requires_grad_(False)
+    if getattr(args, 'extra_teacher_weights', None) and getattr(args, 'stop_rule_teachers', 'train') == 'train':
+        from models.attribute_estimator import TeacherEnsemble
+        _extra = AttributeClassifier(backbone=args.extra_teacher_backbone, pretrained=False)
+        _extra.load_state_dict(load_network(args.extra_teacher_weights))
+        _extra.to(device).eval()
+        for p in _extra.parameters():
+            p.requires_grad_(False)
+        attr_teacher = TeacherEnsemble([attr_teacher, _extra], combine=args.teacher_combine)
+        print(f'[Teacher] training teachers: {args.attribute_weights} + {args.extra_teacher_weights} '
+              f'({args.teacher_combine}); the adaptive stop rule and AccT* use both')
 
     return prior, conditioner, G, id_criterion, attr_teacher, \
            attribute_index, direction_bank, control_encoder
@@ -2139,8 +2153,14 @@ def evaluate(args):
                             set_edit_gain(_gain)
                             _ef = _edit(_sc)
                             _ef_256 = F.interpolate(_ef, (256, 256))
-                            _pt = torch.sigmoid(attr_teacher(_ef_256)[0])[:, _gidx]
-                            _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
+                            if getattr(attr_teacher, 'combine', 'mean') == 'min':
+                                # done only when EVERY training teacher agrees
+                                _pe = attr_teacher.each(_ef_256)[:, :, _gidx]       # (K, B)
+                                _ok = torch.where(_add, (_pe > 0.5 + edit_scale).all(0),
+                                                  (_pe < 0.5 - edit_scale).all(0))
+                            else:
+                                _pt = torch.sigmoid(attr_teacher(_ef_256)[0])[:, _gidx]
+                                _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
                             _new_t = _ok & ~_t_seen
                             _t_first[_new_t] = float(rung_vals[_k])
                             _t_seen |= _ok
@@ -2585,6 +2605,18 @@ def build_parser():
     parser.add_argument('--preds_file',   default='./data/ffhq_e4e_preds.pth')
     parser.add_argument('--stygan2_weights', default='./data/stylegan2-ffhq-config-f.pt')
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth')
+    parser.add_argument('--attribute_backbone', default='r34',
+                        choices=['r18', 'r34', 'r50', 'convnext_t'],
+                        help='Restored from config.json (train --attribute_backbone).')
+    parser.add_argument('--extra_teacher_weights', default=None,
+                        help='Restored from config.json (train --extra_teacher_weights).')
+    parser.add_argument('--extra_teacher_backbone', default='convnext_t',
+                        choices=['r18', 'r34', 'r50', 'convnext_t'])
+    parser.add_argument('--teacher_combine', default='mean', choices=['mean', 'min'])
+    parser.add_argument('--stop_rule_teachers', default='train', choices=['train', 'r34'],
+                        help='train (default): the adaptive stop rule and AccT* use every teacher the '
+                             'run trained against (with --extra_teacher_weights, both). r34: only '
+                             '--attribute_weights, the old behaviour, for an ablation.')
     parser.add_argument('--direction_bank_path', default=None)
     parser.add_argument('--force_bank_directions', action='store_true',
                         help='Re-inject the direction geometry from --direction_bank_path '

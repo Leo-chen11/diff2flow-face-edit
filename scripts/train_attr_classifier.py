@@ -116,7 +116,8 @@ def resolve_images(image_dir, files):
 
 
 class AttrDataset(Dataset):
-    def __init__(self, root, attr_name, image_subdir, img_size, train, resize_mode):
+    def __init__(self, root, attr_name, image_subdir, img_size, train, resize_mode,
+                 strong_aug=False):
         root = os.path.expanduser(root)
         files, labels = read_attr_file(os.path.join(root, attr_name))
         paths, keep = resolve_images(os.path.join(root, image_subdir), files)
@@ -130,6 +131,7 @@ class AttrDataset(Dataset):
         self.img_size = img_size
         self.train = train
         self.resize_mode = resize_mode
+        self.strong_aug = strong_aug and train
 
     def __len__(self):
         return len(self.paths)
@@ -147,7 +149,27 @@ class AttrDataset(Dataset):
                               antialias=True)[0]
         if self.train and random.random() < 0.5:
             x = torch.flip(x, dims=[2])
+        if self.strong_aug:
+            x = strong_augment(x)
         return x, self.labels[i]
+
+
+def strong_augment(x):
+    """x: (3, H, W) in [-1, 1]. Random resized crop, colour jitter, blur."""
+    _, h, w = x.shape
+    s = random.uniform(0.75, 1.0)
+    ch, cw = int(h * s), int(w * s)
+    top, left = random.randint(0, h - ch), random.randint(0, w - cw)
+    x = F.interpolate(x[None, :, top:top + ch, left:left + cw], (h, w), mode='bilinear',
+                      align_corners=False, antialias=True)[0]
+    y = (x + 1.0) * 0.5
+    y = TF.adjust_brightness(y, random.uniform(0.8, 1.2))
+    y = TF.adjust_contrast(y, random.uniform(0.8, 1.2))
+    y = TF.adjust_saturation(y, random.uniform(0.8, 1.2))
+    y = TF.adjust_hue(y, random.uniform(-0.03, 0.03))
+    if random.random() < 0.3:
+        y = TF.gaussian_blur(y, kernel_size=5, sigma=random.uniform(0.3, 1.5))
+    return (y.clamp(0, 1) * 2.0 - 1.0)
 
 
 @torch.no_grad()
@@ -178,7 +200,13 @@ def main():
     p.add_argument('--attr_file', default='attributes.txt')
     p.add_argument('--image_subdir', default='images')
     p.add_argument('--out', default='./data/r50_celebahq_eval.pth')
-    p.add_argument('--backbone', default='r50', choices=['r18', 'r34', 'r50'])
+    p.add_argument('--backbone', default='r50', choices=['r18', 'r34', 'r50', 'convnext_t'])
+    p.add_argument('--strong_aug', action='store_true',
+                   help='Training augmentation beyond flips: random resized crop (scale 0.75-1), '
+                        'colour jitter and occasional blur. For a TRAINING teacher (e.g. '
+                        '--backbone convnext_t): it should judge semantics, not texture details an '
+                        'editor can forge, and it should not be trained exactly like the R50 '
+                        'judge this script also makes.')
     p.add_argument('--img_size', type=int, default=256)
     p.add_argument('--resize_mode', default='mixed', choices=['mixed', 'nearest', 'bilinear'])
     p.add_argument('--epochs', type=int, default=15)
@@ -197,7 +225,7 @@ def main():
 
     print('loading data')
     train_set = AttrDataset(args.train_dir, args.attr_file, args.image_subdir,
-                            args.img_size, True, args.resize_mode)
+                            args.img_size, True, args.resize_mode, strong_aug=args.strong_aug)
     val_set = AttrDataset(args.val_dir, args.attr_file, args.image_subdir,
                           args.img_size, False, args.resize_mode)
     train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True, drop_last=True,
@@ -246,6 +274,7 @@ def main():
             torch.save(model.state_dict(), args.out)
             report = {
                 'epoch': epoch, 'backbone': args.backbone, 'img_size': args.img_size,
+                'strong_aug': args.strong_aug,
                 'resize_mode': args.resize_mode, 'val_mean_acc': best,
                 'val_acc': {a: acc[i].item() for i, a in enumerate(CELEBA_ATTRS)},
                 'val_balanced_acc': {a: bal[i].item() for i, a in enumerate(CELEBA_ATTRS)},

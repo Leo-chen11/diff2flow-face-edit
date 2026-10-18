@@ -257,6 +257,7 @@ def _mechanism_report(args):
         ('shortcut_clip_boost', args.shortcut_clip_boost),
         ('hair_gray', args.hair_gray_loss_weight),
         ('hair_extent', args.hair_extent_loss_weight),
+        ('extra_teacher', 1.0 if args.extra_teacher_weights else 0),
         ('local_region_true_dilate', 1.0 if args.local_region_true_dilate else 0),
         ('target_src_from_recon', 1.0 if args.target_src_from_recon else 0),
         ('clip_prompt_bangs', args.clip_prompt_bangs_weight if args.clip_prompt_bangs else 0),
@@ -903,6 +904,24 @@ if __name__ == '__main__':
     parser.add_argument('--kd_loss_weight',type=float,default=1)
     parser.add_argument('--id_loss_weight',type=float,default=0.35)
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
+    parser.add_argument('--attribute_backbone', default='r34', choices=['r18', 'r34', 'r50', 'convnext_t'],
+                        help='Backbone of --attribute_weights, the training teacher. r34 (default) is '
+                             'the original teacher; convnext_t swaps in a different architecture '
+                             'family (scripts/train_attr_classifier.py --backbone convnext_t). The '
+                             'soft-target table and ID thresholds were tuned on the r34 scale.')
+    parser.add_argument('--extra_teacher_weights', default=None,
+                        help='A second training teacher (an AttributeClassifier checkpoint, e.g. a '
+                             'ConvNeXt-T from scripts/train_attr_classifier.py --backbone convnext_t). '
+                             'The editor learns to fool the one teacher it trains against (r34 reads '
+                             '93-95%% success while the judges read 50-80%%); a forgery has to fool a '
+                             'second architecture too. Must not be an evaluation judge.')
+    parser.add_argument('--extra_teacher_backbone', default='convnext_t',
+                        choices=['r18', 'r34', 'r50', 'convnext_t'])
+    parser.add_argument('--teacher_combine', default='mean', choices=['mean', 'min'],
+                        help='How the teachers\' probabilities enter the losses. mean: averaged '
+                             'everywhere. min: the target loss reads, per sample, the teacher that is '
+                             'LESS convinced the edit reached its end (the edit is done only when '
+                             'every teacher agrees); the other attributes use the mean.')
     parser.add_argument('--counter_attr_weight', type=float, default=0.6)
     parser.add_argument('--preserve_attr_weight', type=float, default=0.6)
     parser.add_argument('--hard_example_gamma', type=float, default=0.0,
@@ -2375,12 +2394,37 @@ if __name__ == '__main__':
         p.requires_grad_(False)
     print('** IDLoss (ArcFace) initialization success !')
 
-    attr_teacher = AttributeClassifier(backbone='r34')
+    attr_teacher = AttributeClassifier(backbone=args.attribute_backbone, pretrained=False)
     attr_teacher.load_state_dict(load_network(args.attribute_weights))
     attr_teacher.cuda().eval()
     for p in attr_teacher.parameters():
         p.requires_grad_(False)
-    print('** Frozen attribute teacher initialization success !')
+    print(f'** Frozen attribute teacher initialization success ! ({args.attribute_backbone})')
+    teachers = [attr_teacher]
+    if args.extra_teacher_weights:
+        for _judge in (args.celeba_attr_judge_weights,):
+            if _judge and os.path.abspath(_judge) == os.path.abspath(args.extra_teacher_weights):
+                raise SystemExit('--extra_teacher_weights is the CelebA judge: training on it would '
+                                 'grade the edits by the model they were optimized against')
+        _extra = AttributeClassifier(backbone=args.extra_teacher_backbone, pretrained=False)
+        _extra.load_state_dict(load_network(args.extra_teacher_weights))
+        _extra.cuda().eval()
+        for p in _extra.parameters():
+            p.requires_grad_(False)
+        teachers.append(_extra)
+        print(f'** Extra training teacher: {args.extra_teacher_weights} '
+              f'({args.extra_teacher_backbone}), combine={args.teacher_combine}')
+
+    def teacher_probs_each(x):
+        """(K, B, 40) sigmoid probabilities of every training teacher."""
+        return torch.stack([torch.sigmoid(t(x)[0][:, :40]) for t in teachers])
+
+    def teacher_probs(x):
+        """(B, 40+) combined probabilities; with one teacher exactly the
+        sigmoid of its logits, as before."""
+        if len(teachers) == 1:
+            return torch.sigmoid(attr_teacher(x)[0])
+        return teacher_probs_each(x).mean(0)
 
     # Independent AccCeleb monitor. Deliberately outside the loss: this is the
     # same classifier evaluate_sdflow.py reports AccCeleb with, so feeding it
@@ -3075,14 +3119,19 @@ if __name__ == '__main__':
             )
             src_face_256, new_face_256 = _aug[0], _aug[1]
             recon_face_256 = _aug[2] if _pres_ref is not None else None
-            src_logits, _ = attr_teacher(src_face_256)
-            gen_logits, _ = attr_teacher(new_face_256)
-            src_probs = torch.sigmoid(src_logits)[:, attribute_index].detach()
-            gen_probs = torch.sigmoid(gen_logits)[:, attribute_index]
+            src_all = teacher_probs(src_face_256)
+            if len(teachers) == 1:
+                gen_each = None
+                gen_all = teacher_probs(new_face_256)
+            else:
+                gen_each = teacher_probs_each(new_face_256)       # (K, B, 40)
+                gen_all = gen_each.mean(0)
+            src_probs = src_all[:, attribute_index].detach()
+            gen_probs = gen_all[:, attribute_index]
             src_attr = src_probs[batch_indices, mid_idx]
             if args.target_src_from_recon and recon_face_256 is not None:
                 with torch.no_grad():
-                    src_attr = torch.sigmoid(attr_teacher(recon_face_256)[0])[:, attribute_index][
+                    src_attr = teacher_probs(recon_face_256)[:, attribute_index][
                         batch_indices, mid_idx]
             # The FLOW was told which way to go by edit_is_rm (above: the
             # conditioner's reading, or the precomputed teacher reading with
@@ -3105,6 +3154,12 @@ if __name__ == '__main__':
             # direction (CLIP, DDS prompts read target >= 0.5).
             edit_end = hard_teacher_target.detach()
             edited_probs = gen_probs[batch_indices, mid_idx]
+            if gen_each is not None and args.teacher_combine == 'min':
+                # the teacher LEAST convinced the edit reached its end
+                _gidx_t = attribute_index.to(mid_idx.device)[mid_idx]
+                _per_t = gen_each[:, batch_indices, _gidx_t]                     # (K, B)
+                edited_probs = torch.where(edit_end >= 0.5, _per_t.min(0).values,
+                                           _per_t.max(0).values)
             # squared error to the soft target (a hinge variant had no effect at
             # matched identity and was removed)
             changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
@@ -3137,7 +3192,7 @@ if __name__ == '__main__':
                 # edit, a floor this loss could never get below.
                 if recon_face_256 is not None:
                     with torch.no_grad():
-                        _pres_probs = torch.sigmoid(attr_teacher(recon_face_256)[0])[:, attribute_index]
+                        _pres_probs = teacher_probs(recon_face_256)[:, attribute_index]
                 else:
                     _pres_probs = src_probs
                 diff_sq = (gen_probs - _pres_probs).pow(2)  # [B, num_attrs]
@@ -3149,7 +3204,7 @@ if __name__ == '__main__':
             # --coupled_targets: attributes the edit must move along with it.
             coupled_loss = _zero.clone()
             if COUPLED_TARGETS and args.coupled_target_weight > 0:
-                _gen_all = torch.sigmoid(gen_logits)
+                _gen_all = gen_all
                 _mid_abs_c = torch.tensor([args.attribute_index[int(j)] for j in mid_idx.tolist()],
                                           device=latent.device)
                 _terms = []
