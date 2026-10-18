@@ -31,7 +31,7 @@ from common.region_stat_loss import (dilate_mask, directional_region_area_loss,
 from models.dataset import IndexedDataset, SDFlowDataset
 from models.flows.flow import cnf
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
-from models.attribute_estimator import AttributeClassifier
+from models.attribute_estimator import AttributeClassifier, make_attr_classifier
 from models.conditioner import IdentityAttributeConditioner
 from models.control_encoder import clip_skips, skips_norm_per_sample, skips_reg_per_sample
 from models.direction_bank import AttributeDirectionBank, _inverse_softplus, bank_mix_at, parse_attr_spec
@@ -904,7 +904,7 @@ if __name__ == '__main__':
     parser.add_argument('--kd_loss_weight',type=float,default=1)
     parser.add_argument('--id_loss_weight',type=float,default=0.35)
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth', type=str)
-    parser.add_argument('--attribute_backbone', default='r34', choices=['r18', 'r34', 'r50', 'convnext_t'],
+    parser.add_argument('--attribute_backbone', default='r34', choices=['r18', 'r34', 'r50', 'convnext_t', 'convnext_b512', 'convnext_b512_pm1'],
                         help='Backbone of --attribute_weights, the training teacher. r34 (default) is '
                              'the original teacher; convnext_t swaps in a different architecture '
                              'family (scripts/train_attr_classifier.py --backbone convnext_t). The '
@@ -915,8 +915,10 @@ if __name__ == '__main__':
                              'The editor learns to fool the one teacher it trains against (r34 reads '
                              '93-95%% success while the judges read 50-80%%); a forgery has to fool a '
                              'second architecture too. Must not be an evaluation judge.')
-    parser.add_argument('--extra_teacher_backbone', default='convnext_t',
-                        choices=['r18', 'r34', 'r50', 'convnext_t'])
+    parser.add_argument('--extra_teacher_backbone', default='convnext_t', choices=['r18', 'r34', 'r50', 'convnext_t', 'convnext_b512', 'convnext_b512_pm1'],
+                        help='convnext_b512 / convnext_b512_pm1: the ConvNeXt-B 512 classifier '
+                             '(data/convnext_base_a40_512_classifier.pth), [0,1] or [-1,1] input '
+                             'before its own mean/std -- see scripts/check_attr_classifier.py.')
     parser.add_argument('--teacher_combine', default='mean', choices=['mean', 'min'],
                         help='How the teachers\' probabilities enter the losses. mean: averaged '
                              'everywhere. min: the target loss reads, per sample, the teacher that is '
@@ -2394,7 +2396,7 @@ if __name__ == '__main__':
         p.requires_grad_(False)
     print('** IDLoss (ArcFace) initialization success !')
 
-    attr_teacher = AttributeClassifier(backbone=args.attribute_backbone, pretrained=False)
+    attr_teacher = make_attr_classifier(args.attribute_backbone, pretrained=False)
     attr_teacher.load_state_dict(load_network(args.attribute_weights))
     attr_teacher.cuda().eval()
     for p in attr_teacher.parameters():
@@ -2406,7 +2408,7 @@ if __name__ == '__main__':
             if _judge and os.path.abspath(_judge) == os.path.abspath(args.extra_teacher_weights):
                 raise SystemExit('--extra_teacher_weights is the CelebA judge: training on it would '
                                  'grade the edits by the model they were optimized against')
-        _extra = AttributeClassifier(backbone=args.extra_teacher_backbone, pretrained=False)
+        _extra = make_attr_classifier(args.extra_teacher_backbone, pretrained=False)
         _extra.load_state_dict(load_network(args.extra_teacher_weights))
         _extra.cuda().eval()
         for p in _extra.parameters():

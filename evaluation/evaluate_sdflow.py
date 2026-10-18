@@ -62,7 +62,7 @@ from common.ops import load_network
 from common.version import code_version
 from models.dataset import SDFlowDataset
 from models.flows.flow import cnf
-from models.attribute_estimator import AttributeClassifier
+from models.attribute_estimator import AttributeClassifier, make_attr_classifier
 from models.conditioner import IdentityAttributeConditioner
 from models.control_encoder import add_skips, clip_skips
 from models.stylegan2.model import Generator
@@ -919,14 +919,14 @@ def load_models(args):
         p.requires_grad_(False)
 
     # ── Attribute teacher (training judge, kept as reference) ─────────────
-    attr_teacher = AttributeClassifier(backbone=getattr(args, 'attribute_backbone', 'r34'))
+    attr_teacher = make_attr_classifier(getattr(args, 'attribute_backbone', 'r34'))
     attr_teacher.load_state_dict(load_network(args.attribute_weights))
     attr_teacher.to(device).eval()
     for p in attr_teacher.parameters():
         p.requires_grad_(False)
     if getattr(args, 'extra_teacher_weights', None) and getattr(args, 'stop_rule_teachers', 'train') == 'train':
         from models.attribute_estimator import TeacherEnsemble
-        _extra = AttributeClassifier(backbone=args.extra_teacher_backbone, pretrained=False)
+        _extra = make_attr_classifier(args.extra_teacher_backbone, pretrained=False)
         _extra.load_state_dict(load_network(args.extra_teacher_weights))
         _extra.to(device).eval()
         for p in _extra.parameters():
@@ -2605,13 +2605,11 @@ def build_parser():
     parser.add_argument('--preds_file',   default='./data/ffhq_e4e_preds.pth')
     parser.add_argument('--stygan2_weights', default='./data/stylegan2-ffhq-config-f.pt')
     parser.add_argument('--attribute_weights', default='./data/r34_a40_age_256_classifier.pth')
-    parser.add_argument('--attribute_backbone', default='r34',
-                        choices=['r18', 'r34', 'r50', 'convnext_t'],
+    parser.add_argument('--attribute_backbone', default='r34', choices=['r18', 'r34', 'r50', 'convnext_t', 'convnext_b512', 'convnext_b512_pm1'],
                         help='Restored from config.json (train --attribute_backbone).')
     parser.add_argument('--extra_teacher_weights', default=None,
                         help='Restored from config.json (train --extra_teacher_weights).')
-    parser.add_argument('--extra_teacher_backbone', default='convnext_t',
-                        choices=['r18', 'r34', 'r50', 'convnext_t'])
+    parser.add_argument('--extra_teacher_backbone', default='convnext_t', choices=['r18', 'r34', 'r50', 'convnext_t', 'convnext_b512', 'convnext_b512_pm1'])
     parser.add_argument('--teacher_combine', default='mean', choices=['mean', 'min'])
     parser.add_argument('--stop_rule_teachers', default='train', choices=['train', 'r34'],
                         help='train (default): the adaptive stop rule and AccT* use every teacher the '
