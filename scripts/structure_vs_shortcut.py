@@ -55,6 +55,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
+import torchvision.utils as vutils
 from torch.utils import data
 from tqdm import tqdm
 
@@ -173,6 +174,11 @@ def main():
     p = build_parser()
     p.add_argument('--edit_scale', type=float, default=0.9,
                    help='One fixed edit strength; the groups are about WHAT changed, not how much.')
+    p.add_argument('--dump_dir', default=None,
+                   help='Also save a source-vs-edit grid per cell and group, so the numbers can be '
+                        'checked by eye: the teacher group changes structure as much as the both '
+                        'group, so what the judge rejects has to be visible, not measurable.')
+    p.add_argument('--dump_n', type=int, default=8, help='Faces per grid (--dump_dir).')
     # --out_json already exists in build_parser; reuse it (evaluate() is never called here)
     args = p.parse_args()
     # evaluate_sdflow does these in its own __main__, not in load_models():
@@ -206,6 +212,7 @@ def main():
 
     cells = [(g, d, lab) for g, d, lab in CELLS if g in args.attribute_index]
     buckets = {lab: {gr: [] for gr in GROUPS} for _, _, lab in cells}
+    shots = {lab: {gr: [] for gr in GROUPS} for _, _, lab in cells}   # --dump_dir
     seen = 0
     for img, latent, _pred in tqdm(loader, desc='faces'):
         if seen >= args.num_samples:
@@ -245,6 +252,9 @@ def main():
                 ok_j = strict_success(float(src_j[b, gidx]), float(e_j[b]), args.success_margin)
                 grp = 'both' if (ok_t and ok_j) else ('teacher' if ok_t else 'neither')
                 buckets[lab][grp].append({m: float(e_m[m][b] - src_m[m][b]) for m in MEASURES})
+                if args.dump_dir and len(shots[lab][grp]) < args.dump_n:
+                    shots[lab][grp].append((src256[b].cpu(), e256[b].cpu(),
+                                            float(src_j[b, gidx]), float(e_j[b])))
         seen += B
 
     report = {}
@@ -267,6 +277,22 @@ def main():
                                **{m: {'abs': s[m][0], 'signed': s[m][1]} for m in MEASURES}}
             print(f'  {gr:<8} {len(rows):>5} '
                   + ' '.join(f'{s[m][0]:9.4f} ({s[m][1]:+.4f})' for m in MEASURES))
+
+    if args.dump_dir:
+        os.makedirs(args.dump_dir, exist_ok=True)
+        for _, _, lab in cells:
+            for gr in GROUPS:
+                rows = shots[lab][gr]
+                if not rows:
+                    continue
+                # one column per face: source reconstruction on top, edit below
+                grid = vutils.make_grid(torch.stack([r[0] for r in rows] + [r[1] for r in rows]),
+                                        nrow=len(rows), normalize=True, value_range=(-1, 1))
+                name = f'{lab.split(" (")[0].replace(" ", "_")}__{gr}.png'
+                vutils.save_image(grid, os.path.join(args.dump_dir, name))
+                probs = ' '.join(f'{r[2]:.2f}->{r[3]:.2f}' for r in rows)
+                print(f'  [dump] {name}  judge prob per column: {probs}')
+        print(f'  [dump] top row = source reconstruction, bottom row = edit; saved to {args.dump_dir}')
 
     out = args.out_json or os.path.join(args.checkpoint_dir, 'structure_vs_shortcut.json')
     with open(out, 'w') as f:
