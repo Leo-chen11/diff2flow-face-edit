@@ -62,8 +62,9 @@ from common.face_parser import FaceParser
 from common.ops import load_network
 from models.attribute_estimator import AttributeClassifier
 from models.dataset import SDFlowDataset
-from evaluation.evaluate_sdflow import (build_parser, edit_single_attribute, is_clear,
-                                        load_models, strict_success)
+from evaluation.evaluate_sdflow import (_latest_step, apply_run_config, build_parser,
+                                        edit_single_attribute, is_clear, load_models,
+                                        resolve_controlnet_disable_attrs, strict_success)
 
 # (absolute attribute index, direction, label). The three weak cells, plus
 # Eyeglasses-add as the control that is known to work.
@@ -174,6 +175,13 @@ def main():
                    help='One fixed edit strength; the groups are about WHAT changed, not how much.')
     # --out_json already exists in build_parser; reuse it (evaluate() is never called here)
     args = p.parse_args()
+    # evaluate_sdflow does these in its own __main__, not in load_models():
+    # without them the flow is built from the argparse defaults (3 attributes)
+    # instead of the run's own config.json (5), and the checkpoint will not load.
+    args = apply_run_config(args)
+    args = resolve_controlnet_disable_attrs(args)
+    if args.step is None:
+        args.step = _latest_step(args.checkpoint_dir)
     if not args.independent_attr_weights:
         raise SystemExit('--independent_attr_weights is required: the judge defines the groups')
     args.eval_scales = [args.edit_scale]
