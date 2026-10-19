@@ -18,6 +18,11 @@ This script separates them. For each edit it splits the faces into
   teacher   the teacher calls it a success, the judge does not   <- the question
   judge     the judge calls it a success, the teacher does not
   neither   both call it a failure
+  pre       the teacher already reads the SOURCE on the target side (the
+            judge does not, or the face would not be in the cell). The
+            conditioner shares the teacher's reading, so without
+            --src_cond_clamp the flow is asked for ~no change; and
+            strict_success would score the teacher in the opposite direction.
 
 and reports, per group, how much the STRUCTURE moved between the source
 reconstruction and the edit, measured from BiSeNet's segmentation (no
@@ -81,7 +86,7 @@ SKIN, GLASSES, HAIR = 1, 6, 17
 # would otherwise leave the forehead band undefined on exactly the control cell
 EYE_LEVEL = [2, 3, 4, 5, 6]
 MEASURES = ['hair_frac', 'forehead_hair', 'jaw_width', 'skin_hf', 'hair_sat', 'glasses_frac']
-GROUPS = ['both', 'teacher', 'judge', 'neither']
+GROUPS = ['both', 'teacher', 'judge', 'neither', 'pre']
 # Attributes CelebA ties to the edited ones (Bangs with not-Male, Eyeglasses
 # with Male and not-Young). The dumps showed the teacher-only group full of
 # adult men for Bangs-add and glasses for Male-rm / Young-add: if the judge
@@ -274,11 +279,15 @@ def main():
             for b in range(B):
                 if not bool(keep[b]):
                     continue
+                pre = (float(src_t[b, gidx]) > 0.5) == add
                 ok_t = strict_success(float(src_t[b, gidx]), float(e_t[b]), args.success_margin)
                 ok_j = strict_success(float(src_j[b, gidx]), float(e_j[b]), args.success_margin)
-                grp = ('both' if ok_j else 'teacher') if ok_t else ('judge' if ok_j else 'neither')
+                if pre:
+                    grp = 'pre'
+                else:
+                    grp = ('both' if ok_j else 'teacher') if ok_t else ('judge' if ok_j else 'neither')
                 buckets[lab][grp].append({m: float(e_m[m][b] - src_m[m][b]) for m in MEASURES})
-                strata[lab].append((ok_t, ok_j, {name: bool(src_j[b, k] > 0.5)
+                strata[lab].append((ok_t and not pre, ok_j, pre, {name: bool(src_j[b, k] > 0.5)
                                                  for k, name in CO_ATTRS if k != gidx}))
                 if args.dump_dir and len(shots[lab][grp]) < args.dump_n:
                     shots[lab][grp].append((src256[b].detach().cpu(),
@@ -288,10 +297,11 @@ def main():
 
     report = {}
     print(f'\n{seen} faces, edit_scale {args.edit_scale:g}, judge '
-          f'{os.path.basename(judge_path)}')
+          f'{os.path.basename(judge_path)}, src_cond_clamp {args.src_cond_clamp}')
     print('Structure change between the source reconstruction and the edit.\n'
           'both = teacher and judge agree it worked; teacher = only the teacher; '
-          'judge = only the judge; neither = both say it failed.\nEach cell: mean |delta| (mean signed delta).')
+          'judge = only the judge; neither = both say it failed; pre = the teacher already\n'
+          'reads the source as edited (a no-op unless --src_cond_clamp).\nEach cell: mean |delta| (mean signed delta).')
     for _, _, lab in cells:
         print(f'\n{lab}')
         print(f'  {"group":<8} {"n":>5} ' + ' '.join(f'{m:>20}' for m in MEASURES))
@@ -308,21 +318,23 @@ def main():
                   + ' '.join(f'{s[m][0]:9.4f} ({s[m][1]:+.4f})' for m in MEASURES))
 
     print('\nSuccess rate split by an attribute of the SOURCE (as the judge reads it).\n'
-          'A judge that inherited a CelebA correlation shows a gap in judge%, not in teacher%.')
+          'A judge that inherited a CelebA correlation shows a gap in judge%, not in teacher%.\n'
+          'pre% = sources the teacher (and the conditioner) already read on the target side.')
     for _, _, lab in cells:
         print(f'\n{lab}')
-        print(f'  {"source":<16} {"n":>5} {"teacher%":>9} {"judge%":>8}')
+        print(f'  {"source":<16} {"n":>5} {"teacher%":>9} {"judge%":>8} {"pre%":>7}')
         report[lab]['strata'] = {}
         for _, name in CO_ATTRS:
             for has in (True, False):
-                rows = [r for r in strata[lab] if r[2].get(name) is has]
-                if name not in (strata[lab][0][2] if strata[lab] else {}) or not rows:
+                rows = [r for r in strata[lab] if r[3].get(name) is has]
+                if name not in (strata[lab][0][3] if strata[lab] else {}) or not rows:
                     continue
                 t = 100 * np.mean([r[0] for r in rows])
                 j = 100 * np.mean([r[1] for r in rows])
+                pr = 100 * np.mean([r[2] for r in rows])
                 key = f'{name}={int(has)}'
-                report[lab]['strata'][key] = {'n': len(rows), 'teacher': t, 'judge': j}
-                print(f'  {key:<16} {len(rows):>5} {t:8.1f}% {j:7.1f}%')
+                report[lab]['strata'][key] = {'n': len(rows), 'teacher': t, 'judge': j, 'pre': pr}
+                print(f'  {key:<16} {len(rows):>5} {t:8.1f}% {j:7.1f}% {pr:6.1f}%')
 
     if args.dump_dir:
         os.makedirs(args.dump_dir, exist_ok=True)
@@ -340,9 +352,12 @@ def main():
                 print(f'  [dump] {name}  judge prob per column: {probs}')
         print(f'  [dump] top row = source reconstruction, bottom row = edit; saved to {args.dump_dir}')
 
-    out = args.out_json or os.path.join(args.checkpoint_dir, f'structure_vs_shortcut_{args.judge}.json')
+    tag = f'{args.judge}_s{args.edit_scale:g}' + (f'_clamp{args.src_cond_clamp:g}'
+                                                  if args.src_cond_clamp is not None else '')
+    out = args.out_json or os.path.join(args.checkpoint_dir, f'structure_vs_shortcut_{tag}.json')
     with open(out, 'w') as f:
         json.dump({'edit_scale': args.edit_scale, 'n_faces': seen,
+                   'src_cond_clamp': args.src_cond_clamp,
                    'checkpoint_dir': args.checkpoint_dir, 'step': args.step,
                    'judge': judge_path, 'cells': report}, f, indent=2)
     print(f'\nsaved {out}')
