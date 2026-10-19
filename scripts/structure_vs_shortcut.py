@@ -210,6 +210,12 @@ def main():
         ds = data.Subset(ds, range(args.sample_offset, len(ds)))
     loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
 
+    # edit_single_attribute is not decorated no_grad (evaluate() wraps its own
+    # call site), and nothing here needs gradients. Without this the generator
+    # graph of every edit stays alive -- harmless while each batch was thrown
+    # away, an OOM once --dump_dir keeps tensors that reference it.
+    torch.set_grad_enabled(False)
+
     cells = [(g, d, lab) for g, d, lab in CELLS if g in args.attribute_index]
     buckets = {lab: {gr: [] for gr in GROUPS} for _, _, lab in cells}
     shots = {lab: {gr: [] for gr in GROUPS} for _, _, lab in cells}   # --dump_dir
@@ -253,7 +259,8 @@ def main():
                 grp = 'both' if (ok_t and ok_j) else ('teacher' if ok_t else 'neither')
                 buckets[lab][grp].append({m: float(e_m[m][b] - src_m[m][b]) for m in MEASURES})
                 if args.dump_dir and len(shots[lab][grp]) < args.dump_n:
-                    shots[lab][grp].append((src256[b].cpu(), e256[b].cpu(),
+                    shots[lab][grp].append((src256[b].detach().cpu(),
+                                            e256[b].detach().cpu(),
                                             float(src_j[b, gidx]), float(e_j[b])))
         seen += B
 
