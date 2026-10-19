@@ -16,6 +16,7 @@ This script separates them. For each edit it splits the faces into
 
   both      the teacher and the judge both call the edit a success
   teacher   the teacher calls it a success, the judge does not   <- the question
+  judge     the judge calls it a success, the teacher does not
   neither   both call it a failure
 
 and reports, per group, how much the STRUCTURE moved between the source
@@ -79,7 +80,7 @@ SKIN, GLASSES, HAIR = 1, 6, 17
 # would otherwise leave the forehead band undefined on exactly the control cell
 EYE_LEVEL = [2, 3, 4, 5, 6]
 MEASURES = ['hair_frac', 'forehead_hair', 'jaw_width', 'skin_hf', 'hair_sat', 'glasses_frac']
-GROUPS = ['both', 'teacher', 'neither']
+GROUPS = ['both', 'teacher', 'judge', 'neither']
 
 
 @torch.no_grad()
@@ -256,7 +257,7 @@ def main():
                     continue
                 ok_t = strict_success(float(src_t[b, gidx]), float(e_t[b]), args.success_margin)
                 ok_j = strict_success(float(src_j[b, gidx]), float(e_j[b]), args.success_margin)
-                grp = 'both' if (ok_t and ok_j) else ('teacher' if ok_t else 'neither')
+                grp = ('both' if ok_j else 'teacher') if ok_t else ('judge' if ok_j else 'neither')
                 buckets[lab][grp].append({m: float(e_m[m][b] - src_m[m][b]) for m in MEASURES})
                 if args.dump_dir and len(shots[lab][grp]) < args.dump_n:
                     shots[lab][grp].append((src256[b].detach().cpu(),
@@ -269,7 +270,7 @@ def main():
           f'{os.path.basename(args.independent_attr_weights)}')
     print('Structure change between the source reconstruction and the edit.\n'
           'both = teacher and judge agree it worked; teacher = only the teacher; '
-          'neither = both say it failed.\nEach cell: mean |delta| (mean signed delta).')
+          'judge = only the judge; neither = both say it failed.\nEach cell: mean |delta| (mean signed delta).')
     for _, _, lab in cells:
         print(f'\n{lab}')
         print(f'  {"group":<8} {"n":>5} ' + ' '.join(f'{m:>20}' for m in MEASURES))
