@@ -186,7 +186,9 @@ def main():
         raise SystemExit('--independent_attr_weights is required: the judge defines the groups')
     args.eval_scales = [args.edit_scale]
 
-    prior, conditioner, G, id_criterion, attr_teacher, attribute_index, direction_bank = \
+    # this branch's load_models also returns control_encoder (None unless the
+    # run used ControlNet); edit_single_attribute is called without it here
+    prior, conditioner, G, id_criterion, attr_teacher, attribute_index, direction_bank, _ = \
         load_models(args)
     judge = AttributeClassifier(backbone=args.independent_attr_backbone)
     judge.load_state_dict(load_network(args.independent_attr_weights))
