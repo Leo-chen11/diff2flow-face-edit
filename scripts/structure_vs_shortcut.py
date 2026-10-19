@@ -172,7 +172,7 @@ def main():
     p = build_parser()
     p.add_argument('--edit_scale', type=float, default=0.9,
                    help='One fixed edit strength; the groups are about WHAT changed, not how much.')
-    p.add_argument('--out_json', dest='out_json_struct', default=None)
+    # --out_json already exists in build_parser; reuse it (evaluate() is never called here)
     args = p.parse_args()
     if not args.independent_attr_weights:
         raise SystemExit('--independent_attr_weights is required: the judge defines the groups')
@@ -258,7 +258,7 @@ def main():
             print(f'  {gr:<8} {len(rows):>5} '
                   + ' '.join(f'{s[m][0]:9.4f} ({s[m][1]:+.4f})' for m in MEASURES))
 
-    out = args.out_json_struct or os.path.join(args.checkpoint_dir, 'structure_vs_shortcut.json')
+    out = args.out_json or os.path.join(args.checkpoint_dir, 'structure_vs_shortcut.json')
     with open(out, 'w') as f:
         json.dump({'edit_scale': args.edit_scale, 'n_faces': seen,
                    'checkpoint_dir': args.checkpoint_dir, 'step': args.step,
