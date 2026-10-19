@@ -24,7 +24,7 @@ Nothing is extrapolated; -- means the step does not reach that ID.
 With --labels the rows are labelled files instead of steps, so two runs'
 checkpoints (e.g. min 80k vs min_robust 80k) can be compared at matched ID.
 
-Usage:
+Usage (consensus columns; add --solo to score each judge alone over all faces):
     python -m scripts.anneal_trajectory \
         $R/eval_anneal_s60000_cons.json $R/eval_anneal_s65000_cons.json ... \
         --scale 0.9 --points 3 --out $R/anneal_trajectory.json
@@ -40,6 +40,16 @@ from models.direction_bank import bank_mix_at
 from scripts.merge_eval_scales import interp, mean
 
 JUDGES = {'both': 'AccBoth', 'celeb': 'AccCeleb', 'clip': 'AccCLIP', 'indep': 'AccInd'}
+# --solo: each judge on its own, over ALL faces whose source it reads clearly
+# (not the consensus subset); add / rm splits available too
+SOLO_JUDGES = {f'{j}{sfx}': f'{JUDGES[j]}{lab}' for j in ('celeb', 'indep', 'clip')
+               for sfx, lab in (('', ''), ('_add', '+'), ('_rm', '-'))}
+SOLO = False
+
+
+def _row(scales, s, attr):
+    r = scales[s].get(attr) or {}
+    return r if SOLO else (r.get('consensus') or {})
 
 
 def run_mix(cfg, args):
@@ -75,13 +85,13 @@ def load_step(path):
 def attr_names(scales):
     first = scales[sorted(scales, key=float)[0]]
     return [a for a, v in first.items()
-            if isinstance(v, dict) and 'consensus' in v]
+            if isinstance(v, dict) and ('id_indep' in v if SOLO else 'consensus' in v)]
 
 
 def points(scales, attr, key):
     pts = []
     for s in sorted(scales, key=float):
-        c = (scales[s].get(attr) or {}).get('consensus') or {}
+        c = _row(scales, s, attr)
         i, v = mean(c, 'id_indep'), mean(c, key)
         if i is not None and v is not None:
             pts.append((i, v))
@@ -91,7 +101,7 @@ def points(scales, attr, key):
 def at_scale(scales, attr, key, scale):
     pts = []
     for s in sorted(scales, key=float):
-        c = (scales[s].get(attr) or {}).get('consensus') or {}
+        c = _row(scales, s, attr)
         v = mean(c, key)
         if v is not None:
             pts.append((float(s), v))
@@ -122,7 +132,12 @@ def main():
     p.add_argument('files', nargs='+', help='--consensus JSONs, one per checkpoint step.')
     p.add_argument('--scale', type=float, default=0.9, help='scale for ID / LPIPS / FID columns')
     p.add_argument('--points', type=int, default=3, help='matched-ID points per attribute')
-    p.add_argument('--judges', nargs='+', default=['both', 'celeb', 'clip'], choices=list(JUDGES))
+    p.add_argument('--judges', nargs='+', default=None,
+                   help='consensus columns (default both celeb clip), or with --solo any of '
+                        + ' '.join(SOLO_JUDGES) + ' (default celeb indep clip)')
+    p.add_argument('--solo', action='store_true',
+                   help='Score every judge on its own over all faces it reads clearly, instead of '
+                        'the two-judge consensus subset. ID / LPIPS are then also over all faces.')
     p.add_argument('--labels', nargs='+', default=None,
                    help='one label per file, in the order given, instead of the checkpoint step '
                         '(and no sorting): use it to compare checkpoints of DIFFERENT runs at the '
@@ -132,11 +147,20 @@ def main():
     p.add_argument('--anneal_steps', type=int, default=20000)
     p.add_argument('--out', default=None)
     args = p.parse_args()
+    global SOLO
+    SOLO = args.solo
+    names = SOLO_JUDGES if SOLO else JUDGES
+    if args.judges is None:
+        args.judges = ['celeb', 'indep', 'clip'] if SOLO else ['both', 'celeb', 'clip']
+    bad = [j for j in args.judges if j not in names]
+    if bad:
+        raise SystemExit(f'unknown --judges {bad}; choose from {list(names)}')
+    JUDGES.update(SOLO_JUDGES)
 
     runs = []
     for f in args.files:
         cfg, scales = load_step(f)
-        if not cfg.get('consensus'):
+        if not cfg.get('consensus') and not args.solo:
             raise SystemExit(f'{f} was not run with --consensus')
         runs.append((cfg.get('step'), run_mix(cfg, args), cfg, scales, f))
     if args.labels:
@@ -146,11 +170,13 @@ def main():
     else:
         runs.sort(key=lambda r: (r[0] is None, r[0]))
     partner = {str(r[2].get('consensus_second') or 'clip') for r in runs}
+    if SOLO:
+        partner = set()   # per-judge scores over all faces do not depend on the partner
     if len(partner) > 1:
         raise SystemExit(f'files pair CelebA with different judges (consensus_second: {sorted(partner)}): '
                          f'AccBoth means something different in each')
-    other = {'clip': 'indep', 'indep': 'clip'}[partner.pop()]
-    if other in args.judges:
+    other = {'clip': 'indep', 'indep': 'clip'}[partner.pop()] if partner else None
+    if other and other in args.judges:
         print(f'[note] these files have no consensus acc_{other}; dropping that column')
         args.judges = [j for j in args.judges if j != other]
     for key in (() if args.labels else ('checkpoint_dir',)) + ('num_samples', 'sample_offset', 'edit_direction',
@@ -172,7 +198,7 @@ def main():
         # ID range every step covers for this attribute
         ranges = []
         for _, _, _, sc, _ in runs:
-            ids = [i for i, _ in points(sc, a, 'acc_both')]
+            ids = [i for i, _ in points(sc, a, f'acc_{args.judges[0]}' if SOLO else 'acc_both')]
             if ids:
                 ranges.append((min(ids), max(ids)))
         if len(ranges) < len(runs):
