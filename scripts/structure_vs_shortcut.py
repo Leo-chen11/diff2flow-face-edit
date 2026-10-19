@@ -81,6 +81,11 @@ SKIN, GLASSES, HAIR = 1, 6, 17
 EYE_LEVEL = [2, 3, 4, 5, 6]
 MEASURES = ['hair_frac', 'forehead_hair', 'jaw_width', 'skin_hf', 'hair_sat', 'glasses_frac']
 GROUPS = ['both', 'teacher', 'judge', 'neither']
+# Attributes CelebA ties to the edited ones (Bangs with not-Male, Eyeglasses
+# with Male and not-Young). The dumps showed the teacher-only group full of
+# adult men for Bangs-add and glasses for Male-rm / Young-add: if the judge
+# inherited those label correlations, its success rate splits on them.
+CO_ATTRS = [(20, 'Male'), (15, 'Eyeglasses'), (39, 'Young'), (35, 'Wearing_Hat')]
 
 
 @torch.no_grad()
@@ -220,6 +225,7 @@ def main():
     cells = [(g, d, lab) for g, d, lab in CELLS if g in args.attribute_index]
     buckets = {lab: {gr: [] for gr in GROUPS} for _, _, lab in cells}
     shots = {lab: {gr: [] for gr in GROUPS} for _, _, lab in cells}   # --dump_dir
+    strata = {lab: [] for _, _, lab in cells}   # (ok_t, ok_j, {co-attr: source has it})
     seen = 0
     for img, latent, _pred in tqdm(loader, desc='faces'):
         if seen >= args.num_samples:
@@ -259,6 +265,8 @@ def main():
                 ok_j = strict_success(float(src_j[b, gidx]), float(e_j[b]), args.success_margin)
                 grp = ('both' if ok_j else 'teacher') if ok_t else ('judge' if ok_j else 'neither')
                 buckets[lab][grp].append({m: float(e_m[m][b] - src_m[m][b]) for m in MEASURES})
+                strata[lab].append((ok_t, ok_j, {name: bool(src_j[b, k] > 0.5)
+                                                 for k, name in CO_ATTRS if k != gidx}))
                 if args.dump_dir and len(shots[lab][grp]) < args.dump_n:
                     shots[lab][grp].append((src256[b].detach().cpu(),
                                             e256[b].detach().cpu(),
@@ -285,6 +293,23 @@ def main():
                                **{m: {'abs': s[m][0], 'signed': s[m][1]} for m in MEASURES}}
             print(f'  {gr:<8} {len(rows):>5} '
                   + ' '.join(f'{s[m][0]:9.4f} ({s[m][1]:+.4f})' for m in MEASURES))
+
+    print('\nSuccess rate split by an attribute of the SOURCE (as the judge reads it).\n'
+          'A judge that inherited a CelebA correlation shows a gap in judge%, not in teacher%.')
+    for _, _, lab in cells:
+        print(f'\n{lab}')
+        print(f'  {"source":<16} {"n":>5} {"teacher%":>9} {"judge%":>8}')
+        report[lab]['strata'] = {}
+        for _, name in CO_ATTRS:
+            for has in (True, False):
+                rows = [r for r in strata[lab] if r[2].get(name) is has]
+                if name not in (strata[lab][0][2] if strata[lab] else {}) or not rows:
+                    continue
+                t = 100 * np.mean([r[0] for r in rows])
+                j = 100 * np.mean([r[1] for r in rows])
+                key = f'{name}={int(has)}'
+                report[lab]['strata'][key] = {'n': len(rows), 'teacher': t, 'judge': j}
+                print(f'  {key:<16} {len(rows):>5} {t:8.1f}% {j:7.1f}%')
 
     if args.dump_dir:
         os.makedirs(args.dump_dir, exist_ok=True)
