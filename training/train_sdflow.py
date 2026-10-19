@@ -817,6 +817,13 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_mode', default='online', choices=['online', 'offline', 'disabled'], help='wandb logging mode')
     parser.add_argument('--print_freq', type=int, default=10,help='print frequency')
     parser.add_argument('--save_freq', type=int, default=5000,help='save frequency')
+    parser.add_argument('--stop_at_step', type=int, default=None,
+                        help='Stop right after the checkpoint at this global step is written, '
+                             'leaving every schedule (cosine LR over --max_steps, bank anneal) '
+                             'exactly as the full run would have it -- unlike a smaller '
+                             '--max_steps, which also compresses the LR schedule. For a shorter '
+                             'ablation compared against the parent run\'s checkpoint at the same '
+                             'step. Must be a multiple of --save_freq.')
     
     
     # parameters for training 
@@ -2583,6 +2590,11 @@ if __name__ == '__main__':
               f'cosine LR {args.lr:g} -> 1e-6 over this run.')
     else:
         _n_epochs = args.epochs
+    if args.stop_at_step is not None:
+        if args.stop_at_step % args.save_freq or args.stop_at_step <= start_step:
+            raise ValueError(f'--stop_at_step {args.stop_at_step} must be a multiple of '
+                             f'--save_freq {args.save_freq} and after the start step {start_step}')
+        print(f'** --stop_at_step {args.stop_at_step}: stopping there; schedules unchanged.')
     if train_sampler is not None:
         train_sampler.step_offset = start_step
         _misaligned = (start_step % len(args.attribute_index) != 0
@@ -3558,7 +3570,12 @@ if __name__ == '__main__':
                         logger.save_root, n_iter, logger,
                         ema_modules_for_save if args.use_ema else None,
                         best_metric_ema, 'judge_celeb_acc_ema')
-                    
+
+                if args.stop_at_step is not None and n_iter >= args.stop_at_step:
+                    print(f'** --stop_at_step {args.stop_at_step}: checkpoint written, stopping')
+                    _stop_training = True
+                    break
+
             # AccCeleb monitor: same success rule as evaluate_sdflow.strict_success
             # (did the edited score cross 0.5), scored by the independent judge.
             # No gradient -- purely a readout.
