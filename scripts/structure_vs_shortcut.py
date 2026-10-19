@@ -64,7 +64,8 @@ from common.face_parser import FaceParser
 from common.ops import load_network
 from models.attribute_estimator import AttributeClassifier
 from models.dataset import SDFlowDataset
-from evaluation.evaluate_sdflow import (_latest_step, apply_run_config, build_parser,
+from evaluation.evaluate_sdflow import (CelebAAttrClassifierJudge, _latest_step,
+                                        apply_run_config, build_parser,
                                         edit_single_attribute, is_clear, load_models,
                                         resolve_controlnet_disable_attrs, strict_success)
 
@@ -185,6 +186,10 @@ def main():
                         'checked by eye: the teacher group changes structure as much as the both '
                         'group, so what the judge rejects has to be visible, not measurable.')
     p.add_argument('--dump_n', type=int, default=8, help='Faces per grid (--dump_dir).')
+    p.add_argument('--judge', choices=['indep', 'celeb'], default='indep',
+                   help="Which judge defines the groups: 'indep' = --independent_attr_weights "
+                        "(r50), 'celeb' = --celeba_attr_judge_weights (the CelebA r18 the "
+                        "headline AccBoth also uses).")
     # --out_json already exists in build_parser; reuse it (evaluate() is never called here)
     args = p.parse_args()
     # evaluate_sdflow does these in its own __main__, not in load_models():
@@ -194,17 +199,25 @@ def main():
     args = resolve_controlnet_disable_attrs(args)
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
-    if not args.independent_attr_weights:
+    if args.judge == 'indep' and not args.independent_attr_weights:
         raise SystemExit('--independent_attr_weights is required: the judge defines the groups')
+    judge_path = (args.independent_attr_weights if args.judge == 'indep'
+                  else args.celeba_attr_judge_weights)
     args.eval_scales = [args.edit_scale]
 
     # this branch's load_models also returns control_encoder (None unless the
     # run used ControlNet); edit_single_attribute is called without it here
     prior, conditioner, G, id_criterion, attr_teacher, attribute_index, direction_bank, _ = \
         load_models(args)
-    judge = AttributeClassifier(backbone=args.independent_attr_backbone)
-    judge.load_state_dict(load_network(args.independent_attr_weights))
-    judge = judge.cuda().eval()
+    if args.judge == 'indep':
+        judge_net = AttributeClassifier(backbone=args.independent_attr_backbone)
+        judge_net.load_state_dict(load_network(args.independent_attr_weights))
+        judge_net = judge_net.cuda().eval()
+
+        def judge(x):
+            return torch.sigmoid(judge_net(x)[0])
+    else:
+        judge = CelebAAttrClassifierJudge(args.celeba_attr_judge_weights).scores
     parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
 
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)),
@@ -236,7 +249,7 @@ def main():
         src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         src256 = F.interpolate(src, (256, 256))
         src_t = torch.sigmoid(attr_teacher(src256)[0])
-        src_j = torch.sigmoid(judge(src256)[0])
+        src_j = judge(src256)
         src_m, anchors = measure(parser, src256)
 
         for gidx, dirn, lab in cells:
@@ -255,7 +268,7 @@ def main():
                 composite=False, direction=direction)
             e256 = F.interpolate(edited, (256, 256))
             e_t = torch.sigmoid(attr_teacher(e256)[0])[:, gidx]
-            e_j = torch.sigmoid(judge(e256)[0])[:, gidx]
+            e_j = judge(e256)[:, gidx]
             e_m, _ = measure(parser, e256, anchors)
 
             for b in range(B):
@@ -275,7 +288,7 @@ def main():
 
     report = {}
     print(f'\n{seen} faces, edit_scale {args.edit_scale:g}, judge '
-          f'{os.path.basename(args.independent_attr_weights)}')
+          f'{os.path.basename(judge_path)}')
     print('Structure change between the source reconstruction and the edit.\n'
           'both = teacher and judge agree it worked; teacher = only the teacher; '
           'judge = only the judge; neither = both say it failed.\nEach cell: mean |delta| (mean signed delta).')
@@ -327,11 +340,11 @@ def main():
                 print(f'  [dump] {name}  judge prob per column: {probs}')
         print(f'  [dump] top row = source reconstruction, bottom row = edit; saved to {args.dump_dir}')
 
-    out = args.out_json or os.path.join(args.checkpoint_dir, 'structure_vs_shortcut.json')
+    out = args.out_json or os.path.join(args.checkpoint_dir, f'structure_vs_shortcut_{args.judge}.json')
     with open(out, 'w') as f:
         json.dump({'edit_scale': args.edit_scale, 'n_faces': seen,
                    'checkpoint_dir': args.checkpoint_dir, 'step': args.step,
-                   'judge': args.independent_attr_weights, 'cells': report}, f, indent=2)
+                   'judge': judge_path, 'cells': report}, f, indent=2)
     print(f'\nsaved {out}')
 
 
