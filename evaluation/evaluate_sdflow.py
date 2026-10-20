@@ -831,6 +831,16 @@ def consistent_source(attr_cond, local_idx, direction, margin):
 _PRESERVE = None           # --preserve_boundaries; set in load_models()
 _FINAL_DELTA_MAX_NORM = None    # training's --final_delta_max_norm; set in load_models()
 _EDIT_GAIN = 1.0            # --edit_gain / --adaptive_gains: W+ edit x k after the final cap
+_RESIZE_MODE = 'nearest'    # --eval_resize; set in evaluate()
+
+
+def resize_for_judge(x, size):
+    """Downsample G's 1024 output (or a photo) for the judges. 'nearest'
+    keeps 1 pixel in 16 at 1024 -> 256, so every judge reads an aliased
+    image; 'area' averages each block, as the real photos' Resize does."""
+    if _RESIZE_MODE == 'nearest':
+        return F.interpolate(x, size)
+    return F.interpolate(x, size, mode=_RESIZE_MODE)
 
 
 def set_edit_gain(k):
@@ -939,7 +949,7 @@ def closed_loop_edit(prior, conditioner, G, direction_bank, attr_teacher, latent
             delta = cap_delta_norm(raw - w, _FINAL_DELTA_MAX_NORM) * _EDIT_GAIN
         w_new = w + delta
         face = G([w_new], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-        p_t = torch.sigmoid(attr_teacher(F.interpolate(face, (256, 256)))[0])[:, global_idx]
+        p_t = torch.sigmoid(attr_teacher(resize_for_judge(face, (256, 256)))[0])[:, global_idx]
         ok = torch.where(add, p_t > 0.5 + margin, p_t < 0.5 - margin)
         take = (~done) & (ok | (k == max_steps - 1))
         if out is None:
@@ -952,7 +962,7 @@ def closed_loop_edit(prior, conditioner, G, direction_bank, attr_teacher, latent
         # feedback for the faces still going
         go = ~done
         w[go] = w_new[go]
-        read = conditioner.attr_estimator(F.interpolate(face, (img_size, img_size)))
+        read = conditioner.attr_estimator(resize_for_judge(face, (img_size, img_size)))
         read = read[0] if isinstance(read, tuple) else read
         ac[go] = read[go].to(ac.dtype)
         ac[go, local_idx] = p_t[go].to(ac.dtype)
@@ -1535,6 +1545,9 @@ def _fmt(summary, pct=False):
 # grad locally for its divergence term, so the flow still runs.
 @torch.no_grad()
 def evaluate(args):
+    global _RESIZE_MODE
+    _RESIZE_MODE = getattr(args, 'eval_resize', 'nearest')
+    print(f'Judge-input resize: {_RESIZE_MODE}')
     prior, conditioner, G, id_criterion, attr_teacher, \
         attribute_index, direction_bank = load_models(args)
 
@@ -1700,8 +1713,8 @@ def evaluate(args):
             # Source reconstruction (this is what edits are compared against)
             src_face = G([latent], input_is_latent=True,
                          randomize_noise=False)[0].clamp(-1, 1)
-            src_face_256 = F.interpolate(src_face, (256, 256))
-            real_256 = F.interpolate(img, (256, 256))
+            src_face_256 = resize_for_judge(src_face, (256, 256))
+            real_256 = resize_for_judge(img, (256, 256))
 
             # Judges on the source
             src_id_arc = F.normalize(id_criterion.extract_features(src_face_256), dim=1)
@@ -1785,7 +1798,7 @@ def evaluate(args):
                         for _k, (_sc, _gain) in enumerate(rungs):
                             set_edit_gain(_gain)
                             _ef = _edit(_sc)
-                            _ef_256 = F.interpolate(_ef, (256, 256))
+                            _ef_256 = resize_for_judge(_ef, (256, 256))
                             _pt = torch.sigmoid(attr_teacher(_ef_256)[0])[:, _gidx]
                             _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
                             _take = (~_done) & (_ok | (_k == len(rungs) - 1))
@@ -1801,7 +1814,7 @@ def evaluate(args):
                     metrics[f'chosen_scale_{attr_name}'].extend(_chosen.cpu().tolist())
                 else:
                     edited_face = _edit(edit_scale)
-                edited_256 = F.interpolate(edited_face, (256, 256))
+                edited_256 = resize_for_judge(edited_face, (256, 256))
 
                 edit_id_arc = F.normalize(id_criterion.extract_features(edited_256), dim=1)
                 edit_probs_teacher = torch.sigmoid(attr_teacher(edited_256)[0])[:, attribute_index]
@@ -2166,6 +2179,7 @@ def evaluate(args):
         + (f'_bank{args.bank_mode}' if getattr(args, 'bank_mode', 'replace') != 'replace' else '')
         + (f'_mix{args.bank_mix:g}' if getattr(args, 'bank_mix', None) is not None else '')
         + ('_cons' if getattr(args, 'consensus', False) else '')
+        + (f'_rs{args.eval_resize}' if getattr(args, 'eval_resize', 'nearest') != 'nearest' else '')
         + '.json',
     )
     # The default name only encodes step and sample count, so a second eval of
@@ -2426,6 +2440,12 @@ def build_parser():
     parser.add_argument('--report_id_at', nargs='*', type=float, default=[0.80],
                         help='After all --eval_scales, report each judge\'s accuracy at these '
                              'ID_ind values, interpolated between scales (needs >=2 scales).')
+    parser.add_argument('--eval_resize', default='nearest', choices=['nearest', 'area', 'bilinear'],
+                        help='How images are downsampled before the judges (1024 -> 256). nearest '
+                             '(default, what every earlier eval used) keeps 1 pixel in 16, so the '
+                             'judges read aliased images; area averages each block, like the real '
+                             'photos\' Resize. Changes every judge number: compare runs only under '
+                             'the same mode. Output name gets an _rs<mode> suffix.')
     parser.add_argument('--success_margin', type=float, default=0.0,
                         help='Strict success requires the edited score to cross 0.5 by this '
                              'margin. 0.0 = just cross the decision boundary.')
