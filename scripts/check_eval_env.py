@@ -9,7 +9,8 @@ downloads land in the cache once; afterwards the eval also runs offline.
     python -m scripts.check_eval_env --run ./output/SDFlow/multi_v1_smile_bangs --step 80000
 
 What it checks (each line OK / MISSING / FAIL):
-  packages   torch, torchvision, lpips, facenet_pytorch, clip, numpy, PIL, tqdm
+  packages   torch, torchvision, lpips, facenet_pytorch, clip, numpy, PIL, tqdm,
+             torchmetrics + torch_fidelity (FID)
   data       the files evaluate_sdflow.py reads by default (+ the bank the run's
              config.json names, and the run's checkpoint files with --run)
   weights    torchvision resnet18/34/50 and alexnet (ImageNet, used as backbones and
@@ -30,11 +31,15 @@ DATA_FILES = [
     'data/stylegan2-ffhq-config-f.pt', 'data/ffhq_e4e_latents.pth', 'data/ffhq_e4e_preds.pth',
     'data/ffhq.txt', 'data/FFHQ', 'data/r34_a40_age_256_classifier.pth',
     'data/r50_celebahq_eval.pth', 'data/parsing_bisenet.pth',
+    'data/celeba_attr_resnet18.pth',      # the CelebA r18 judge (AccCeleb, every consensus)
 ]
 PACKAGES = [('torch', 'torch'), ('torchvision', 'torchvision'), ('numpy', 'numpy'),
             ('PIL', 'pillow'), ('tqdm', 'tqdm'), ('lpips', 'pip install lpips'),
             ('facenet_pytorch', 'pip install facenet-pytorch'),
-            ('clip', 'pip install git+https://github.com/openai/CLIP.git')]
+            ('clip', 'pip install git+https://github.com/openai/CLIP.git'),
+            # FID: without them evaluate_sdflow prints a WARN and reports no FID
+            ('torchmetrics', 'pip install torchmetrics'),
+            ('torch_fidelity', 'pip install torch-fidelity')]
 
 
 def line(status, what, extra=''):
