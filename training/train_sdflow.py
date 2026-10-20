@@ -28,6 +28,7 @@ from common.region_stat_loss import (dilate_mask, directional_region_area_loss,
                                      outside_region_preservation_loss)
 from models.dataset import IndexedDataset, SDFlowDataset
 from models.flows.flow import cnf
+from models.flows.normalization import MovingBatchNormNd
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
@@ -203,6 +204,11 @@ def _mechanism_report(args):
          None if args.dir_gate_reg_weight > 0 else 'K-slot gate unsupervised'),
         ('  residual_scale', f'{args.direction_residual_scale:g} (learned from here)', None),
         ('velocity_field', args.velocity_field, None),
+        ('flow_bn_stats', args.flow_bn_stats,
+         None if args.flow_bn_stats != 'update' else 'train round trip w->z->w is not the identity'),
+        ('conditioner_bn', args.conditioner_bn if args.conditioner_bn == 'train'
+         else f'freeze after {args.conditioner_bn_freeze_after}',
+         None if args.conditioner_bn != 'train' else 'edit direction read with batch stats'),
         ('train_edit_direction', args.train_edit_direction, None),
         ('soft_target_override', args.soft_target_override or 'off', None),
         ('coupled_targets', args.coupled_targets or 'off', None),
@@ -721,6 +727,81 @@ def apply_id_condition_dropout(id_cond, drop_prob):
     return id_cond * mask
 
 
+def freeze_flow_bn(flow_model):
+    """Stop the flow's MovingBatchNorm layers from updating their running
+    stats (see --flow_bn_stats). They already normalize with the running
+    stats in train mode (bn_lag=0); the update after each forward call is
+    what made a training step's reverse use other stats than its forward."""
+    layers = [m for m in flow_model.modules() if isinstance(m, MovingBatchNormNd)]
+    for m in layers:
+        m.update_stats = False
+    return layers
+
+
+@torch.no_grad()
+def calibrate_flow_bn(flow_model, conditioner, id_extractor, dataset, loader, n_batches):
+    """--flow_bn_stats dataset: set each flow BatchNorm's running stats from
+    data instead of the last ~10 training batches. The first (input) layer
+    gets the exact per-channel moments of every training W+ latent; each
+    later one gets moments of its input averaged over n_batches of the
+    training loader, passed through the layers before it in eval mode.
+    Pooled over the 18 W+ layers, as the layer's own update pools them."""
+    chain = flow_model.chain
+    bns = [i for i, m in enumerate(chain) if isinstance(m, MovingBatchNormNd)]
+    def moments(s1, s2, n):
+        mean = s1 / n
+        var = (s2 / n - mean.pow(2)) * n / max(n - 1, 1)     # unbiased, as torch.var
+        return mean.float(), var.clamp(min=0).float()
+
+    s1 = s2 = 0.0
+    n = 0
+    for f in dataset.image_list:     # streamed: stacking every latent would copy ~2 GB
+        x = dataset._lookup_precomputed(dataset.latents, f).double()
+        x = x.reshape(-1, x.shape[-1])
+        s1, s2, n = s1 + x.sum(0), s2 + x.pow(2).sum(0), n + x.shape[0]
+    mean, var = moments(s1, s2, n)
+    chain[bns[0]].running_mean.copy_(mean)
+    chain[bns[0]].running_var.copy_(var)
+    print(f'** flow BN {bns[0]}: stats from all {len(dataset.image_list)} training latents')
+    if len(bns) == 1:
+        return
+    was_flow, was_cond = flow_model.training, conditioner.training
+    flow_model.eval()
+    conditioner.eval()
+    try:
+        for target in bns[1:]:
+            s1 = s2 = 0.0
+            n = 0
+            for b, datas in enumerate(loader):
+                if b >= n_batches:
+                    break
+                img, latent = datas[0].cuda(), datas[1].cuda()
+                cond, _, _ = conditioner.make_condition(img, latent, id_extractor)
+                x = latent
+                for k in range(target):
+                    x = chain[k](x, cond, None, None, False)
+                x = x.reshape(-1, x.shape[-1]).double()
+                s1, s2, n = s1 + x.sum(0), s2 + x.pow(2).sum(0), n + x.shape[0]
+            mean, var = moments(s1, s2, n)
+            chain[target].running_mean.copy_(mean)
+            chain[target].running_var.copy_(var)
+            print(f'** flow BN {target}: stats from {n // 18} latents ({n_batches} batches)')
+    finally:
+        flow_model.train(was_flow)
+        conditioner.train(was_cond)
+
+
+def freeze_conditioner_bn(conditioner):
+    """--conditioner_bn freeze: the conditioner's BatchNorm layers normalize
+    with their running stats in training too, so the reading that decides
+    each training edit's direction is the one eval gets. Their affine
+    weights still train. Re-applied every step: .train() (the preview's
+    mode restore) switches them back."""
+    for m in conditioner.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.eval()
+
+
 def collect_lag_dof_losses(flow_model):
     losses = []
     for module in flow_model.modules():
@@ -755,6 +836,20 @@ if __name__ == '__main__':
                              'shared velocity with a per-attribute layer mask was removed.')
     parser.add_argument('--lag_gate_hidden_dim', type=int, default=64)
     parser.add_argument('--lag_gate_init_bias', type=float, default=-0.5)
+    parser.add_argument('--flow_bn_stats', default='update', choices=['update', 'freeze', 'dataset'],
+                        help='Running stats of the flow\'s MovingBatchNorm layers. update (default, '
+                             'every earlier run): each training forward moves them by 0.1 toward '
+                             'the batch, so the same step\'s reverse uses other stats than its '
+                             'forward -- the round trip w -> z -> w is not the identity in training '
+                             '(it is in eval) and the offset follows the attribute the batch was '
+                             'balanced for; the stats a checkpoint saves are those of its last ~10 '
+                             'batches. freeze: never update (keeps the init stats, or the resumed '
+                             'checkpoint\'s -- use this with --resume_dir). dataset: set them from '
+                             'the training latents before step 0 (see --flow_bn_calib_batches), '
+                             'then freeze; new runs only.')
+    parser.add_argument('--flow_bn_calib_batches', type=int, default=50,
+                        help='With --flow_bn_stats dataset: training batches used for the stats of '
+                             'the flow BatchNorm after the CNF (the input one uses every latent).')
     parser.add_argument("--attribute_index",nargs='*',default=[15,20,39], type=int, help="list of the face attributes index of CelebA")
     parser.add_argument("--stygan2_weights",default='./data/stylegan2-ffhq-config-f.pt',type=str,help='stylegan2 weights path')
     
@@ -809,6 +904,19 @@ if __name__ == '__main__':
                         help='Hidden dim of the trainable CLIP/fused projection head.')
     parser.add_argument('--id_cond_dropout', type=float, default=0.2,
                         help='Training-only dropout on identity condition to stop identity from suppressing edits.')
+    parser.add_argument('--conditioner_bn', default='train', choices=['train', 'freeze'],
+                        help='The conditioner\'s BatchNorm layers. train (default, every earlier run): '
+                             'batch statistics of 8 images, half of them with the edited attribute, '
+                             'while eval uses the running stats -- the reading that sets the edit '
+                             'direction (conditioner > 0.5) differs between training and eval. '
+                             'freeze: running stats in training too, no updates; affine weights '
+                             'still train. Also stops the frozen ResNet of --conditioner_backbone '
+                             'resnet_clip from updating its BN stats. See --conditioner_bn_freeze_after.')
+    parser.add_argument('--conditioner_bn_freeze_after', type=int, default=0,
+                        help='With --conditioner_bn freeze: steps of this run before freezing. 0 for '
+                             'a --resume_dir run (keeps the checkpoint\'s stats); a few thousand for '
+                             'a new run, whose ResNet50 stats are ImageNet\'s under another input '
+                             'normalization.')
     # Independent-judge eval evidence: the model is deployed at edit strengths
     # 0.9-1.25, but the old 0.35-0.55 range meant training never saw anything
     # stronger than 0.55 and inference had to extrapolate. Cover the deployed
@@ -1605,6 +1713,9 @@ if __name__ == '__main__':
             _a, _lo, _hi = _chunk.strip().split(':')
             SOFT_TARGET_TABLE[int(_a)] = (float(_lo), float(_hi))
     COUPLED_TARGETS = parse_coupled_targets(args.coupled_targets)
+    if args.flow_bn_stats == 'dataset' and args.resume_dir:
+        raise ValueError('--flow_bn_stats dataset replaces the flow BatchNorm stats a resumed flow '
+                         'was trained with; use --flow_bn_stats freeze with --resume_dir')
     torch.manual_seed(args.seed)
     args.code_version = code_version()
     print(f'** code version {args.code_version}, seed {args.seed}')
@@ -2178,6 +2289,16 @@ if __name__ == '__main__':
     if args.reset_bank_magnitude and not (args.resume_dir and args.resume_direction_bank):
         print('[WARN] --reset_bank_magnitude does nothing without --resume_dir + '
               '--resume_direction_bank (a fresh bank already starts at the prior).')
+    if args.flow_bn_stats == 'dataset':
+        calibrate_flow_bn(prior, conditioner, id_criterion, train_dataset, train_loader,
+                          args.flow_bn_calib_batches)
+    if args.flow_bn_stats != 'update':
+        _n_bn = len(freeze_flow_bn(prior))
+        print(f'** flow BatchNorm stats frozen ({_n_bn} layers, --flow_bn_stats {args.flow_bn_stats})')
+        if args.use_ema and args.flow_bn_stats == 'dataset':
+            # fresh run (dataset excludes --resume_dir): the EMA equals the
+            # live flow except for the stats just set
+            prior_ema.load_state_dict(prior.state_dict())
     _stop_training = False
     for epoch in range(_n_epochs):
         if _stop_training:
@@ -2199,6 +2320,10 @@ if __name__ == '__main__':
 
             # 4th item: the dataset index IndexedDataset appends (unused here).
             img,latent,pred,_ = datas
+            if args.conditioner_bn == 'freeze' and local_step >= args.conditioner_bn_freeze_after:
+                if local_step == args.conditioner_bn_freeze_after:
+                    print(f'** conditioner BatchNorm frozen at step {n_iter}')
+                freeze_conditioner_bn(conditioner)
             img = img.cuda()
             latent = latent.cuda()
             pred = pred.cuda()

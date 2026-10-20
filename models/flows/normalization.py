@@ -16,6 +16,10 @@ class MovingBatchNormNd(nn.Module):
         self.decay = decay
         self.bn_lag = bn_lag
         self.register_buffer('step', torch.zeros(1))
+        # False: train mode normalizes with the running stats and leaves them
+        # as they are (train_sdflow.py --flow_bn_stats freeze/dataset). Not
+        # in the state_dict; eval mode never updates either way.
+        self.update_stats = True
         if self.affine:
             self.weight = Parameter(torch.Tensor(num_features))
             self.bias = Parameter(torch.Tensor(num_features))
@@ -48,7 +52,7 @@ class MovingBatchNormNd(nn.Module):
         used_mean = self.running_mean.clone().detach()
         used_var = self.running_var.clone().detach()
 
-        if self.training:
+        if self.training and self.update_stats:
             # compute batch statistics
 
             x_t = x.transpose(0, 2).reshape(num_channels, -1)
