@@ -24,6 +24,13 @@ class MovingBatchNormNd(nn.Module):
             self.register_parameter('bias', None)
         self.register_buffer('running_mean', torch.zeros(num_features))
         self.register_buffer('running_var', torch.ones(num_features))
+        # Plain attribute, not a buffer: checkpoints are unchanged. False stops
+        # train mode from updating the running stats. With bn_lag=0 the forward
+        # pass normalizes with the stats from BEFORE the update while the
+        # reverse pass uses the updated ones, so in train mode an encode ->
+        # decode round trip of one batch does not return its input
+        # (scripts/diagnose_bn.py measures by how much).
+        self.update_stats = True
         self.reset_parameters()
 
     @property
@@ -70,9 +77,10 @@ class MovingBatchNormNd(nn.Module):
                 used_var /= (1. - self.bn_lag**(self.step[0] + 1))
 
             # update running estimates
-            self.running_mean -= self.decay * (self.running_mean - batch_mean.data)
-            self.running_var -= self.decay * (self.running_var - batch_var.data)
-            self.step += 1
+            if self.update_stats:
+                self.running_mean -= self.decay * (self.running_mean - batch_mean.data)
+                self.running_var -= self.decay * (self.running_var - batch_var.data)
+                self.step += 1
 
         # perform normalization
         used_mean = used_mean.view(*self.shape).expand_as(x)
