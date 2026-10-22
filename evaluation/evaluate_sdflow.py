@@ -617,6 +617,16 @@ def load_models(args):
     if _EDIT_TARGET_MODE != 'mirror':
         print(f'[EditTarget] {_EDIT_TARGET_MODE}: edits aim at the training targets '
               f'(0.2/0.8, Eyeglasses 0.1/0.9) -- not comparable with mirror-mode numbers.')
+    global _LEARNED_SCALE, _CLAMP_TARGET
+    _CLAMP_TARGET = bool(getattr(args, 'clamp_edit_target', False))
+    _LEARNED_SCALE = {}
+    if getattr(args, 'scale_by_learned', False):
+        if _EDIT_TARGET_MODE != 'train':
+            raise SystemExit('--scale_by_learned needs --edit_target train: the learned strengths '
+                             'are strengths of the training rule, not of mirror')
+        _LEARNED_SCALE = load_learned_scales(args.checkpoint_dir, args.step, args.attribute_index)
+        print('[EditTarget] scale x learned strength: '
+              + ', '.join(f'{a}:{v:.3f}' for a, v in _LEARNED_SCALE.items()))
     device = 'cuda'
     attribute_index = torch.tensor(args.attribute_index, dtype=torch.long)
     num_attrs = len(args.attribute_index)
@@ -803,6 +813,8 @@ def load_models(args):
 # --edit_target, set once by load_models() so every script that edits through
 # edit_single_attribute / edit_multi_attribute follows it without passing it.
 _EDIT_TARGET_MODE = 'mirror'
+_LEARNED_SCALE = {}         # --scale_by_learned: global attr idx -> training's learned strength
+_CLAMP_TARGET = False       # --clamp_edit_target
 
 
 def consistent_source(attr_cond, local_idx, direction, margin):
@@ -1036,7 +1048,30 @@ def project_preserve(delta, edited_globals):
     return flat.view_as(delta)
 
 
+def load_learned_scales(checkpoint_dir, step, attribute_index, min_scale=0.3, max_scale=1.5):
+    """Each attribute's training edit strength at `step`: the centre of
+    train_sdflow.LearnableAttributeScales, exp(attr_log_scales) clamped to
+    its [0.3, 1.5] (training adds +/- noise around it). Returns
+    {global attr idx: strength}."""
+    path = _ckpt_path(checkpoint_dir, 'attr_scales', step)
+    if not os.path.exists(path):
+        raise SystemExit(f'--scale_by_learned: no {path}')
+    log_scales = load_network(path)['attr_log_scales'].float()
+    if log_scales.numel() != len(attribute_index):
+        raise SystemExit(f'{path} has {log_scales.numel()} strengths for '
+                         f'{len(attribute_index)} attributes')
+    scales = torch.exp(log_scales).clamp(min_scale, max_scale)
+    return {int(a): float(v) for a, v in zip(attribute_index, scales)}
+
+
 def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
+    out = _edited_attr_value(src, scale, attr_global_idx, mode, direction)
+    # --clamp_edit_target: train-mode strengths above 1 can ask for slightly
+    # less than 0 (Eyeglasses' 0.1 target from a source near 1)
+    return out.clamp(0.0, 1.0) if _CLAMP_TARGET else out
+
+
+def _edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
     """The attribute value the flow is asked to reach at edit strength `scale`.
 
     'mirror' (default, what every eval so far used): src*(1-s) + (1-src)*s, so
@@ -1049,7 +1084,12 @@ def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
     0.48 under train@1.0. Mirror therefore under-edits exactly the sources
     that are hardest to flip, and asks for a smaller change than training
     taught the model to make for that source. Numbers from the two modes are
-    not comparable: compare checkpoints under the same mode."""
+    not comparable: compare checkpoints under the same mode.
+
+    With --scale_by_learned, 'train' multiplies `scale` by the attribute's
+    strength training had learned (load_learned_scales), so scale 1.0 asks
+    for exactly what training asked for. Not applied with an explicit
+    direction (--edit_direction other than cond, --closed_loop_steps)."""
     if direction is not None:
         # Explicit direction (+1 add, -1 rm), e.g. from the eval judge's own
         # add/rm split: move toward the matching end of [0, 1] by `scale`.
@@ -1062,6 +1102,7 @@ def edited_attr_value(src, scale, attr_global_idx, mode=None, direction=None):
     if mode == 'train' and attr_global_idx is not None:
         low, high = SOFT_TARGET_TABLE.get(int(attr_global_idx), DEFAULT_SOFT_TARGET)
         hard = torch.where(src > 0.5, torch.full_like(src, low), torch.full_like(src, high))
+        scale = scale * _LEARNED_SCALE.get(int(attr_global_idx), 1.0)
         return src + scale * (hard - src)
     return src * (1.0 - scale) + (1.0 - src) * scale
 
@@ -1646,6 +1687,8 @@ def evaluate(args):
             'train_caps': train_caps(args),
             'no_train_caps': bool(getattr(args, 'no_train_caps', False)),
             'edit_target': getattr(args, 'edit_target', 'mirror'),
+            'scale_by_learned': {str(k): v for k, v in _LEARNED_SCALE.items()} or None,
+            'clamp_edit_target': _CLAMP_TARGET,
             'age_fine_layer_scale': getattr(args, 'age_fine_layer_scale', None),
             'age_fine_layer_start': (getattr(args, 'age_fine_layer_start', None)
                                      if getattr(args, 'age_fine_layer_scale', None) is not None else None),
@@ -2180,6 +2223,9 @@ def evaluate(args):
         + (f'_mix{args.bank_mix:g}' if getattr(args, 'bank_mix', None) is not None else '')
         + ('_cons' if getattr(args, 'consensus', False) else '')
         + (f'_rs{args.eval_resize}' if getattr(args, 'eval_resize', 'nearest') != 'nearest' else '')
+        + (f'_et{args.edit_target}' if getattr(args, 'edit_target', 'mirror') != 'mirror' else '')
+        + ('_learned' if getattr(args, 'scale_by_learned', False) else '')
+        + ('_clamp' if getattr(args, 'clamp_edit_target', False) else '')
         + '.json',
     )
     # The default name only encodes step and sample count, so a second eval of
@@ -2305,6 +2351,14 @@ def build_parser():
                              "Eyeglasses), which stops ambiguous sources being under-edited "
                              "relative to what training taught. See edited_attr_value(). Compare "
                              "checkpoints under the SAME mode.")
+    parser.add_argument('--scale_by_learned', action='store_true',
+                        help='With --edit_target train: multiply every --eval_scales value by each '
+                             'attribute\'s edit strength training had learned at this step '
+                             '(attr_scales checkpoint), so 1.0 asks for what training asked for '
+                             'and the sweep runs around it. Output name gets _learned.')
+    parser.add_argument('--clamp_edit_target', action='store_true',
+                        help='Keep the requested attribute value inside [0, 1] (strengths above 1 '
+                             'in train mode can ask for slightly less than 0). Output name gets _clamp.')
     # Independent judges
     parser.add_argument('--clip_judge_model', default='ViT-L/14',
                         help='CLIP model for the zero-shot attribute judge. Keep it different '

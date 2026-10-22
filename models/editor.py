@@ -4,7 +4,7 @@ import os
 
 import torch
 
-from common.attr_tables import bank_num_k
+from common.attr_tables import DEFAULT_SOFT_TARGET, SOFT_TARGET_TABLE, bank_num_k
 from common.id_loss import IDLoss
 from models.conditioner import IdentityAttributeConditioner
 from models.direction_bank import AttributeDirectionBank, bank_mix_at
@@ -92,7 +92,16 @@ class SDFlow(object):
                  ckpt_step=None,
                  guided_delta_max_norm=None,
                  bank_mode=None,
+                 edit_target='mirror',
+                 scale_by_learned=False,
+                 clamp_edit_target=False,
                  use_run_config=True) -> None:
+        # edit_target / scale_by_learned / clamp_edit_target: what value an
+        # edit of strength `scale` asks the flow for, as evaluate_sdflow.py's
+        # flags of the same names. 'mirror' (default): src*(1-s) + (1-src)*s.
+        # 'train': src + s*(target - src) with training's 0.2/0.8 targets
+        # (0.1/0.9 Eyeglasses); scale_by_learned multiplies s by the strength
+        # training had learned for the attribute (attr_scales checkpoint).
         # When the run saved a config.json (train_sdflow.py writes one), treat
         # it as the source of truth for model structure: the constructor
         # defaults here historically disagreed with training defaults
@@ -174,8 +183,26 @@ class SDFlow(object):
         # hack. None disables the cap so the raw, LDA-direction-guided delta
         # can be measured honestly before deciding whether any cap is needed.
         self.guided_delta_max_norm = guided_delta_max_norm
+        if edit_target not in ('mirror', 'train'):
+            raise ValueError(f'edit_target must be mirror or train, got {edit_target!r}')
+        if scale_by_learned and edit_target != 'train':
+            raise ValueError('scale_by_learned needs edit_target="train": the learned strengths '
+                             'are strengths of the training rule, not of mirror')
+        self.edit_target = edit_target
+        self.clamp_edit_target = clamp_edit_target
 
         self.class_indices = attr_list
+
+        # Training's learned edit strength per attribute (global idx -> s),
+        # the centre of LearnableAttributeScales: exp(attr_log_scales)
+        # clamped to its [0.3, 1.5].
+        self.learned_scale = {}
+        if scale_by_learned:
+            filename = _find_latest_ckpt(ckpt_dir, 'attr_scales', ckpt_step)
+            log_scales = torch.load(filename, map_location='cpu')['attr_log_scales'].float()
+            scales = torch.exp(log_scales).clamp(0.3, 1.5)
+            self.learned_scale = {int(a): float(v) for a, v in zip(attr_list, scales)}
+            print(f'Loaded learned edit strengths from {filename}: {self.learned_scale}')
 
         self.id_extractor = IDLoss(crop=True).to(self.device).eval()
         for p in self.id_extractor.parameters():
@@ -293,7 +320,17 @@ class SDFlow(object):
         targets = sources.clone()
         strength = max(0.0, min(float(self.scale), 4.0))
         source_attr = sources[:, self.attr_num]
-        targets[:, self.attr_num] = source_attr * (1.0 - strength) + (1.0 - source_attr) * strength
+        if self.edit_target == 'train':
+            low, high = SOFT_TARGET_TABLE.get(int(self.attr_num), DEFAULT_SOFT_TARGET)
+            hard = torch.where(source_attr > 0.5, torch.full_like(source_attr, low),
+                               torch.full_like(source_attr, high))
+            strength = strength * self.learned_scale.get(int(self.attr_num), 1.0)
+            target = source_attr + strength * (hard - source_attr)
+        else:
+            target = source_attr * (1.0 - strength) + (1.0 - source_attr) * strength
+        if self.clamp_edit_target:
+            target = target.clamp(0.0, 1.0)
+        targets[:, self.attr_num] = target
 
         targets = targets[:, self.class_indices]
 
