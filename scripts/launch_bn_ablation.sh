@@ -3,6 +3,7 @@
 #   ctrl    the parent run's exact flags
 #   flowbn  + --flow_bn_stats freeze                       (3+ GPUs only)
 #   both    + --flow_bn_stats freeze --conditioner_bn freeze
+#   both_area  both + --train_resize area                  (only via ARMS)
 # then evaluate each arm's last step (--consensus --eval_resize area, plus the
 # R50 judge when ./data/r50_celebahq_eval.pth exists; R50=<path> to change it).
 # Arms are dealt round-robin to the GPUs; arms sharing a GPU run one after
@@ -15,6 +16,10 @@
 # TAG=<suffix> appends _<suffix> to every run name and log directory, so a
 # repeat does not overwrite an earlier one; SEED=<n> overrides the parent
 # run's --seed (a repeat with the same seed mostly reproduces the same run).
+# ARMS="<arm> ..." picks the arms instead of the GPU-count default.
+# EVAL_ALSO="<run name> ..." evaluates those existing runs under
+# output/<model>/ at the same final step and with the same eval flags, after
+# the first GPU's queue (e.g. an earlier arm, re-scored with the R50 judge).
 set -uo pipefail
 
 RUN=${1:?usage: bash scripts/launch_bn_ablation.sh <run_dir> <step> "<gpu ids>" [max_steps]}
@@ -37,14 +42,26 @@ LOG=logs/bn_ablation$TAG
 mkdir -p "$LOG"
 R50=${R50:-./data/r50_celebahq_eval.pth}
 
-if [ "${#GPUS[@]}" -ge 3 ]; then ARMS=(ctrl flowbn both); else ARMS=(ctrl both); fi
+if [ -n "${ARMS:-}" ]; then read -r -a ARMS <<< "$ARMS"
+elif [ "${#GPUS[@]}" -ge 3 ]; then ARMS=(ctrl flowbn both); else ARMS=(ctrl both); fi
 
 arm_flags() {
     case $1 in
         ctrl)   ;;
         flowbn) echo "--set flow_bn_stats=freeze" ;;
         both)   echo "--set flow_bn_stats=freeze --set conditioner_bn=freeze" ;;
+        both_area) echo "--set flow_bn_stats=freeze --set conditioner_bn=freeze --set train_resize=area" ;;
+        *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac
+}
+
+for arm in "${ARMS[@]}"; do arm_flags "$arm" > /dev/null; done   # an unknown arm stops here
+
+eval_for() {
+    local cmd="python evaluation/evaluate_sdflow.py --checkpoint_dir output/$MODEL/$1 --step $END --consensus --eval_resize area"
+    # the R50 judge too, when its weights are here (evaluate_sdflow loads none by default)
+    [ -f "$R50" ] && cmd+=" --independent_attr_weights $R50 --independent_attr_backbone r50"
+    echo "$cmd"
 }
 
 declare -A QUEUE
@@ -59,13 +76,20 @@ for i in "${!ARMS[@]}"; do
         2>>"$LOG/rebuild.log") \
         || { echo "rebuild_train_cmd failed for $arm, see $LOG/rebuild.log"; exit 1; }
     train=$(echo "$train" | tr -d '\\\n' | tr -s ' ')
-    eval_cmd="python evaluation/evaluate_sdflow.py --checkpoint_dir output/$MODEL/$name --step $END --consensus --eval_resize area"
-    # the R50 judge too, when its weights are here (evaluate_sdflow loads none by default)
-    [ -f "$R50" ] && eval_cmd+=" --independent_attr_weights $R50 --independent_attr_backbone r50"
+    eval_cmd=$(eval_for "$name")
     echo "== $arm on GPU $gpu =="
     echo "   $train"
     echo "   $eval_cmd"
     QUEUE[$gpu]+="CUDA_VISIBLE_DEVICES=$gpu $train > $LOG/${arm}_train.log 2>&1 && CUDA_VISIBLE_DEVICES=$gpu $eval_cmd > $LOG/${arm}_eval.log 2>&1 || echo '!! $arm failed, see $LOG/${arm}_*.log' >> $LOG/status.txt; "
+done
+
+for extra in ${EVAL_ALSO:-}; do
+    [ -d "output/$MODEL/$extra" ] || { echo "EVAL_ALSO: no output/$MODEL/$extra"; exit 1; }
+    gpu=${GPUS[0]}
+    cmd=$(eval_for "$extra")
+    echo "== re-evaluate $extra on GPU $gpu =="
+    echo "   $cmd"
+    QUEUE[$gpu]+="CUDA_VISIBLE_DEVICES=$gpu $cmd > $LOG/eval_${extra}.log 2>&1 || echo '!! eval $extra failed' >> $LOG/status.txt; "
 done
 
 [ "${DRY_RUN:-0}" = 1 ] && { echo "(DRY_RUN: nothing launched)"; exit 0; }

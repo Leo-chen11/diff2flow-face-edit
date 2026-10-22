@@ -206,6 +206,8 @@ def _mechanism_report(args):
         ('velocity_field', args.velocity_field, None),
         ('flow_bn_stats', args.flow_bn_stats,
          None if args.flow_bn_stats != 'update' else 'train round trip w->z->w is not the identity'),
+        ('train_resize', args.train_resize,
+         None if args.train_resize != 'nearest' else 'image losses see 1 pixel in 4'),
         ('conditioner_bn', args.conditioner_bn if args.conditioner_bn == 'train'
          else f'freeze after {args.conditioner_bn_freeze_after}',
          None if args.conditioner_bn != 'train' else 'edit direction read with batch stats'),
@@ -449,6 +451,16 @@ def save_best_checkpoints(save_root, step, logger, ema_modules, metric, metric_n
         json.dump({'step': int(step), 'metric_name': metric_name,
                    'metric': float(metric)}, f, indent=2)
     print(f'** new best {metric_name}={metric:.4f} at step {step} -> {best_root}')
+
+
+def resize_generated(images, size, mode):
+    """G's 1024 output down to the training resolution (--train_resize).
+    nearest keeps 1 pixel in 4 at 1024 -> 512, so every image-space loss
+    reaches only those pixels; area averages each 2x2 block, which is what
+    the real photos' bilinear Resize does at exactly half size."""
+    if mode == 'nearest':
+        return F.interpolate(images, size)
+    return F.interpolate(images, size, mode=mode)
 
 
 def cap_delta_norm(delta, max_norm):
@@ -1207,6 +1219,13 @@ if __name__ == '__main__':
                              '(e.g. "39" for Young only). Default (unset) applies to every '
                              'attribute\'s steps. Has no effect when --disc_realism_weight is 0 '
                              '(the discriminator is not even loaded in that case).')
+    parser.add_argument('--train_resize', default='nearest', choices=['nearest', 'area'],
+                        help='How G\'s 1024 output (edit and source reconstruction) is brought down '
+                             'to --img_size before every image-space loss. nearest (default, every '
+                             'earlier run) keeps 1 pixel in 4, so teacher / ID / CLIP / DDS / '
+                             'locality gradients reach only those pixels, and the generated images '
+                             'are aliased where the real photos (bilinear Resize, a 2x2 average at '
+                             'half size) are not. area: average each block.')
     parser.add_argument('--losses_vs_recon', action=argparse.BooleanOptionalAction, default=True,
                         help='Compare the edited image against the source RECONSTRUCTION '
                              'G(latent) instead of the real photo in id_loss, the directional '
@@ -2417,13 +2436,14 @@ if __name__ == '__main__':
                 with torch.no_grad():
                     src_recon = G([latent], input_is_latent=True,
                                   randomize_noise=False)[0].clamp(-1, 1)
-                    src_recon = F.interpolate(src_recon, (args.img_size, args.img_size))
+                    src_recon = resize_generated(src_recon, (args.img_size, args.img_size), args.train_resize)
             # Reference image for id_loss / directional CLIP / DDS.
             loss_ref_img = src_recon if (args.losses_vs_recon and src_recon is not None) else img
 
             new_face_tensors = G([new_latents], input_is_latent=True,
                                  randomize_noise=False)[0].clamp(-1, 1)
-            new_face_tensors = F.interpolate(new_face_tensors, (args.img_size, args.img_size))
+            new_face_tensors = resize_generated(new_face_tensors, (args.img_size, args.img_size),
+                                                args.train_resize)
 
             # ── Realism regularizer (frozen StyleGAN2 discriminator) ─────────
             # Every other loss here measures a specific proxy (classifier score,
@@ -2877,7 +2897,7 @@ if __name__ == '__main__':
                         ], dim=1)
                         _ft = G([_nl], input_is_latent=True,
                                randomize_noise=False)[0].clamp(-1, 1)
-                        return F.interpolate(_ft, (args.img_size, args.img_size))
+                        return resize_generated(_ft, (args.img_size, args.img_size), args.train_resize)
                     return new_face_tensors
 
                 # --dds_face_mask: restrict the DDS gradient to the region each
