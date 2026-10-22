@@ -12,6 +12,9 @@
 #   bash scripts/launch_bn_ablation.sh output/SDFlow/myrun 80000 "0 1 2"
 #
 # Prints every command before launching it; pass DRY_RUN=1 to only print.
+# TAG=<suffix> appends _<suffix> to every run name and log directory, so a
+# repeat does not overwrite an earlier one; SEED=<n> overrides the parent
+# run's --seed (a repeat with the same seed mostly reproduces the same run).
 set -uo pipefail
 
 RUN=${1:?usage: bash scripts/launch_bn_ablation.sh <run_dir> <step> "<gpu ids>" [max_steps]}
@@ -29,7 +32,8 @@ MODEL=$(python -c "import json,sys; print(json.load(open(sys.argv[1])).get('mode
 BASE=$(basename "$RUN")
 [ "$BASE" = best ] && BASE=$(basename "$(dirname "$RUN")")
 END=$((STEP + MAX_STEPS))
-LOG=logs/bn_ablation
+TAG=${TAG:+_$TAG}
+LOG=logs/bn_ablation$TAG
 mkdir -p "$LOG"
 R50=${R50:-./data/r50_celebahq_eval.pth}
 
@@ -47,11 +51,12 @@ declare -A QUEUE
 for i in "${!ARMS[@]}"; do
     arm=${ARMS[$i]}
     gpu=${GPUS[$((i % ${#GPUS[@]}))]}
-    name="${BASE}_bn_${arm}"
+    name="${BASE}_bn_${arm}$TAG"
     # shellcheck disable=SC2046
     train=$(python -m scripts.rebuild_train_cmd --config "$CFG" \
         --set "run_name=$name" --set "resume_dir=$RUN" --set "resume_step=$STEP" \
-        --set "max_steps=$MAX_STEPS" $(arm_flags "$arm") 2>>"$LOG/rebuild.log") \
+        --set "max_steps=$MAX_STEPS" ${SEED:+--set seed=$SEED} $(arm_flags "$arm") \
+        2>>"$LOG/rebuild.log") \
         || { echo "rebuild_train_cmd failed for $arm, see $LOG/rebuild.log"; exit 1; }
     train=$(echo "$train" | tr -d '\\\n' | tr -s ' ')
     eval_cmd="python evaluation/evaluate_sdflow.py --checkpoint_dir output/$MODEL/$name --step $END --consensus --eval_resize area"
