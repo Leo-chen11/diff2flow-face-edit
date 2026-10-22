@@ -3,7 +3,8 @@
 #   ctrl    the parent run's exact flags
 #   flowbn  + --flow_bn_stats freeze                       (3+ GPUs only)
 #   both    + --flow_bn_stats freeze --conditioner_bn freeze
-# then evaluate each arm's last step (--consensus --eval_resize area).
+# then evaluate each arm's last step (--consensus --eval_resize area, plus the
+# R50 judge when ./data/r50_celebahq_eval.pth exists; R50=<path> to change it).
 # Arms are dealt round-robin to the GPUs; arms sharing a GPU run one after
 # the other. Everything runs in the background; logs in logs/bn_ablation/.
 #
@@ -30,6 +31,7 @@ BASE=$(basename "$RUN")
 END=$((STEP + MAX_STEPS))
 LOG=logs/bn_ablation
 mkdir -p "$LOG"
+R50=${R50:-./data/r50_celebahq_eval.pth}
 
 if [ "${#GPUS[@]}" -ge 3 ]; then ARMS=(ctrl flowbn both); else ARMS=(ctrl both); fi
 
@@ -53,6 +55,8 @@ for i in "${!ARMS[@]}"; do
         || { echo "rebuild_train_cmd failed for $arm, see $LOG/rebuild.log"; exit 1; }
     train=$(echo "$train" | tr -d '\\\n' | tr -s ' ')
     eval_cmd="python evaluation/evaluate_sdflow.py --checkpoint_dir output/$MODEL/$name --step $END --consensus --eval_resize area"
+    # the R50 judge too, when its weights are here (evaluate_sdflow loads none by default)
+    [ -f "$R50" ] && eval_cmd+=" --independent_attr_weights $R50 --independent_attr_backbone r50"
     echo "== $arm on GPU $gpu =="
     echo "   $train"
     echo "   $eval_cmd"
