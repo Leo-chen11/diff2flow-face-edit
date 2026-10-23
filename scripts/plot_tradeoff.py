@@ -23,8 +23,12 @@ edit for each run and each --edit_target mode.
 R50), celeb, clip, cons (consensus subset, both judges agree; ID and
 preservation are then taken on the same subset where the eval reports them),
 or teacher (the training teacher -- not an independent judge).
---match_acc prints, per attribute, each run's ID at that accuracy (interpolated
-along its curve) next to the first run's.
+--match_acc prints, per panel, each run's ID at that accuracy; --match_id each
+run's accuracy at that ID (both interpolated along the run's curve, '-' when
+the value is outside it). Either takes 'auto': per panel, the middle of the
+range every run's curve covers, so each attribute is compared where all runs
+have data. These are the numbers for a table: compare runs at the same
+accuracy or the same identity, as the figure does.
 
 Colors: slots 1-5 of the reference categorical palette (light), validated with
   node validate_palette.js "#2a78d6,#eb6834,#1baf7a,#eda100,#e87ba4" --mode light
@@ -108,6 +112,18 @@ def y_at_acc(pts, ykey, x0):
     return float(np.interp(x0, xs, ys))
 
 
+def acc_at_y(pts, ykey, y0):
+    pts = [p for p in pts if p[ykey] is not None]
+    if len(pts) < 2:
+        return None
+    ys = np.array([p[ykey] for p in pts])
+    xs = np.array([p['acc'] for p in pts])
+    o = np.argsort(ys)
+    if not (ys.min() <= y0 <= ys.max()):
+        return None
+    return float(np.interp(y0, ys[o], xs[o]))
+
+
 def style(ax):
     ax.set_facecolor(SURFACE)
     ax.grid(True, color=GRID, lw=0.6)
@@ -172,8 +188,10 @@ def main():
                    help='a curve: legend name = evaluate_sdflow.py JSON (repeatable, up to 5)')
     p.add_argument('--judge', default='indep', choices=list(JUDGE_LABEL))
     p.add_argument('--attrs', nargs='*', default=ATTRS)
-    p.add_argument('--match_acc', type=float, default=None,
+    p.add_argument('--match_acc', default=None,
                    help='print each run\'s ID at this accuracy (%%), per panel')
+    p.add_argument('--match_id', default=None,
+                   help='print each run\'s accuracy (%%) at this ID_ind, per panel')
     p.add_argument('--out', default='figures/tradeoff')
     args = p.parse_args()
     if len(args.run) > len(COLORS):
@@ -211,13 +229,29 @@ def main():
                                 '' if pt['keep'] is None else f"{pt['keep']:.2f}"])
     print(f'saved {args.out}.csv')
 
-    if args.match_acc is not None:
-        print(f'\nID at {args.judge} accuracy {args.match_acc:g}% (interpolated; - = outside the curve)')
-        print(f'{"panel":<16}' + ''.join(f'{n[:18]:>20}' for n, _ in runs))
+    for opt, xkey, label, fmt_x, fmt_v, read in (
+            (args.match_acc, 'acc', f'ID_ind at the same {args.judge} accuracy', '{:.1f}%', '{:.3f}',
+             lambda pts, x: y_at_acc(pts, 'id', x)),
+            (args.match_id, 'id', f'{args.judge} accuracy (%) at the same ID_ind', '{:.3f}', '{:.1f}',
+             lambda pts, x: acc_at_y(pts, 'id', x))):
+        if opt is None:
+            continue
+        print(f'\n{label} (interpolated along each curve; - = outside it)')
+        print(f'{"panel":<16}{"at":>9}' + ''.join(f'{n[:18]:>20}' for n, _ in runs))
         for panel in panels:
-            vals = [y_at_acc(d.get(panel, []), 'id', args.match_acc) for _, d in runs]
-            print(f'{panel:<16}' + ''.join(f'{"-" if v is None else f"{v:.3f}":>20}' for v in vals))
-
+            curves = [[p for p in d.get(panel, [])] for _, d in runs]
+            if opt == 'auto':
+                spans = [(min(p[xkey] for p in c), max(p[xkey] for p in c)) for c in curves if c]
+                lo, hi = max(a for a, _ in spans), min(b for _, b in spans)
+                if len(spans) < len(runs) or lo > hi:
+                    print(f'{panel:<16}{"none":>9}   (the runs\' curves do not overlap)')
+                    continue
+                x0 = (lo + hi) / 2
+            else:
+                x0 = float(opt)
+            vals = [read(c, x0) for c in curves]
+            print(f'{panel:<16}{fmt_x.format(x0):>9}'
+                  + ''.join(f'{"-" if v is None else fmt_v.format(v):>20}' for v in vals))
 
 if __name__ == '__main__':
     main()
