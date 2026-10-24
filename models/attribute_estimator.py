@@ -103,3 +103,32 @@ class AttributeEstimator(nn.Module):
         out = self.sigmoid(self.backbone(img))
         out = out.view(bs, self.attribute_dim)
         return out
+
+class ConvNeXtB512Classifier(nn.Module):
+    """The ConvNeXt-Base 40-attribute classifier in
+    data/convnext_base_a40_512_classifier.pth: buffers mean/std (1,3,1,1), a
+    torchvision convnext_base with classifier[2] = Linear(1024, 40), input
+    512 x 512. Takes the project's [-1, 1] images and returns (logits (B, 40),
+    preds) like AttributeClassifier. input_range: the range the images had
+    before (x - mean) / std when it was trained -- '01' (x in [0, 1]) or
+    'pm1' (x in [-1, 1]); the wrong one reads near chance."""
+
+    def __init__(self, input_range='01'):
+        super().__init__()
+        self.input_range = input_range
+        self.register_buffer('mean', torch.zeros(1, 3, 1, 1))
+        self.register_buffer('std', torch.ones(1, 3, 1, 1))
+        try:
+            net = torchvision.models.convnext_base(weights=None)
+        except TypeError:   # torchvision < 0.13
+            net = torchvision.models.convnext_base(pretrained=False)
+        net.classifier[2] = nn.Linear(1024, 40)
+        self.backbone = net
+
+    def forward(self, x):
+        if self.input_range == '01':
+            x = (x + 1.0) * 0.5
+        if x.shape[-1] != 512 or x.shape[-2] != 512:
+            x = nn.functional.interpolate(x, (512, 512), mode='bilinear', align_corners=False)
+        logits = self.backbone((x - self.mean) / self.std)
+        return logits, (logits > 0).float()

@@ -842,6 +842,56 @@ def consistent_source(attr_cond, local_idx, direction, margin):
 
 _PRESERVE = None           # --preserve_boundaries; set in load_models()
 _FINAL_DELTA_MAX_NORM = None    # training's --final_delta_max_norm; set in load_models()
+class ConvNeXtAttrJudge(nn.Module):
+    """The ConvNeXt-B/512 40-attribute classifier (--cnx_judge_weights), as a
+    judge and, with --stop_judge cnx, as the adaptive ladder's stop rule. It
+    never touched training, unlike the r34 teacher the model learned to fool
+    on Male/Young/Bangs. Reads G's output resized to 512 (resize_for_judge),
+    not the 256 the other judges get.
+
+    input_range '01' / 'pm1' is the range its images had before its own
+    mean/std; 'auto' tries both on the first batch's source reconstructions
+    and keeps the one that agrees more with the r34 teacher over all 40
+    attributes (the wrong one reads near chance; sources are not edited, so
+    the teacher is a fair reference there)."""
+
+    def __init__(self, weights_path, input_range='auto', device='cuda'):
+        super().__init__()
+        from models.attribute_estimator import ConvNeXtB512Classifier
+        self.net = ConvNeXtB512Classifier('01' if input_range == 'auto' else input_range)
+        _check_load(self.net.load_state_dict(load_network(weights_path), strict=False),
+                    'ConvNeXt judge')
+        self.net.to(device).eval()
+        for p in self.net.parameters():
+            p.requires_grad_(False)
+        self.input_range = None if input_range == 'auto' else input_range
+        self.range_agreement = None
+
+    @torch.no_grad()
+    def scores(self, images):
+        """images: [-1, 1] (B, 3, H, W), any size -> (B, 40) probabilities, CelebA order."""
+        x = images if images.shape[-1] == 512 else resize_for_judge(images, (512, 512))
+        return torch.sigmoid(self.net(x)[0].float())
+
+    @torch.no_grad()
+    def pick_range(self, images, ref_probs):
+        """--cnx_input_range auto: keep the range that agrees more with ref_probs (B, 40)."""
+        if self.input_range is not None:
+            return
+        agree = {}
+        for r in ('01', 'pm1'):
+            self.net.input_range = r
+            agree[r] = float(((self.scores(images) > 0.5) == (ref_probs > 0.5)).float().mean())
+        self.input_range = max(agree, key=agree.get)
+        self.net.input_range = self.input_range
+        self.range_agreement = agree
+        print(f'[Judge] ConvNeXt input range: agreement with r34 on {images.size(0)} sources x 40 '
+              f'attributes: 01 {agree["01"]:.1%}, pm1 {agree["pm1"]:.1%} -> {self.input_range}')
+        if agree[self.input_range] < 0.75:
+            print('[WARN] ConvNeXt agrees with r34 on under 75% of source attributes even in its '
+                  'better input range: check --cnx_judge_weights.')
+
+
 _EDIT_GAIN = 1.0            # --edit_gain / --adaptive_gains: W+ edit x k after the final cap
 _RESIZE_MODE = 'nearest'    # --eval_resize; set in evaluate()
 
@@ -1595,6 +1645,15 @@ def evaluate(args):
     clip_judge, indep_id, lpips_fn, indep_teacher, glasses_parser, celeb_judge = \
         build_optional_judges(args, args.attribute_index, id_criterion)
     _glasses_local = args.attribute_index.index(15) if 15 in args.attribute_index else None
+    cnx_judge = None
+    if getattr(args, 'cnx_judge_weights', None):
+        cnx_judge = ConvNeXtAttrJudge(args.cnx_judge_weights, args.cnx_input_range)
+        print(f'[Judge] ConvNeXt-B/512 classifier: {args.cnx_judge_weights}')
+    stop_cnx = getattr(args, 'stop_judge', 'teacher') == 'cnx'
+    if stop_cnx and cnx_judge is None:
+        raise SystemExit('--stop_judge cnx needs --cnx_judge_weights')
+    if stop_cnx and not getattr(args, 'adaptive_ladder', None):
+        raise SystemExit('--stop_judge cnx only applies to --adaptive_ladder')
     consensus_on = bool(getattr(args, 'consensus', False))
     cons_second = getattr(args, 'consensus_second', 'clip')
     _CONS_SECOND.update({'key': 'clip', 'label': 'CLIP', 'desc': 'CLIP/parser'} if cons_second == 'clip'
@@ -1701,6 +1760,8 @@ def evaluate(args):
             'bank_mix': getattr(args, 'bank_mix', None),
             'consensus': consensus_on,
             'bg_metric': bool(getattr(args, 'bg_metric', False)),
+            'cnx_judge_weights': getattr(args, 'cnx_judge_weights', None),
+            'stop_judge': getattr(args, 'stop_judge', 'teacher'),
         },
     }
 
@@ -1772,6 +1833,10 @@ def evaluate(args):
             src_probs_celeb = celeb_judge.scores(src_face_256)[:, attribute_index] \
                 if celeb_judge is not None else None
             src_id_indep = indep_id.extract(src_face_256) if indep_id is not None else None
+            src_probs_cnx = None
+            if cnx_judge is not None:
+                cnx_judge.pick_range(src_face, torch.sigmoid(attr_teacher(src_face_256)[0])[:, :40])
+                src_probs_cnx = cnx_judge.scores(src_face)[:, attribute_index]
 
             # Inversion gap (once, on the first scale pass only)
             if first_scale:
@@ -1826,7 +1891,8 @@ def evaluate(args):
                 elif adaptive:
                     # Per-face edit strength: walk up the ladder and keep, for
                     # each face, the FIRST scale at which the training teacher
-                    # (r34, not the R50 judge that scores the result) sees the
+                    # (r34, not the R50 judge that scores the result; the
+                    # ConvNeXt with --stop_judge cnx) sees the
                     # edit done by `edit_scale` (= the teacher margin here).
                     # Easy faces stop early and keep their identity; faces a
                     # fixed scale leaves unedited ("still" failures) get more.
@@ -1842,7 +1908,8 @@ def evaluate(args):
                             set_edit_gain(_gain)
                             _ef = _edit(_sc)
                             _ef_256 = resize_for_judge(_ef, (256, 256))
-                            _pt = torch.sigmoid(attr_teacher(_ef_256)[0])[:, _gidx]
+                            _pt = cnx_judge.scores(_ef)[:, _gidx] if stop_cnx \
+                                else torch.sigmoid(attr_teacher(_ef_256)[0])[:, _gidx]
                             _ok = torch.where(_add, _pt > 0.5 + edit_scale, _pt < 0.5 - edit_scale)
                             _take = (~_done) & (_ok | (_k == len(rungs) - 1))
                             if edited_face is None:
@@ -1871,6 +1938,8 @@ def evaluate(args):
                 edit_probs_celeb = celeb_judge.scores(edited_256)[:, attribute_index] \
                     if celeb_judge is not None else None
                 edit_id_indep = indep_id.extract(edited_256) if indep_id is not None else None
+                edit_probs_cnx = cnx_judge.scores(edited_face)[:, attribute_index] \
+                    if cnx_judge is not None else None
                 lpips_d = lpips_fn(src_face_256, edited_256).flatten() \
                     if lpips_fn is not None else None
                 bg_d = None
@@ -1897,6 +1966,19 @@ def evaluate(args):
                         judge_sets.append(('indep', src_probs_indep, edit_probs_indep))
                     if src_probs_celeb is not None:
                         judge_sets.append(('celeb', src_probs_celeb, edit_probs_celeb))
+                    if src_probs_cnx is not None:
+                        judge_sets.append(('cnx', src_probs_cnx, edit_probs_cnx))
+                        # Is the ConvNeXt fooled where r34 is? On faces all three
+                        # read as clear sources on the same side, record whether
+                        # each calls the edit done.
+                        if src_probs_indep is not None:
+                            _ss = [sp[b, local_idx].item() for sp in
+                                   (src_probs_teacher, src_probs_indep, src_probs_cnx)]
+                            if all(is_clear(v) for v in _ss) and len({v > 0.5 for v in _ss}) == 1:
+                                metrics[f'cnx_vs_{attr_name}'].append(tuple(
+                                    bool(strict_success(sv, ep[b, local_idx].item(), args.success_margin))
+                                    for sv, ep in zip(_ss, (edit_probs_teacher, edit_probs_indep,
+                                                            edit_probs_cnx))))
 
                     any_clear = False
                     for jname, sp, ep in judge_sets:
@@ -2003,6 +2085,7 @@ def evaluate(args):
                 (f'acc_clip_{attr_name}', True),
                 (f'acc_indep_{attr_name}', True),
                 (f'acc_celeb_{attr_name}', True),
+                (f'acc_cnx_{attr_name}', True),
                 (f'delta_teacher_{attr_name}', False),
                 (f'delta_clip_{attr_name}', False),
                 (f'delta_indep_{attr_name}', False),
@@ -2046,7 +2129,8 @@ def evaluate(args):
             scale_summary[attr_name]['acc_clip_rm'] = _r
 
         for jname, label, present in (('indep', 'AccInd', indep_teacher is not None),
-                                      ('celeb', 'AccCeleb', celeb_judge is not None)):
+                                      ('celeb', 'AccCeleb', celeb_judge is not None),
+                                      ('cnx', 'AccCnx', cnx_judge is not None)):
             if not present:
                 continue
             print(f'  Direction split ({label}): add = source lacks attr, rm = source has attr')
@@ -2084,6 +2168,33 @@ def evaluate(args):
                     cells.append(f'{_dir}: n={prog["n_fail"]:<3} dP={prog["mean_delta"]:+.2f} '
                                  f'near {prog["near"] * 100:4.0f}% still {prog["still"] * 100:4.0f}%')
                 print(f'    {attr_name:<12} ' + '   '.join(cells))
+
+        if cnx_judge is not None and indep_teacher is not None:
+            print('  ConvNeXt vs r34 (teacher) vs R50 (AccInd), faces all three read as clear sources:\n'
+                  '    fooled = r34 says done, R50 says not: share the ConvNeXt also calls done '
+                  '(low = not fooled like r34)\n'
+                  '    missed = r34 says not, R50 says done: share the ConvNeXt calls done\n'
+                  '    agree = same verdict as R50 / as r34, over all such faces')
+            for attr_name in attr_names:
+                rows = metrics.get(f'cnx_vs_{attr_name}')
+                if not rows:
+                    continue
+                arr = np.asarray(rows, dtype=bool)
+                t, i, c = arr[:, 0], arr[:, 1], arr[:, 2]
+                fooled, missed = t & ~i, ~t & i
+                cv = {'n': int(len(arr)),
+                      'n_fooled': int(fooled.sum()), 'cnx_done_on_fooled':
+                          float(c[fooled].mean()) if fooled.any() else None,
+                      'n_missed': int(missed.sum()), 'cnx_done_on_missed':
+                          float(c[missed].mean()) if missed.any() else None,
+                      'cnx_agree_r50': float((c == i).mean()), 'cnx_agree_r34': float((c == t).mean()),
+                      'r34_agree_r50': float((t == i).mean())}
+                scale_summary[attr_name]['cnx_vs'] = cv
+                _p = lambda v: '   --' if v is None else f'{v * 100:4.0f}%'
+                print(f'    {attr_name:<12} n={cv["n"]:<4} fooled n={cv["n_fooled"]:<3} '
+                      f'cnx done {_p(cv["cnx_done_on_fooled"])}   missed n={cv["n_missed"]:<3} '
+                      f'cnx done {_p(cv["cnx_done_on_missed"])}   agree R50 {_p(cv["cnx_agree_r50"])} '
+                      f'r34 {_p(cv["cnx_agree_r34"])}  (r34~R50 {_p(cv["r34_agree_r50"])})')
 
         if consensus_on:
             _cons_attr, _cons_overall = summarize_consensus(metrics, attr_names)
@@ -2146,7 +2257,7 @@ def evaluate(args):
         if adaptive or closed_loop:
             print(('  Closed-loop steps used per face (training-teacher stop rule; '
                    '"at max" = never reached the margin, kept the last step):') if closed_loop else
-                  ('  Chosen edit_scale per face (training-teacher stop rule; '
+                  (f'  Chosen edit_scale per face ({"ConvNeXt" if stop_cnx else "training-teacher"} stop rule; '
                    '"at max" = never reached the margin, kept the largest scale):'))
             for attr_name in attr_names:
                 cs = metrics.get(f'chosen_scale_{attr_name}')
@@ -2166,6 +2277,7 @@ def evaluate(args):
                               ('acc_clip_', 'acc_clip'),
                               ('acc_indep_', 'acc_indep'),
                               ('acc_celeb_', 'acc_celeb'),
+                              ('acc_cnx_', 'acc_cnx'),
                               ('lpips_', 'lpips'),
                               ('id_arc_', 'id_arc'),
                               ('acc_teacher_', 'acc_teacher')]:
@@ -2226,6 +2338,8 @@ def evaluate(args):
         + (f'_et{args.edit_target}' if getattr(args, 'edit_target', 'mirror') != 'mirror' else '')
         + ('_learned' if getattr(args, 'scale_by_learned', False) else '')
         + ('_clamp' if getattr(args, 'clamp_edit_target', False) else '')
+        + ('_cnx' if getattr(args, 'cnx_judge_weights', None) else '')
+        + ('_stopcnx' if getattr(args, 'stop_judge', 'teacher') == 'cnx' else '')
         + '.json',
     )
     # The default name only encodes step and sample count, so a second eval of
@@ -2560,6 +2674,18 @@ def build_parser():
                              'their own --out_json. Costs up to len(ladder) generations per edit '
                              '(stops early once every face in the batch is done). '
                              'e.g. 0.5 0.7 0.85 1.0 1.25 1.5')
+    parser.add_argument('--cnx_judge_weights', default=None,
+                        help='The ConvNeXt-B/512 40-attribute classifier, e.g. '
+                             './data/convnext_base_a40_512_classifier.pth: one more judge (AccCnx, '
+                             'never used in training), plus, with --independent_attr_weights, a '
+                             'table of how often it calls an edit done where r34 does and the R50 '
+                             'does not (r34 fooled). Output name gets a _cnx suffix.')
+    parser.add_argument('--cnx_input_range', default='auto', choices=['auto', '01', 'pm1'],
+                        help='Input range the ConvNeXt was trained on; auto picks the one that '
+                             'agrees with r34 on the first batch\'s sources (printed).')
+    parser.add_argument('--stop_judge', default='teacher', choices=['teacher', 'cnx'],
+                        help='Who decides when --adaptive_ladder stops: the r34 training teacher, '
+                             'or the ConvNeXt (--cnx_judge_weights). Output name gets _stopcnx.')
     parser.add_argument('--adaptive_gains', nargs='*', type=float, default=None,
                         help='With --adaptive_ladder: extra rungs after the ladder that keep its largest '
                              'scale and lengthen the edit by these factors along its own direction '
