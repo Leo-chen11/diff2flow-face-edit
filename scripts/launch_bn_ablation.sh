@@ -4,8 +4,17 @@
 #   flowbn  + --flow_bn_stats freeze                       (3+ GPUs only)
 #   both    + --flow_bn_stats freeze --conditioner_bn freeze
 #   both_area  both + --train_resize area                  (only via ARMS)
+#   maleid  + --id_hinge_threshold_override 39:0.68,20:0.72  (only via ARMS)
+#           a lower ID hinge floor for Young and Male, whose real edits cost
+#           identity; needs a parent trained with --id_loss_hinge
+#   accum   + --grad_accum_steps 5 --ema_decay 0.995         (only via ARMS)
+#           one optimizer step per 5 iterations, i.e. per round of all five
+#           attributes; max_steps still counts iterations, so this arm sees
+#           the same data with 1/5 the updates (decay 0.995 per update is
+#           ~0.999 per iteration, the default)
 # then evaluate each arm's last step (--consensus --eval_resize area, plus the
-# R50 judge when ./data/r50_celebahq_eval.pth exists; R50=<path> to change it).
+# R50 judge when ./data/r50_celebahq_eval.pth exists, R50=<path> to change it;
+# the ConvNeXt judge likewise from ./data/convnext_base_a40_512_classifier.pth, CNX=<path>).
 # Arms are dealt round-robin to the GPUs; arms sharing a GPU run one after
 # the other. Everything runs in the background; logs in logs/bn_ablation/.
 #
@@ -41,6 +50,7 @@ TAG=${TAG:+_$TAG}
 LOG=logs/bn_ablation$TAG
 mkdir -p "$LOG"
 R50=${R50:-./data/r50_celebahq_eval.pth}
+CNX=${CNX:-./data/convnext_base_a40_512_classifier.pth}
 
 if [ -n "${ARMS:-}" ]; then read -r -a ARMS <<< "$ARMS"
 elif [ "${#GPUS[@]}" -ge 3 ]; then ARMS=(ctrl flowbn both); else ARMS=(ctrl both); fi
@@ -51,16 +61,24 @@ arm_flags() {
         flowbn) echo "--set flow_bn_stats=freeze" ;;
         both)   echo "--set flow_bn_stats=freeze --set conditioner_bn=freeze" ;;
         both_area) echo "--set flow_bn_stats=freeze --set conditioner_bn=freeze --set train_resize=area" ;;
+        maleid) echo "--set id_hinge_threshold_override=39:0.68,20:0.72" ;;
+        accum)  echo "--set grad_accum_steps=5 --set ema_decay=0.995" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac
 }
 
 for arm in "${ARMS[@]}"; do arm_flags "$arm" > /dev/null; done   # an unknown arm stops here
+for arm in "${ARMS[@]}"; do
+    if [ "$arm" = maleid ] && [ "$(python -c "import json,sys; print(bool(json.load(open(sys.argv[1])).get('id_loss_hinge')))" "$CFG")" != True ]; then
+        echo "arm maleid: $RUN was not trained with --id_loss_hinge, the override would do nothing"; exit 1
+    fi
+done
 
 eval_for() {
     local cmd="python evaluation/evaluate_sdflow.py --checkpoint_dir output/$MODEL/$1 --step $END --consensus --eval_resize area"
     # the R50 judge too, when its weights are here (evaluate_sdflow loads none by default)
     [ -f "$R50" ] && cmd+=" --independent_attr_weights $R50 --independent_attr_backbone r50"
+    [ -f "$CNX" ] && cmd+=" --cnx_judge_weights $CNX"
     echo "$cmd"
 }
 
