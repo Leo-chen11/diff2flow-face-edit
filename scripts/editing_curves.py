@@ -32,6 +32,13 @@ Methods (--method):
   linear   w + sign * alpha * d with d the mean of the attribute's bank slots
            (the InterFaceGAN-style baseline of scripts/linear_baseline.py);
            --scales are then alphas
+  sdflow   the released SDFlow (github.com/phil329/SDFlow, Li et al., ICCV 2023) with its own
+           checkpoint (--sdflow_ckpt_dir holding labeldist-<step> and prior-<step>, default step 10000):
+           its attribute estimator reads the face, the flow encodes w under that reading, the edited
+           attribute is set to -scale (remove) or 1+scale (add) as in its models/editor.py, and the
+           flow is run backwards. It only knows Eyeglasses, Male and Young (--sdflow_attrs), so give
+           every method --only_attrs 15 20 39: "All" then averages the same attributes for all of them.
+           --scales are the editor's `scale`, e.g. 0 0.25 0.5 1 1.5 2
   boundary InterFaceGAN: w + sign * alpha * sd * n with n the attribute's unit
            normal of a linear W+ boundary (scripts/fit_attr_boundaries.py,
            --boundaries) and sd the spread of the test faces' latents along n,
@@ -123,9 +130,48 @@ def boundary_directions(path, attribute_index, ds, max_faces=2000):
     return out
 
 
+class OfficialSDFlow:
+    """models/editor.py of the released SDFlow, with the edit direction given. Its flow has the
+    same parameter names and shapes as this repo's cnf(512, '512-512-512-512-512', n_attrs, 1),
+    so its checkpoint loads strictly; the condition is the attribute estimator's reading only
+    (no identity vector)."""
+
+    def __init__(self, ckpt_dir, step, attrs, device='cuda'):
+        from models.attribute_estimator import AttributeEstimator
+        from models.flows.flow import cnf
+        self.attrs = list(attrs)
+        self.labeldist = AttributeEstimator(backbone='resnet34', attribute_dim=len(self.attrs)).to(device)
+        self.flow = cnf(512, '512-512-512-512-512', len(self.attrs), 1).to(device)
+        for module, stem in ((self.labeldist, 'labeldist'), (self.flow, 'prior')):
+            path = os.path.join(ckpt_dir, f'{stem}-{step:07d}')
+            if not os.path.exists(path):
+                raise SystemExit(f'no {path}; the files in {ckpt_dir}: {sorted(os.listdir(ckpt_dir)) if os.path.isdir(ckpt_dir) else "(missing directory)"}'
+                                 f' -- pass the right --sdflow_ckpt_dir / --sdflow_step')
+            module.load_state_dict(torch.load(path, map_location='cpu'), strict=True)
+            module.eval()
+        print(f'[SDFlow] released checkpoint {ckpt_dir} step {step}, attributes {self.attrs}')
+
+    @torch.no_grad()
+    def edit(self, G, img, latent, g, direction, scale):
+        reading = self.labeldist(img, latent)
+        z = self.flow(latent, reading, torch.zeros(latent.size(0), latent.size(1), 1).to(latent))[0]
+        new = reading.clone()
+        new[:, self.attrs.index(g)] = torch.where(direction > 0, 1.0 + scale, -scale)
+        w = self.flow(z, new, reverse=True)
+        return G([w], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+
+
 def main():
     p = build_parser()
-    p.add_argument('--method', default='model', choices=['model', 'linear', 'boundary'])
+    p.add_argument('--method', default='model', choices=['model', 'linear', 'boundary', 'sdflow'])
+    p.add_argument('--sdflow_ckpt_dir', default='./data/ckpt',
+                   help='--method sdflow: folder with labeldist-<step> and prior-<step>.')
+    p.add_argument('--sdflow_step', type=int, default=10000)
+    p.add_argument('--sdflow_attrs', nargs='+', type=int, default=[15, 20, 39],
+                   help='CelebA ids the released SDFlow checkpoint was trained on.')
+    p.add_argument('--only_attrs', nargs='+', type=int, default=None,
+                   help='Evaluate only these CelebA ids (the run\'s own order), so every method\'s "All" '
+                        'averages the same attributes; --method sdflow defaults to --sdflow_attrs.')
     p.add_argument('--arcface_weights', default='./data/model_ir_se50.pth',
                    help='ArcFace IR-SE50 weights (model_ir_se50.pth, the pSp / e4e ID-loss model) '
                         'for the paper\'s identity metric; without the file only facenet is measured.')
@@ -157,7 +203,18 @@ def main():
         print(f'[WARN] no ArcFace weights at {args.arcface_weights}: id_arc is left empty and '
               f'plot_strength_curves.py needs --id_metric indep. Get model_ir_se50.pth from the '
               f'pSp / e4e README (the IR-SE50 of TreB1eN/InsightFace_Pytorch).')
-    attrs = list(args.attribute_index)
+    attrs = list(args.only_attrs or (args.sdflow_attrs if args.method == 'sdflow' else args.attribute_index))
+    missing = [a for a in attrs if a not in args.attribute_index]
+    if missing:
+        raise SystemExit(f'--only_attrs {missing} are not edited attributes of {args.checkpoint_dir} '
+                         f'({args.attribute_index})')
+    sdf = None
+    if args.method == 'sdflow':
+        bad = [a for a in attrs if a not in args.sdflow_attrs]
+        if bad:
+            raise SystemExit(f'the released SDFlow checkpoint only covers {args.sdflow_attrs}, not {bad}: '
+                             f'pass --only_attrs {" ".join(map(str, args.sdflow_attrs))}')
+        sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs)
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root,
                        latents_file=args.latent_file, preds_file=args.preds_file,
@@ -180,14 +237,17 @@ def main():
             sc_src = celeb_judge.scores(src_256)[:, :40] if celeb_judge is not None else None
             src_id = indep_id.extract(src_256)
             src_arc = arc.extract(src_256) if arc is not None else None
-            for li, g in enumerate(attrs):
+            for g in attrs:
+                li = args.attribute_index.index(g)
                 d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
                 keep = (sp[:, g] > CLEAR_HI) | (sp[:, g] < CLEAR_LO)
                 if not keep.any():
                     continue
                 others = [j for j in (attrs if args.preserve_set == 'edited' else range(40)) if j != g]
                 for sc in args.scales:
-                    if lin is not None:
+                    if sdf is not None:
+                        face = sdf.edit(G, img, latent, g, d, sc)
+                    elif lin is not None:
                         new_lat = latent + (d * sc).view(-1, 1, 1) * lin[g].to(latent)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     else:
