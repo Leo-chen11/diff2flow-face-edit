@@ -159,14 +159,29 @@ class CLIPAttributeJudge(nn.Module):
             self.register_buffer('text_feats', torch.stack(text_feats, dim=0))
 
     @torch.no_grad()
-    def scores(self, images):
-        """images: [-1, 1] tensor (B, 3, H, W) -> (B, A) prob attribute present."""
+    def _image_feat(self, images):
         x = (images + 1.0) * 0.5
         x = F.interpolate(x, (224, 224), mode='bicubic', align_corners=False)
         mean = x.new_tensor((0.48145466, 0.4578275, 0.40821073)).view(1, 3, 1, 1)
         std = x.new_tensor((0.26862954, 0.26130258, 0.27577711)).view(1, 3, 1, 1)
         x = (x - mean) / std
-        img_feat = F.normalize(self.model.encode_image(x).float(), dim=-1)  # (B, D)
+        return F.normalize(self.model.encode_image(x).float(), dim=-1)  # (B, D)
+
+    @torch.no_grad()
+    def target_similarity(self, images, local_idx, add):
+        """Raw cosine similarity (not x100) between each image and the prompt of the
+        TARGET state of attribute number `local_idx` (its position in the list this
+        judge was built with): the 'present' prompt where `add` (bool, (B,)) is True,
+        else the 'absent' prompt. The CLIP score of papers' SSIM/FID/LPIPS/CLIP tables;
+        read it as a change from the unedited face, since the raw value is narrow."""
+        t = self.text_feats[local_idx]                                   # (2, D)
+        target = torch.where(add.view(-1, 1), t[0], t[1])
+        return (self._image_feat(images) * target).sum(-1)
+
+    @torch.no_grad()
+    def scores(self, images):
+        """images: [-1, 1] tensor (B, 3, H, W) -> (B, A) prob attribute present."""
+        img_feat = self._image_feat(images)
         # (B, A, 2) similarity to pos/neg prompt of each attribute
         logits = 100.0 * torch.einsum('bd,akd->bak', img_feat, self.text_feats)
         raw = torch.softmax(logits, dim=-1)[:, :, 0]   # (B, A)
