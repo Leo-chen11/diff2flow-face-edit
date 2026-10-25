@@ -62,6 +62,7 @@ def read_summary(path):
                 'effective_success': float(row.get('effective_success', row['target_success'])),
                 'celeb_success': float(row.get('celeb_success') or 'nan'),
                 'id_sim_real': float(row['id_sim_real']),
+                'id_arc': float(row.get('id_arc') or 'nan'),
                 'preserve_acc': float(row['preserve_acc']),
             })
     return rows
@@ -78,13 +79,20 @@ def collect_attribute_order(data_by_run, requested):
     return seen
 
 
-def read_at(rows, x_metric, points=READ_AT):
+ID_KEYS = {'arc': 'id_arc', 'indep': 'id_sim_real'}
+# The SDFlow paper's Fig. 4 colours (matplotlib tab10): baselines blue, orange,
+# green in --run order, and a run named Ours* always red.
+PAPER_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b']
+OURS_COLOR = '#d62728'
+
+
+def read_at(rows, x_metric, id_key='id_arc', points=READ_AT):
     """{point: (id, preserve %) or None}: the curve's ID and attribute preservation
     at each Editing Accuracy (%), linearly interpolated between the measured
     strengths and never extrapolated -- a curve that does not reach a point
     (strengths too small or too large) gets None there."""
-    pts = sorted((r[x_metric] * 100.0, r['id_sim_real'], r['preserve_acc'] * 100.0)
-                 for r in rows if r[x_metric] == r[x_metric])
+    pts = sorted((r[x_metric] * 100.0, r[id_key], r['preserve_acc'] * 100.0)
+                 for r in rows if r[x_metric] == r[x_metric] and r[id_key] == r[id_key])
     out = {}
     if not pts:
         return {q: None for q in points}
@@ -98,15 +106,29 @@ def read_at(rows, x_metric, points=READ_AT):
     return out
 
 
-def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(READ_AT[0], READ_AT[-1])):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    colors = plt.cm.tab10.colors
+def run_colors(run_names):
+    colors, k = {}, 0
+    for name in run_names:
+        if name.lower().startswith('ours'):
+            colors[name] = OURS_COLOR
+        else:
+            colors[name] = PAPER_COLORS[k % len(PAPER_COLORS)]
+            k += 1
+    return colors
+
+
+def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102), id_key='id_arc'):
+    """Two panels in the layout of the SDFlow paper's Fig. 4: Identity Preservation
+    (cosine similarity) and Attribute Preservation (accuracy) against Editing
+    Accuracy; legend in the lower left of the left panel. Writes .png and .pdf."""
+    fig, axes = plt.subplots(1, 2, figsize=(7.8, 3.1))
+    colors = run_colors(data_by_run)
     plotted_any = False
 
-    for run_idx, (run_name, rows) in enumerate(data_by_run.items()):
-        attr_rows = [r for r in rows if r['attribute'] == attr_name]
+    for run_name, rows in data_by_run.items():
+        attr_rows = [r for r in rows if r['attribute'] == attr_name and r[id_key] == r[id_key]]
         if not attr_rows:
-            print(f'[warn] run "{run_name}" has no rows for attribute "{attr_name}", skipping.')
+            print(f'[warn] run "{run_name}" has no {id_key} rows for attribute "{attr_name}", skipping.')
             continue
         plotted_any = True
 
@@ -115,12 +137,12 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(READ_AT[0
         # paper-style figure reads left-to-right by accuracy.
         attr_rows = sorted(attr_rows, key=lambda r: r[x_metric])
         edit_acc = [r[x_metric] * 100.0 for r in attr_rows]
-        id_sim = [r['id_sim_real'] for r in attr_rows]
+        id_sim = [r[id_key] for r in attr_rows]
         attr_pres = [r['preserve_acc'] * 100.0 for r in attr_rows]
 
-        color = colors[run_idx % len(colors)]
-        axes[0].plot(edit_acc, id_sim, marker='o', color=color, linewidth=2, label=run_name)
-        axes[1].plot(edit_acc, attr_pres, marker='o', color=color, linewidth=2, label=run_name)
+        style = dict(marker='o', markersize=5.5, linewidth=1.6, color=colors[run_name], label=run_name)
+        axes[0].plot(edit_acc, id_sim, **style)
+        axes[1].plot(edit_acc, attr_pres, **style)
 
     if not plotted_any:
         plt.close(fig)
@@ -129,23 +151,20 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(READ_AT[0
     for ax in axes:
         ax.set_xlim(*xlim)
         ax.set_xticks([q for q in READ_AT if xlim[0] <= q <= xlim[1]])
-    axes[0].set_xlabel('Editing Accuracy (%)')
+        ax.set_xlabel('Editing Accuracy(%)')
     axes[0].set_ylabel('Cosine Similarity')
     axes[0].set_title('Identity Preservation')
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
-
-    axes[1].set_xlabel('Editing Accuracy (%)')
-    axes[1].set_ylabel('Attribute Preservation (%)')
+    axes[0].legend(loc='lower left', fontsize=8.5)
+    axes[1].set_ylabel('Accuracy(%)')
     axes[1].set_title('Attribute Preservation')
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
 
-    fig.suptitle(attr_name)
+    if attr_name != 'All':
+        fig.suptitle(attr_name, fontsize=11)
     fig.tight_layout()
     safe_name = attr_name.replace(' ', '_')
     out_path = os.path.join(output_dir, f'curves_{safe_name}.png')
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    fig.savefig(os.path.splitext(out_path)[0] + '.pdf', bbox_inches='tight')
     plt.close(fig)
     return out_path
 
@@ -161,8 +180,11 @@ def main():
                         choices=['target_success', 'effective_success', 'celeb_success'],
                         help='Which success metric to plot as "Editing Accuracy" (celeb_success: '
                              'the CelebA r18 judge, from scripts/editing_curves.py CSVs).')
-    parser.add_argument('--xlim', nargs=2, type=float, default=[READ_AT[0], READ_AT[-1]],
-                        help='x range of every plot, the same for all attributes (default 40 100).')
+    parser.add_argument('--xlim', nargs=2, type=float, default=[30, 102],
+                        help='x range of every plot, the same for all attributes; ticks at 40 60 80 100.')
+    parser.add_argument('--id_metric', default='arc', choices=['arc', 'indep'],
+                        help='Identity cosine similarity: arc = ArcFace IR-SE50 (as in the SDFlow paper, '
+                             'column id_arc of scripts/editing_curves.py), indep = facenet casia-webface.')
     parser.add_argument('--attributes', nargs='*', default=None,
                         help='Restrict to these attribute names. Default: every attribute '
                              'found across the given runs.')
@@ -171,6 +193,12 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     data_by_run = {name: read_summary(path) for name, path in args.runs}
+    _k = ID_KEYS[args.id_metric]
+    _empty = [n for n, rows in data_by_run.items() if not any(r[_k] == r[_k] for r in rows)]
+    if _empty:
+        raise SystemExit(f'--id_metric {args.id_metric}: no {_k} values in {", ".join(_empty)}'
+                         + (' (run scripts/editing_curves.py with --arcface_weights model_ir_se50.pth, '
+                            'or plot facenet with --id_metric indep)' if args.id_metric == 'arc' else ''))
     attrs = collect_attribute_order(data_by_run, args.attributes)
 
     if not attrs:
@@ -179,7 +207,7 @@ def main():
     written = []
     for attr_name in attrs:
         out_path = plot_attribute(attr_name, data_by_run, args.x_metric, args.output_dir,
-                                  xlim=tuple(args.xlim))
+                                  xlim=tuple(args.xlim), id_key=ID_KEYS[args.id_metric])
         if out_path:
             written.append(out_path)
             print(f'Wrote {out_path}')
@@ -196,11 +224,11 @@ def main():
             arows = [r for r in rows if r['attribute'] == attr_name]
             if not arows:
                 continue
-            for q, v in read_at(arows, args.x_metric).items():
+            for q, v in read_at(arows, args.x_metric, ID_KEYS[args.id_metric]).items():
                 table.append({'attribute': attr_name, 'run': run_name, 'editing_accuracy': q,
                               'id_sim': '' if v is None else f'{v[0]:.4f}',
                               'attr_preserve': '' if v is None else f'{v[1]:.2f}'})
-    path = os.path.join(args.output_dir, f'at_accuracy_{args.x_metric}.csv')
+    path = os.path.join(args.output_dir, f'at_accuracy_{args.x_metric}_{args.id_metric}.csv')
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=['attribute', 'run', 'editing_accuracy', 'id_sim', 'attr_preserve'])
         w.writeheader()

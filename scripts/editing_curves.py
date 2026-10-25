@@ -5,9 +5,11 @@ numbers are recorded:
 
   Editing Accuracy        R50 judge: the edited attribute crossed 0.5 in the
                           requested direction (sources the judge reads clearly)
-  Identity Preservation   cosine similarity of the independent face-ID model
-                          (facenet, casia-webface) between edit and source
-                          reconstruction
+  Identity Preservation   cosine similarity between edit and source
+                          reconstruction: ArcFace (IR-SE50, models/arcface.py,
+                          --arcface_weights) as in the SDFlow paper, column
+                          id_arc; and the independent facenet (casia-webface),
+                          column id_sim_real
   Attribute Preservation  share of the OTHER attributes whose R50 label (>0.5)
                           did not change; only attributes the judge reads
                           clearly on the source count (an ambiguous 0.49 that
@@ -76,6 +78,7 @@ from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges,
     build_parser, edit_single_attribute, load_models, resize_for_judge,
 )
+from models.arcface import ArcFaceJudge
 from models.dataset import SDFlowDataset
 
 CLEAR_LO, CLEAR_HI = 0.35, 0.65
@@ -123,6 +126,9 @@ def boundary_directions(path, attribute_index, ds, max_faces=2000):
 def main():
     p = build_parser()
     p.add_argument('--method', default='model', choices=['model', 'linear', 'boundary'])
+    p.add_argument('--arcface_weights', default='./data/model_ir_se50.pth',
+                   help='ArcFace IR-SE50 weights (model_ir_se50.pth, the pSp / e4e ID-loss model) '
+                        'for the paper\'s identity metric; without the file only facenet is measured.')
     p.add_argument('--boundaries', default='./data/attr_boundaries_wplus.pth',
                    help='--method boundary: scripts/fit_attr_boundaries.py output.')
     p.add_argument('--scales', nargs='+', type=float, default=[0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
@@ -143,6 +149,14 @@ def main():
     _, indep_id, _, indep_teacher, _, celeb_judge = build_optional_judges(args, args.attribute_index, id_criterion)
     if indep_id is None:
         raise SystemExit('the independent face-ID model (facenet-pytorch) is required')
+    arc = None
+    if os.path.exists(args.arcface_weights):
+        arc = ArcFaceJudge(args.arcface_weights)
+        print(f'[Judge] ArcFace IR-SE50: {args.arcface_weights}')
+    else:
+        print(f'[WARN] no ArcFace weights at {args.arcface_weights}: id_arc is left empty and '
+              f'plot_strength_curves.py needs --id_metric indep. Get model_ir_se50.pth from the '
+              f'pSp / e4e README (the IR-SE50 of TreB1eN/InsightFace_Pytorch).')
     attrs = list(args.attribute_index)
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root,
@@ -165,6 +179,7 @@ def main():
             sp = torch.sigmoid(indep_teacher(src_256)[0])[:, :40]
             sc_src = celeb_judge.scores(src_256)[:, :40] if celeb_judge is not None else None
             src_id = indep_id.extract(src_256)
+            src_arc = arc.extract(src_256) if arc is not None else None
             for li, g in enumerate(attrs):
                 d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
                 keep = (sp[:, g] > CLEAR_HI) | (sp[:, g] < CLEAR_LO)
@@ -200,6 +215,8 @@ def main():
                     r['acc'] += ok[keep].float().tolist()
                     r['id'] += idv[keep].tolist()
                     r['pres'] += pres[keep].tolist()
+                    if arc is not None:
+                        r['id_arc'] += (src_arc * arc.extract(f256)).sum(1)[keep].tolist()
                     if sc_src is not None:
                         r['celeb'] += c_ok[both].float().tolist()
             seen += img.size(0)
@@ -213,6 +230,7 @@ def main():
             rows.append({'attribute': name(g), 'strength': sc, 'target_success': float(np.mean(r['acc'])),
                          'effective_success': float(np.mean(r['acc'])), 'id_sim_real': float(np.mean(r['id'])),
                          'preserve_acc': float(np.mean(r['pres'])), 'n': len(r['acc']),
+                         'id_arc': float(np.mean(r['id_arc'])) if r['id_arc'] else float('nan'),
                          'celeb_success': float(np.mean(r['celeb'])) if r['celeb'] else float('nan'),
                          'n_celeb': len(r['celeb'])})
     for sc in args.scales:
@@ -221,16 +239,17 @@ def main():
             rows.append({'attribute': 'All', 'strength': sc,
                          **{k: float(np.mean([x[k] for x in per]))
                             for k in ('target_success', 'effective_success', 'id_sim_real', 'preserve_acc',
-                                      'celeb_success')},
+                                      'celeb_success', 'id_arc')},
                          'n': sum(x['n'] for x in per), 'n_celeb': sum(x['n_celeb'] for x in per)})
 
     label = f'{args.method}'
     print(f'\n{label}, {seen} faces, preserve_set={args.preserve_set}')
-    print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"r18Acc":>7} {"ID cos":>7} {"AttrPres":>9} {"n":>5}')
+    print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"r18Acc":>7} {"ArcFace":>8} {"facenet":>8} '
+          f'{"AttrPres":>9} {"n":>5}')
     for x in rows:
         print(f'  {x["attribute"]:<11} {x["strength"]:6.2f} {x["target_success"] * 100:7.1f}% '
-              f'{x["celeb_success"] * 100:6.1f}% {x["id_sim_real"]:7.3f} {x["preserve_acc"] * 100:8.1f}% '
-              f'{x["n"]:5d}')
+              f'{x["celeb_success"] * 100:6.1f}% {x["id_arc"]:8.3f} {x["id_sim_real"]:8.3f} '
+              f'{x["preserve_acc"] * 100:8.1f}% {x["n"]:5d}')
 
     path = args.out_csv or os.path.join(args.checkpoint_dir, f'curves_{args.method}_s{args.step}.csv')
     with open(path, 'w', newline='') as f:
@@ -241,6 +260,7 @@ def main():
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'method': args.method,
                               'scales': args.scales, 'num_samples': seen, 'preserve_set': args.preserve_set,
                               'eval_resize': args.eval_resize,
+                              'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
