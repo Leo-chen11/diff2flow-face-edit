@@ -31,6 +31,9 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
+
+READ_AT = (40, 60, 80, 100)     # Editing Accuracy (%) every curve is read at, and the x ticks
 
 
 def parse_named_path(value):
@@ -75,7 +78,27 @@ def collect_attribute_order(data_by_run, requested):
     return seen
 
 
-def plot_attribute(attr_name, data_by_run, x_metric, output_dir):
+def read_at(rows, x_metric, points=READ_AT):
+    """{point: (id, preserve %) or None}: the curve's ID and attribute preservation
+    at each Editing Accuracy (%), linearly interpolated between the measured
+    strengths and never extrapolated -- a curve that does not reach a point
+    (strengths too small or too large) gets None there."""
+    pts = sorted((r[x_metric] * 100.0, r['id_sim_real'], r['preserve_acc'] * 100.0)
+                 for r in rows if r[x_metric] == r[x_metric])
+    out = {}
+    if not pts:
+        return {q: None for q in points}
+    x = np.array([t[0] for t in pts])
+    for q in points:
+        if q < x.min() - 1e-9 or q > x.max() + 1e-9:
+            out[q] = None
+            continue
+        out[q] = (float(np.interp(q, x, [t[1] for t in pts])),
+                  float(np.interp(q, x, [t[2] for t in pts])))
+    return out
+
+
+def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(READ_AT[0], READ_AT[-1])):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     colors = plt.cm.tab10.colors
     plotted_any = False
@@ -103,6 +126,9 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir):
         plt.close(fig)
         return None
 
+    for ax in axes:
+        ax.set_xlim(*xlim)
+        ax.set_xticks([q for q in READ_AT if xlim[0] <= q <= xlim[1]])
     axes[0].set_xlabel('Editing Accuracy (%)')
     axes[0].set_ylabel('Cosine Similarity')
     axes[0].set_title('Identity Preservation')
@@ -110,7 +136,7 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir):
     axes[0].legend()
 
     axes[1].set_xlabel('Editing Accuracy (%)')
-    axes[1].set_ylabel('Accuracy (%)')
+    axes[1].set_ylabel('Attribute Preservation (%)')
     axes[1].set_title('Attribute Preservation')
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
@@ -135,6 +161,8 @@ def main():
                         choices=['target_success', 'effective_success', 'celeb_success'],
                         help='Which success metric to plot as "Editing Accuracy" (celeb_success: '
                              'the CelebA r18 judge, from scripts/editing_curves.py CSVs).')
+    parser.add_argument('--xlim', nargs=2, type=float, default=[READ_AT[0], READ_AT[-1]],
+                        help='x range of every plot, the same for all attributes (default 40 100).')
     parser.add_argument('--attributes', nargs='*', default=None,
                         help='Restrict to these attribute names. Default: every attribute '
                              'found across the given runs.')
@@ -150,7 +178,8 @@ def main():
 
     written = []
     for attr_name in attrs:
-        out_path = plot_attribute(attr_name, data_by_run, args.x_metric, args.output_dir)
+        out_path = plot_attribute(attr_name, data_by_run, args.x_metric, args.output_dir,
+                                  xlim=tuple(args.xlim))
         if out_path:
             written.append(out_path)
             print(f'Wrote {out_path}')
@@ -159,6 +188,38 @@ def main():
 
     if not written:
         raise SystemExit('No plots were written — check that --attributes matches the CSV contents.')
+
+    # Numbers read off the curves at the fixed Editing Accuracies.
+    table = []
+    for attr_name in attrs:
+        for run_name, rows in data_by_run.items():
+            arows = [r for r in rows if r['attribute'] == attr_name]
+            if not arows:
+                continue
+            for q, v in read_at(arows, args.x_metric).items():
+                table.append({'attribute': attr_name, 'run': run_name, 'editing_accuracy': q,
+                              'id_sim': '' if v is None else f'{v[0]:.4f}',
+                              'attr_preserve': '' if v is None else f'{v[1]:.2f}'})
+    path = os.path.join(args.output_dir, f'at_accuracy_{args.x_metric}.csv')
+    with open(path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['attribute', 'run', 'editing_accuracy', 'id_sim', 'attr_preserve'])
+        w.writeheader()
+        w.writerows(table)
+    print(f'\nID / attribute preservation at Editing Accuracy ({args.x_metric}); "--" = the curve does not reach it')
+    for attr_name in attrs:
+        sub = [t for t in table if t['attribute'] == attr_name]
+        if not sub:
+            continue
+        print(f'\n{attr_name}')
+        print(f'  {"run":<14}' + ''.join(f'{"acc " + str(q):>16}' for q in READ_AT) + '     (ID / preserve%)')
+        for run_name in data_by_run:
+            cells = []
+            for q in READ_AT:
+                t = next((t for t in sub if t['run'] == run_name and t['editing_accuracy'] == q), None)
+                cells.append('--' if t is None or t['id_sim'] == '' else f'{t["id_sim"]} / {float(t["attr_preserve"]):4.1f}')
+            if any(c != '--' for c in cells):
+                print(f'  {run_name:<14}' + ''.join(f'{c:>16}' for c in cells))
+    print(f'\nsaved {path}')
 
 
 if __name__ == '__main__':
