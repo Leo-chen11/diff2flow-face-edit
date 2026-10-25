@@ -57,6 +57,7 @@ def read_summary(path):
                 'strength': float(row['strength']),
                 'target_success': float(row['target_success']),
                 'effective_success': float(row.get('effective_success', row['target_success'])),
+                'celeb_success': float(row.get('celeb_success') or 'nan'),
                 'id_sim_real': float(row['id_sim_real']),
                 'preserve_acc': float(row['preserve_acc']),
             })
@@ -131,8 +132,9 @@ def main():
                         help='NAME=path/to/metrics_summary.csv. Repeatable, one per line/method.')
     parser.add_argument('--output_dir', default='./output/curve_comparison')
     parser.add_argument('--x_metric', default='target_success',
-                        choices=['target_success', 'effective_success'],
-                        help='Which success metric to plot as "Editing Accuracy".')
+                        choices=['target_success', 'effective_success', 'celeb_success'],
+                        help='Which success metric to plot as "Editing Accuracy" (celeb_success: '
+                             'the CelebA r18 judge, from scripts/editing_curves.py CSVs).')
     parser.add_argument('--attributes', nargs='*', default=None,
                         help='Restrict to these attribute names. Default: every attribute '
                              'found across the given runs.')

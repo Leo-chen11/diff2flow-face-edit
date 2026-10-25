@@ -30,6 +30,19 @@ Methods (--method):
   linear   w + sign * alpha * d with d the mean of the attribute's bank slots
            (the InterFaceGAN-style baseline of scripts/linear_baseline.py);
            --scales are then alphas
+  boundary InterFaceGAN: w + sign * alpha * sd * n with n the attribute's unit
+           normal of a linear W+ boundary (scripts/fit_attr_boundaries.py,
+           --boundaries) and sd the spread of the test faces' latents along n,
+           so alpha = 2 moves a face two standard deviations across the
+           boundary; uses nothing of the checkpoint (but its data paths), so
+           it is an external baseline; --scales are then alphas, e.g. 1 2 3 4 5 6
+
+Judges read G's output downsampled with --eval_resize (default here: area, as
+evaluate_sdflow's runs since the resize fix). With the CelebA r18 judge
+(--celeba_attr_judge_weights, loaded when the file exists) a second accuracy,
+celeb_success, is written too: on faces both judges read clearly and the same
+way, did the r18 reading cross 0.5. plot_strength_curves.py --x_metric
+celeb_success plots it.
 
 The absolute numbers depend on the judges (R50, facenet), so only curves made
 by this script are comparable with each other; the paper's values used other
@@ -53,15 +66,15 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.utils import data
 from tqdm import tqdm
 
+import evaluation.evaluate_sdflow as E
 from common.attr_tables import bank_num_k
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges,
-    build_parser, edit_single_attribute, load_models,
+    build_parser, edit_single_attribute, load_models, resize_for_judge,
 )
 from models.dataset import SDFlowDataset
 
@@ -90,32 +103,53 @@ def linear_directions(bank_path, attribute_index):
     return {a: tables[a]['single'][0] for a in attribute_index}
 
 
+def boundary_directions(path, attribute_index, ds, max_faces=2000):
+    """{attr: (18, 512)} unit boundary normal times the std of the dataset's
+    latents projected on it (scripts/fit_attr_boundaries.py output)."""
+    d = torch.load(path, map_location='cpu')
+    normals = d['normals'].float().reshape(40, -1)
+    files = list(ds.image_list)[:max_faces]
+    X = torch.stack([torch.as_tensor(ds._lookup_precomputed(ds.latents, f)).float().reshape(-1)
+                     for f in files])
+    out = {}
+    for a in attribute_index:
+        n = normals[a] / normals[a].norm().clamp(min=1e-12)
+        sd = float((X @ n).std())
+        print(f'[boundary] {name(a)}: AUC {float(d["auc"][a]):.3f}, latent spread along the normal {sd:.3f}')
+        out[a] = (n * sd).view(18, 512)
+    return out
+
+
 def main():
     p = build_parser()
-    p.add_argument('--method', default='model', choices=['model', 'linear'])
+    p.add_argument('--method', default='model', choices=['model', 'linear', 'boundary'])
+    p.add_argument('--boundaries', default='./data/attr_boundaries_wplus.pth',
+                   help='--method boundary: scripts/fit_attr_boundaries.py output.')
     p.add_argument('--scales', nargs='+', type=float, default=[0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
                    help='Edit strengths (alphas for --method linear).')
     p.add_argument('--preserve_set', default='edited', choices=['edited', 'all40'])
     p.add_argument('--out_csv', default=None,
                    help='Default <checkpoint_dir>/curves_<method>_s<step>.csv (a .json beside it).')
+    p.set_defaults(eval_resize='area')
     args = p.parse_args()
     args = apply_run_config(args)
+    E._RESIZE_MODE = args.eval_resize
     if args.step is None:
         args.step = _latest_step(args.checkpoint_dir)
     if not args.independent_attr_weights:
         raise SystemExit('--independent_attr_weights is required (R50 judge).')
 
     prior, conditioner, G, id_criterion, _, _, direction_bank = load_models(args)
-    _, indep_id, _, indep_teacher, _, _ = build_optional_judges(args, args.attribute_index, id_criterion)
+    _, indep_id, _, indep_teacher, _, celeb_judge = build_optional_judges(args, args.attribute_index, id_criterion)
     if indep_id is None:
         raise SystemExit('the independent face-ID model (facenet-pytorch) is required')
     attrs = list(args.attribute_index)
-    lin = linear_directions(args.direction_bank_path, attrs) if args.method == 'linear' else None
-
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root,
                        latents_file=args.latent_file, preds_file=args.preds_file,
                        train=False, transform=tf)
+    lin = linear_directions(args.direction_bank_path, attrs) if args.method == 'linear' \
+        else boundary_directions(args.boundaries, attrs, ds) if args.method == 'boundary' else None
     loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
 
     rec = defaultdict(lambda: defaultdict(list))      # rec[(attr, scale)][metric] -> per-sample values
@@ -127,8 +161,9 @@ def main():
             img, latent = img.cuda(), latent.cuda()
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-            src_256 = F.interpolate(src, (256, 256))
+            src_256 = resize_for_judge(src, (256, 256))
             sp = torch.sigmoid(indep_teacher(src_256)[0])[:, :40]
+            sc_src = celeb_judge.scores(src_256)[:, :40] if celeb_judge is not None else None
             src_id = indep_id.extract(src_256)
             for li, g in enumerate(attrs):
                 d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
@@ -146,10 +181,16 @@ def main():
                             li, sc, direction_bank, attr_global_idx=g,
                             bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
                             composite=False, direction=d)
-                    f256 = F.interpolate(face, (256, 256))
+                    f256 = resize_for_judge(face, (256, 256))
                     ep = torch.sigmoid(indep_teacher(f256)[0])[:, :40]
                     ok = torch.where(sp[:, g] > 0.5, ep[:, g] < 0.5 - args.success_margin,
                                      ep[:, g] > 0.5 + args.success_margin)
+                    if sc_src is not None:
+                        ce = celeb_judge.scores(f256)[:, g]
+                        cs = sc_src[:, g]
+                        both = keep & ((cs > CLEAR_HI) | (cs < CLEAR_LO)) & ((cs > 0.5) == (sp[:, g] > 0.5))
+                        c_ok = torch.where(cs > 0.5, ce < 0.5 - args.success_margin,
+                                           ce > 0.5 + args.success_margin)
                     idv = (src_id * indep_id.extract(f256)).sum(1)
                     so, eo = sp[:, others], ep[:, others]
                     clear_o = (so > CLEAR_HI) | (so < CLEAR_LO)
@@ -159,6 +200,8 @@ def main():
                     r['acc'] += ok[keep].float().tolist()
                     r['id'] += idv[keep].tolist()
                     r['pres'] += pres[keep].tolist()
+                    if sc_src is not None:
+                        r['celeb'] += c_ok[both].float().tolist()
             seen += img.size(0)
 
     rows = []
@@ -169,21 +212,25 @@ def main():
                 continue
             rows.append({'attribute': name(g), 'strength': sc, 'target_success': float(np.mean(r['acc'])),
                          'effective_success': float(np.mean(r['acc'])), 'id_sim_real': float(np.mean(r['id'])),
-                         'preserve_acc': float(np.mean(r['pres'])), 'n': len(r['acc'])})
+                         'preserve_acc': float(np.mean(r['pres'])), 'n': len(r['acc']),
+                         'celeb_success': float(np.mean(r['celeb'])) if r['celeb'] else float('nan'),
+                         'n_celeb': len(r['celeb'])})
     for sc in args.scales:
         per = [x for x in rows if x['strength'] == sc]
         if len(per) == len(attrs):
             rows.append({'attribute': 'All', 'strength': sc,
                          **{k: float(np.mean([x[k] for x in per]))
-                            for k in ('target_success', 'effective_success', 'id_sim_real', 'preserve_acc')},
-                         'n': sum(x['n'] for x in per)})
+                            for k in ('target_success', 'effective_success', 'id_sim_real', 'preserve_acc',
+                                      'celeb_success')},
+                         'n': sum(x['n'] for x in per), 'n_celeb': sum(x['n_celeb'] for x in per)})
 
     label = f'{args.method}'
     print(f'\n{label}, {seen} faces, preserve_set={args.preserve_set}')
-    print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"ID cos":>7} {"AttrPres":>9} {"n":>5}')
+    print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"r18Acc":>7} {"ID cos":>7} {"AttrPres":>9} {"n":>5}')
     for x in rows:
         print(f'  {x["attribute"]:<11} {x["strength"]:6.2f} {x["target_success"] * 100:7.1f}% '
-              f'{x["id_sim_real"]:7.3f} {x["preserve_acc"] * 100:8.1f}% {x["n"]:5d}')
+              f'{x["celeb_success"] * 100:6.1f}% {x["id_sim_real"]:7.3f} {x["preserve_acc"] * 100:8.1f}% '
+              f'{x["n"]:5d}')
 
     path = args.out_csv or os.path.join(args.checkpoint_dir, f'curves_{args.method}_s{args.step}.csv')
     with open(path, 'w', newline='') as f:
@@ -192,7 +239,9 @@ def main():
         w.writerows(rows)
     with open(os.path.splitext(path)[0] + '.json', 'w') as f:
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'method': args.method,
-                              'scales': args.scales, 'num_samples': seen, 'preserve_set': args.preserve_set},
+                              'scales': args.scales, 'num_samples': seen, 'preserve_set': args.preserve_set,
+                              'eval_resize': args.eval_resize,
+                              'boundaries': args.boundaries if args.method == 'boundary' else None},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
           f'[--run OTHER=...] --attributes All --output_dir ./output/curves')
