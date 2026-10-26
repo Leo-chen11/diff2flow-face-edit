@@ -132,3 +132,14 @@ class ConvNeXtB512Classifier(nn.Module):
             x = nn.functional.interpolate(x, (512, 512), mode='bilinear', align_corners=False)
         logits = self.backbone((x - self.mean) / self.std)
         return logits, (logits > 0).float()
+
+
+def make_attr_classifier(backbone='r34'):
+    """A training teacher: AttributeClassifier (r34 / r50), or the ConvNeXt-B/512
+    classifier for 'convnext_b512' ([0, 1] input before its own mean/std) /
+    'convnext_b512_pm1' ([-1, 1] input)."""
+    if backbone == 'convnext_b512':
+        return ConvNeXtB512Classifier('01')
+    if backbone == 'convnext_b512_pm1':
+        return ConvNeXtB512Classifier('pm1')
+    return AttributeClassifier(backbone=backbone)

@@ -7,6 +7,13 @@
 #   maleid  + --id_hinge_threshold_override 39:0.68,20:0.72  (only via ARMS)
 #           a lower ID hinge floor for Young and Male, whose real edits cost
 #           identity; needs a parent trained with --id_loss_hinge
+#   twoteach + the ConvNeXt-B/512 as a second training teacher, --teacher_combine min
+#           (only via ARMS; for a parent trained with r34 alone)
+#   push    + --soft_target_override 20:0.10:0.80,39:0.20:0.90,5:0.20:0.90  (only via ARMS)
+#   push2   + --soft_target_override 20:0.05:0.80,39:0.20:0.95,5:0.20:0.95  (only via ARMS)
+#           the target loss's ends for the weak directions (Male removal, Young and
+#           Bangs addition) moved past the 0.80 where the teacher already calls the edit
+#           done but the R50 judge does not; meant on top of two teachers
 #   accum   + --grad_accum_steps 5 --ema_decay 0.995         (only via ARMS)
 #           one optimizer step per 5 iterations, i.e. per round of all five
 #           attributes; max_steps still counts iterations, so this arm sees
@@ -63,6 +70,9 @@ arm_flags() {
         both_area) echo "--set flow_bn_stats=freeze --set conditioner_bn=freeze --set train_resize=area" ;;
         maleid) echo "--set id_hinge_threshold_override=39:0.68,20:0.72" ;;
         accum)  echo "--set grad_accum_steps=5 --set ema_decay=0.995" ;;
+        twoteach) echo "--set extra_teacher_weights=$CNX --set extra_teacher_backbone=convnext_b512 --set teacher_combine=min" ;;
+        push)   echo "--set soft_target_override=20:0.10:0.80,39:0.20:0.90,5:0.20:0.90" ;;
+        push2)  echo "--set soft_target_override=20:0.05:0.80,39:0.20:0.95,5:0.20:0.95" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac
 }
@@ -74,11 +84,13 @@ for arm in "${ARMS[@]}"; do
     fi
 done
 
-eval_for() {
+PARENT_EXTRA=$(python -c "import json,sys; print(json.load(open(sys.argv[1])).get('extra_teacher_weights') or '')" "$CFG")
+eval_for() {   # <run name> [arm]
     local cmd="python evaluation/evaluate_sdflow.py --checkpoint_dir output/$MODEL/$1 --step $END --consensus --eval_resize area"
     # the R50 judge too, when its weights are here (evaluate_sdflow loads none by default)
     [ -f "$R50" ] && cmd+=" --independent_attr_weights $R50 --independent_attr_backbone r50"
-    [ -f "$CNX" ] && cmd+=" --cnx_judge_weights $CNX"
+    # the ConvNeXt judge only for runs that never trained against it
+    [ -f "$CNX" ] && [ -z "$PARENT_EXTRA" ] && [ "${2:-}" != twoteach ] && cmd+=" --cnx_judge_weights $CNX"
     echo "$cmd"
 }
 
@@ -94,7 +106,7 @@ for i in "${!ARMS[@]}"; do
         2>>"$LOG/rebuild.log") \
         || { echo "rebuild_train_cmd failed for $arm, see $LOG/rebuild.log"; exit 1; }
     train=$(echo "$train" | tr -d '\\\n' | tr -s ' ')
-    eval_cmd=$(eval_for "$name")
+    eval_cmd=$(eval_for "$name" "$arm")
     echo "== $arm on GPU $gpu =="
     echo "   $train"
     echo "   $eval_cmd"
