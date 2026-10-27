@@ -268,14 +268,24 @@ class FrozenDiffusionDDSGuidance(nn.Module):
 
     def forward(self, src_images, edit_images, attr_abs_idx, target_values, source_prompt=None,
                 timestep_min=None, timestep_max=None, face_mask=None, gender_prob=None,
-                young_add_hair_cue=False, gender_rm_texture_cue=False):
+                young_add_hair_cue=False, gender_rm_texture_cue=False, contrast_source=False):
         device = edit_images.device
         B = edit_images.shape[0]
-        source_prompt = source_prompt or "a realistic face photo of a person"
-        src_prompts = [source_prompt] * B
         edit_prompts = build_edit_prompts(attr_abs_idx, target_values, gender_prob=gender_prob,
                                           young_add_hair_cue=young_add_hair_cue,
                                           gender_rm_texture_cue=gender_rm_texture_cue)
+        if contrast_source:
+            # The source branch describes the source's own state ("without
+            # eyeglasses" for an add edit), as in DDS (Hertz et al. 2023),
+            # instead of a neutral face prompt: the residual difference then
+            # carries the whole with/without contrast, not only the half of
+            # it that separates the target state from "a person".
+            src_prompts = build_edit_prompts(attr_abs_idx, (target_values < 0.5).float(),
+                                             gender_prob=gender_prob,
+                                             young_add_hair_cue=young_add_hair_cue,
+                                             gender_rm_texture_cue=gender_rm_texture_cue)
+        else:
+            src_prompts = [source_prompt or "a realistic face photo of a person"] * B
 
         src_text = self._encode_text(src_prompts, device)
         edit_text = self._encode_text(edit_prompts, device)

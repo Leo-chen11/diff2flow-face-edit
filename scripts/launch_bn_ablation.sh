@@ -14,6 +14,15 @@
 #           the target loss's ends for the weak directions (Male removal, Young and
 #           Bangs addition) moved past the 0.80 where the teacher already calls the edit
 #           done but the R50 judge does not; meant on top of two teachers
+#   nodds   + --no-use_diffusion_guidance                    (only via ARMS)
+#   dds     DDS at full strength (only via ARMS): source prompt = the source's own
+#           state (--dds_contrast_prompt), CFG 7.5, Male's DDS reaches W+ layers 7-11
+#           (--gender_dds_fine_layer_start 12), every 2nd step instead of every 8th,
+#           and the weight set so DDS's gradient on W+ is 0.3x the target loss's
+#           (--dds_grad_ratio 0.3)
+#   dds_hi  dds with --dds_grad_ratio 1.0                    (only via ARMS)
+#   dds512  dds with --diffusion_image_size 512, the resolution SD 1.5 was trained
+#           at (256 gives it 32x32 latents); more VRAM      (only via ARMS)
 #   accum   + --grad_accum_steps 5 --ema_decay 0.995         (only via ARMS)
 #           one optimizer step per 5 iterations, i.e. per round of all five
 #           attributes; max_steps still counts iterations, so this arm sees
@@ -62,6 +71,9 @@ CNX=${CNX:-./data/convnext_base_a40_512_classifier.pth}
 if [ -n "${ARMS:-}" ]; then read -r -a ARMS <<< "$ARMS"
 elif [ "${#GPUS[@]}" -ge 3 ]; then ARMS=(ctrl flowbn both); else ARMS=(ctrl both); fi
 
+DDS_FLAGS="--set use_diffusion_guidance=True --set dds_contrast_prompt=True \
+--set diffusion_guidance_scale=7.5 --set gender_dds_fine_layer_start=12 \
+--set diffusion_guidance_interval=2 --set age_diffusion_interval=2"
 arm_flags() {
     case $1 in
         ctrl)   ;;
@@ -73,6 +85,10 @@ arm_flags() {
         twoteach) echo "--set extra_teacher_weights=$CNX --set extra_teacher_backbone=convnext_b512 --set teacher_combine=min" ;;
         push)   echo "--set soft_target_override=20:0.10:0.80,39:0.20:0.90,5:0.20:0.90" ;;
         push2)  echo "--set soft_target_override=20:0.05:0.80,39:0.20:0.95,5:0.20:0.95" ;;
+        nodds)  echo "--set use_diffusion_guidance=False" ;;
+        dds)    echo "$DDS_FLAGS --set dds_grad_ratio=0.3" ;;
+        dds_hi) echo "$DDS_FLAGS --set dds_grad_ratio=1.0" ;;
+        dds512) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac
 }

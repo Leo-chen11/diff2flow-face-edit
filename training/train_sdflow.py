@@ -238,6 +238,8 @@ def _mechanism_report(args):
         ('dir_gate_reg', args.dir_gate_reg_weight),
         ('diffusion_dds', args.diffusion_guidance_weight if dds_on else 0),
         ('age_dds', age_dds_w if dds_on else 0),
+        ('dds_contrast_prompt', 1.0 if dds_on and args.dds_contrast_prompt else 0),
+        ('dds_grad_ratio', args.dds_grad_ratio if dds_on else 0),
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
@@ -1047,6 +1049,22 @@ if __name__ == '__main__':
                              'changed from off to on -- pass --no-dds_face_mask to resume an '
                              'existing --resume_dir run unmasked (matching the DDS numerics it '
                              'was trained with) instead of introducing the mask mid-run.')
+    parser.add_argument('--dds_contrast_prompt', action=argparse.BooleanOptionalAction, default=False,
+                        help='DDS source branch uses the prompt for the source\'s own state '
+                             '("a person without eyeglasses" for an add edit) instead of the '
+                             'neutral "a realistic face photo of a person", as DDS itself does. '
+                             'The neutral prompt leaves half of the with/without contrast out of '
+                             'the residual difference.')
+    parser.add_argument('--dds_grad_ratio', type=float, default=0.0,
+                        help='>0: on each step DDS fires, replace --diffusion_guidance_weight and '
+                             '--age_diffusion_weight by the weight that makes the DDS gradient on '
+                             'the edited W+ latent this fraction of the teacher target loss\'s '
+                             '(counter_attr_weight x changed_loss) gradient there. The fixed '
+                             'weights give DDS whatever share its raw scale happens to have, '
+                             'which moves with the timestep, CFG scale, resolution and face-mask '
+                             'area; this pins it. Costs two extra backward passes on the steps '
+                             'DDS fires. 0 (default) keeps the fixed weights. Logged as '
+                             'dds_adaptive_w.')
     parser.add_argument('--local_region_add_blur', type=float, default=15,
                         help='Mask dilation (gaussian blur sigma) for ADDITION-direction '
                              'local edits. The source face has no glasses pixels for '
@@ -3009,6 +3027,7 @@ if __name__ == '__main__':
                             target_values=edit_end[_grp_mask],
                             face_mask=_dds_mask(_face_non_age[_grp_mask], mid_abs_idx[_grp_mask]),
                             gender_rm_texture_cue=args.gender_rm_prompt_cue,
+                            contrast_source=args.dds_contrast_prompt,
                         )
                         diffusion_loss = diffusion_loss + _loss
                         diffusion_logs.update(_logs)
@@ -3032,9 +3051,23 @@ if __name__ == '__main__':
                         gender_prob=(src_probs[is_age, gender_local_idx].detach()
                                     if gender_local_idx is not None else None),
                         young_add_hair_cue=args.age_add_hair_prompt_cue,
+                        contrast_source=args.dds_contrast_prompt,
                     )
                     age_diffusion_loss = age_diffusion_loss + _loss
                     diffusion_logs.update({f'age_{k}': v for k, v in _logs.items()})
+
+            # --dds_grad_ratio: DDS weight set so its gradient on the edited W+
+            # latent is a fixed fraction of the target loss's gradient there.
+            _dds_w, _age_dds_w_eff = args.diffusion_guidance_weight, _age_dds_w
+            if args.dds_grad_ratio > 0 and diffusion_logs:
+                _g_dds = torch.autograd.grad(diffusion_loss + age_diffusion_loss, new_latents,
+                                             retain_graph=True, allow_unused=True)[0]
+                _g_tgt = torch.autograd.grad(args.counter_attr_weight * changed_loss, new_latents,
+                                             retain_graph=True, allow_unused=True)[0]
+                if _g_dds is not None and _g_tgt is not None and _g_dds.norm() > 0:
+                    _dds_w = _age_dds_w_eff = (args.dds_grad_ratio * _g_tgt.norm()
+                                               / _g_dds.norm()).detach()
+                    diffusion_logs['dds_adaptive_w'] = _dds_w
 
             loss = args.kd_loss_weight * kd_loss +\
                 args.nll_loss_weight * log_p2 +\
@@ -3044,8 +3077,8 @@ if __name__ == '__main__':
                 args.coupled_target_weight * coupled_loss +\
                 args.lag_reg_weight * lag_reg_loss +\
                 args.dir_gate_reg_weight * dir_gate_reg_loss +\
-                args.diffusion_guidance_weight * diffusion_loss +\
-                _age_dds_w * age_diffusion_loss +\
+                _dds_w * diffusion_loss +\
+                _age_dds_w_eff * age_diffusion_loss +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
