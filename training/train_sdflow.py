@@ -3068,6 +3068,15 @@ if __name__ == '__main__':
                     _dds_w = _age_dds_w_eff = (args.dds_grad_ratio * _g_tgt.norm()
                                                / _g_dds.norm()).detach()
                     diffusion_logs['dds_adaptive_w'] = _dds_w
+                    # Direction of DDS against the target loss on W+: ~1 repeats
+                    # the teachers, ~0 is noise or unrelated, <0 fights them.
+                    _cos = F.cosine_similarity(_g_dds.flatten(), _g_tgt.flatten(), dim=0).detach()
+                    diffusion_logs['dds_tgt_cos'] = _cos
+                    _mid_abs = mid_abs_idx.unique()
+                    if _mid_abs.numel() == 1:
+                        _a = int(_mid_abs)
+                        diffusion_logs[f'dds_adaptive_w/attr_{_a}'] = _dds_w
+                        diffusion_logs[f'dds_tgt_cos/attr_{_a}'] = _cos
 
             loss = args.kd_loss_weight * kd_loss +\
                 args.nll_loss_weight * log_p2 +\
