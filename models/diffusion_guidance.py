@@ -268,7 +268,8 @@ class FrozenDiffusionDDSGuidance(nn.Module):
 
     def forward(self, src_images, edit_images, attr_abs_idx, target_values, source_prompt=None,
                 timestep_min=None, timestep_max=None, face_mask=None, gender_prob=None,
-                young_add_hair_cue=False, gender_rm_texture_cue=False, contrast_source=False):
+                young_add_hair_cue=False, gender_rm_texture_cue=False, contrast_source=False,
+                n_samples=1):
         device = edit_images.device
         B = edit_images.shape[0]
         edit_prompts = build_edit_prompts(attr_abs_idx, target_values, gender_prob=gender_prob,
@@ -299,23 +300,31 @@ class FrozenDiffusionDDSGuidance(nn.Module):
         _t_max = self.timestep_max if timestep_max is None else int(timestep_max)
         t_min = max(0, min(_t_min, num_train_steps - 1))
         t_max = max(t_min + 1, min(_t_max, num_train_steps))
-        timesteps = torch.randint(t_min, t_max, (B,), device=device, dtype=torch.long)
-
-        noise = torch.randn_like(edit_latents)
-        noisy_edit = self.scheduler.add_noise(edit_latents, noise, timesteps)
-        noisy_src = self.scheduler.add_noise(src_latents, noise, timesteps)
 
         autocast_ctx = torch.cuda.amp.autocast if (self.fp16 and torch.cuda.is_available()) else contextlib.nullcontext
-        # Both UNet passes run without autograd: the DDS gradient below is
-        # (eps_edit - eps_src).detach() applied to edit_latents, so nothing
-        # ever backpropagates through the UNet. Recording its graph for the
-        # edit pass only held every UNet activation in memory until return.
-        with torch.no_grad():
-            with autocast_ctx():
-                eps_src = self._predict_noise(noisy_src, timesteps, src_text)
-                eps_edit = self._predict_noise(noisy_edit, timesteps, edit_text)
-
-        grad = (eps_edit - eps_src).detach()
+        # n_samples > 1 averages the residual difference over that many
+        # (timestep, noise) draws: one draw is mostly noise, and noise
+        # directions cancel across training steps instead of moving the edit.
+        grad = torch.zeros_like(edit_latents)
+        t_sum = torch.zeros(B, device=device)
+        for _ in range(max(1, int(n_samples))):
+            timesteps = torch.randint(t_min, t_max, (B,), device=device, dtype=torch.long)
+            noise = torch.randn_like(edit_latents)
+            noisy_edit = self.scheduler.add_noise(edit_latents.detach(), noise, timesteps)
+            noisy_src = self.scheduler.add_noise(src_latents, noise, timesteps)
+            # Both UNet passes run without autograd: the DDS gradient below is
+            # (eps_edit - eps_src).detach() applied to edit_latents, so nothing
+            # ever backpropagates through the UNet. Recording its graph for the
+            # edit pass only held every UNet activation in memory until return.
+            with torch.no_grad():
+                with autocast_ctx():
+                    eps_src = self._predict_noise(noisy_src, timesteps, src_text)
+                    eps_edit = self._predict_noise(noisy_edit, timesteps, edit_text)
+            grad = grad + (eps_edit - eps_src).float()
+            t_sum = t_sum + timesteps.float()
+        n = max(1, int(n_samples))
+        grad = (grad / n).to(edit_latents.dtype).detach()
+        timesteps = t_sum / n
         if face_mask is not None:
             # Unmasked, the DDS gradient covers the WHOLE latent -- background,
             # hair, clothing included -- because the diffusion model is asked

@@ -240,6 +240,8 @@ def _mechanism_report(args):
         ('age_dds', age_dds_w if dds_on else 0),
         ('dds_contrast_prompt', 1.0 if dds_on and args.dds_contrast_prompt else 0),
         ('dds_grad_ratio', args.dds_grad_ratio if dds_on else 0),
+        ('dds_n_samples', args.dds_n_samples if dds_on and args.dds_n_samples > 1 else 0),
+        ('dds_ratio_ema', args.dds_ratio_ema if dds_on and args.dds_grad_ratio > 0 else 0),
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
@@ -1065,6 +1067,17 @@ if __name__ == '__main__':
                              'area; this pins it. Costs two extra backward passes on the steps '
                              'DDS fires. 0 (default) keeps the fixed weights. Logged as '
                              'dds_adaptive_w.')
+    parser.add_argument('--dds_n_samples', type=int, default=1,
+                        help='Average the DDS residual difference over this many (timestep, noise) '
+                             'draws per firing. One draw is mostly noise (diffusion_dds_grad_norm '
+                             'stays flat through training); each extra draw costs two UNet forwards '
+                             'and no backward.')
+    parser.add_argument('--dds_ratio_ema', type=float, default=0.0,
+                        help='With --dds_grad_ratio: scale DDS against a running mean (this decay, '
+                             'e.g. 0.99, per attribute) of the target-loss gradient norm instead of '
+                             'the current step\'s. Per step, DDS shrinks with the target-loss '
+                             'gradient, i.e. it fades out exactly on the samples the teachers already '
+                             'call done -- the fooled ones it is meant to correct. 0 = per step.')
     parser.add_argument('--local_region_add_blur', type=float, default=15,
                         help='Mask dilation (gaussian blur sigma) for ADDITION-direction '
                              'local edits. The source face has no glasses pixels for '
@@ -2277,6 +2290,7 @@ if __name__ == '__main__':
                   f'(Eyeglasses locality) and the DDS face mask.')
 
     diffusion_guidance = None
+    dds_tgt_norm_ema = {}     # --dds_ratio_ema: running target-gradient norm per attribute
     if args.use_diffusion_guidance:
         try:
             from models.diffusion_guidance import FrozenDiffusionDDSGuidance
@@ -3028,6 +3042,7 @@ if __name__ == '__main__':
                             face_mask=_dds_mask(_face_non_age[_grp_mask], mid_abs_idx[_grp_mask]),
                             gender_rm_texture_cue=args.gender_rm_prompt_cue,
                             contrast_source=args.dds_contrast_prompt,
+                            n_samples=args.dds_n_samples,
                         )
                         diffusion_loss = diffusion_loss + _loss
                         diffusion_logs.update(_logs)
@@ -3052,6 +3067,7 @@ if __name__ == '__main__':
                                     if gender_local_idx is not None else None),
                         young_add_hair_cue=args.age_add_hair_prompt_cue,
                         contrast_source=args.dds_contrast_prompt,
+                        n_samples=args.dds_n_samples,
                     )
                     age_diffusion_loss = age_diffusion_loss + _loss
                     diffusion_logs.update({f'age_{k}': v for k, v in _logs.items()})
@@ -3065,14 +3081,21 @@ if __name__ == '__main__':
                 _g_tgt = torch.autograd.grad(args.counter_attr_weight * changed_loss, new_latents,
                                              retain_graph=True, allow_unused=True)[0]
                 if _g_dds is not None and _g_tgt is not None and _g_dds.norm() > 0:
-                    _dds_w = _age_dds_w_eff = (args.dds_grad_ratio * _g_tgt.norm()
+                    _tgt_norm = _g_tgt.norm().detach()
+                    _mid_abs = mid_abs_idx.unique()
+                    if args.dds_ratio_ema > 0:
+                        _key = int(_mid_abs[0]) if _mid_abs.numel() == 1 else -1
+                        _prev = dds_tgt_norm_ema.get(_key)
+                        _tgt_norm = _tgt_norm if _prev is None else \
+                            args.dds_ratio_ema * _prev + (1 - args.dds_ratio_ema) * _tgt_norm
+                        dds_tgt_norm_ema[_key] = _tgt_norm
+                    _dds_w = _age_dds_w_eff = (args.dds_grad_ratio * _tgt_norm
                                                / _g_dds.norm()).detach()
                     diffusion_logs['dds_adaptive_w'] = _dds_w
                     # Direction of DDS against the target loss on W+: ~1 repeats
                     # the teachers, ~0 is noise or unrelated, <0 fights them.
                     _cos = F.cosine_similarity(_g_dds.flatten(), _g_tgt.flatten(), dim=0).detach()
                     diffusion_logs['dds_tgt_cos'] = _cos
-                    _mid_abs = mid_abs_idx.unique()
                     if _mid_abs.numel() == 1:
                         _a = int(_mid_abs)
                         diffusion_logs[f'dds_adaptive_w/attr_{_a}'] = _dds_w
