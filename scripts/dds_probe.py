@@ -9,6 +9,8 @@ steps it records:
   r18     the same with the CelebA r18 judge, on faces it reads clearly and
           like the R50 on the source
   id_arc  ArcFace cosine to the source reconstruction
+  R50 shift  mean change of the R50 probability toward the target (+ = the
+          right way), which shows partial progress before anything crosses 0.5
 
 Adam normalizes the gradient's scale, so this measures the DIRECTION DDS
 pushes in, which no loss weight can fix. Reading the result:
@@ -158,8 +160,9 @@ def main():
                         ep = r50_probs(face)[:, a]
                         ok = torch.where(add, ep > 0.5, ep < 0.5).float()
                         idc = torch.nn.functional.cosine_similarity(arc.extract(f256), src_arc, dim=-1)
-                        h = hist.setdefault(step, {'r50': [], 'r18': [], 'id': []})
+                        h = hist.setdefault(step, {'r50': [], 'r18': [], 'id': [], 'shift': []})
                         h['r50'] += ok.tolist()
+                        h['shift'] += torch.where(add, ep - sp, sp - ep).tolist()
                         h['id'] += idc.tolist()
                         if sc is not None:
                             ec = celeb.scores(f256)[:, a]
@@ -176,18 +179,19 @@ def main():
 
         name = ATTR_NAMES.get(a, f'attr{a}')
         print(f'\n{name} (W+ layers 0-{fs - 1}, {lat_all.shape[0]} faces)')
-        print(f'  {"step":>5}{"R50 %":>8}{"r18 %":>8}{"id_arc":>8}')
+        print(f'  {"step":>5}{"R50 %":>8}{"r18 %":>8}{"id_arc":>8}{"R50 shift":>11}')
         for step in sorted(hist):
             h = hist[step]
             mean = lambda v: sum(v) / len(v) if v else float('nan')
             r = {'attribute': name, 'step': step, 'r50': mean(h['r50']), 'r18': mean(h['r18']),
-                 'id_arc': mean(h['id']), 'n': len(h['r50'])}
+                 'id_arc': mean(h['id']), 'r50_shift': mean(h['shift']), 'n': len(h['r50'])}
             rows.append(r)
-            print(f'  {step:>5}{r["r50"] * 100:8.1f}{r["r18"] * 100:8.1f}{r["id_arc"]:8.3f}')
+            print(f'  {step:>5}{r["r50"] * 100:8.1f}{r["r18"] * 100:8.1f}{r["id_arc"]:8.3f}'
+                  f'{r["r50_shift"]:+11.3f}')
 
     out = os.path.join(args.checkpoint_dir, f'dds_probe_{args.tag}.csv')
     with open(out, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=['attribute', 'step', 'r50', 'r18', 'id_arc', 'n'])
+        w = csv.DictWriter(f, fieldnames=['attribute', 'step', 'r50', 'r18', 'id_arc', 'r50_shift', 'n'])
         w.writeheader()
         w.writerows(rows)
     print(f'\nsaved {out}')
