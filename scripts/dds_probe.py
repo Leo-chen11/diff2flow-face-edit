@@ -75,7 +75,6 @@ def main():
     p.add_argument('--dds_contrast', action='store_true',
                    help='Source prompt = the source\'s own state (--dds_contrast_prompt).')
     p.add_argument('--no_face_mask', action='store_true')
-    p.add_argument('--face_parser_weights', default='./data/parsing_bisenet.pth')
     p.add_argument('--arcface_weights', default='./data/model_ir_se50.pth')
     p.add_argument('--tag', default='probe')
     p.set_defaults(eval_resize='area')
