@@ -23,6 +23,10 @@
 #   dds_hi  dds with --dds_grad_ratio 1.0                    (only via ARMS)
 #   dds512  dds with --diffusion_image_size 512, the resolution SD 1.5 was trained
 #           at (256 gives it 32x32 latents); more VRAM      (only via ARMS)
+#   ddsema  dds + the weight scaled against a running mean of the target gradient
+#           (--dds_ratio_ema 0.99) and no DDS for Eyeglasses (--dds_skip_attrs 15);
+#           scripts/dds_probe.py found 256 px with one draw (dds's own setting) at
+#           least as good as 512 px or 4 draws, so this keeps those (only via ARMS)
 #   ddsfull dds512 + 4 (timestep, noise) draws averaged per firing (--dds_n_samples 4) and
 #           the weight scaled against a running mean of the target gradient
 #           (--dds_ratio_ema 0.99), so DDS stays on where the teachers are already
@@ -94,6 +98,7 @@ arm_flags() {
         dds)    echo "$DDS_FLAGS --set dds_grad_ratio=0.3" ;;
         dds_hi) echo "$DDS_FLAGS --set dds_grad_ratio=1.0" ;;
         dds512) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512" ;;
+        ddsema) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac
