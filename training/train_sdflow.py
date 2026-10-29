@@ -241,6 +241,8 @@ def _mechanism_report(args):
         ('dds_contrast_prompt', 1.0 if dds_on and args.dds_contrast_prompt else 0),
         ('dds_grad_ratio', args.dds_grad_ratio if dds_on else 0),
         ('dds_n_samples', args.dds_n_samples if dds_on and args.dds_n_samples > 1 else 0),
+        (f'dds_skip_attrs({",".join(map(str, args.dds_skip_attrs))})',
+         1.0 if dds_on and args.dds_skip_attrs else 0),
         ('dds_ratio_ema', args.dds_ratio_ema if dds_on and args.dds_grad_ratio > 0 else 0),
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
@@ -1067,6 +1069,11 @@ if __name__ == '__main__':
                              'area; this pins it. Costs two extra backward passes on the steps '
                              'DDS fires. 0 (default) keeps the fixed weights. Logged as '
                              'dds_adaptive_w.')
+    parser.add_argument('--dds_skip_attrs', type=int, nargs='*', default=[],
+                        help='CelebA ids that get no DDS (age is not skippable here; set '
+                             '--age_diffusion_weight 0 for that). scripts/dds_probe.py: DDS '
+                             'alone never adds eyeglasses (3-9%% R50 after 150 steps) while ID '
+                             'falls to 0.74, so e.g. --dds_skip_attrs 15.')
     parser.add_argument('--dds_n_samples', type=int, default=1,
                         help='Average the DDS residual difference over this many (timestep, noise) '
                              'draws per firing. One draw is mostly noise (diffusion_dds_grad_norm '
@@ -2954,9 +2961,13 @@ if __name__ == '__main__':
                     dtype=torch.long,
                 )
                 is_age = mid_abs_idx == 39
+                # --dds_skip_attrs: these attributes get no non-age DDS at all
+                dds_skip = torch.zeros_like(is_age)
+                for _a in args.dds_skip_attrs:
+                    dds_skip |= mid_abs_idx == _a
 
                 non_age_fires = (
-                    (~is_age).any()
+                    (~is_age & ~dds_skip).any()
                     and args.diffusion_guidance_weight > 0
                     and args.diffusion_guidance_interval > 0
                     and _attr_step % args.diffusion_guidance_interval == 0
@@ -3005,7 +3016,7 @@ if __name__ == '__main__':
                     return mask
 
                 # Non-age samples (glasses, gender): standard cutoff and timestep range
-                non_age_mask = ~is_age
+                non_age_mask = ~is_age & ~dds_skip
                 if non_age_fires:
                     # Gender may ask for its own fine-layer cutoff
                     # (--gender_dds_fine_layer_start), exactly as age does. A

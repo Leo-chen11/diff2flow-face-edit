@@ -26,7 +26,7 @@
 #   ddsfull dds512 + 4 (timestep, noise) draws averaged per firing (--dds_n_samples 4) and
 #           the weight scaled against a running mean of the target gradient
 #           (--dds_ratio_ema 0.99), so DDS stays on where the teachers are already
-#           satisfied; DDS_EXTRA="--set k=v ..." adds the settings scripts/dds_probe.py
+#           satisfied, and no DDS for Eyeglasses (--dds_skip_attrs 15); DDS_EXTRA="--set k=v ..." adds the settings scripts/dds_probe.py
 #           picked (e.g. --set diffusion_timestep_min=200)          (only via ARMS)
 #   accum   + --grad_accum_steps 5 --ema_decay 0.995         (only via ARMS)
 #           one optimizer step per 5 iterations, i.e. per round of all five
@@ -94,7 +94,7 @@ arm_flags() {
         dds)    echo "$DDS_FLAGS --set dds_grad_ratio=0.3" ;;
         dds_hi) echo "$DDS_FLAGS --set dds_grad_ratio=1.0" ;;
         dds512) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512" ;;
-        ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 ${DDS_EXTRA:-}" ;;
+        ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac
 }
