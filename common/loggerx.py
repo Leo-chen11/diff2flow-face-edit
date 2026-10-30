@@ -95,7 +95,13 @@ class LoggerXBase(object):
 
         output_dict = {}
         if (self.rank == 0) and (step % print_freq == 0):
-            for var_name in var_names:
+            # Every metric updated since the last print, not only this step's:
+            # a term that fires on some steps (interval-gated, or one attribute
+            # of a cycle) was otherwise logged only when it happened to fire
+            # on a print step.
+            pending = var_names + [n for n, m in self.metrics.items()
+                                   if n not in var_names and m.count > 0]
+            for var_name in pending:
                 var = self.metrics[var_name].avg
                 output_dict[var_name] = var
                 f = '{} {:2.%sf}, ' % precision
