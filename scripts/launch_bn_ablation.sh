@@ -27,6 +27,10 @@
 #           (--dds_ratio_ema 0.99) and no DDS for Eyeglasses (--dds_skip_attrs 15);
 #           scripts/dds_probe.py found 256 px with one draw (dds's own setting) at
 #           least as good as 512 px or 4 draws, so this keeps those (only via ARMS)
+#   ddsproj ddsema with DDS projected off the target, ID and preservation gradients
+#           wherever it opposes them (--dds_project tgt,id,pres): DDS can no longer
+#           pull an edit back, cost identity or move other attributes; it only adds
+#           what none of them oppose                                (only via ARMS)
 #   ddsfull dds512 + 4 (timestep, noise) draws averaged per firing (--dds_n_samples 4) and
 #           the weight scaled against a running mean of the target gradient
 #           (--dds_ratio_ema 0.99), so DDS stays on where the teachers are already
@@ -99,6 +103,7 @@ arm_flags() {
         dds_hi) echo "$DDS_FLAGS --set dds_grad_ratio=1.0" ;;
         dds512) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512" ;;
         ddsema) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
+        ddsproj) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 --set dds_project=tgt,id,pres ${DDS_EXTRA:-}" ;;
         ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac

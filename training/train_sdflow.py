@@ -244,6 +244,8 @@ def _mechanism_report(args):
         (f'dds_skip_attrs({",".join(map(str, args.dds_skip_attrs))})',
          1.0 if dds_on and args.dds_skip_attrs else 0),
         ('dds_ratio_ema', args.dds_ratio_ema if dds_on and args.dds_grad_ratio > 0 else 0),
+        (f'dds_project({args.dds_project})',
+         1.0 if dds_on and args.dds_grad_ratio > 0 and args.dds_project else 0),
         ('clip_prompt', args.clip_prompt_weight if args.use_clip_prompt_loss else 0),
         ('local_region', args.local_region_loss_weight),
         ('hair_gray', args.hair_gray_loss_weight),
@@ -1074,6 +1076,15 @@ if __name__ == '__main__':
                              '--age_diffusion_weight 0 for that). scripts/dds_probe.py: DDS '
                              'alone never adds eyeglasses (3-9%% R50 after 150 steps) while ID '
                              'falls to 0.74, so e.g. --dds_skip_attrs 15.')
+    parser.add_argument('--dds_project', default='',
+                        help='Comma list of tgt,id,pres. With --dds_grad_ratio: per face, remove from the DDS gradient on the '
+                             'edited W+ latent its component against these losses\' gradients there '
+                             '(PCGrad): tgt = the teacher target loss, id = the ID loss, pres = the '
+                             'other-attribute preservation loss. dds_tgt_cos sat at 0 to -0.15: past '
+                             'the soft target the target loss pulls the edit back while DDS keeps '
+                             'pushing, and the two cancel. Projected, DDS can only add what the others '
+                             'do not oppose. Logged as dds_conflict_frac/<name> (share of faces whose '
+                             'DDS gradient was cut).')
     parser.add_argument('--dds_n_samples', type=int, default=1,
                         help='Average the DDS residual difference over this many (timestep, noise) '
                              'draws per firing. One draw is mostly noise (diffusion_dds_grad_norm '
@@ -1790,6 +1801,11 @@ if __name__ == '__main__':
     if args.flow_bn_stats == 'dataset' and args.resume_dir:
         raise ValueError('--flow_bn_stats dataset replaces the flow BatchNorm stats a resumed flow '
                          'was trained with; use --flow_bn_stats freeze with --resume_dir')
+    DDS_PROJECT = [x for x in args.dds_project.split(',') if x]
+    if set(DDS_PROJECT) - {'tgt', 'id', 'pres'}:
+        raise ValueError(f'--dds_project {args.dds_project}: names are tgt, id, pres')
+    if DDS_PROJECT and args.dds_grad_ratio <= 0:
+        raise ValueError('--dds_project works on the gradients --dds_grad_ratio computes; set it > 0')
     torch.manual_seed(args.seed)
     args.code_version = code_version()
     print(f'** code version {args.code_version}, seed {args.seed}')
@@ -3086,6 +3102,7 @@ if __name__ == '__main__':
             # --dds_grad_ratio: DDS weight set so its gradient on the edited W+
             # latent is a fixed fraction of the target loss's gradient there.
             _dds_w, _age_dds_w_eff = args.diffusion_guidance_weight, _age_dds_w
+            dds_projected = _zero.clone()     # --dds_project: DDS as a projected W+ gradient
             if args.dds_grad_ratio > 0 and diffusion_logs:
                 _g_dds = torch.autograd.grad(diffusion_loss + age_diffusion_loss, new_latents,
                                              retain_graph=True, allow_unused=True)[0]
@@ -3111,6 +3128,31 @@ if __name__ == '__main__':
                         _a = int(_mid_abs)
                         diffusion_logs[f'dds_adaptive_w/attr_{_a}'] = _dds_w
                         diffusion_logs[f'dds_tgt_cos/attr_{_a}'] = _cos
+                    if DDS_PROJECT:
+                        _others = {'tgt': _g_tgt}
+                        for _name, _l in (('id', id_weight * id_loss),
+                                          ('pres', args.counter_attr_weight * args.preserve_attr_weight
+                                           * preserve_loss)):
+                            if _name in DDS_PROJECT and torch.is_tensor(_l) and _l.requires_grad:
+                                _others[_name] = torch.autograd.grad(
+                                    _l, new_latents, retain_graph=True, allow_unused=True)[0]
+                        _g = (_dds_w * _g_dds).flatten(1)
+                        for _name in DDS_PROJECT:
+                            _o = _others.get(_name)
+                            if _o is None:
+                                continue
+                            _o = _o.flatten(1)
+                            _dot = (_g * _o).sum(1, keepdim=True)
+                            _cut = _dot < 0
+                            _g = _g - torch.where(_cut, _dot / _o.pow(2).sum(1, keepdim=True).clamp(min=1e-12),
+                                                  torch.zeros_like(_dot)) * _o
+                            diffusion_logs[f'dds_conflict_frac/{_name}'] = _cut.float().mean()
+                            if _mid_abs.numel() == 1:
+                                diffusion_logs[f'dds_conflict_frac/{_name}/attr_{int(_mid_abs)}'] = \
+                                    _cut.float().mean()
+                        # gradient of this term on new_latents is exactly the projected DDS gradient
+                        dds_projected = (new_latents * _g.view_as(new_latents).detach()).sum()
+                        _dds_w = _age_dds_w_eff = _zero.clone()
 
             loss = args.kd_loss_weight * kd_loss +\
                 args.nll_loss_weight * log_p2 +\
@@ -3122,6 +3164,7 @@ if __name__ == '__main__':
                 args.dir_gate_reg_weight * dir_gate_reg_loss +\
                 _dds_w * diffusion_loss +\
                 _age_dds_w_eff * age_diffusion_loss +\
+                dds_projected +\
                 args.clip_prompt_weight * clip_semantic_loss +\
                 args.local_region_loss_weight * local_region_loss +\
                 args.hair_gray_loss_weight * hair_gray_loss +\
