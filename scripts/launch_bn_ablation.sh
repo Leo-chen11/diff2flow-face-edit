@@ -31,6 +31,12 @@
 #           wherever it opposes them (--dds_project tgt,id,pres): DDS can no longer
 #           pull an edit back, cost identity or move other attributes; it only adds
 #           what none of them oppose                                (only via ARMS)
+#   eot     the teachers score the edit as the mean over 3 augmentation draws, each
+#           with down/up-sampling, blur and brightness/contrast added to the crop/flip/
+#           noise (--teacher_eot 3 --teacher_aug_strong): an edit has to survive all of
+#           them, which the fine patterns that fool a teacher do not  (only via ARMS)
+#   augstrong  the stronger augmentation with one draw, as before (--teacher_aug_strong)
+#           -- separates the transforms from the averaging        (only via ARMS)
 #   ddsfull dds512 + 4 (timestep, noise) draws averaged per firing (--dds_n_samples 4) and
 #           the weight scaled against a running mean of the target gradient
 #           (--dds_ratio_ema 0.99), so DDS stays on where the teachers are already
@@ -104,6 +110,8 @@ arm_flags() {
         dds512) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512" ;;
         ddsema) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         ddsproj) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 --set dds_project=tgt,id,pres ${DDS_EXTRA:-}" ;;
+        eot)    echo "--set teacher_aug=True --set teacher_eot=3 --set teacher_aug_strong=True" ;;
+        augstrong) echo "--set teacher_aug=True --set teacher_aug_strong=True" ;;
         ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
     esac

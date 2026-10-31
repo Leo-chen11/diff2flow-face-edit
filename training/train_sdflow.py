@@ -260,6 +260,9 @@ def _mechanism_report(args):
     shape = [
         ('id_loss', f'hinge@{args.id_hinge_threshold:g}' if args.id_loss_hinge else 'continuous (1-cos)',
          None if args.id_loss_hinge else 'keeps pulling even when identity is already preserved'),
+        ('teacher_aug', ('off' if not args.teacher_aug else
+                         ('strong' if args.teacher_aug_strong else 'crop/flip/noise')
+                         + (f', EOT x{args.teacher_eot}' if args.teacher_eot > 1 else '')), None),
     ]
 
     w = 34
@@ -323,7 +326,7 @@ def compute_soft_targets(src_vals, attr_local_idx, attribute_index, is_rm=None):
 
 
 def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_size=256,
-                    ref_images=None):
+                    ref_images=None, strong=False):
     """Shared-parameter, differentiable augmentation applied to BOTH the source
     and the edited image before the frozen attribute teacher.
 
@@ -339,6 +342,11 @@ def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_s
     ref_images: optional third batch given the SAME crop/flip/noise (returned
     third), so another reference can be scored against the edit without a
     second, gradient-carrying teacher pass over the edit.
+
+    strong: also a random down/up-sampling (to 128-256 px and back), a gaussian
+    blur (sigma 0-1 px) and a brightness/contrast jitter, all shared like the
+    rest. The crop/flip/noise above leave fine high-frequency patterns mostly
+    intact; these remove them, and a real edit survives them.
     """
     if not enabled:
         out = (F.interpolate(src_images, (out_size, out_size)),
@@ -362,12 +370,44 @@ def teacher_augment(src_images, edit_images, enabled=True, noise_std=0.02, out_s
     edit = F.interpolate(edit, (out_size, out_size), mode='bilinear', align_corners=False)
     if ref is not None:
         ref = F.interpolate(ref, (out_size, out_size), mode='bilinear', align_corners=False)
+    if strong:
+        src, edit, ref = _strong_teacher_aug([src, edit, ref], out_size)
     if noise_std > 0:
         noise = torch.randn_like(edit) * noise_std
         src = (src + noise).clamp(-1, 1)
         edit = (edit + noise).clamp(-1, 1)
         ref = (ref + noise).clamp(-1, 1) if ref is not None else None
     return (src, edit) if ref is None else (src, edit, ref)
+
+
+def _strong_teacher_aug(images, out_size):
+    """Down/up-sampling, blur and brightness/contrast with one draw of
+    parameters for every tensor in images (None entries pass through)."""
+    r = int(torch.randint(out_size // 2, out_size + 1, (1,)))
+    sigma = float(torch.empty(1).uniform_(0.0, 1.0))
+    contrast = float(torch.empty(1).uniform_(0.9, 1.1))
+    brightness = float(torch.empty(1).uniform_(-0.1, 0.1))
+    kernel = None
+    if sigma > 0.1:
+        k = torch.arange(5, dtype=torch.float32) - 2
+        k = torch.exp(-k ** 2 / (2 * sigma ** 2))
+        k = k / k.sum()
+        kernel = (k[:, None] * k[None, :])
+    out = []
+    for x in images:
+        if x is None:
+            out.append(None)
+            continue
+        if r < out_size:
+            x = F.interpolate(F.interpolate(x, (r, r), mode='area'), (out_size, out_size),
+                              mode='bilinear', align_corners=False)
+        if kernel is not None:
+            w = kernel.to(x).expand(x.shape[1], 1, 5, 5)
+            x = F.conv2d(F.pad(x, (2, 2, 2, 2), mode='reflect'), w, groups=x.shape[1])
+        m = x.mean(dim=(1, 2, 3), keepdim=True)
+        x = ((x - m) * contrast + m + brightness).clamp(-1, 1)
+        out.append(x)
+    return out
 
 
 def resolve_resume_save_dir(resume_dir):
@@ -1025,6 +1065,17 @@ if __name__ == '__main__':
                              'between teacher and CLIP accuracy without it).')
     parser.add_argument('--teacher_aug_noise', type=float, default=0.02,
                         help='Std of the shared gaussian noise in --teacher_aug.')
+    parser.add_argument('--teacher_aug_strong', action=argparse.BooleanOptionalAction, default=False,
+                        help='With --teacher_aug: add random down/up-sampling, blur and '
+                             'brightness/contrast jitter before the teachers (see '
+                             'teacher_augment). Crop/flip/noise alone leave the fine '
+                             'patterns that move a teacher without a real edit.')
+    parser.add_argument('--teacher_eot', type=int, default=1,
+                        help='Expectation over transformation: score the edit by the mean '
+                             'teacher probability over this many independent --teacher_aug '
+                             'draws, so the edit has to hold up under all of them, not one. '
+                             'Each draw is one more gradient-carrying pass through every '
+                             'teacher. 1 = one draw, as before.')
     parser.add_argument('--local_region_loss_weight', type=float, default=0.5,
                         help='Weight for the face-parser locality loss on LOCAL attributes '
                              '(currently eyeglasses, see LOCAL_REGION_CLASSES): outside the '
@@ -2782,28 +2833,42 @@ if __name__ == '__main__':
             # The source RECONSTRUCTION gets the same crop/flip/noise, for the
             # preservation loss below (with --losses_vs_recon).
             _pres_ref = src_recon if (args.losses_vs_recon and src_recon is not None) else None
-            _aug = teacher_augment(
-                img, new_face_tensors,
-                enabled=args.teacher_aug,
-                noise_std=args.teacher_aug_noise,
-                ref_images=_pres_ref,
-            )
-            src_face_256, new_face_256 = _aug[0], _aug[1]
-            recon_face_256 = _aug[2] if _pres_ref is not None else None
-            src_all = teacher_probs(src_face_256)
-            if len(teachers) == 1:
-                gen_each = None
-                gen_all = teacher_probs(new_face_256)
-            else:
-                gen_each = teacher_probs_each(new_face_256)       # (K, B, 40)
-                gen_all = gen_each.mean(0)
+            # --teacher_eot: every probability below is the mean over that many
+            # independent augmentation draws (one draw = the old behavior).
+            _n_eot = max(1, args.teacher_eot)
+            src_all = gen_all = gen_each = recon_all = None
+            for _k in range(_n_eot):
+                _aug = teacher_augment(
+                    img, new_face_tensors,
+                    enabled=args.teacher_aug,
+                    noise_std=args.teacher_aug_noise,
+                    ref_images=_pres_ref,
+                    strong=args.teacher_aug_strong,
+                )
+                src_face_256, new_face_256 = _aug[0], _aug[1]
+                recon_face_256 = _aug[2] if _pres_ref is not None else None
+                _src = teacher_probs(src_face_256) / _n_eot
+                if len(teachers) == 1:
+                    _each = None
+                    _gen = teacher_probs(new_face_256) / _n_eot
+                else:
+                    _each = teacher_probs_each(new_face_256) / _n_eot   # (K, B, 40)
+                    _gen = _each.sum(0) / len(teachers)
+                _rec = None
+                if recon_face_256 is not None:
+                    with torch.no_grad():
+                        _rec = teacher_probs(recon_face_256) / _n_eot
+                src_all = _src if src_all is None else src_all + _src
+                gen_all = _gen if gen_all is None else gen_all + _gen
+                if _each is not None:
+                    gen_each = _each if gen_each is None else gen_each + _each
+                if _rec is not None:
+                    recon_all = _rec if recon_all is None else recon_all + _rec
             src_probs = src_all[:, attribute_index].detach()
             gen_probs = gen_all[:, attribute_index]
             src_attr = src_probs[batch_indices, mid_idx]
             if args.target_src_from_recon and recon_face_256 is not None:
-                with torch.no_grad():
-                    src_attr = teacher_probs(recon_face_256)[:, attribute_index][
-                        batch_indices, mid_idx]
+                src_attr = recon_all[:, attribute_index][batch_indices, mid_idx]
             # The FLOW was told which way to go by edit_is_rm (above: the
             # conditioner's reading, or the precomputed teacher reading with
             # --train_edit_direction teacher); this loss picks its direction
@@ -2847,8 +2912,7 @@ if __name__ == '__main__':
                 # attributes' scores differ by the inversion gap even with no
                 # edit, a floor this loss could never get below.
                 if recon_face_256 is not None:
-                    with torch.no_grad():
-                        _pres_probs = teacher_probs(recon_face_256)[:, attribute_index]
+                    _pres_probs = recon_all[:, attribute_index]
                 else:
                     _pres_probs = src_probs
                 diff_sq = (gen_probs - _pres_probs).pow(2)  # [B, num_attrs]
