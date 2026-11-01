@@ -45,6 +45,13 @@ Methods (--method):
            so alpha = 2 moves a face two standard deviations across the
            boundary; uses nothing of the checkpoint (but its data paths), so
            it is an external baseline; --scales are then alphas, e.g. 1 2 3 4 5 6
+  lt       Latent Transformer (Yao et al., ICCV 2021) retrained on these latents
+           (scripts/train_baselines.py lt): w + sign * alpha * F(w); --scales are alphas,
+           its training step being alpha ~ 0.5-1, e.g. 0.25 0.5 0.75 1 1.5 2
+  styleflow StyleFlow (Abdal et al., TOG 2021) retrained on these latents
+           (scripts/train_baselines.py styleflow): encode under the r34 readings, move the
+           attribute toward its target end by --scales (1 = reach it), decode;
+           e.g. 0.25 0.5 0.75 1 1.5 2 3
 
 Judges read G's output downsampled with --eval_resize (default here: area, as
 evaluate_sdflow's runs since the resize fix). With the CelebA r18 judge
@@ -163,7 +170,12 @@ class OfficialSDFlow:
 
 def main():
     p = build_parser()
-    p.add_argument('--method', default='model', choices=['model', 'linear', 'boundary', 'sdflow'])
+    p.add_argument('--method', default='model',
+                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow'])
+    p.add_argument('--lt_dir', default='./output/baselines/lt',
+                   help='--method lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
+    p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
+                   help='--method styleflow: scripts/train_baselines.py styleflow output.')
     p.add_argument('--sdflow_ckpt_dir', default='./data/ckpt',
                    help='--method sdflow: folder with labeldist-<step> and prior-<step>.')
     p.add_argument('--sdflow_step', type=int, default=10000)
@@ -215,6 +227,25 @@ def main():
             raise SystemExit(f'the released SDFlow checkpoint only covers {args.sdflow_attrs}, not {bad}: '
                              f'pass --only_attrs {" ".join(map(str, args.sdflow_attrs))}')
         sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs)
+    lt_nets, sflow = {}, None
+    if args.method == 'lt':
+        from models.baselines import LatentTransformer
+        for a in attrs:
+            path = os.path.join(args.lt_dir, f'tnet_{a}.pth')
+            if not os.path.exists(path):
+                raise SystemExit(f'no {path}: run python -m scripts.train_baselines lt --out {args.lt_dir}')
+            lt_nets[a] = LatentTransformer().cuda().eval()
+            lt_nets[a].load_state_dict(torch.load(path, map_location='cpu'))
+    elif args.method == 'styleflow':
+        from models.baselines import styleflow_cnf, styleflow_edit
+        ck = torch.load(args.styleflow_ckpt, map_location='cpu')
+        bad = [a for a in attrs if a not in ck['attrs']]
+        if bad:
+            raise SystemExit(f'{args.styleflow_ckpt} was trained on {ck["attrs"]}, not {bad}')
+        sflow = styleflow_cnf(len(ck['attrs'])).cuda().eval()
+        sflow.load_state_dict(ck['state_dict'])
+        sflow_attrs = list(ck['attrs'])
+        print(f'[StyleFlow] {args.styleflow_ckpt} step {ck["step"]}, attributes {sflow_attrs}')
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root,
                        latents_file=args.latent_file, preds_file=args.preds_file,
@@ -226,10 +257,15 @@ def main():
     rec = defaultdict(lambda: defaultdict(list))      # rec[(attr, scale)][metric] -> per-sample values
     seen = 0
     with torch.no_grad():
-        for img, latent, _ in tqdm(loader, desc=f'curves ({args.method})'):
+        for img, latent, pred in tqdm(loader, desc=f'curves ({args.method})'):
             if seen >= args.num_samples:
                 break
             img, latent = img.cuda(), latent.cuda()
+            if sflow is not None:      # StyleFlow's condition: the r34 readings it was trained on
+                pred = pred.float().reshape(pred.size(0), -1)[:, :40].cuda()
+                if pred.min() < 0 or pred.max() > 1:
+                    pred = torch.sigmoid(pred)
+                sf_cond = pred[:, sflow_attrs]
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             src_256 = resize_for_judge(src, (256, 256))
@@ -247,6 +283,12 @@ def main():
                 for sc in args.scales:
                     if sdf is not None:
                         face = sdf.edit(G, img, latent, g, d, sc)
+                    elif lt_nets:
+                        new_lat = lt_nets[g](latent, d * sc)
+                        face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                    elif sflow is not None:
+                        new_lat = styleflow_edit(sflow, latent, sf_cond, sflow_attrs.index(g), d, sc)
+                        face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif lin is not None:
                         new_lat = latent + (d * sc).view(-1, 1, 1) * lin[g].to(latent)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
