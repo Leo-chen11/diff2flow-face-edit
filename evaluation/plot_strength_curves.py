@@ -86,13 +86,26 @@ PAPER_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b']
 OURS_COLOR = '#d62728'
 
 
+def rising_part(rows, x_metric):
+    """The rows by increasing strength up to the strength where editing accuracy
+    peaks. Past that, a stronger edit breaks the face and the accuracy falls again
+    (InterFaceGAN at large alphas): those points are not a better trade-off, and
+    sorting them by accuracy would interleave them with the rising ones."""
+    rows = sorted(rows, key=lambda r: r['strength'])
+    if not rows:
+        return rows
+    peak = max(range(len(rows)), key=lambda i: (rows[i][x_metric], -i))
+    return rows[:peak + 1]
+
+
 def read_at(rows, x_metric, id_key='id_arc', points=READ_AT):
     """{point: (id, preserve %) or None}: the curve's ID and attribute preservation
     at each Editing Accuracy (%), linearly interpolated between the measured
     strengths and never extrapolated -- a curve that does not reach a point
     (strengths too small or too large) gets None there."""
-    pts = sorted((r[x_metric] * 100.0, r[id_key], r['preserve_acc'] * 100.0)
-                 for r in rows if r[x_metric] == r[x_metric] and r[id_key] == r[id_key])
+    rows = rising_part([r for r in rows if r[x_metric] == r[x_metric] and r[id_key] == r[id_key]],
+                       x_metric)
+    pts = sorted((r[x_metric] * 100.0, r[id_key], r['preserve_acc'] * 100.0) for r in rows)
     out = {}
     if not pts:
         return {q: None for q in points}
@@ -126,7 +139,8 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
     plotted_any = False
 
     for run_name, rows in data_by_run.items():
-        attr_rows = [r for r in rows if r['attribute'] == attr_name and r[id_key] == r[id_key]]
+        attr_rows = rising_part([r for r in rows if r['attribute'] == attr_name and r[id_key] == r[id_key]],
+                                x_metric)
         if not attr_rows:
             print(f'[warn] run "{run_name}" has no {id_key} rows for attribute "{attr_name}", skipping.')
             continue
