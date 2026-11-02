@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 from torchdiffeq import odeint_adjoint
 from torchdiffeq import odeint as odeint_normal
+import torchdiffeq
+
+# torchdiffeq 0.0.1 (requirements.txt) takes one tolerance per state tensor. Later
+# versions reuse the training tolerances for the adjoint pass, whose augmented state
+# has more tensors, and reject the list there; they get the same value as a scalar.
+_PER_STATE_TOL = not hasattr(torchdiffeq, '__version__')
 
 __all__ = ["CNF", "SequentialFlow"]
 
@@ -63,12 +69,10 @@ class CNF(nn.Module):
         if self.conditional:
             assert context is not None
             states = (x, _logpx, context)
-            atol = [self.atol] * 3
-            rtol = [self.rtol] * 3
         else:
             states = (x, _logpx)
-            atol = [self.atol] * 2
-            rtol = [self.rtol] * 2
+        atol = [self.atol] * len(states) if _PER_STATE_TOL else self.atol
+        rtol = [self.rtol] * len(states) if _PER_STATE_TOL else self.rtol
             
 
         if integration_times is None:
