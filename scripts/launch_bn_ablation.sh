@@ -35,6 +35,14 @@
 #           with down/up-sampling, blur and brightness/contrast added to the crop/flip/
 #           noise (--teacher_eot 3 --teacher_aug_strong): an edit has to survive all of
 #           them, which the fine patterns that fool a teacher do not  (only via ARMS)
+#   ylayers Young's direction edit reaches W+ layers 0-13 instead of 0-10 (--bank_dir_layers
+#           39:0-13): layers 11-13 (256 px) hold skin texture the old->young edit may need;
+#           the bank directions are fit on real faces, so this adds no free-form texture
+#                                                                       (only via ARMS)
+#   ycap    Young's residual cap 0.05 -> 0.10 (--residual_scale_cap 39:0.10). The cap was
+#           set because the free-form residual aged faces with fake texture / lipstick
+#           (see its --help): check the previews for that, not only the scores
+#                                                                       (only via ARMS)
 #   disc    + the frozen StyleGAN2 discriminator as a realism term, weight 0.03
 #           (--disc_realism_weight; the flag's help suggests 0.01-0.05): an edit that
 #           moves a classifier by an unrealistic pattern -- lipstick, blotchy skin --
@@ -115,6 +123,8 @@ arm_flags() {
         ddsema) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         ddsproj) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 --set dds_project=tgt,id,pres ${DDS_EXTRA:-}" ;;
         eot)    echo "--set teacher_aug=True --set teacher_eot=3 --set teacher_aug_strong=True" ;;
+        ylayers) echo "--set bank_dir_layers=39:0-13" ;;
+        ycap)   echo "--set residual_scale_cap=39:0.10" ;;
         disc)   echo "--set disc_realism_weight=0.03" ;;
         augstrong) echo "--set teacher_aug=True --set teacher_aug_strong=True" ;;
         ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
