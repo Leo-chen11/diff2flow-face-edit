@@ -12,11 +12,13 @@ No images and no generator are needed: both are trained in latent space.
 Evaluate with scripts/editing_curves.py --method lt --lt_dir ./output/baselines/lt, or
 --method styleflow --styleflow_ckpt ./output/baselines/styleflow/styleflow.pth.
 
-Recipes follow the papers' code: Latent Transformer (configs/001.yaml: Adam 1e-3,
-weight decay 5e-4, batch 32, 10 epochs, loss = BCE(target) + 10 * latent MSE +
-other-attribute logit MSE weighted by 1 - |label correlation|); StyleFlow
-(maximum likelihood of W+ under the attribute-conditioned CNF, as the released
-SDFlow's flow minus its extra losses).
+Recipes follow the papers' code. Latent Transformer: the latent classifier as
+pretraining/latent_classifier.py (Adam 1e-4, weight decay 5e-4, batch 256, 20 epochs,
+lr x0.1 every 10), the transformers as trainer.py + configs/001.yaml (Adam 1e-3, weight
+decay 5e-4, batch 32, 10 epochs, loss = BCE(target) + 10 * latent MSE + other-attribute
+logit MSE weighted by 1 - |label correlation|). StyleFlow: train_flow.py (maximum
+likelihood of W+ under the attribute-conditioned CNF, Adam 1e-3, batch 5, 3 epochs over
+10k latents = 6000 steps).
 """
 import argparse
 import os
@@ -54,7 +56,8 @@ def load_split(args, train=True):
 
 def batches(n, bs, shuffle=True):
     idx = torch.randperm(n) if shuffle else torch.arange(n)
-    for i in range(0, n - bs + 1 if shuffle else n, bs):
+    # shuffled: whole batches only (one short batch if n < bs)
+    for i in range(0, (n - bs + 1 if n >= bs else 1) if shuffle else n, bs):
         yield idx[i:i + bs]
 
 
@@ -62,7 +65,8 @@ def train_lcnet(args):
     W, P = load_split(args, True)
     Wt, Pt = load_split(args, False)
     net = LCNet().cuda()
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=5e-4)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.1)
     labels, labels_t = (P > 0.5).float(), (Pt > 0.5).float()
     for ep in range(args.epochs):
         net.train()
@@ -71,6 +75,7 @@ def train_lcnet(args):
             opt.zero_grad()
             loss.backward()
             opt.step()
+        sched.step()
         net.eval()
         with torch.no_grad():
             pred = torch.cat([net(Wt[b].cuda()).cpu() for b in batches(len(Wt), 512, False)])
@@ -160,18 +165,21 @@ def main():
     p.add_argument('--image_root', default='data/FFHQ')
     p.add_argument('--latent_file', default='./data/ffhq_e4e_latents.pth')
     p.add_argument('--preds_file', default='./data/ffhq_e4e_preds.pth')
-    p.add_argument('--max_faces', type=int, default=0, help='Use only the first N faces of a split (0 = all).')
+    p.add_argument('--max_faces', type=int, default=None,
+                   help='Use only the first N faces of a split (0 = all); styleflow default 10000, as its paper.')
     p.add_argument('--epochs', type=int, default=None, help='lcnet default 20, lt default 10.')
-    p.add_argument('--batch', type=int, default=None, help='lcnet default 256, lt 32, styleflow 32.')
-    p.add_argument('--lr', type=float, default=None, help='lcnet / lt default 1e-3, styleflow 1e-4.')
-    p.add_argument('--steps', type=int, default=10000, help='styleflow optimizer steps.')
+    p.add_argument('--batch', type=int, default=None, help='lcnet default 256, lt 32, styleflow 5.')
+    p.add_argument('--lr', type=float, default=None, help='lcnet default 1e-4, lt 1e-3, styleflow 1e-3.')
+    p.add_argument('--steps', type=int, default=6000, help='styleflow optimizer steps.')
     p.add_argument('--seed', type=int, default=0)
     args = p.parse_args()
     torch.manual_seed(args.seed)
-    defaults = {'lcnet': (20, 256, 1e-3), 'lt': (10, 32, 1e-3), 'styleflow': (1, 32, 1e-4)}[args.what]
+    defaults = {'lcnet': (20, 256, 1e-4, 0), 'lt': (10, 32, 1e-3, 0),
+                'styleflow': (1, 5, 1e-3, 10000)}[args.what]
     args.epochs = args.epochs or defaults[0]
     args.batch = args.batch or defaults[1]
     args.lr = args.lr or defaults[2]
+    args.max_faces = defaults[3] if args.max_faces is None else args.max_faces
     {'lcnet': train_lcnet, 'lt': train_lt, 'styleflow': train_styleflow}[args.what](args)
 
 

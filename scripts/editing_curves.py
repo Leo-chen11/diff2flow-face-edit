@@ -284,10 +284,10 @@ def main():
                     if sdf is not None:
                         face = sdf.edit(G, img, latent, g, d, sc)
                     elif lt_nets:
-                        new_lat = lt_nets[g](latent, d * sc)
+                        new_lat = lt_nets[g].edit(latent, d * sc)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif sflow is not None:
-                        new_lat = styleflow_edit(sflow, latent, sf_cond, sflow_attrs.index(g), d, sc)
+                        new_lat = styleflow_edit(sflow, latent, sf_cond, sflow_attrs.index(g), d, sc, attr=g)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif lin is not None:
                         new_lat = latent + (d * sc).view(-1, 1, 1) * lin[g].to(latent)
