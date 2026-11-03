@@ -86,7 +86,10 @@ PAPER_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b']
 OURS_COLOR = '#d62728'
 
 
-def rising_part(rows, x_metric):
+SAT_TOL = 0.01      # accuracy (fraction) below the peak that already counts as saturated
+
+
+def rising_part(rows, x_metric, sat_tol=None):
     """The rows by increasing strength up to the strength where editing accuracy
     peaks. Past that, a stronger edit breaks the face and the accuracy falls again
     (InterFaceGAN at large alphas): those points are not a better trade-off, and
@@ -95,6 +98,13 @@ def rising_part(rows, x_metric):
     if not rows:
         return rows
     peak = max(range(len(rows)), key=lambda i: (rows[i][x_metric], -i))
+    # The last strengths before the peak only add a sliver of accuracy while the
+    # identity keeps falling (a vertical tail): stop at the first strength that is
+    # already within sat_tol of the peak.
+    tol = SAT_TOL if sat_tol is None else sat_tol
+    for i in range(peak + 1):
+        if rows[i][x_metric] >= rows[peak][x_metric] - tol:
+            return rows[:i + 1]
     return rows[:peak + 1]
 
 
@@ -204,7 +214,12 @@ def main():
                              'found across the given runs.')
     parser.add_argument('--read_at', nargs='+', type=float, default=list(READ_AT),
                         help='Editing Accuracies (%%) the table reads every curve at, e.g. 60 80 90.')
+    parser.add_argument('--sat_tol', type=float, default=SAT_TOL,
+                        help='Drop the saturated tail: curves end at the first strength whose editing '
+                             'accuracy is within this fraction (0.01 = 1 pp) of the curve peak. 0 keeps '
+                             'everything up to the peak.')
     args = parser.parse_args()
+    globals()['SAT_TOL'] = args.sat_tol
     points = tuple(args.read_at)
 
     os.makedirs(args.output_dir, exist_ok=True)
