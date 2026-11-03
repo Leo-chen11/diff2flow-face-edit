@@ -202,7 +202,10 @@ def main():
     parser.add_argument('--attributes', nargs='*', default=None,
                         help='Restrict to these attribute names. Default: every attribute '
                              'found across the given runs.')
+    parser.add_argument('--read_at', nargs='+', type=float, default=list(READ_AT),
+                        help='Editing Accuracies (%%) the table reads every curve at, e.g. 60 80 90.')
     args = parser.parse_args()
+    points = tuple(args.read_at)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -238,10 +241,27 @@ def main():
             arows = [r for r in rows if r['attribute'] == attr_name]
             if not arows:
                 continue
-            for q, v in read_at(arows, args.x_metric, ID_KEYS[args.id_metric]).items():
+            for q, v in read_at(arows, args.x_metric, ID_KEYS[args.id_metric], points).items():
                 table.append({'attribute': attr_name, 'run': run_name, 'editing_accuracy': q,
                               'id_sim': '' if v is None else f'{v[0]:.4f}',
                               'attr_preserve': '' if v is None else f'{v[1]:.2f}'})
+    # Mean: every attribute read at the same accuracy first, then averaged -- unlike the
+    # "All" curve, which averages the attributes at each STRENGTH, where one attribute can
+    # sit at 95% and another at 60%. Over the attributes every run has, so a method
+    # covering fewer (the released SDFlow) is compared on the same ones.
+    common = [a for a in attrs if a != 'All'
+              and all(any(r['attribute'] == a for r in rows) for rows in data_by_run.values())]
+    if common:
+        for run_name in data_by_run:
+            for q in points:
+                vals = [next((t for t in table if t['attribute'] == a and t['run'] == run_name
+                              and t['editing_accuracy'] == q), None) for a in common]
+                ok = all(v is not None and v['id_sim'] != '' for v in vals)
+                table.append({'attribute': 'Mean', 'run': run_name, 'editing_accuracy': q,
+                              'id_sim': f'{np.mean([float(v["id_sim"]) for v in vals]):.4f}' if ok else '',
+                              'attr_preserve': f'{np.mean([float(v["attr_preserve"]) for v in vals]):.2f}'
+                              if ok else ''})
+        attrs = attrs + ['Mean']
     path = os.path.join(args.output_dir, f'at_accuracy_{args.x_metric}_{args.id_metric}.csv')
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=['attribute', 'run', 'editing_accuracy', 'id_sim', 'attr_preserve'])
@@ -252,15 +272,16 @@ def main():
         sub = [t for t in table if t['attribute'] == attr_name]
         if not sub:
             continue
-        print(f'\n{attr_name}')
-        print(f'  {"run":<14}' + ''.join(f'{"acc " + str(q):>16}' for q in READ_AT) + '     (ID / preserve%)')
+        print(f'\n{attr_name}' + (f' (each attribute read at the accuracy, then averaged: '
+                                    f'{", ".join(common)})' if attr_name == 'Mean' else ''))
+        print(f'  {"run":<18}' + ''.join(f'{"acc " + f"{q:g}":>16}' for q in points) + '     (ID / preserve%)')
         for run_name in data_by_run:
             cells = []
-            for q in READ_AT:
+            for q in points:
                 t = next((t for t in sub if t['run'] == run_name and t['editing_accuracy'] == q), None)
                 cells.append('--' if t is None or t['id_sim'] == '' else f'{t["id_sim"]} / {float(t["attr_preserve"]):4.1f}')
             if any(c != '--' for c in cells):
-                print(f'  {run_name:<14}' + ''.join(f'{c:>16}' for c in cells))
+                print(f'  {run_name:<18}' + ''.join(f'{c:>16}' for c in cells))
     print(f'\nsaved {path}')
 
 
