@@ -141,7 +141,7 @@ def run_colors(run_names):
 
 
 def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102), id_key='id_arc',
-                   ylim_id=(0.2, 1.02), ylim_attr=(78, 100)):
+                   ylim_id=(0.2, 1.02), ylim_attr=(70, 100)):
     """Two panels in the layout of the SDFlow paper's Fig. 4: Identity Preservation
     (cosine similarity) and Attribute Preservation (accuracy) against Editing
     Accuracy; legend in the lower left of the left panel. Writes .png and .pdf."""
@@ -217,8 +217,8 @@ def main():
                         help='Fixed y range of the Identity panel, the same for every attribute '
                              '(default 0.2 1.02). Pass --ylim_id with no override by giving the data range, '
                              'or 0 0 to autoscale.')
-    parser.add_argument('--ylim_attr', nargs=2, type=float, default=[78, 100],
-                        help='Fixed y range (%%) of the Attribute Preservation panel (default 78 100); 0 0 autoscales.')
+    parser.add_argument('--ylim_attr', nargs=2, type=float, default=[70, 100],
+                        help='Fixed y range (%%) of the Attribute Preservation panel (default 70 100); 0 0 autoscales.')
     parser.add_argument('--id_metric', default='arc', choices=['arc', 'indep'],
                         help='Identity cosine similarity: arc = ArcFace IR-SE50 (as in the SDFlow paper, '
                              'column id_arc of scripts/editing_curves.py), indep = facenet casia-webface.')
