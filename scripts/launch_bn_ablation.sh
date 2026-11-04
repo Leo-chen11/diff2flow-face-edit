@@ -35,6 +35,8 @@
 #           with down/up-sampling, blur and brightness/contrast added to the crop/flip/
 #           noise (--teacher_eot 3 --teacher_aug_strong): an edit has to survive all of
 #           them, which the fine patterns that fool a teacher do not  (only via ARMS)
+#   eotny   eot except Young, which keeps the control's one plain draw
+#           (--teacher_eot_skip_attrs 39): eot cost Young 1.3-2.2 pp R50 (only via ARMS)
 #   ylayers Young's direction edit reaches W+ layers 0-13 instead of 0-10 (--bank_dir_layers
 #           39:0-13): layers 11-13 (256 px) hold skin texture the old->young edit may need;
 #           the bank directions are fit on real faces, so this adds no free-form texture
@@ -123,6 +125,7 @@ arm_flags() {
         ddsema) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         ddsproj) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 --set dds_project=tgt,id,pres ${DDS_EXTRA:-}" ;;
         eot)    echo "--set teacher_aug=True --set teacher_eot=3 --set teacher_aug_strong=True" ;;
+        eotny)  echo "--set teacher_aug=True --set teacher_eot=3 --set teacher_aug_strong=True --set teacher_eot_skip_attrs=39" ;;
         ylayers) echo "--set bank_dir_layers=39:0-13" ;;
         ycap)   echo "--set residual_scale_cap=39:0.10" ;;
         disc)   echo "--set disc_realism_weight=0.03" ;;

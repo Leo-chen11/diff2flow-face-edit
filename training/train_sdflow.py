@@ -262,7 +262,10 @@ def _mechanism_report(args):
          None if args.id_loss_hinge else 'keeps pulling even when identity is already preserved'),
         ('teacher_aug', ('off' if not args.teacher_aug else
                          ('strong' if args.teacher_aug_strong else 'crop/flip/noise')
-                         + (f', EOT x{args.teacher_eot}' if args.teacher_eot > 1 else '')), None),
+                         + (f', EOT x{args.teacher_eot}' if args.teacher_eot > 1 else '')
+                         + (f' (not {",".join(map(str, args.teacher_eot_skip_attrs))})'
+                            if args.teacher_eot_skip_attrs and (args.teacher_eot > 1 or args.teacher_aug_strong)
+                            else '')), None),
     ]
 
     w = 34
@@ -1076,6 +1079,13 @@ if __name__ == '__main__':
                              'draws, so the edit has to hold up under all of them, not one. '
                              'Each draw is one more gradient-carrying pass through every '
                              'teacher. 1 = one draw, as before.')
+    parser.add_argument('--teacher_eot_skip_attrs', type=int, nargs='*', default=[],
+                        help='CelebA ids scored as without --teacher_eot / --teacher_aug_strong: one '
+                             'plain crop/flip/noise draw, as the control run. EOT x3 + strong '
+                             'augmentation from 50k raised Male (+3.4 R50, +8 r18 at matched ID) but '
+                             'cost Young 1.3-2.2 pp R50, so e.g. --teacher_eot_skip_attrs 39. Decided '
+                             'per batch: a batch is skipped only when ALL its samples edit a listed '
+                             'attribute (always so with the default one-attribute-per-step cycle).')
     parser.add_argument('--local_region_loss_weight', type=float, default=0.5,
                         help='Weight for the face-parser locality loss on LOCAL attributes '
                              '(currently eyeglasses, see LOCAL_REGION_CLASSES): outside the '
@@ -2836,6 +2846,14 @@ if __name__ == '__main__':
             # --teacher_eot: every probability below is the mean over that many
             # independent augmentation draws (one draw = the old behavior).
             _n_eot = max(1, args.teacher_eot)
+            _aug_strong = args.teacher_aug_strong
+            if args.teacher_eot_skip_attrs:
+                _mid_abs = attribute_index.to(mid_idx.device)[mid_idx]
+                _skip = torch.zeros_like(_mid_abs, dtype=torch.bool)
+                for _a in args.teacher_eot_skip_attrs:
+                    _skip |= _mid_abs == _a
+                if bool(_skip.all()):
+                    _n_eot, _aug_strong = 1, False
             src_all = gen_all = gen_each = recon_all = None
             for _k in range(_n_eot):
                 _aug = teacher_augment(
@@ -2843,7 +2861,7 @@ if __name__ == '__main__':
                     enabled=args.teacher_aug,
                     noise_std=args.teacher_aug_noise,
                     ref_images=_pres_ref,
-                    strong=args.teacher_aug_strong,
+                    strong=_aug_strong,
                 )
                 src_face_256, new_face_256 = _aug[0], _aug[1]
                 recon_face_256 = _aug[2] if _pres_ref is not None else None
