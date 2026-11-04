@@ -179,8 +179,10 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
         ax.set_xlabel('Editing Accuracy(%)')
     if ylim_id:
         axes[0].set_ylim(*ylim_id)
+        axes[0].set_yticks([t / 10 for t in range(int(np.ceil(ylim_id[0] * 10)), int(ylim_id[1] * 10) + 1, 2)])
     if ylim_attr:
         axes[1].set_ylim(*ylim_attr)
+        axes[1].set_yticks(list(range(int(np.ceil(ylim_attr[0] / 5) * 5), int(ylim_attr[1]) + 1, 5)))
     axes[0].set_ylabel('Cosine Similarity')
     axes[0].set_title('Identity Preservation')
     axes[0].legend(loc='lower left', fontsize=8.5)
