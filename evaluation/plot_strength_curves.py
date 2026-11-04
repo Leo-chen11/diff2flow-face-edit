@@ -140,7 +140,8 @@ def run_colors(run_names):
     return colors
 
 
-def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102), id_key='id_arc'):
+def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102), id_key='id_arc',
+                   ylim_id=(0.2, 1.02), ylim_attr=(78, 100)):
     """Two panels in the layout of the SDFlow paper's Fig. 4: Identity Preservation
     (cosine similarity) and Attribute Preservation (accuracy) against Editing
     Accuracy; legend in the lower left of the left panel. Writes .png and .pdf."""
@@ -176,6 +177,10 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
         ax.set_xlim(*xlim)
         ax.set_xticks([q for q in READ_AT if xlim[0] <= q <= xlim[1]])
         ax.set_xlabel('Editing Accuracy(%)')
+    if ylim_id:
+        axes[0].set_ylim(*ylim_id)
+    if ylim_attr:
+        axes[1].set_ylim(*ylim_attr)
     axes[0].set_ylabel('Cosine Similarity')
     axes[0].set_title('Identity Preservation')
     axes[0].legend(loc='lower left', fontsize=8.5)
@@ -206,6 +211,12 @@ def main():
                              'the CelebA r18 judge, from scripts/editing_curves.py CSVs).')
     parser.add_argument('--xlim', nargs=2, type=float, default=[30, 102],
                         help='x range of every plot, the same for all attributes; ticks at 40 60 80 100.')
+    parser.add_argument('--ylim_id', nargs=2, type=float, default=[0.2, 1.02],
+                        help='Fixed y range of the Identity panel, the same for every attribute '
+                             '(default 0.2 1.02). Pass --ylim_id with no override by giving the data range, '
+                             'or 0 0 to autoscale.')
+    parser.add_argument('--ylim_attr', nargs=2, type=float, default=[78, 100],
+                        help='Fixed y range (%%) of the Attribute Preservation panel (default 78 100); 0 0 autoscales.')
     parser.add_argument('--id_metric', default='arc', choices=['arc', 'indep'],
                         help='Identity cosine similarity: arc = ArcFace IR-SE50 (as in the SDFlow paper, '
                              'column id_arc of scripts/editing_curves.py), indep = facenet casia-webface.')
@@ -219,6 +230,10 @@ def main():
                              'accuracy is within this fraction (0.01 = 1 pp) of the curve peak. 0 keeps '
                              'everything up to the peak.')
     args = parser.parse_args()
+    if args.ylim_id == [0, 0]:
+        args.ylim_id = None
+    if args.ylim_attr == [0, 0]:
+        args.ylim_attr = None
     globals()['SAT_TOL'] = args.sat_tol
     points = tuple(args.read_at)
 
@@ -239,7 +254,9 @@ def main():
     written = []
     for attr_name in attrs:
         out_path = plot_attribute(attr_name, data_by_run, args.x_metric, args.output_dir,
-                                  xlim=tuple(args.xlim), id_key=ID_KEYS[args.id_metric])
+                                  xlim=tuple(args.xlim), id_key=ID_KEYS[args.id_metric],
+                                  ylim_id=tuple(args.ylim_id) if args.ylim_id else None,
+                                  ylim_attr=tuple(args.ylim_attr) if args.ylim_attr else None)
         if out_path:
             written.append(out_path)
             print(f'Wrote {out_path}')
