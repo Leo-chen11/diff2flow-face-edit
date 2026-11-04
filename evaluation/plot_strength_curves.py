@@ -140,8 +140,25 @@ def run_colors(run_names):
     return colors
 
 
+def smooth_line(x, y, n=200):
+    """A shape-preserving (monotone-cubic, PCHIP) curve through the measured points:
+    it passes through every point and never overshoots between them, so it only
+    rounds the corners of the polyline. The markers stay the measured values."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    keep = np.concatenate([[True], np.diff(x) > 1e-9])      # PCHIP needs strictly increasing x
+    x, y = x[keep], y[keep]
+    if len(x) < 3:
+        return x, y
+    try:
+        from scipy.interpolate import PchipInterpolator
+    except ImportError:
+        return x, y
+    xs = np.linspace(x[0], x[-1], n)
+    return xs, PchipInterpolator(x, y)(xs)
+
+
 def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102), id_key='id_arc',
-                   ylim_id=(0.2, 1.02), ylim_attr=(70, 100)):
+                   ylim_id=(0.2, 1.02), ylim_attr=(70, 100), smooth=True):
     """Two panels in the layout of the SDFlow paper's Fig. 4: Identity Preservation
     (cosine similarity) and Attribute Preservation (accuracy) against Editing
     Accuracy; legend in the lower left of the left panel. Writes .png and .pdf."""
@@ -166,8 +183,18 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
         attr_pres = [r['preserve_acc'] * 100.0 for r in attr_rows]
 
         style = dict(marker='o', markersize=5.5, linewidth=1.6, color=colors[run_name], label=run_name)
-        axes[0].plot(edit_acc, id_sim, **style)
-        axes[1].plot(edit_acc, attr_pres, **style)
+        if smooth:
+            xs, ys_id = smooth_line(edit_acc, id_sim)
+            _, ys_at = smooth_line(edit_acc, attr_pres)
+            line = dict(linewidth=1.6, color=colors[run_name])
+            axes[0].plot(xs, ys_id, **line)
+            axes[1].plot(xs, ys_at, **line)
+            dots = dict(marker='o', markersize=5.5, linestyle='none', color=colors[run_name])
+            axes[0].plot(edit_acc, id_sim, label=run_name, **dots)
+            axes[1].plot(edit_acc, attr_pres, **dots)
+        else:
+            axes[0].plot(edit_acc, id_sim, **style)
+            axes[1].plot(edit_acc, attr_pres, **style)
 
     if not plotted_any:
         plt.close(fig)
@@ -219,6 +246,9 @@ def main():
                              'or 0 0 to autoscale.')
     parser.add_argument('--ylim_attr', nargs=2, type=float, default=[70, 100],
                         help='Fixed y range (%%) of the Attribute Preservation panel (default 70 100); 0 0 autoscales.')
+    parser.add_argument('--no_smooth', action='store_true',
+                        help='Join the measured points with straight segments instead of a smooth '
+                             'monotone curve through them.')
     parser.add_argument('--id_metric', default='arc', choices=['arc', 'indep'],
                         help='Identity cosine similarity: arc = ArcFace IR-SE50 (as in the SDFlow paper, '
                              'column id_arc of scripts/editing_curves.py), indep = facenet casia-webface.')
@@ -258,7 +288,8 @@ def main():
         out_path = plot_attribute(attr_name, data_by_run, args.x_metric, args.output_dir,
                                   xlim=tuple(args.xlim), id_key=ID_KEYS[args.id_metric],
                                   ylim_id=tuple(args.ylim_id) if args.ylim_id else None,
-                                  ylim_attr=tuple(args.ylim_attr) if args.ylim_attr else None)
+                                  ylim_attr=tuple(args.ylim_attr) if args.ylim_attr else None,
+                                  smooth=not args.no_smooth)
         if out_path:
             written.append(out_path)
             print(f'Wrote {out_path}')
