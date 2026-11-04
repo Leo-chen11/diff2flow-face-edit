@@ -224,6 +224,9 @@ def _mechanism_report(args):
             ('  weight', f'{args.disc_realism_weight:g}', None),
             ('  attrs', str(args.disc_realism_attrs or 'all'), None),
         ]
+    realism.append(('attr_disc', (f'w={args.attr_disc_weight:g} conf={args.attr_disc_conf:g} '
+                                  f'warmup={args.attr_disc_warmup}') if args.attr_disc_weight > 0
+                    else 'off', None))
 
     # A term whose model is not loaded contributes nothing, whatever its weight.
     dds_on = args.use_diffusion_guidance
@@ -1341,6 +1344,24 @@ if __name__ == '__main__':
                              '--counter_attr_weight\'s gradient; this is a prior toward realism, '
                              'not toward any particular attribute value, so an overly large weight '
                              'will fight the edit itself, not just the artifact.')
+    parser.add_argument('--attr_disc_weight', type=float, default=0.0,
+                        help='Attribute-conditional discriminator (models/attr_discriminator.py), trained '
+                             'alongside the flow: conditioned on (attribute, state), it separates e4e '
+                             'reconstructions of training faces confidently in that state (their own '
+                             'teacher reading past --attr_disc_conf) from edits into that state. The '
+                             'editor gets weight * hinge loss -D(edit), only on samples the teachers '
+                             'already score as edited: the teachers decide WHETHER the attribute '
+                             'changed, this asks whether it looks like it does on real faces, which the '
+                             'fine patterns that fool a teacher do not. Needs --losses_vs_recon. 0 = off '
+                             '(not built). Start ~0.01-0.05.')
+    parser.add_argument('--attr_disc_lr', type=float, default=2e-4,
+                        help='Adam lr of the attribute discriminator (betas 0, 0.99).')
+    parser.add_argument('--attr_disc_conf', type=float, default=0.9,
+                        help='A reconstruction is a real sample of state 1 (0) only when the teachers '
+                             'read it above this (below 1 - this).')
+    parser.add_argument('--attr_disc_warmup', type=int, default=2000,
+                        help='Iterations of this run in which the discriminator trains but the editor '
+                             'gets no loss from it, so it is not judged by an untrained discriminator.')
     parser.add_argument('--disc_realism_attrs', nargs='*', type=int, default=None,
                         help='Absolute CelebA attribute ids to apply --disc_realism_weight to '
                              '(e.g. "39" for Young only). Default (unset) applies to every '
@@ -2246,6 +2267,27 @@ if __name__ == '__main__':
     log_modules = [prior, conditioner, attr_scales, reg_loss_weights, optimizer]
     if direction_bank is not None:
         log_modules.insert(-1, direction_bank)
+
+    attr_disc = attr_disc_optim = None
+    if args.attr_disc_weight > 0:
+        if not args.losses_vs_recon:
+            raise ValueError('--attr_disc_weight needs --losses_vs_recon (its real samples are the '
+                             'source reconstructions)')
+        from models.attr_discriminator import AttrConditionalDiscriminator
+        attr_disc = AttrConditionalDiscriminator(len(args.attribute_index)).cuda().train()
+        attr_disc_optim = optim.Adam(attr_disc.parameters(), lr=args.attr_disc_lr, betas=(0.0, 0.99))
+        if args.resume_dir:
+            try:
+                load_module_checkpoint(attr_disc, resume_save_dir, 'attr_disc', start_step, strict=True)
+                _opt_path = os.path.join(resume_save_dir, f'attr_disc_optim-{str(start_step).zfill(7)}')
+                if os.path.exists(_opt_path):
+                    attr_disc_optim.load_state_dict(torch.load(_opt_path, map_location='cpu'))
+            except FileNotFoundError:
+                print('[Resume] no attr_disc checkpoint; the attribute discriminator starts fresh '
+                      f'(the editor gets no loss from it for {args.attr_disc_warmup} iterations).')
+        log_modules += [attr_disc, attr_disc_optim]
+        print(f'** Attribute-conditional discriminator (weight={args.attr_disc_weight}, '
+              f'conf={args.attr_disc_conf}, warmup={args.attr_disc_warmup}) initialization success !')
 
     # Best-checkpoint tracking. The metric is the AccCeleb monitor, smoothed --
     # the raw value scores one small batch and lands on 0/0.5/1, so selecting on
@@ -3236,6 +3278,42 @@ if __name__ == '__main__':
                         dds_projected = (new_latents * _g.view_as(new_latents).detach()).sum()
                         _dds_w = _age_dds_w_eff = _zero.clone()
 
+            # ── Attribute-conditional discriminator (--attr_disc_weight) ─────
+            # Real: source reconstructions the teachers read confidently, with
+            # their state for this step's attribute. Fake: the edits, with their
+            # target state. One hinge D step here (its own optimizer and graph),
+            # then the editor's hinge loss on the samples the teachers already
+            # pass -- whether the attribute changed is the teachers' call.
+            attr_disc_g_loss = _zero.clone()
+            attr_disc_logs = {}
+            if attr_disc is not None and src_recon is not None:
+                _slot = mid_idx.long()
+                _rr = (recon_all[:, attribute_index][batch_indices, mid_idx] if recon_all is not None
+                       else src_attr).detach()
+                _real_ok = (_rr > args.attr_disc_conf) | (_rr < 1 - args.attr_disc_conf)
+                _c_real = 2 * _slot + (_rr > 0.5).long()
+                _c_fake = 2 * _slot + (edit_end >= 0.5).long()
+                _pass = torch.where(edit_end >= 0.5, edited_probs > 0.5, edited_probs < 0.5).detach()
+                for _p in attr_disc.parameters():
+                    _p.requires_grad_(True)
+                _d_fake = attr_disc(new_face_tensors.detach(), _c_fake)
+                _d_loss = F.relu(1 + _d_fake).mean()
+                if _real_ok.any():
+                    _d_real = attr_disc(src_recon[_real_ok], _c_real[_real_ok])
+                    _d_loss = _d_loss + F.relu(1 - _d_real).mean()
+                    attr_disc_logs['attr_disc_real_acc'] = (_d_real > 0).float().mean()
+                attr_disc_optim.zero_grad(set_to_none=True)
+                _d_loss.backward()
+                attr_disc_optim.step()
+                for _p in attr_disc.parameters():
+                    _p.requires_grad_(False)
+                attr_disc_logs['attr_disc_d_loss'] = _d_loss.detach()
+                attr_disc_logs['attr_disc_fake_acc'] = (_d_fake < 0).float().mean().detach()
+                attr_disc_logs['attr_disc_pass_frac'] = _pass.float().mean()
+                if local_step >= args.attr_disc_warmup and _pass.any():
+                    attr_disc_g_loss = -attr_disc(new_face_tensors[_pass], _c_fake[_pass]).mean()
+                attr_disc_logs['attr_disc_g_loss'] = attr_disc_g_loss.detach()
+
             loss = args.kd_loss_weight * kd_loss +\
                 args.nll_loss_weight * log_p2 +\
                 args.reg_loss_weight * reg_loss +\
@@ -3252,6 +3330,7 @@ if __name__ == '__main__':
                 args.hair_gray_loss_weight * hair_gray_loss +\
                 args.hair_extent_loss_weight * hair_extent_loss +\
                 args.disc_realism_weight * disc_realism_loss +\
+                args.attr_disc_weight * attr_disc_g_loss +\
                 bank_prior_weight * loss_bank_prior
 
             attr_scale_grad_norm = _zero.detach().clone()
@@ -3410,6 +3489,7 @@ if __name__ == '__main__':
             # directional mode, clip_score_* in absolute mode, clip_direction_mean
             # in both. (They used to be logged as constant 0 in the other mode.)
             _log_dict.update(clip_logs)
+            _log_dict.update(attr_disc_logs)
             # Sampler check, from the same dataset preds the sampler pools on:
             # with the sampler aligned, sampler_src_high_frac is exactly 0.5
             # on every step (half low, half high for the attribute being

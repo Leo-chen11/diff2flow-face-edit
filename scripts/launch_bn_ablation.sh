@@ -35,6 +35,9 @@
 #           with down/up-sampling, blur and brightness/contrast added to the crop/flip/
 #           noise (--teacher_eot 3 --teacher_aug_strong): an edit has to survive all of
 #           them, which the fine patterns that fool a teacher do not  (only via ARMS)
+#   adisc   attribute-conditional discriminator trained alongside (--attr_disc_weight 0.03,
+#           ADISC_W=<w> to change): real = reconstructions confidently in a state, fake =
+#           edits into it; the editor's loss only on samples the teachers already pass (only via ARMS)
 #   eotny   eot except Young, which keeps the control's one plain draw
 #           (--teacher_eot_skip_attrs 39): eot cost Young 1.3-2.2 pp R50 (only via ARMS)
 #   ylayers Young's direction edit reaches W+ layers 0-13 instead of 0-10 (--bank_dir_layers
@@ -129,6 +132,7 @@ arm_flags() {
         ylayers) echo "--set bank_dir_layers=39:0-13" ;;
         ycap)   echo "--set residual_scale_cap=39:0.10" ;;
         disc)   echo "--set disc_realism_weight=0.03" ;;
+        adisc)  echo "--set attr_disc_weight=${ADISC_W:-0.03}" ;;
         augstrong) echo "--set teacher_aug=True --set teacher_aug_strong=True" ;;
         ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
