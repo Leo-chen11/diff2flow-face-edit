@@ -261,7 +261,8 @@ def _mechanism_report(args):
     ]
 
     shape = [
-        ('id_loss', f'hinge@{args.id_hinge_threshold:g}' if args.id_loss_hinge else 'continuous (1-cos)',
+        ('id_loss', (f'hinge@{args.id_hinge_threshold:g}' if args.id_loss_hinge else 'continuous (1-cos)')
+                    + (' outside attr subspace' if args.id_attr_subspace else ''),
          None if args.id_loss_hinge else 'keeps pulling even when identity is already preserved'),
         ('teacher_aug', ('off' if not args.teacher_aug else
                          ('strong' if args.teacher_aug_strong else 'crop/flip/noise')
@@ -1863,6 +1864,15 @@ if __name__ == '__main__':
                              '~1000 steps. Higher = smoother but slower to reflect recent training.')
 
     # ── Hinge identity loss ─────────────────────────────────────────────────
+    parser.add_argument('--id_attr_subspace', default=None,
+                        help='Attribute subspace of the training ID embedding (facenet VGGFace2), '
+                             'from scripts/id_attr_subspace.py --out_subspace. The identity '
+                             'similarity of id_loss is then taken after projecting that subspace out of '
+                             'both unit embeddings (and re-normalising): the loss no longer charges '
+                             'the change an edit must make along gender/age/glasses/beard directions '
+                             '(stage 1: 30-51%% of the embedding change of an edit lies there), so a '
+                             'higher --id_hinge_threshold can hold the rest of the identity without '
+                             'fighting the edit. Default off.')
     parser.add_argument('--id_loss_hinge', action=argparse.BooleanOptionalAction, default=False,
                         help='Replace the continuous id_loss (1 - cosine_sim, always pulling) with '
                              'a hinge loss that is exactly zero once id cosine similarity is at or '
@@ -2495,6 +2505,15 @@ if __name__ == '__main__':
                   f'attribute than the one being edited. Pass --align_sampler_global_step.')
     # --id_hinge_threshold_override: per-LOCAL-attribute hinge floor, indexed
     # by mid_idx in the loop. None = the shared --id_hinge_threshold.
+    _id_attr_Q = None
+    if args.id_attr_subspace:
+        _sub = torch.load(args.id_attr_subspace, map_location='cpu')
+        _id_attr_Q = _sub['basis'].float().cuda()                    # (512, k), orthonormal columns
+        _qerr = (_id_attr_Q.T @ _id_attr_Q - torch.eye(_id_attr_Q.shape[1], device='cuda')).abs().max()
+        if _qerr > 1e-3:
+            raise ValueError(f'{args.id_attr_subspace}: basis columns are not orthonormal ({_qerr:.2e})')
+        print(f'** ID loss outside the attribute subspace: {_id_attr_Q.shape[1]} dims '
+              f'({_sub.get("space", "?")}; attrs {_sub.get("attrs")})')
     _id_thr_by_local = None
     _id_over = parse_attr_spec(args.id_hinge_threshold_override)
     if _id_over:
@@ -2870,6 +2889,13 @@ if __name__ == '__main__':
             id_src_feat = F.normalize(id_criterion.extract_features(loss_ref_img), dim=1).detach()
             id_edit_feat = F.normalize(id_criterion.extract_features(new_face_tensors), dim=1)
             id_cos_sim = F.cosine_similarity(id_edit_feat, id_src_feat, dim=1)
+            id_cos_raw = id_cos_sim.detach()
+            if _id_attr_Q is not None:
+                if _id_attr_Q.shape[0] != id_edit_feat.shape[1]:
+                    raise ValueError(f'--id_attr_subspace is {_id_attr_Q.shape[0]}-dim, the ID '
+                                     f'embedding {id_edit_feat.shape[1]}-dim')
+                _po = lambda x: x - (x @ _id_attr_Q) @ _id_attr_Q.T
+                id_cos_sim = F.cosine_similarity(_po(id_edit_feat), _po(id_src_feat), dim=1)
             if args.id_loss_hinge:
                 if _id_thr_by_local is not None:
                     _thr = _id_thr_by_local.to(id_cos_sim.device)[mid_idx].to(id_cos_sim.dtype)
@@ -3444,6 +3470,8 @@ if __name__ == '__main__':
                 'loss_leakage': preserve_loss,
                 'loss_reg': reg_loss,
                 'loss_id': id_loss,
+                'id_cos_raw': id_cos_raw.mean(),
+                'id_cos_used': id_cos_sim.detach().mean(),
                 'id_weight': torch.tensor(id_weight),
                 'reg_loss_global': reg_loss_global.mean(),
                 'reg_loss_coarse': reg_loss_coarse.mean(),
