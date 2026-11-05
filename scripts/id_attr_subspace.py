@@ -150,7 +150,6 @@ def main():
                    help='CelebA ids whose directions span the attribute subspace.')
     p.add_argument('--fit_faces', type=int, default=4000, help='TRAIN faces the subspace is fit on.')
     p.add_argument('--shrink', type=float, default=0.1, help='LDA covariance shrinkage.')
-    p.add_argument('--out_json', default=None)
     p.add_argument('--out_subspace', default='./data/id_attr_subspace.pt',
                    help='Where the train_id subspace is saved for the stage-2 loss.')
     p.set_defaults(eval_resize='area')
