@@ -39,9 +39,11 @@
 #           ADISC_W=<w> to change): real = reconstructions confidently in a state, fake =
 #           edits into it; the editor's loss only on samples the teachers already pass (only via ARMS)
 #   orthid  id_loss measured outside the attribute subspace of the training ID embedding
-#           (--id_attr_subspace, from scripts/id_attr_subspace.py; ID_SUBSPACE=<path>), hinge 0.8
-#   orthid_hi  the same with the hinge floor raised to 0.9 (ORTHID_THR=<t>): with the attribute
-#           part no longer charged, hold the rest of the identity harder     (both only via ARMS)
+#           (--id_attr_subspace, from scripts/id_attr_subspace.py; ID_SUBSPACE=<path>), the
+#           parent's hinge floors kept
+#   orthid_hi  the same with the floors raised: 0.9 (ORTHID_THR=<t>) and Young 0.85
+#           (ORTHID_OVERRIDE=<spec>, the parent's 39:0.68 would otherwise jump to 0.9): with the
+#           attribute part no longer charged, hold the rest of the identity harder (only via ARMS)
 #   eotny   eot except Young, which keeps the control's one plain draw
 #           (--teacher_eot_skip_attrs 39): eot cost Young 1.3-2.2 pp R50 (only via ARMS)
 #   ylayers Young's direction edit reaches W+ layers 0-13 instead of 0-10 (--bank_dir_layers
@@ -137,8 +139,8 @@ arm_flags() {
         ycap)   echo "--set residual_scale_cap=39:0.10" ;;
         disc)   echo "--set disc_realism_weight=0.03" ;;
         adisc)  echo "--set attr_disc_weight=${ADISC_W:-0.03}" ;;
-        orthid) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True --set id_hinge_threshold=0.8 --set id_hinge_threshold_override=none" ;;
-        orthid_hi) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True --set id_hinge_threshold=${ORTHID_THR:-0.9} --set id_hinge_threshold_override=none" ;;
+        orthid) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True" ;;
+        orthid_hi) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True --set id_hinge_threshold=${ORTHID_THR:-0.9} --set id_hinge_threshold_override=${ORTHID_OVERRIDE:-39:0.85}" ;;
         augstrong) echo "--set teacher_aug=True --set teacher_aug_strong=True" ;;
         ddsfull) echo "$DDS_FLAGS --set dds_grad_ratio=0.3 --set diffusion_image_size=512 --set dds_n_samples=4 --set dds_ratio_ema=0.99 --set dds_skip_attrs=15 ${DDS_EXTRA:-}" ;;
         *)      echo "unknown arm $1" >&2; exit 1 ;;
