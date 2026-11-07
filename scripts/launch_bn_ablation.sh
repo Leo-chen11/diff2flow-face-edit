@@ -44,6 +44,10 @@
 #   orthid_hi  the same with the floors raised: 0.9 (ORTHID_THR=<t>) and Young 0.85
 #           (ORTHID_OVERRIDE=<spec>, the parent's 39:0.68 would otherwise jump to 0.9): with the
 #           attribute part no longer charged, hold the rest of the identity harder (only via ARMS)
+#   adisc2  retry of adisc: discriminator lr 4e-4, 2 updates per step, no spectral norm on its
+#           condition embedding, 5k-step warmup, and the flow's lr flat until the last 20%
+#           (--lr_schedule wsd) so it can still follow the discriminator late (only via ARMS)
+#   ctrl_wsd   the control for adisc2: --lr_schedule wsd alone            (only via ARMS)
 #   eotny   eot except Young, which keeps the control's one plain draw
 #           (--teacher_eot_skip_attrs 39): eot cost Young 1.3-2.2 pp R50 (only via ARMS)
 #   ylayers Young's direction edit reaches W+ layers 0-13 instead of 0-10 (--bank_dir_layers
@@ -139,6 +143,8 @@ arm_flags() {
         ycap)   echo "--set residual_scale_cap=39:0.10" ;;
         disc)   echo "--set disc_realism_weight=0.03" ;;
         adisc)  echo "--set attr_disc_weight=${ADISC_W:-0.03}" ;;
+        adisc2) echo "--set attr_disc_weight=${ADISC_W:-0.03} --set attr_disc_lr=4e-4 --set attr_disc_d_steps=2 --set attr_disc_embed_sn=False --set attr_disc_warmup=5000 --set lr_schedule=wsd" ;;
+        ctrl_wsd) echo "--set lr_schedule=wsd" ;;
         orthid) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True" ;;
         orthid_hi) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True --set id_hinge_threshold=${ORTHID_THR:-0.9} --set id_hinge_threshold_override=${ORTHID_OVERRIDE:-39:0.85}" ;;
         augstrong) echo "--set teacher_aug=True --set teacher_aug_strong=True" ;;

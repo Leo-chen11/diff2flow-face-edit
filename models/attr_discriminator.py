@@ -36,7 +36,7 @@ class AttrConditionalDiscriminator(nn.Module):
     """Input (B, 3, 256, 256) in [-1, 1] (other sizes are resized to 256), condition
     index (B,) in [0, 2 * num_attrs). Returns (B,) logits."""
 
-    def __init__(self, num_attrs, size=256, ch=(32, 64, 128, 256, 256, 256)):
+    def __init__(self, num_attrs, size=256, ch=(32, 64, 128, 256, 256, 256), embed_sn=True):
         super().__init__()
         self.size = size
         blocks, cin = [], 3
@@ -45,7 +45,8 @@ class AttrConditionalDiscriminator(nn.Module):
             cin = c
         self.blocks = nn.Sequential(*blocks)
         self.linear = SN(nn.Linear(cin, 1))
-        self.embed = SN(nn.Embedding(2 * num_attrs, cin))
+        emb = nn.Embedding(2 * num_attrs, cin)
+        self.embed = SN(emb) if embed_sn else emb
 
     def forward(self, x, cond):
         if x.shape[-1] != self.size:

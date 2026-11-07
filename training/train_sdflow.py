@@ -1,5 +1,6 @@
 import argparse
 import copy
+import math
 import json
 import os,shutil,sys
 
@@ -225,8 +226,11 @@ def _mechanism_report(args):
             ('  attrs', str(args.disc_realism_attrs or 'all'), None),
         ]
     realism.append(('attr_disc', (f'w={args.attr_disc_weight:g} conf={args.attr_disc_conf:g} '
-                                  f'warmup={args.attr_disc_warmup}') if args.attr_disc_weight > 0
-                    else 'off', None))
+                                  f'warmup={args.attr_disc_warmup} lr={args.attr_disc_lr:g} '
+                                  f'd_steps={args.attr_disc_d_steps} embed_sn={args.attr_disc_embed_sn}')
+                    if args.attr_disc_weight > 0 else 'off', None))
+    realism.append(('lr_schedule', args.lr_schedule + (f' (decay last {args.lr_decay_frac:g})'
+                                                       if args.lr_schedule == 'wsd' else ''), None))
 
     # A term whose model is not loaded contributes nothing, whatever its weight.
     dds_on = args.use_diffusion_guidance
@@ -1355,6 +1359,19 @@ if __name__ == '__main__':
                              'changed, this asks whether it looks like it does on real faces, which the '
                              'fine patterns that fool a teacher do not. Needs --losses_vs_recon. 0 = off '
                              '(not built). Start ~0.01-0.05.')
+    parser.add_argument('--attr_disc_d_steps', type=int, default=1,
+                        help='Discriminator updates per training step (on the same batch).')
+    parser.add_argument('--attr_disc_embed_sn', action=argparse.BooleanOptionalAction, default=True,
+                        help='Spectral norm on the condition embedding. Off lets the projection '
+                             'term grow, so the discriminator can lean on the condition: with it, the '
+                             'first run stayed at chance (real/fake accuracy ~0.55, hinge loss 1.8-1.9).')
+    parser.add_argument('--lr_schedule', default='cosine', choices=['cosine', 'wsd'],
+                        help='cosine: the run anneals from --lr to 1e-6 over its whole length. wsd: '
+                             'flat at --lr, then that cosine over the last --lr_decay_frac only, so a '
+                             'signal that appears late (the attribute discriminator) still meets a '
+                             'flow that can follow it. Compare a wsd run only with a wsd control.')
+    parser.add_argument('--lr_decay_frac', type=float, default=0.2,
+                        help='--lr_schedule wsd: share of the run spent decaying.')
     parser.add_argument('--attr_disc_lr', type=float, default=2e-4,
                         help='Adam lr of the attribute discriminator (betas 0, 0.99).')
     parser.add_argument('--attr_disc_conf', type=float, default=0.9,
@@ -2172,9 +2189,23 @@ if __name__ == '__main__':
         _sched_T = max(1, args.max_steps // args.grad_accum_steps)
     else:
         _sched_T = args.epochs * len(train_loader) // args.grad_accum_steps
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=_sched_T, eta_min=1e-6
-    )
+    if args.lr_schedule == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=_sched_T, eta_min=1e-6
+        )
+    else:
+        # --lr_schedule wsd: flat at --lr, then the same cosine down to 1e-6 over
+        # the last --lr_decay_frac of the run.
+        _flat = int(round(_sched_T * (1.0 - args.lr_decay_frac)))
+        _eta = 1e-6 / max(args.lr, 1e-12)
+
+        def _wsd(step, _flat=_flat, _T=_sched_T, _eta=_eta):
+            if step < _flat:
+                return 1.0
+            p = min(1.0, (step - _flat) / max(1, _T - _flat))
+            return _eta + (1.0 - _eta) * 0.5 * (1.0 + math.cos(math.pi * p))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _wsd)
+        print(f'** LR schedule wsd: flat for {_flat} optimizer steps, cosine to 1e-6 over the last {_sched_T - _flat}')
 
     ema_pairs = []       # [(live_module, ema_module, save_name), ...]
     ema_modules_for_save = {}
@@ -2284,7 +2315,8 @@ if __name__ == '__main__':
             raise ValueError('--attr_disc_weight needs --losses_vs_recon (its real samples are the '
                              'source reconstructions)')
         from models.attr_discriminator import AttrConditionalDiscriminator
-        attr_disc = AttrConditionalDiscriminator(len(args.attribute_index)).cuda().train()
+        attr_disc = AttrConditionalDiscriminator(len(args.attribute_index),
+                                                 embed_sn=args.attr_disc_embed_sn).cuda().train()
         attr_disc_optim = optim.Adam(attr_disc.parameters(), lr=args.attr_disc_lr, betas=(0.0, 0.99))
         if args.resume_dir:
             try:
@@ -3322,15 +3354,16 @@ if __name__ == '__main__':
                 _pass = torch.where(edit_end >= 0.5, edited_probs > 0.5, edited_probs < 0.5).detach()
                 for _p in attr_disc.parameters():
                     _p.requires_grad_(True)
-                _d_fake = attr_disc(new_face_tensors.detach(), _c_fake)
-                _d_loss = F.relu(1 + _d_fake).mean()
-                if _real_ok.any():
-                    _d_real = attr_disc(src_recon[_real_ok], _c_real[_real_ok])
-                    _d_loss = _d_loss + F.relu(1 - _d_real).mean()
-                    attr_disc_logs['attr_disc_real_acc'] = (_d_real > 0).float().mean()
-                attr_disc_optim.zero_grad(set_to_none=True)
-                _d_loss.backward()
-                attr_disc_optim.step()
+                for _ in range(max(1, args.attr_disc_d_steps)):
+                    _d_fake = attr_disc(new_face_tensors.detach(), _c_fake)
+                    _d_loss = F.relu(1 + _d_fake).mean()
+                    if _real_ok.any():
+                        _d_real = attr_disc(src_recon[_real_ok], _c_real[_real_ok])
+                        _d_loss = _d_loss + F.relu(1 - _d_real).mean()
+                        attr_disc_logs['attr_disc_real_acc'] = (_d_real > 0).float().mean().detach()
+                    attr_disc_optim.zero_grad(set_to_none=True)
+                    _d_loss.backward()
+                    attr_disc_optim.step()
                 for _p in attr_disc.parameters():
                     _p.requires_grad_(False)
                 attr_disc_logs['attr_disc_d_loss'] = _d_loss.detach()
