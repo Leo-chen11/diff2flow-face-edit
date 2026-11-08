@@ -48,12 +48,6 @@
 #           condition embedding, 5k-step warmup, and the flow's lr flat until the last 20%
 #           (--lr_schedule wsd) so it can still follow the discriminator late (only via ARMS)
 #   ctrl_wsd   the control for adisc2: --lr_schedule wsd alone            (only via ARMS)
-#   headloc the locality loss extended to the attributes without a tight region of their own
-#           (--local_region_head: Male, Young, Smiling, Bangs keep everything outside the head --
-#           background, clothes -- as it was); curves showed Male leaving only 72-77% of those
-#           pixels unchanged at 80-90% editing accuracy                    (only via ARMS)
-#   orthid_head  orthid_hi + --local_region_head: orthid_hi bought +0.011-0.018 Young ArcFace
-#           with 2-3 pp less region preservation; this asks for the identity without that cost
 #   eotny   eot except Young, which keeps the control's one plain draw
 #           (--teacher_eot_skip_attrs 39): eot cost Young 1.3-2.2 pp R50 (only via ARMS)
 #   ylayers Young's direction edit reaches W+ layers 0-13 instead of 0-10 (--bank_dir_layers
@@ -151,8 +145,6 @@ arm_flags() {
         adisc)  echo "--set attr_disc_weight=${ADISC_W:-0.03}" ;;
         adisc2) echo "--set attr_disc_weight=${ADISC_W:-0.03} --set attr_disc_lr=4e-4 --set attr_disc_d_steps=2 --set attr_disc_embed_sn=False --set attr_disc_warmup=5000 --set lr_schedule=wsd" ;;
         ctrl_wsd) echo "--set lr_schedule=wsd" ;;
-        headloc) echo "--set local_region_head=True" ;;
-        orthid_head) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True --set id_hinge_threshold=${ORTHID_THR:-0.9} --set id_hinge_threshold_override=${ORTHID_OVERRIDE:-39:0.85} --set local_region_head=True" ;;
         orthid) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True" ;;
         orthid_hi) echo "--set id_attr_subspace=${ID_SUBSPACE:-./data/id_attr_subspace.pt} --set id_loss_hinge=True --set id_hinge_threshold=${ORTHID_THR:-0.9} --set id_hinge_threshold_override=${ORTHID_OVERRIDE:-39:0.85}" ;;
         augstrong) echo "--set teacher_aug=True --set teacher_aug_strong=True" ;;
