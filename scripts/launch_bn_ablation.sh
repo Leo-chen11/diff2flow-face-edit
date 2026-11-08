@@ -50,8 +50,8 @@
 #   ctrl_wsd   the control for adisc2: --lr_schedule wsd alone            (only via ARMS)
 #   headloc the locality loss extended to the attributes without a tight region of their own
 #           (--local_region_head: Male, Young, Smiling, Bangs keep everything outside the head --
-#           background, clothes -- as it was); curves showed Male leaving only 72-77%% of those
-#           pixels unchanged at 80-90%% editing accuracy                    (only via ARMS)
+#           background, clothes -- as it was); curves showed Male leaving only 72-77% of those
+#           pixels unchanged at 80-90% editing accuracy                    (only via ARMS)
 #   orthid_head  orthid_hi + --local_region_head: orthid_hi bought +0.011-0.018 Young ArcFace
 #           with 2-3 pp less region preservation; this asks for the identity without that cost
 #   eotny   eot except Young, which keeps the control's one plain draw
