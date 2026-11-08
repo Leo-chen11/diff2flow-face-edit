@@ -71,6 +71,7 @@ Usage:
         --independent_attr_backbone r50 --age_fine_layer_scale 1.0 \
         --method model --scales 0.2 0.4 0.6 0.8 1.0 1.25 1.5 --num_samples 300
 """
+import argparse
 import csv
 import json
 import os
@@ -192,6 +193,12 @@ def main():
     p.add_argument('--scales', nargs='+', type=float, default=[0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
                    help='Edit strengths (alphas for --method linear).')
     p.add_argument('--preserve_set', default='edited', choices=['edited', 'all40'])
+    p.add_argument('--bg_metric', action=argparse.BooleanOptionalAction, default=True,
+                   help='Background preservation: PSNR (dB, higher = less changed) and MSE of the edit '
+                        'against the source reconstruction OUTSIDE the head -- everything the BiSeNet '
+                        'parser (--face_parser_weights) does not call face or hair in either image, '
+                        'dilated 4 px: background, clothing, necklace, hat. Columns bg_psnr, bg_mse; '
+                        'plot it with plot_strength_curves.py --right_panel bg.')
     p.add_argument('--out_csv', default=None,
                    help='Default <checkpoint_dir>/curves_<method>_s<step>.csv (a .json beside it).')
     p.set_defaults(eval_resize='area')
@@ -254,6 +261,16 @@ def main():
         else boundary_directions(args.boundaries, attrs, ds) if args.method == 'boundary' else None
     loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
 
+    bg_parser = None
+    if args.bg_metric:
+        if os.path.exists(args.face_parser_weights):
+            from common.face_parser import FACE_CLASSES, FaceParser
+            from common.region_stat_loss import dilate_mask
+            bg_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
+            print(f'[Metric] background preservation outside face+hair ({args.face_parser_weights})')
+        else:
+            print(f'[WARN] no face parser at {args.face_parser_weights}: bg_psnr / bg_mse left empty')
+
     rec = defaultdict(lambda: defaultdict(list))      # rec[(attr, scale)][metric] -> per-sample values
     seen = 0
     with torch.no_grad():
@@ -273,6 +290,8 @@ def main():
             sc_src = celeb_judge.scores(src_256)[:, :40] if celeb_judge is not None else None
             src_id = indep_id.extract(src_256)
             src_arc = arc.extract(src_256) if arc is not None else None
+            head_src = (bg_parser.get_region_mask(src_256, FACE_CLASSES, blur_sigma=0)
+                        if bg_parser is not None else None)
             for g in attrs:
                 li = args.attribute_index.index(g)
                 d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
@@ -314,6 +333,15 @@ def main():
                     same = ((so > 0.5) == (eo > 0.5)) & clear_o
                     pres = same.float().sum(1) / clear_o.float().sum(1).clamp(min=1)
                     r = rec[(g, sc)]
+                    if bg_parser is not None:
+                        _head = dilate_mask(torch.maximum(
+                            head_src, bg_parser.get_region_mask(f256, FACE_CLASSES, blur_sigma=0)), 4)
+                        _out = 1.0 - _head
+                        _mse = (((f256 - src_256).pow(2) * _out).sum((1, 2, 3))
+                                / (_out.sum((1, 2, 3)) * 3).clamp(min=1e-6))
+                        _ok_bg = keep & (_out.sum((1, 2, 3)) > 100)     # some background visible
+                        r['bg_mse'] += _mse[_ok_bg].tolist()
+                        r['bg_psnr'] += (10 * torch.log10(4.0 / _mse.clamp(min=1e-10)))[_ok_bg].tolist()
                     r['acc'] += ok[keep].float().tolist()
                     r['id'] += idv[keep].tolist()
                     r['pres'] += pres[keep].tolist()
@@ -334,24 +362,26 @@ def main():
                          'preserve_acc': float(np.mean(r['pres'])), 'n': len(r['acc']),
                          'id_arc': float(np.mean(r['id_arc'])) if r['id_arc'] else float('nan'),
                          'celeb_success': float(np.mean(r['celeb'])) if r['celeb'] else float('nan'),
-                         'n_celeb': len(r['celeb'])})
+                         'n_celeb': len(r['celeb']),
+                         'bg_psnr': float(np.mean(r['bg_psnr'])) if r['bg_psnr'] else float('nan'),
+                         'bg_mse': float(np.mean(r['bg_mse'])) if r['bg_mse'] else float('nan')})
     for sc in args.scales:
         per = [x for x in rows if x['strength'] == sc]
         if len(per) == len(attrs):
             rows.append({'attribute': 'All', 'strength': sc,
                          **{k: float(np.mean([x[k] for x in per]))
                             for k in ('target_success', 'effective_success', 'id_sim_real', 'preserve_acc',
-                                      'celeb_success', 'id_arc')},
+                                      'celeb_success', 'id_arc', 'bg_psnr', 'bg_mse')},
                          'n': sum(x['n'] for x in per), 'n_celeb': sum(x['n_celeb'] for x in per)})
 
     label = f'{args.method}'
     print(f'\n{label}, {seen} faces, preserve_set={args.preserve_set}')
     print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"r18Acc":>7} {"ArcFace":>8} {"facenet":>8} '
-          f'{"AttrPres":>9} {"n":>5}')
+          f'{"AttrPres":>9} {"BG dB":>7} {"n":>5}')
     for x in rows:
         print(f'  {x["attribute"]:<11} {x["strength"]:6.2f} {x["target_success"] * 100:7.1f}% '
               f'{x["celeb_success"] * 100:6.1f}% {x["id_arc"]:8.3f} {x["id_sim_real"]:8.3f} '
-              f'{x["preserve_acc"] * 100:8.1f}% {x["n"]:5d}')
+              f'{x["preserve_acc"] * 100:8.1f}% {x["bg_psnr"]:7.2f} {x["n"]:5d}')
 
     path = args.out_csv or os.path.join(args.checkpoint_dir, f'curves_{args.method}_s{args.step}.csv')
     with open(path, 'w', newline='') as f:

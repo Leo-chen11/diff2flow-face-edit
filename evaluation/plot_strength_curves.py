@@ -35,6 +35,13 @@ import numpy as np
 
 READ_AT = (40, 60, 80, 100)     # Editing Accuracy (%) every curve is read at, and the x ticks
 
+# The right panel: (row key, multiplier, title, y label, table column)
+RIGHT_PANELS = {
+    'attr': ('preserve_acc', 100.0, 'Attribute Preservation', 'Accuracy(%)', 'attr_preserve'),
+    'bg':   ('bg_psnr', 1.0, 'Background Preservation', 'PSNR outside head (dB)', 'bg_psnr'),
+}
+RIGHT = RIGHT_PANELS['attr']
+
 
 def parse_named_path(value):
     """argparse type for NAME=path pairs."""
@@ -64,6 +71,7 @@ def read_summary(path):
                 'id_sim_real': float(row['id_sim_real']),
                 'id_arc': float(row.get('id_arc') or 'nan'),
                 'preserve_acc': float(row['preserve_acc']),
+                'bg_psnr': float(row.get('bg_psnr') or 'nan'),
             })
     return rows
 
@@ -113,9 +121,9 @@ def read_at(rows, x_metric, id_key='id_arc', points=READ_AT):
     at each Editing Accuracy (%), linearly interpolated between the measured
     strengths and never extrapolated -- a curve that does not reach a point
     (strengths too small or too large) gets None there."""
-    rows = rising_part([r for r in rows if r[x_metric] == r[x_metric] and r[id_key] == r[id_key]],
-                       x_metric)
-    pts = sorted((r[x_metric] * 100.0, r[id_key], r['preserve_acc'] * 100.0) for r in rows)
+    rows = rising_part([r for r in rows if r[x_metric] == r[x_metric] and r[id_key] == r[id_key]
+                        and r[RIGHT[0]] == r[RIGHT[0]]], x_metric)
+    pts = sorted((r[x_metric] * 100.0, r[id_key], r[RIGHT[0]] * RIGHT[1]) for r in rows)
     out = {}
     if not pts:
         return {q: None for q in points}
@@ -158,7 +166,7 @@ def smooth_line(x, y, n=200):
 
 
 def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102), id_key='id_arc',
-                   ylim_id=(0.2, 1.02), ylim_attr=(70, 100), smooth=True):
+                   ylim_id=(0.2, 1.02), ylim_attr=(70, 100), smooth=True, markers=True, right_tick=5):
     """Two panels in the layout of the SDFlow paper's Fig. 4: Identity Preservation
     (cosine similarity) and Attribute Preservation (accuracy) against Editing
     Accuracy; legend in the lower left of the left panel. Writes .png and .pdf."""
@@ -167,8 +175,8 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
     plotted_any = False
 
     for run_name, rows in data_by_run.items():
-        attr_rows = rising_part([r for r in rows if r['attribute'] == attr_name and r[id_key] == r[id_key]],
-                                x_metric)
+        attr_rows = rising_part([r for r in rows if r['attribute'] == attr_name and r[id_key] == r[id_key]
+                                 and r[RIGHT[0]] == r[RIGHT[0]]], x_metric)
         if not attr_rows:
             print(f'[warn] run "{run_name}" has no {id_key} rows for attribute "{attr_name}", skipping.')
             continue
@@ -180,10 +188,16 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
         attr_rows = sorted(attr_rows, key=lambda r: r[x_metric])
         edit_acc = [r[x_metric] * 100.0 for r in attr_rows]
         id_sim = [r[id_key] for r in attr_rows]
-        attr_pres = [r['preserve_acc'] * 100.0 for r in attr_rows]
+        attr_pres = [r[RIGHT[0]] * RIGHT[1] for r in attr_rows]
 
-        style = dict(marker='o', markersize=5.5, linewidth=1.6, color=colors[run_name], label=run_name)
-        if smooth:
+        style = dict(marker='o' if markers else None, markersize=5.5, linewidth=1.6,
+                     color=colors[run_name], label=run_name)
+        if smooth and not markers:
+            xs, ys_id = smooth_line(edit_acc, id_sim)
+            _, ys_at = smooth_line(edit_acc, attr_pres)
+            axes[0].plot(xs, ys_id, linewidth=1.8, color=colors[run_name], label=run_name)
+            axes[1].plot(xs, ys_at, linewidth=1.8, color=colors[run_name])
+        elif smooth:
             xs, ys_id = smooth_line(edit_acc, id_sim)
             _, ys_at = smooth_line(edit_acc, attr_pres)
             line = dict(linewidth=1.6, color=colors[run_name])
@@ -209,12 +223,17 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
         axes[0].set_yticks([t / 10 for t in range(int(np.ceil(ylim_id[0] * 10)), int(ylim_id[1] * 10) + 1, 2)])
     if ylim_attr:
         axes[1].set_ylim(*ylim_attr)
-        axes[1].set_yticks(list(range(int(np.ceil(ylim_attr[0] / 5) * 5), int(ylim_attr[1]) + 1, 5)))
+        axes[1].set_yticks(list(range(int(np.ceil(ylim_attr[0] / right_tick) * right_tick),
+                                      int(ylim_attr[1]) + 1, right_tick)))
     axes[0].set_ylabel('Cosine Similarity')
     axes[0].set_title('Identity Preservation')
-    axes[0].legend(loc='lower left', fontsize=8.5)
-    axes[1].set_ylabel('Accuracy(%)')
-    axes[1].set_title('Attribute Preservation')
+    from matplotlib.lines import Line2D
+    handles = [Line2D([0], [0], color=colors[n], linewidth=1.6, marker='o' if markers else None,
+                      markersize=5.5, label=n)
+               for n, rows in data_by_run.items() if any(r['attribute'] == attr_name for r in rows)]
+    axes[0].legend(handles=handles, loc='lower left', fontsize=8.5)
+    axes[1].set_ylabel(RIGHT[3])
+    axes[1].set_title(RIGHT[2])
 
     if attr_name != 'All':
         fig.suptitle(attr_name, fontsize=11)
@@ -257,6 +276,16 @@ def main():
                              'found across the given runs.')
     parser.add_argument('--read_at', nargs='+', type=float, default=list(READ_AT),
                         help='Editing Accuracies (%%) the table reads every curve at, e.g. 60 80 90.')
+    parser.add_argument('--right_panel', default='attr', choices=list(RIGHT_PANELS),
+                        help='attr: Attribute Preservation (other CelebA attributes unchanged, the SDFlow '
+                             'paper\'s panel). bg: Background Preservation, PSNR of everything outside face '
+                             'and hair (background, clothing) vs the source reconstruction -- needs CSVs from '
+                             'scripts/editing_curves.py with --bg_metric (its default).')
+    parser.add_argument('--ylim_bg', nargs=2, type=float, default=None,
+                        help='y range (dB) of the bg panel, the same for every attribute. Default: the '
+                             'data range over all runs and attributes, rounded out to 2 dB.')
+    parser.add_argument('--no_markers', action='store_true',
+                        help='Draw the curves without a dot per measured strength.')
     parser.add_argument('--sat_tol', type=float, default=SAT_TOL,
                         help='Drop the saturated tail: curves end at the first strength whose editing '
                              'accuracy is within this fraction (0.01 = 1 pp) of the curve peak. 0 keeps '
@@ -267,6 +296,7 @@ def main():
     if args.ylim_attr == [0, 0]:
         args.ylim_attr = None
     globals()['SAT_TOL'] = args.sat_tol
+    globals()['RIGHT'] = RIGHT_PANELS[args.right_panel]
     points = tuple(args.read_at)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -283,13 +313,23 @@ def main():
     if not attrs:
         raise SystemExit('No attributes found in the provided --run CSV files.')
 
+    right_tick = 5
+    if args.right_panel == 'bg':
+        vals = [r['bg_psnr'] for rows in data_by_run.values() for r in rows if r['bg_psnr'] == r['bg_psnr']]
+        if not vals:
+            raise SystemExit('--right_panel bg: no bg_psnr in these CSVs; rerun scripts/editing_curves.py '
+                             '(--bg_metric is on by default in the current version)')
+        lo, hi = args.ylim_bg or (2 * np.floor(min(vals) / 2) - 1, 2 * np.ceil(max(vals) / 2) + 1)
+        args.ylim_attr = [lo, hi]
+        right_tick = 5 if hi - lo > 14 else 2
     written = []
     for attr_name in attrs:
         out_path = plot_attribute(attr_name, data_by_run, args.x_metric, args.output_dir,
                                   xlim=tuple(args.xlim), id_key=ID_KEYS[args.id_metric],
                                   ylim_id=tuple(args.ylim_id) if args.ylim_id else None,
                                   ylim_attr=tuple(args.ylim_attr) if args.ylim_attr else None,
-                                  smooth=not args.no_smooth)
+                                  smooth=not args.no_smooth, markers=not args.no_markers,
+                                  right_tick=right_tick)
         if out_path:
             written.append(out_path)
             print(f'Wrote {out_path}')
@@ -309,7 +349,7 @@ def main():
             for q, v in read_at(arows, args.x_metric, ID_KEYS[args.id_metric], points).items():
                 table.append({'attribute': attr_name, 'run': run_name, 'editing_accuracy': q,
                               'id_sim': '' if v is None else f'{v[0]:.4f}',
-                              'attr_preserve': '' if v is None else f'{v[1]:.2f}'})
+                              RIGHT[4]: '' if v is None else f'{v[1]:.2f}'})
     # Mean: every attribute read at the same accuracy first, then averaged -- unlike the
     # "All" curve, which averages the attributes at each STRENGTH, where one attribute can
     # sit at 95% and another at 60%. Over the attributes every run has, so a method
@@ -324,12 +364,13 @@ def main():
                 ok = all(v is not None and v['id_sim'] != '' for v in vals)
                 table.append({'attribute': 'Mean', 'run': run_name, 'editing_accuracy': q,
                               'id_sim': f'{np.mean([float(v["id_sim"]) for v in vals]):.4f}' if ok else '',
-                              'attr_preserve': f'{np.mean([float(v["attr_preserve"]) for v in vals]):.2f}'
+                              RIGHT[4]: f'{np.mean([float(v[RIGHT[4]]) for v in vals]):.2f}'
                               if ok else ''})
         attrs = attrs + ['Mean']
-    path = os.path.join(args.output_dir, f'at_accuracy_{args.x_metric}_{args.id_metric}.csv')
+    path = os.path.join(args.output_dir, f'at_accuracy_{args.x_metric}_{args.id_metric}'
+                        + ('_bg' if args.right_panel == 'bg' else '') + '.csv')
     with open(path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=['attribute', 'run', 'editing_accuracy', 'id_sim', 'attr_preserve'])
+        w = csv.DictWriter(f, fieldnames=['attribute', 'run', 'editing_accuracy', 'id_sim', RIGHT[4]])
         w.writeheader()
         w.writerows(table)
     print(f'\nID / attribute preservation at Editing Accuracy ({args.x_metric}); "--" = the curve does not reach it')
@@ -339,12 +380,13 @@ def main():
             continue
         print(f'\n{attr_name}' + (f' (each attribute read at the accuracy, then averaged: '
                                     f'{", ".join(common)})' if attr_name == 'Mean' else ''))
-        print(f'  {"run":<18}' + ''.join(f'{"acc " + f"{q:g}":>16}' for q in points) + '     (ID / preserve%)')
+        print(f'  {"run":<18}' + ''.join(f'{"acc " + f"{q:g}":>16}' for q in points)
+              + ('     (ID / background dB)' if args.right_panel == 'bg' else '     (ID / preserve%)'))
         for run_name in data_by_run:
             cells = []
             for q in points:
                 t = next((t for t in sub if t['run'] == run_name and t['editing_accuracy'] == q), None)
-                cells.append('--' if t is None or t['id_sim'] == '' else f'{t["id_sim"]} / {float(t["attr_preserve"]):4.1f}')
+                cells.append('--' if t is None or t['id_sim'] == '' else f'{t["id_sim"]} / {float(t[RIGHT[4]]):4.1f}')
             if any(c != '--' for c in cells):
                 print(f'  {run_name:<18}' + ''.join(f'{c:>16}' for c in cells))
     print(f'\nsaved {path}')
