@@ -284,7 +284,7 @@ def main():
                              'edited attribute\'s own region (hair for Bangs, eyes for Eyeglasses, mouth for '
                              'Smiling, the head for Male/Young) left unchanged. bg: PSNR of everything outside face '
                              'and hair (background, clothing) vs the source reconstruction -- needs CSVs from '
-                             'scripts/editing_curves.py with --bg_metric (its default).')
+                             'scripts/editing_curves.py with --region_metric (its default).')
     parser.add_argument('--ylim_bg', nargs=2, type=float, default=None,
                         help='y range of the region (%%) or bg (dB) panel, the same for every attribute. '
                              'Default: the data range over all runs and attributes.')
@@ -323,14 +323,14 @@ def main():
                 if r['region_preserve'] == r['region_preserve']]
         if not vals:
             raise SystemExit('--right_panel region: no region_preserve in these CSVs; rerun '
-                             'scripts/editing_curves.py (--bg_metric is on by default)')
+                             'scripts/editing_curves.py (--region_metric is on by default)')
         args.ylim_attr = args.ylim_bg or [max(0.0, 5 * np.floor(min(vals) / 5) - 1), 100.0]
         right_tick = 5 if args.ylim_attr[1] - args.ylim_attr[0] <= 40 else 10
     if args.right_panel == 'bg':
         vals = [r['bg_psnr'] for rows in data_by_run.values() for r in rows if r['bg_psnr'] == r['bg_psnr']]
         if not vals:
             raise SystemExit('--right_panel bg: no bg_psnr in these CSVs; rerun scripts/editing_curves.py '
-                             '(--bg_metric is on by default in the current version)')
+                             '(--region_metric is on by default in the current version)')
         lo, hi = args.ylim_bg or (2 * np.floor(min(vals) / 2) - 1, 2 * np.ceil(max(vals) / 2) + 1)
         args.ylim_attr = [lo, hi]
         right_tick = 5 if hi - lo > 14 else 2

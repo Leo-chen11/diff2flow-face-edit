@@ -98,7 +98,7 @@ from models.dataset import SDFlowDataset
 
 CLEAR_LO, CLEAR_HI = 0.35, 0.65
 
-# --bg_metric "region_preserve": where each attribute is ALLOWED to change (BiSeNet classes:
+# --region_metric "region_preserve": where each attribute is ALLOWED to change (BiSeNet classes:
 # 1 skin, 2/3 brows, 4/5 eyes, 6 glasses, 10 nose, 11 mouth, 12/13 lips, 17 hair; the union
 # of the source's and the edit's region, dilated by the given pixels at 256 px). Everything
 # else -- the rest of the face, hair, ears, neck, background, clothes -- must stay as it was.
@@ -221,7 +221,7 @@ def main():
     p.add_argument('--scales', nargs='+', type=float, default=[0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
                    help='Edit strengths (alphas for --method linear).')
     p.add_argument('--preserve_set', default='edited', choices=['edited', 'all40'])
-    p.add_argument('--bg_metric', action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument('--region_metric', action=argparse.BooleanOptionalAction, default=True,
                    help='Region preservation (column region_preserve, plot with plot_strength_curves.py '
                         '--right_panel region): the share of pixels OUTSIDE the region the edited '
                         'attribute may change (EDIT_REGIONS: eyes/glasses for Eyeglasses, hair for Bangs, '
@@ -294,7 +294,7 @@ def main():
     loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
 
     bg_parser = None
-    if args.bg_metric:
+    if args.region_metric:
         if os.path.exists(args.face_parser_weights):
             from common.face_parser import FaceParser
             from common.region_stat_loss import dilate_mask
