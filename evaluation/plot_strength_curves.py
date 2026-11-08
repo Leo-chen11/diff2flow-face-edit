@@ -38,6 +38,7 @@ READ_AT = (40, 60, 80, 100)     # Editing Accuracy (%) every curve is read at, a
 # The right panel: (row key, multiplier, title, y label, table column)
 RIGHT_PANELS = {
     'attr': ('preserve_acc', 100.0, 'Attribute Preservation', 'Accuracy(%)', 'attr_preserve'),
+    'region': ('region_preserve', 100.0, 'Region Preservation', 'Unchanged(%)', 'region_preserve'),
     'bg':   ('bg_psnr', 1.0, 'Background Preservation', 'PSNR outside head (dB)', 'bg_psnr'),
 }
 RIGHT = RIGHT_PANELS['attr']
@@ -72,6 +73,7 @@ def read_summary(path):
                 'id_arc': float(row.get('id_arc') or 'nan'),
                 'preserve_acc': float(row['preserve_acc']),
                 'bg_psnr': float(row.get('bg_psnr') or 'nan'),
+                'region_preserve': float(row.get('region_preserve') or 'nan'),
             })
     return rows
 
@@ -278,12 +280,14 @@ def main():
                         help='Editing Accuracies (%%) the table reads every curve at, e.g. 60 80 90.')
     parser.add_argument('--right_panel', default='attr', choices=list(RIGHT_PANELS),
                         help='attr: Attribute Preservation (other CelebA attributes unchanged, the SDFlow '
-                             'paper\'s panel). bg: Background Preservation, PSNR of everything outside face '
+                             'paper\'s panel). region: Region Preservation, %% of the pixels outside the '
+                             'edited attribute\'s own region (hair for Bangs, eyes for Eyeglasses, mouth for '
+                             'Smiling, the head for Male/Young) left unchanged. bg: PSNR of everything outside face '
                              'and hair (background, clothing) vs the source reconstruction -- needs CSVs from '
                              'scripts/editing_curves.py with --bg_metric (its default).')
     parser.add_argument('--ylim_bg', nargs=2, type=float, default=None,
-                        help='y range (dB) of the bg panel, the same for every attribute. Default: the '
-                             'data range over all runs and attributes, rounded out to 2 dB.')
+                        help='y range of the region (%%) or bg (dB) panel, the same for every attribute. '
+                             'Default: the data range over all runs and attributes.')
     parser.add_argument('--no_markers', action='store_true',
                         help='Draw the curves without a dot per measured strength.')
     parser.add_argument('--sat_tol', type=float, default=SAT_TOL,
@@ -314,6 +318,14 @@ def main():
         raise SystemExit('No attributes found in the provided --run CSV files.')
 
     right_tick = 5
+    if args.right_panel == 'region':
+        vals = [r['region_preserve'] * 100 for rows in data_by_run.values() for r in rows
+                if r['region_preserve'] == r['region_preserve']]
+        if not vals:
+            raise SystemExit('--right_panel region: no region_preserve in these CSVs; rerun '
+                             'scripts/editing_curves.py (--bg_metric is on by default)')
+        args.ylim_attr = args.ylim_bg or [max(0.0, 5 * np.floor(min(vals) / 5) - 1), 100.0]
+        right_tick = 5 if args.ylim_attr[1] - args.ylim_attr[0] <= 40 else 10
     if args.right_panel == 'bg':
         vals = [r['bg_psnr'] for rows in data_by_run.values() for r in rows if r['bg_psnr'] == r['bg_psnr']]
         if not vals:
@@ -368,7 +380,7 @@ def main():
                               if ok else ''})
         attrs = attrs + ['Mean']
     path = os.path.join(args.output_dir, f'at_accuracy_{args.x_metric}_{args.id_metric}'
-                        + ('_bg' if args.right_panel == 'bg' else '') + '.csv')
+                        + ('' if args.right_panel == 'attr' else f'_{args.right_panel}') + '.csv')
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=['attribute', 'run', 'editing_accuracy', 'id_sim', RIGHT[4]])
         w.writeheader()
@@ -381,7 +393,8 @@ def main():
         print(f'\n{attr_name}' + (f' (each attribute read at the accuracy, then averaged: '
                                     f'{", ".join(common)})' if attr_name == 'Mean' else ''))
         print(f'  {"run":<18}' + ''.join(f'{"acc " + f"{q:g}":>16}' for q in points)
-              + ('     (ID / background dB)' if args.right_panel == 'bg' else '     (ID / preserve%)'))
+              + {'bg': '     (ID / background dB)', 'region': '     (ID / unchanged%)'}.get(
+                  args.right_panel, '     (ID / preserve%)'))
         for run_name in data_by_run:
             cells = []
             for q in points:

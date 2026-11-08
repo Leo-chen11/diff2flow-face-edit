@@ -98,6 +98,34 @@ from models.dataset import SDFlowDataset
 
 CLEAR_LO, CLEAR_HI = 0.35, 0.65
 
+# --bg_metric "region_preserve": where each attribute is ALLOWED to change (BiSeNet classes:
+# 1 skin, 2/3 brows, 4/5 eyes, 6 glasses, 10 nose, 11 mouth, 12/13 lips, 17 hair; the union
+# of the source's and the edit's region, dilated by the given pixels at 256 px). Everything
+# else -- the rest of the face, hair, ears, neck, background, clothes -- must stay as it was.
+# Male and Young change the whole head, so for them only the background/clothes count.
+_HEAD = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17]
+EDIT_REGIONS = {
+    15: ([2, 3, 4, 5, 6, 10], 8),      # Eyeglasses: eyes, brows, glasses, nose bridge
+    5:  ([17, 2, 3], 8),               # Bangs: hair and brows (the fringe covers the forehead,
+                                       # which the edit's own hair mask then includes)
+    31: ([11, 12, 13], 12),            # Smiling: mouth and lips
+    20: (_HEAD, 4),                    # Male: the head
+    39: (_HEAD, 4),                    # Young: the head
+}
+
+
+def parse_seg(parser, x256):
+    """BiSeNet label map (B, 256, 256) of [-1, 1] images, one network pass."""
+    import torch.nn.functional as F
+    inp = F.interpolate(x256, 512, mode='bilinear', align_corners=False)
+    inp = (inp * 0.5 + 0.5 - parser.mean) / parser.std
+    seg = parser.net(inp).argmax(dim=1, keepdim=True).float()
+    return F.interpolate(seg, (x256.shape[-2], x256.shape[-1]), mode='nearest')
+
+
+def class_mask(seg, classes):
+    return torch.isin(seg, torch.tensor(classes, device=seg.device, dtype=seg.dtype)).float()
+
 
 def name(g):
     return ATTR_NAMES.get(g, f'attr{g}')
@@ -194,11 +222,15 @@ def main():
                    help='Edit strengths (alphas for --method linear).')
     p.add_argument('--preserve_set', default='edited', choices=['edited', 'all40'])
     p.add_argument('--bg_metric', action=argparse.BooleanOptionalAction, default=True,
-                   help='Background preservation: PSNR (dB, higher = less changed) and MSE of the edit '
-                        'against the source reconstruction OUTSIDE the head -- everything the BiSeNet '
-                        'parser (--face_parser_weights) does not call face or hair in either image, '
-                        'dilated 4 px: background, clothing, necklace, hat. Columns bg_psnr, bg_mse; '
-                        'plot it with plot_strength_curves.py --right_panel bg.')
+                   help='Region preservation (column region_preserve, plot with plot_strength_curves.py '
+                        '--right_panel region): the share of pixels OUTSIDE the region the edited '
+                        'attribute may change (EDIT_REGIONS: eyes/glasses for Eyeglasses, hair for Bangs, '
+                        'mouth for Smiling, the whole head for Male/Young; BiSeNet parser, '
+                        '--face_parser_weights) that stay within --region_tol of the source '
+                        'reconstruction. Also bg_psnr / bg_mse outside the whole head.')
+    p.add_argument('--region_tol', type=float, default=10.0,
+                   help='A pixel counts as unchanged when no channel moved more than this many '
+                        '0-255 levels.')
     p.add_argument('--out_csv', default=None,
                    help='Default <checkpoint_dir>/curves_<method>_s<step>.csv (a .json beside it).')
     p.set_defaults(eval_resize='area')
@@ -264,7 +296,7 @@ def main():
     bg_parser = None
     if args.bg_metric:
         if os.path.exists(args.face_parser_weights):
-            from common.face_parser import FACE_CLASSES, FaceParser
+            from common.face_parser import FaceParser
             from common.region_stat_loss import dilate_mask
             bg_parser = FaceParser(weights_path=args.face_parser_weights).cuda().eval()
             print(f'[Metric] background preservation outside face+hair ({args.face_parser_weights})')
@@ -290,8 +322,7 @@ def main():
             sc_src = celeb_judge.scores(src_256)[:, :40] if celeb_judge is not None else None
             src_id = indep_id.extract(src_256)
             src_arc = arc.extract(src_256) if arc is not None else None
-            head_src = (bg_parser.get_region_mask(src_256, FACE_CLASSES, blur_sigma=0)
-                        if bg_parser is not None else None)
+            seg_src = parse_seg(bg_parser, src_256) if bg_parser is not None else None
             for g in attrs:
                 li = args.attribute_index.index(g)
                 d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
@@ -334,8 +365,18 @@ def main():
                     pres = same.float().sum(1) / clear_o.float().sum(1).clamp(min=1)
                     r = rec[(g, sc)]
                     if bg_parser is not None:
-                        _head = dilate_mask(torch.maximum(
-                            head_src, bg_parser.get_region_mask(f256, FACE_CLASSES, blur_sigma=0)), 4)
+                        seg_e = parse_seg(bg_parser, f256)
+                        _cls, _dil = EDIT_REGIONS.get(g, (_HEAD, 4))
+                        _allowed = dilate_mask(torch.maximum(class_mask(seg_src, _cls),
+                                                             class_mask(seg_e, _cls)), _dil)
+                        _keep_px = 1.0 - _allowed
+                        _same = ((f256 - src_256).abs().amax(1, keepdim=True)
+                                 <= args.region_tol / 127.5).float()
+                        _npx = _keep_px.sum((1, 2, 3))
+                        _rp = (_same * _keep_px).sum((1, 2, 3)) / _npx.clamp(min=1)
+                        r['region'] += _rp[keep & (_npx > 100)].tolist()
+                        _head = dilate_mask(torch.maximum(class_mask(seg_src, _HEAD),
+                                                          class_mask(seg_e, _HEAD)), 4)
                         _out = 1.0 - _head
                         _mse = (((f256 - src_256).pow(2) * _out).sum((1, 2, 3))
                                 / (_out.sum((1, 2, 3)) * 3).clamp(min=1e-6))
@@ -363,6 +404,7 @@ def main():
                          'id_arc': float(np.mean(r['id_arc'])) if r['id_arc'] else float('nan'),
                          'celeb_success': float(np.mean(r['celeb'])) if r['celeb'] else float('nan'),
                          'n_celeb': len(r['celeb']),
+                         'region_preserve': float(np.mean(r['region'])) if r['region'] else float('nan'),
                          'bg_psnr': float(np.mean(r['bg_psnr'])) if r['bg_psnr'] else float('nan'),
                          'bg_mse': float(np.mean(r['bg_mse'])) if r['bg_mse'] else float('nan')})
     for sc in args.scales:
@@ -371,17 +413,17 @@ def main():
             rows.append({'attribute': 'All', 'strength': sc,
                          **{k: float(np.mean([x[k] for x in per]))
                             for k in ('target_success', 'effective_success', 'id_sim_real', 'preserve_acc',
-                                      'celeb_success', 'id_arc', 'bg_psnr', 'bg_mse')},
+                                      'celeb_success', 'id_arc', 'region_preserve', 'bg_psnr', 'bg_mse')},
                          'n': sum(x['n'] for x in per), 'n_celeb': sum(x['n_celeb'] for x in per)})
 
     label = f'{args.method}'
     print(f'\n{label}, {seen} faces, preserve_set={args.preserve_set}')
     print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"r18Acc":>7} {"ArcFace":>8} {"facenet":>8} '
-          f'{"AttrPres":>9} {"BG dB":>7} {"n":>5}')
+          f'{"AttrPres":>9} {"Region":>7} {"n":>5}')
     for x in rows:
         print(f'  {x["attribute"]:<11} {x["strength"]:6.2f} {x["target_success"] * 100:7.1f}% '
               f'{x["celeb_success"] * 100:6.1f}% {x["id_arc"]:8.3f} {x["id_sim_real"]:8.3f} '
-              f'{x["preserve_acc"] * 100:8.1f}% {x["bg_psnr"]:7.2f} {x["n"]:5d}')
+              f'{x["preserve_acc"] * 100:8.1f}% {x["region_preserve"] * 100:6.1f}% {x["n"]:5d}')
 
     path = args.out_csv or os.path.join(args.checkpoint_dir, f'curves_{args.method}_s{args.step}.csv')
     with open(path, 'w', newline='') as f:
