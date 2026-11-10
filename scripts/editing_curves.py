@@ -221,6 +221,16 @@ def main():
     p.add_argument('--scales', nargs='+', type=float, default=[0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
                    help='Edit strengths (alphas for --method linear).')
     p.add_argument('--preserve_set', default='edited', choices=['edited', 'all40'])
+    p.add_argument('--consistent_reading', type=float, default=None, metavar='MARGIN',
+                   help='--method model only. Direction-consistent source reading: when the '
+                        'conditioner reads the source on the wrong side of 0.5 for the requested '
+                        'direction (asked to add an attribute it already reads as present, or the '
+                        'reverse), the flow encodes and targets with that reading moved to '
+                        '0.5 - MARGIN (add) / 0.5 + MARGIN (remove); sources read on the right side '
+                        'are edited exactly as before. Uses only the requested direction, no judge '
+                        'reading. scripts/edit_direction_audit.py protocol dc: at MARGIN 0.1 it '
+                        'lifted the misread Young sources from 35%% to 93%% R50 success, Male from '
+                        '50%% to 100%%. Off by default.')
     p.add_argument('--region_metric', action=argparse.BooleanOptionalAction, default=True,
                    help='Region preservation (column region_preserve, plot with plot_strength_curves.py '
                         '--right_panel region): the share of pixels OUTSIDE the region the edited '
@@ -347,7 +357,11 @@ def main():
                             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
                             li, sc, direction_bank, attr_global_idx=g,
                             bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-                            composite=False, direction=d)
+                            composite=False, direction=d,
+                            src_value=(None if args.consistent_reading is None else torch.where(
+                                d > 0, attr_cond[:, li].clamp(max=0.5 - args.consistent_reading),
+                                attr_cond[:, li].clamp(min=0.5 + args.consistent_reading))),
+                            src_value_in_encoding=args.consistent_reading is not None)
                     f256 = resize_for_judge(face, (256, 256))
                     ep = torch.sigmoid(indep_teacher(f256)[0])[:, :40]
                     ok = torch.where(sp[:, g] > 0.5, ep[:, g] < 0.5 - args.success_margin,
@@ -433,6 +447,7 @@ def main():
     with open(os.path.splitext(path)[0] + '.json', 'w') as f:
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'method': args.method,
                               'scales': args.scales, 'num_samples': seen, 'preserve_set': args.preserve_set,
+                              'consistent_reading': args.consistent_reading,
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None},
