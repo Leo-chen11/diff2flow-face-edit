@@ -11,10 +11,23 @@ and records, per face:
   cond_src    the conditioner's reading (what picks the direction in the eval)
   clear       r50_src outside 0.35-0.65
   agree       conditioner and R50 put the source on the same side of 0.5
-  per scale, for the cond direction (c_) and the R50 direction (r_):
+  t_src       the r34 TRAINING teacher's reading (--attribute_weights)
+  per scale and per protocol (--protocols):
+    c   direction and target from the conditioner          (= evaluate_sdflow, edit_direction cond)
+    r   direction from R50, target from the conditioner    (= editing_curves.py)
+    t   direction AND target value from the training teacher; the flow still
+        encodes the source under the conditioner's reading
+    te  as t, and the flow also ENCODES the source under the teacher's reading
+    o   direction and target from R50 itself: an ORACLE that uses the evaluation
+        judge, an upper bound for what a correct reading could give, not a method
+  with
     ok        R50 success, judged from R50's own reading of the source
     arc       ArcFace of edit vs source reconstruction
     lip, mk   Wearing_Lipstick / Heavy_Makeup flipped (source read clearly)
+
+t and te are fair: the teacher is the model training already uses, not a judge.
+If they recover the faces c / r leave untouched, the misses come from the
+conditioner's reading of the source, not from the flow's ability to edit.
 
 Run it once per checkpoint, then compare two runs:
 
@@ -22,6 +35,7 @@ Run it once per checkpoint, then compare two runs:
         --independent_attr_weights ./data/r50_celebahq_eval.pth --independent_attr_backbone r50 \\
         --attr 20 --scales 0.8 0.9 0.95 --num_samples 500 --out_csv output/audit/ctrl_male.csv
     python -m scripts.edit_direction_audit compare output/audit/ctrl_male.csv output/audit/eotny_male.csv
+    python -m scripts.edit_direction_audit compare output/audit/ctrl_male.csv     # one run: every protocol
 
 compare splits the faces into clear+agree / clear+disagree / ambiguous and gives, for
 each group, its share of faces and both runs' success, ArcFace and lipstick/makeup flips
@@ -41,20 +55,69 @@ CLEAR_LO, CLEAR_HI = 0.35, 0.65
 LIP, MAKEUP = 36, 18
 
 
+def load_rows(p):
+    rows = list(csv.DictReader(open(p)))
+    return {int(r['face']): r for r in rows}
+
+
+def group_of(r):
+    if r['clear'] != '1':
+        return 'ambiguous'
+    return 'clear+agree' if r['agree'] == '1' else 'clear+disagree'
+
+
+def fmean(rows, key):
+    v = [float(r[key]) for r in rows if r.get(key, '') not in ('', 'nan')]
+    return float(np.mean(v)) if v else float('nan')
+
+
+PROTO_LABEL = {'c': 'conditioner direction and target (as evaluate_sdflow --edit_direction cond)',
+               'r': 'R50 direction, conditioner target (as editing_curves.py)',
+               't': 'training-teacher direction and target (encode with the conditioner)',
+               'te': 'training-teacher direction and target, also in the encoding',
+               'o': 'ORACLE: R50 direction and target (uses the eval judge; upper bound, not a method)'}
+
+
+def report(path):
+    A = load_rows(path)
+    faces = sorted(A)
+    keys = next(iter(A.values())).keys()
+    protos = [p for p in PROTO_LABEL if any(k.startswith(p + '_ok@') for k in keys)]
+    scales = sorted({k.split('@')[1] for k in keys if '@' in k}, key=float)
+    groups = defaultdict(list)
+    for f in faces:
+        groups[group_of(A[f])].append(f)
+    print(f'{os.path.basename(path)}: {len(faces)} faces')
+    print('  share: ' + ', '.join(f'{g} {len(groups[g]) / len(faces):.1%}'
+                                  for g in ('clear+agree', 'clear+disagree', 'ambiguous')))
+    if 't_src' in keys:
+        clear = [A[f] for f in faces if A[f]['clear'] == '1']
+        t_agree = np.mean([(float(r['t_src']) > 0.5) == (float(r['r50_src']) > 0.5) for r in clear])
+        c_agree = np.mean([r['agree'] == '1' for r in clear])
+        print(f'  on R50-clear faces, agreement with R50: conditioner {c_agree:.1%}, training teacher {t_agree:.1%}')
+    for sc in scales:
+        print(f'\n  scale {sc}   (ok = R50 success %, arc = ArcFace)')
+        print(f'    {"protocol":<9}' + ''.join(f'{g:>22}' for g in ('clear+agree', 'clear+disagree', 'ambiguous', 'all')))
+        for p in protos:
+            cells = []
+            for g in ('clear+agree', 'clear+disagree', 'ambiguous', 'all'):
+                rows = [A[f] for f in (faces if g == 'all' else groups[g])]
+                ok, arc = fmean(rows, f'{p}_ok@{sc}'), fmean(rows, f'{p}_arc@{sc}')
+                cells.append(f'{ok * 100:5.1f}% / {arc:.3f}' if rows else '--')
+            print(f'    {p:<9}' + ''.join(f'{c:>22}' for c in cells))
+    print('\n  protocols: ' + '; '.join(f'{p} = {PROTO_LABEL[p]}' for p in protos))
+    print('  If t / te lift clear+disagree toward clear+agree, the misses are the conditioner\'s reading of\n'
+          '  the source; o bounds what any correct reading can recover.')
+
+
 def compare(path_a, path_b):
-    def load(p):
-        rows = list(csv.DictReader(open(p)))
-        return {int(r['face']): r for r in rows}
-    A, B = load(path_a), load(path_b)
+    A, B = load_rows(path_a), load_rows(path_b)
     faces = sorted(set(A) & set(B))
     scales = sorted({k.split('@')[1] for k in next(iter(A.values())) if '@' in k}, key=float)
     na, nb = os.path.basename(path_a), os.path.basename(path_b)
     print(f'{len(faces)} faces in both ({na}: {len(A)}, {nb}: {len(B)})')
 
-    def group(r):
-        if r['clear'] != '1':
-            return 'ambiguous'
-        return 'clear+agree' if r['agree'] == '1' else 'clear+disagree'
+    group = group_of
     # the group is a property of the SOURCE face under each run's conditioner; take run A's
     # R50 reading (identical in both: same reconstruction, same judge) and report both runs'
     # agreement separately
@@ -69,8 +132,8 @@ def compare(path_a, path_b):
         v = [float(r[key]) for r in rows if r.get(key, '') not in ('', 'nan')]
         return (float(np.mean(v)), len(v)) if v else (float('nan'), 0)
 
-    for proto, label in (('c', 'conditioner direction (as evaluate_sdflow --edit_direction cond)'),
-                         ('r', 'R50 direction (as editing_curves.py)')):
+    keys = next(iter(A.values())).keys()
+    for proto, label in [(p, l) for p, l in PROTO_LABEL.items() if any(k.startswith(p + '_ok@') for k in keys)]:
         print(f'\n=== {label}')
         for sc in scales:
             print(f'  scale {sc}')
@@ -110,6 +173,8 @@ def run():
     p.add_argument('--attr', type=int, default=20, help='CelebA id of the edited attribute.')
     p.add_argument('--scales', nargs='+', type=float, default=[0.8, 0.9, 0.95])
     p.add_argument('--arcface_weights', default='./data/model_ir_se50.pth')
+    p.add_argument('--protocols', nargs='+', default=['c', 'r', 't', 'te', 'o'],
+                   choices=list(PROTO_LABEL), help='Which ways of setting direction and target to run.')
     p.add_argument('--out_csv', required=True)
     p.set_defaults(eval_resize='area')
     args = p.parse_args()
@@ -122,7 +187,7 @@ def run():
     if args.attr not in args.attribute_index:
         raise SystemExit(f'--attr {args.attr} is not an edited attribute of this run ({args.attribute_index})')
 
-    prior, conditioner, G, id_criterion, _, _, direction_bank = load_models(args)
+    prior, conditioner, G, id_criterion, attr_teacher, _, direction_bank = load_models(args)
     _, _, _, r50, _, _ = build_optional_judges(args, args.attribute_index, id_criterion)
     arc = ArcFaceJudge(args.arcface_weights)
     g, li = args.attr, args.attribute_index.index(args.attr)
@@ -147,20 +212,28 @@ def run():
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             s256 = resize_for_judge(src, (256, 256))
             sp = torch.sigmoid(r50(s256)[0])[:, :40]
+            tp = torch.sigmoid(attr_teacher(s256)[0])[:, :40]
             s_arc = arc.extract(s256)
             cond_src = attr_cond[:, li]
             d_r50 = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
+            d_t = torch.where(tp[:, g] > 0.5, -1.0, 1.0)
+            # protocol -> (direction, source value for the target, also in the encoding)
+            setups = {'c': (None, None, False), 'r': (d_r50, None, False),
+                      't': (d_t, tp[:, g], False), 'te': (d_t, tp[:, g], True),
+                      'o': (d_r50, sp[:, g], False)}
             B = img.size(0)
             recs = [{'face': seen + b, 'r50_src': float(sp[b, g]), 'cond_src': float(cond_src[b]),
+                     't_src': float(tp[b, g]),
                      'clear': int((sp[b, g] > CLEAR_HI) or (sp[b, g] < CLEAR_LO)),
                      'agree': int((sp[b, g] > 0.5) == (cond_src[b] > 0.5))} for b in range(B)]
             for sc in args.scales:
-                for proto, d in (('c', None), ('r', d_r50)):
+                for proto in args.protocols:
+                    d, sv, enc = setups[proto]
                     face = edit_single_attribute(
                         prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond,
                         li, sc, direction_bank, attr_global_idx=g,
                         bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-                        composite=False, direction=d)
+                        composite=False, direction=d, src_value=sv, src_value_in_encoding=enc)
                     f256 = resize_for_judge(face, (256, 256))
                     ep = torch.sigmoid(r50(f256)[0])[:, :40]
                     ok = torch.where(sp[:, g] > 0.5, ep[:, g] < 0.5, ep[:, g] > 0.5)
@@ -187,8 +260,11 @@ def run():
 
 if __name__ == '__main__':
     if len(sys.argv) >= 2 and sys.argv[1] == 'compare':
-        if len(sys.argv) != 4:
-            raise SystemExit('usage: python -m scripts.edit_direction_audit compare <run A csv> <run B csv>')
-        compare(sys.argv[2], sys.argv[3])
+        if len(sys.argv) == 3:
+            report(sys.argv[2])
+        elif len(sys.argv) == 4:
+            compare(sys.argv[2], sys.argv[3])
+        else:
+            raise SystemExit('usage: python -m scripts.edit_direction_audit compare <run csv> [<run B csv>]')
     else:
         run()

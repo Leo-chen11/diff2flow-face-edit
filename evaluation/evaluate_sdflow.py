@@ -1259,9 +1259,17 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
                           attr_local_idx, edit_scale, direction_bank=None,
                           attr_global_idx=None, bypass_glasses_direction_bank=False,
                           face_parser=None, composite_method='alpha', composite_blur_sigma=15,
-                          composite=True, direction=None):
+                          composite=True, direction=None, src_value=None, src_value_in_encoding=False):
     """
     direction: optional (B,) tensor, +1 = add the attribute, -1 = remove it.
+
+    src_value: optional (B,) reading of the edited attribute on the source, used
+    INSTEAD of the conditioner's attr_cond[:, attr_local_idx] to compute the target
+    value (scripts/edit_direction_audit.py: does a correct reading of the source fix
+    the edits the conditioner's misreading leaves untouched?). With
+    src_value_in_encoding the flow also ENCODES the source under that reading
+    (attr_cond's entry replaced before the forward pass), not only decodes toward
+    the target computed from it. None (default): unchanged behaviour.
     None (default) = the old behaviour: the direction follows the
     conditioner's own reading of the source (src > 0.5 -> remove). See
     --edit_direction.
@@ -1295,11 +1303,14 @@ def edit_single_attribute(prior, conditioner, G, id_criterion,
             src_recon = G([latent], input_is_latent=True,
                           randomize_noise=False)[0].clamp(-1, 1)
 
+    if src_value is not None and src_value_in_encoding:
+        attr_cond = attr_cond.clone()
+        attr_cond[:, attr_local_idx] = src_value.to(attr_cond.dtype)
     src_cond = torch.cat([id_cond, attr_cond], dim=1)
     mid_latent, _ = prior(latent, src_cond, zero_pad)
 
     new_attr_cond = attr_cond.clone()
-    src = attr_cond[:, attr_local_idx]
+    src = attr_cond[:, attr_local_idx] if src_value is None else src_value.to(attr_cond.dtype)
     new_attr_cond[:, attr_local_idx] = edited_attr_value(src, edit_scale, attr_global_idx,
                                                          direction=direction)
     new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
