@@ -168,7 +168,8 @@ def smooth_line(x, y, n=200):
 
 
 def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102), id_key='id_arc',
-                   ylim_id=(0.2, 1.02), ylim_attr=(70, 100), smooth=True, markers=True, right_tick=5):
+                   ylim_id=(0.2, 1.02), ylim_attr=(70, 100), smooth=True, markers=True, right_tick=5,
+                   markers_at=None):
     """Two panels in the layout of the SDFlow paper's Fig. 4: Identity Preservation
     (cosine similarity) and Attribute Preservation (accuracy) against Editing
     Accuracy; legend in the lower left of the left panel. Writes .png and .pdf."""
@@ -191,6 +192,25 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
         edit_acc = [r[x_metric] * 100.0 for r in attr_rows]
         id_sim = [r[id_key] for r in attr_rows]
         attr_pres = [r[RIGHT[0]] * RIGHT[1] for r in attr_rows]
+
+        if markers_at:
+            # Dots at the SAME editing accuracies for every method, read off the drawn
+            # curve (never extrapolated): the measured strengths sit at different
+            # accuracies per method, which makes their dots hard to compare.
+            if smooth:
+                xs, ys_id = smooth_line(edit_acc, id_sim)
+                _, ys_at = smooth_line(edit_acc, attr_pres)
+            else:
+                xs, ys_id, ys_at = edit_acc, id_sim, attr_pres
+            xs, ys_id, ys_at = np.asarray(xs), np.asarray(ys_id), np.asarray(ys_at)
+            axes[0].plot(xs, ys_id, linewidth=1.6, color=colors[run_name])
+            axes[1].plot(xs, ys_at, linewidth=1.6, color=colors[run_name])
+            qs = [q for q in markers_at if xs.min() - 1e-9 <= q <= xs.max() + 1e-9]
+            if qs:
+                dots = dict(marker='o', markersize=5.5, linestyle='none', color=colors[run_name])
+                axes[0].plot(qs, np.interp(qs, xs, ys_id), **dots)
+                axes[1].plot(qs, np.interp(qs, xs, ys_at), **dots)
+            continue
 
         style = dict(marker='o' if markers else None, markersize=5.5, linewidth=1.6,
                      color=colors[run_name], label=run_name)
@@ -230,7 +250,7 @@ def plot_attribute(attr_name, data_by_run, x_metric, output_dir, xlim=(30, 102),
     axes[0].set_ylabel('Cosine Similarity')
     axes[0].set_title('Identity Preservation')
     from matplotlib.lines import Line2D
-    handles = [Line2D([0], [0], color=colors[n], linewidth=1.6, marker='o' if markers else None,
+    handles = [Line2D([0], [0], color=colors[n], linewidth=1.6, marker='o' if (markers or markers_at) else None,
                       markersize=5.5, label=n)
                for n, rows in data_by_run.items() if any(r['attribute'] == attr_name for r in rows)]
     axes[0].legend(handles=handles, loc='lower left', fontsize=8.5)
@@ -288,6 +308,11 @@ def main():
     parser.add_argument('--ylim_bg', nargs=2, type=float, default=None,
                         help='y range of the region (%%) or bg (dB) panel, the same for every attribute. '
                              'Default: the data range over all runs and attributes.')
+    parser.add_argument('--markers_at', nargs='+', type=float, default=None,
+                        help='Put the dots at these editing accuracies (%%) for EVERY method, read off its '
+                             'drawn curve (not extrapolated: a curve that does not reach a value has no dot '
+                             'there), instead of at its measured strengths. Captions should then say the '
+                             'dots are read off the curves. e.g. --markers_at 40 50 60 70 80 90')
     parser.add_argument('--no_markers', action='store_true',
                         help='Draw the curves without a dot per measured strength.')
     parser.add_argument('--sat_tol', type=float, default=SAT_TOL,
@@ -341,6 +366,7 @@ def main():
                                   ylim_id=tuple(args.ylim_id) if args.ylim_id else None,
                                   ylim_attr=tuple(args.ylim_attr) if args.ylim_attr else None,
                                   smooth=not args.no_smooth, markers=not args.no_markers,
+                                  markers_at=args.markers_at,
                                   right_tick=right_tick)
         if out_path:
             written.append(out_path)
