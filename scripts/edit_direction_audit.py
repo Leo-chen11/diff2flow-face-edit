@@ -18,8 +18,10 @@ and records, per face:
     t   direction AND target value from the training teacher; the flow still
         encodes the source under the conditioner's reading
     te  as t, and the flow also ENCODES the source under the teacher's reading
-    o   direction and target from R50 itself: an ORACLE that uses the evaluation
-        judge, an upper bound for what a correct reading could give, not a method
+    o   direction and target from R50 itself, the flow still encoding under the
+        conditioner's reading (ORACLE: uses the evaluation judge, not a method)
+    oe  as o, and the flow also ENCODES under R50's reading: the upper bound for
+        what a correct reading of the source could give
   with
     ok        R50 success, judged from R50's own reading of the source
     arc       ArcFace of edit vs source reconstruction
@@ -75,7 +77,8 @@ PROTO_LABEL = {'c': 'conditioner direction and target (as evaluate_sdflow --edit
                'r': 'R50 direction, conditioner target (as editing_curves.py)',
                't': 'training-teacher direction and target (encode with the conditioner)',
                'te': 'training-teacher direction and target, also in the encoding',
-               'o': 'ORACLE: R50 direction and target (uses the eval judge; upper bound, not a method)'}
+               'o': 'ORACLE: R50 direction and target, encoding unchanged (uses the eval judge; not a method)',
+               'oe': 'ORACLE: R50 direction and target, also in the encoding (upper bound, not a method)'}
 
 
 def report(path):
@@ -95,6 +98,11 @@ def report(path):
         t_agree = np.mean([(float(r['t_src']) > 0.5) == (float(r['r50_src']) > 0.5) for r in clear])
         c_agree = np.mean([r['agree'] == '1' for r in clear])
         print(f'  on R50-clear faces, agreement with R50: conditioner {c_agree:.1%}, training teacher {t_agree:.1%}')
+        dis = [A[f] for f in groups['clear+disagree']]
+        if dis:
+            tc = np.mean([(float(r['t_src']) > 0.5) == (float(r['cond_src']) > 0.5) for r in dis])
+            print(f'  on clear+disagree faces the training teacher sides with the conditioner on {tc:.1%} '
+                  f'(high = R50 is the odd one out on these faces, not the model)')
     for sc in scales:
         print(f'\n  scale {sc}   (ok = R50 success %, arc = ArcFace)')
         print(f'    {"protocol":<9}' + ''.join(f'{g:>22}' for g in ('clear+agree', 'clear+disagree', 'ambiguous', 'all')))
@@ -173,7 +181,7 @@ def run():
     p.add_argument('--attr', type=int, default=20, help='CelebA id of the edited attribute.')
     p.add_argument('--scales', nargs='+', type=float, default=[0.8, 0.9, 0.95])
     p.add_argument('--arcface_weights', default='./data/model_ir_se50.pth')
-    p.add_argument('--protocols', nargs='+', default=['c', 'r', 't', 'te', 'o'],
+    p.add_argument('--protocols', nargs='+', default=['c', 'r', 't', 'te', 'o', 'oe'],
                    choices=list(PROTO_LABEL), help='Which ways of setting direction and target to run.')
     p.add_argument('--out_csv', required=True)
     p.set_defaults(eval_resize='area')
@@ -220,7 +228,7 @@ def run():
             # protocol -> (direction, source value for the target, also in the encoding)
             setups = {'c': (None, None, False), 'r': (d_r50, None, False),
                       't': (d_t, tp[:, g], False), 'te': (d_t, tp[:, g], True),
-                      'o': (d_r50, sp[:, g], False)}
+                      'o': (d_r50, sp[:, g], False), 'oe': (d_r50, sp[:, g], True)}
             B = img.size(0)
             recs = [{'face': seen + b, 'r50_src': float(sp[b, g]), 'cond_src': float(cond_src[b]),
                      't_src': float(tp[b, g]),
