@@ -22,6 +22,11 @@ and records, per face:
         conditioner's reading (ORACLE: uses the evaluation judge, not a method)
     oe  as o, and the flow also ENCODES under R50's reading: the upper bound for
         what a correct reading of the source could give
+    dc  direction from R50 (the stand-in for what a user asks for, as every method
+        gets in editing_curves.py); the conditioner's own reading is kept unless it
+        sits on the wrong side for that request, then it is moved to 0.5 -/+
+        --dc_margin, in the encoding and the target. Uses no judge's reading: a
+        candidate inference rule, not an oracle
   with
     ok        R50 success, judged from R50's own reading of the source
     arc       ArcFace of edit vs source reconstruction
@@ -78,7 +83,9 @@ PROTO_LABEL = {'c': 'conditioner direction and target (as evaluate_sdflow --edit
                't': 'training-teacher direction and target (encode with the conditioner)',
                'te': 'training-teacher direction and target, also in the encoding',
                'o': 'ORACLE: R50 direction and target, encoding unchanged (uses the eval judge; not a method)',
-               'oe': 'ORACLE: R50 direction and target, also in the encoding (upper bound, not a method)'}
+               'oe': 'ORACLE: R50 direction and target, also in the encoding (upper bound, not a method)',
+               'dc': 'R50 direction; the conditioner reading moved to the requested side (--dc_margin), '
+                     'in the encoding and the target'}
 
 
 def report(path):
@@ -181,6 +188,10 @@ def run():
     p.add_argument('--attr', type=int, default=20, help='CelebA id of the edited attribute.')
     p.add_argument('--scales', nargs='+', type=float, default=[0.8, 0.9, 0.95])
     p.add_argument('--arcface_weights', default='./data/model_ir_se50.pth')
+    p.add_argument('--dc_margin', type=float, default=0.1,
+                   help='Protocol dc: how far past 0.5, on the side the requested direction starts '
+                        'from, the conditioner reading of the source is put when it was on the other '
+                        'side (0.1: a face asked to become young is read as at most 0.4 young).')
     p.add_argument('--protocols', nargs='+', default=['c', 'r', 't', 'te', 'o', 'oe'],
                    choices=list(PROTO_LABEL), help='Which ways of setting direction and target to run.')
     p.add_argument('--out_csv', required=True)
@@ -228,7 +239,12 @@ def run():
             # protocol -> (direction, source value for the target, also in the encoding)
             setups = {'c': (None, None, False), 'r': (d_r50, None, False),
                       't': (d_t, tp[:, g], False), 'te': (d_t, tp[:, g], True),
-                      'o': (d_r50, sp[:, g], False), 'oe': (d_r50, sp[:, g], True)}
+                      'o': (d_r50, sp[:, g], False), 'oe': (d_r50, sp[:, g], True),
+                      # direction-consistent reading: a source asked to GAIN the attribute is
+                      # read as at most 0.5 - margin, one asked to LOSE it as at least
+                      # 0.5 + margin; sources already on that side keep their own reading
+                      'dc': (d_r50, torch.where(d_r50 > 0, cond_src.clamp(max=0.5 - args.dc_margin),
+                                                cond_src.clamp(min=0.5 + args.dc_margin)), True)}
             B = img.size(0)
             recs = [{'face': seen + b, 'r50_src': float(sp[b, g]), 'cond_src': float(cond_src[b]),
                      't_src': float(tp[b, g]),
