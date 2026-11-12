@@ -38,6 +38,13 @@ fidelity metrics give for doing nothing.
         --method_spec "SDFlow:sdflow:output/curves/sdflow.csv" \\
         --method_spec "Ours:model:output/curves/ours.csv"
 
+Kinds: model (the checkpoint), boundary (InterFaceGAN), linear (the bank's mean direction),
+sdflow (the released checkpoint), lt and styleflow (the baselines retrained by
+scripts/train_baselines.py; --lt_dir / --styleflow_ckpt), noedit.
+
+--sample_offset N skips the first N test faces (the first 500 are the development set); give
+the same value to scripts/editing_curves.py so the strengths are picked on the same faces.
+
 A method whose curve does not reach the target for an attribute gets "--" there.
 """
 import csv
@@ -82,7 +89,7 @@ METRICS = [
 ]
 PAPER_COLUMNS = ['acc', 'id', 'ssim', 'lpips', 'fid', 'clip_d']
 PER_FACE = ('acc', 'acc_celeb', 'id', 'ssim', 'lpips', 'pres', 'clip', 'clip_d')
-KINDS = ('model', 'boundary', 'linear', 'sdflow', 'noedit')
+KINDS = ('model', 'boundary', 'linear', 'sdflow', 'lt', 'styleflow', 'noedit')
 
 
 def name(g):
@@ -300,7 +307,7 @@ def parse_specs(raw):
 def main(argv=None):
     p = build_parser()
     p.add_argument('--method_spec', action='append', required=True, metavar='NAME:KIND[:CSV]',
-                   help='A method: its name in the table, its kind (model, boundary, linear, sdflow, noedit) '
+                   help='A method: its name in the table, its kind (model, boundary, linear, sdflow, lt, styleflow, noedit) '
                         'and the curves CSV from scripts/editing_curves.py whose accuracy-vs-strength '
                         'curve picks its strength. Repeatable; order = row order.')
     p.add_argument('--target_acc', nargs='+', type=float, default=[80.0],
@@ -313,6 +320,10 @@ def main(argv=None):
     p.add_argument('--sdflow_ckpt_dir', default='./data/ckpt')
     p.add_argument('--sdflow_step', type=int, default=10000)
     p.add_argument('--sdflow_attrs', nargs='+', type=int, default=[15, 20, 39])
+    p.add_argument('--lt_dir', default='./output/baselines/lt',
+                   help='kind lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
+    p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
+                   help='kind styleflow: scripts/train_baselines.py styleflow output.')
     p.add_argument('--no_fid', action='store_true', help='Skip FID / KID (needs torchmetrics + torch-fidelity).')
     p.add_argument('--out_dir', default='./output/comparison')
     p.set_defaults(eval_resize='area', num_samples=1000)
@@ -342,14 +353,38 @@ def main(argv=None):
     if missing:
         raise SystemExit(f'--only_attrs {missing} are not edited attributes of {args.checkpoint_dir}')
     sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs) if 'sdflow' in kinds else None
+    # the retrained baselines, loaded as scripts/editing_curves.py does
+    lt_nets, sflow, sflow_attrs = {}, None, []
+    if 'lt' in kinds:
+        from models.baselines import LatentTransformer
+        for a in attrs:
+            path = os.path.join(args.lt_dir, f'tnet_{a}.pth')
+            if not os.path.exists(path):
+                raise SystemExit(f'no {path}: run python -m scripts.train_baselines lt --out {args.lt_dir}')
+            lt_nets[a] = LatentTransformer().cuda().eval()
+            lt_nets[a].load_state_dict(torch.load(path, map_location='cpu'))
+    if 'styleflow' in kinds:
+        from models.baselines import styleflow_cnf, styleflow_edit
+        ck = torch.load(args.styleflow_ckpt, map_location='cpu')
+        bad = [a for a in attrs if a not in ck['attrs']]
+        if bad:
+            raise SystemExit(f'{args.styleflow_ckpt} was trained on {ck["attrs"]}, not {bad}')
+        sflow = styleflow_cnf(len(ck['attrs'])).cuda().eval()
+        sflow.load_state_dict(ck['state_dict'])
+        sflow_attrs = list(ck['attrs'])
+        print(f'[StyleFlow] {args.styleflow_ckpt} step {ck["step"]}, attributes {sflow_attrs}')
 
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=args.index_file, image_root=args.image_root, latents_file=args.latent_file,
                        preds_file=args.preds_file, train=False, transform=tf)
     lin = linear_directions(args.direction_bank_path, attrs) if 'linear' in kinds else None
     bnd = boundary_directions(args.boundaries, attrs, ds) if 'boundary' in kinds else None
-    loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
-    N = min(args.num_samples, len(ds))
+    # --sample_offset (evaluate_sdflow.py's flag): skip the development faces. The curves CSVs
+    # that pick the strengths should come from the same faces (editing_curves.py --sample_offset).
+    eval_ds = data.Subset(ds, range(args.sample_offset, len(ds))) if args.sample_offset else ds
+    print(f'Test set: {len(eval_ds)} faces (offset {args.sample_offset})')
+    loader = data.DataLoader(eval_ds, shuffle=False, batch_size=args.batch, num_workers=4)
+    N = min(args.num_samples, len(eval_ds))
 
     # the operating point of every (target, method, attribute)
     strength = {}
@@ -365,11 +400,17 @@ def main(argv=None):
                 f'{name(g)} ' + ('--' if strength[(t, s["name"], g)] is None else f'{strength[(t, s["name"], g)]:.3f}')
                 for g in attrs))
 
-    def edit(kind, img, latent, src, attr_cond, id_cond, g, li, d, sc):
+    def edit(kind, img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond=None):
         if kind == 'noedit':
             return src
         if kind == 'sdflow':
             return sdf.edit(G, img, latent, g, d, sc)
+        if kind == 'lt':
+            new_lat = lt_nets[g].edit(latent, d * sc)
+            return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+        if kind == 'styleflow':
+            new_lat = styleflow_edit(sflow, latent, sf_cond, sflow_attrs.index(g), d, sc, attr=g)
+            return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         if kind in ('linear', 'boundary'):
             dirs = lin if kind == 'linear' else bnd
             new_lat = latent + (d * sc).view(-1, 1, 1) * dirs[g].to(latent)
@@ -384,11 +425,17 @@ def main(argv=None):
     src_feats = defaultdict(list)               # g -> unedited features of the kept faces
     seen = 0
     with torch.no_grad():
-        for img, latent, _ in tqdm(loader, desc='comparison'):
+        for img, latent, pred in tqdm(loader, desc='comparison'):
             if seen >= N:
                 break
             take = min(img.size(0), N - seen)
             img, latent = img[:take].cuda(), latent[:take].cuda()
+            sf_cond = None
+            if sflow is not None:      # StyleFlow's condition: the r34 readings it was trained on
+                pred = pred[:take].float().reshape(take, -1)[:, :40].cuda()
+                if pred.min() < 0 or pred.max() > 1:
+                    pred = torch.sigmoid(pred)
+                sf_cond = pred[:, sflow_attrs]
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             src_256 = resize_for_judge(src, (256, 256))
@@ -415,7 +462,7 @@ def main(argv=None):
                         sc = strength[(t, s['name'], g)]
                         if sc is None:
                             continue
-                        face = edit(s['kind'], img, latent, src, attr_cond, id_cond, g, li, d, sc)
+                        face = edit(s['kind'], img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond)
                         f256 = resize_for_judge(face, (256, 256))
                         ep = torch.sigmoid(indep_teacher(f256)[0])[:, :40]
                         vals = {
@@ -480,6 +527,7 @@ def main(argv=None):
         all_out[tag] = {m: {name(g): v for g, v in d.items()} for m, d in res.items()}
     with open(os.path.join(args.out_dir, 'comparison.json'), 'w') as f:
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'num_faces': seen,
+                              'sample_offset': args.sample_offset,
                               'target_acc': args.target_acc, 'match_metric': args.match_metric,
                               'attributes': [name(a) for a in attrs], 'eval_resize': args.eval_resize,
                               'id_model': 'ArcFace IR-SE50' if arc is not None else 'facenet casia-webface',

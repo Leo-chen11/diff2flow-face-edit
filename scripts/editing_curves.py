@@ -64,6 +64,10 @@ The absolute numbers depend on the judges (R50, facenet), so only curves made
 by this script are comparable with each other; the paper's values used other
 models and cannot be overlaid.
 
+--sample_offset N (evaluate_sdflow.py's flag) skips the first N test faces: the first 500
+are the development set, so the numbers that go in the paper use --sample_offset 500 for
+every method. The default CSV name then ends in _off<N>.
+
 Usage:
     python -m scripts.editing_curves \
         --checkpoint_dir ./output/SDFlow/multi_v1_cont20k_ctrl --step 100000 \
@@ -301,7 +305,11 @@ def main():
                        train=False, transform=tf)
     lin = linear_directions(args.direction_bank_path, attrs) if args.method == 'linear' \
         else boundary_directions(args.boundaries, attrs, ds) if args.method == 'boundary' else None
-    loader = data.DataLoader(ds, shuffle=False, batch_size=args.batch, num_workers=4)
+    # --sample_offset (evaluate_sdflow.py's flag, same test order): skip the development faces.
+    # boundary_directions above reads ds itself, so only the loader is offset.
+    eval_ds = data.Subset(ds, range(args.sample_offset, len(ds))) if args.sample_offset else ds
+    print(f'Test set: {len(eval_ds)} faces (offset {args.sample_offset})')
+    loader = data.DataLoader(eval_ds, shuffle=False, batch_size=args.batch, num_workers=4)
 
     bg_parser = None
     if args.region_metric:
@@ -439,14 +447,17 @@ def main():
               f'{x["celeb_success"] * 100:6.1f}% {x["id_arc"]:8.3f} {x["id_sim_real"]:8.3f} '
               f'{x["preserve_acc"] * 100:8.1f}% {x["region_preserve"] * 100:6.1f}% {x["n"]:5d}')
 
-    path = args.out_csv or os.path.join(args.checkpoint_dir, f'curves_{args.method}_s{args.step}.csv')
+    path = args.out_csv or os.path.join(
+        args.checkpoint_dir,
+        f'curves_{args.method}_s{args.step}' + (f'_off{args.sample_offset}' if args.sample_offset else '') + '.csv')
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
     with open(os.path.splitext(path)[0] + '.json', 'w') as f:
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'method': args.method,
-                              'scales': args.scales, 'num_samples': seen, 'preserve_set': args.preserve_set,
+                              'scales': args.scales, 'num_samples': seen, 'sample_offset': args.sample_offset,
+                              'preserve_set': args.preserve_set,
                               'consistent_reading': args.consistent_reading,
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
