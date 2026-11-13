@@ -174,12 +174,20 @@ class OfficialSDFlow:
     """models/editor.py of the released SDFlow, with the edit direction given. Its flow has the
     same parameter names and shapes as this repo's cnf(512, '512-512-512-512-512', n_attrs, 1),
     so its checkpoint loads strictly; the condition is the attribute estimator's reading only
-    (no identity vector)."""
+    (no identity vector).
 
-    def __init__(self, ckpt_dir, step, attrs, device='cuda'):
+    img_size: the resolution its attribute estimator reads the face at. The released code
+    trains and edits at 256 (train_sdflow.py --img_size default 256; its notebook passes
+    F.interpolate(face, (256, 256)) to the editor), while this repo's loader gives the run's
+    --img_size (512): fed as it is, the estimator read every face at twice the scale it was
+    trained on, and that reading is the condition the flow encodes the source under. 0 / None
+    feeds the loader's image unchanged (how the baseline was run before)."""
+
+    def __init__(self, ckpt_dir, step, attrs, device='cuda', img_size=256):
         from models.attribute_estimator import AttributeEstimator
         from models.flows.flow import cnf
         self.attrs = list(attrs)
+        self.img_size = int(img_size or 0)
         self.labeldist = AttributeEstimator(backbone='resnet34', attribute_dim=len(self.attrs)).to(device)
         self.flow = cnf(512, '512-512-512-512-512', len(self.attrs), 1).to(device)
         for module, stem in ((self.labeldist, 'labeldist'), (self.flow, 'prior')):
@@ -189,10 +197,15 @@ class OfficialSDFlow:
                                  f' -- pass the right --sdflow_ckpt_dir / --sdflow_step')
             module.load_state_dict(torch.load(path, map_location='cpu'), strict=True)
             module.eval()
-        print(f'[SDFlow] released checkpoint {ckpt_dir} step {step}, attributes {self.attrs}')
+        print(f'[SDFlow] released checkpoint {ckpt_dir} step {step}, attributes {self.attrs}, '
+              f'estimator input ' + (f'{self.img_size} px' if self.img_size else 'as loaded (no resize)'))
 
     @torch.no_grad()
     def edit(self, G, img, latent, g, direction, scale):
+        if self.img_size and img.shape[-1] != self.img_size:
+            # bilinear, as the released loader's T.Resize; at exactly half size it is a 2x2 average
+            img = torch.nn.functional.interpolate(img, (self.img_size, self.img_size), mode='bilinear',
+                                                  align_corners=False)
         reading = self.labeldist(img, latent)
         z = self.flow(latent, reading, torch.zeros(latent.size(0), latent.size(1), 1).to(latent))[0]
         new = reading.clone()
@@ -214,6 +227,11 @@ def main():
     p.add_argument('--sdflow_step', type=int, default=10000)
     p.add_argument('--sdflow_attrs', nargs='+', type=int, default=[15, 20, 39],
                    help='CelebA ids the released SDFlow checkpoint was trained on.')
+    p.add_argument('--sdflow_img_size', type=int, default=256,
+                   help='--method sdflow: resolution the released attribute estimator reads the face '
+                        'at. 256 is what the released SDFlow trains and edits at; 0 feeds the '
+                        'loader\'s --img_size image unchanged (512 here, how this baseline was run '
+                        'before -- its curves from then are not comparable with the 256 ones).')
     p.add_argument('--only_attrs', nargs='+', type=int, default=None,
                    help='Evaluate only these CelebA ids (the run\'s own order), so every method\'s "All" '
                         'averages the same attributes; --method sdflow defaults to --sdflow_attrs.')
@@ -279,7 +297,8 @@ def main():
         if bad:
             raise SystemExit(f'the released SDFlow checkpoint only covers {args.sdflow_attrs}, not {bad}: '
                              f'pass --only_attrs {" ".join(map(str, args.sdflow_attrs))}')
-        sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs)
+        sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs,
+                             img_size=args.sdflow_img_size)
     lt_nets, sflow = {}, None
     if args.method == 'lt':
         from models.baselines import LatentTransformer
@@ -461,7 +480,8 @@ def main():
                               'consistent_reading': args.consistent_reading,
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
-                              'boundaries': args.boundaries if args.method == 'boundary' else None},
+                              'boundaries': args.boundaries if args.method == 'boundary' else None,
+                              'sdflow_img_size': args.sdflow_img_size if args.method == 'sdflow' else None},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
           f'[--run OTHER=...] --attributes All --output_dir ./output/curves')

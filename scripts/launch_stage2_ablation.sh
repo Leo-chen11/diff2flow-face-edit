@@ -11,6 +11,14 @@
 #   nohead    --no-local_region_head only        (the head locality, added on top of the eyeglasses one)
 #   oneteach  r34 alone: no ConvNeXt second teacher, teacher_combine mean
 #   idcont    continuous ID loss (1 - cos) instead of the hinge
+# and, not removals but the fixes the final run left off (train_sdflow.py prints them at startup
+# under KNOWN ISSUES LEFT ON; only via ARMS):
+#   bangsclip   --clip_prompt_bangs: Bangs gets its own CLIP prompt pair instead of the generic one,
+#               whose sign pushes a Bangs REMOVAL toward "a distorted face photo"
+#   dircond     --target_direction_from_cond: the target / CLIP / DDS losses follow the direction
+#               the flow was given
+#   truedilate  --local_region_true_dilate: the add-eyeglasses mask grown, not blurred
+#   fixes       the three together
 #
 # The term is removed from the resume step on: the first stage's steps still had it. Stage 2 is where
 # the edit moves from the direction bank to the flow, so it is the phase these terms shape the flow in;
@@ -70,6 +78,10 @@ arm_sets() {   # the --set key=value pairs of an arm
         nohead)   echo "local_region_head=false" ;;
         oneteach) echo "extra_teacher_weights=none teacher_combine=mean" ;;
         idcont)   echo "id_loss_hinge=false" ;;
+        bangsclip)  echo "clip_prompt_bangs=true" ;;
+        dircond)    echo "target_direction_from_cond=true" ;;
+        truedilate) echo "local_region_true_dilate=true" ;;
+        fixes)      echo "clip_prompt_bangs=true target_direction_from_cond=true local_region_true_dilate=true" ;;
         *)        echo "unknown arm $1" >&2; exit 1 ;;
     esac
 }

@@ -7,7 +7,7 @@ import torch
 from common.attr_tables import DEFAULT_SOFT_TARGET, SOFT_TARGET_TABLE, bank_num_k
 from common.id_loss import IDLoss
 from models.conditioner import IdentityAttributeConditioner
-from models.direction_bank import AttributeDirectionBank, bank_mix_at
+from models.direction_bank import AttributeDirectionBank, bank_mix_at, parse_attr_spec
 from models.flows.flow import cnf
 
 
@@ -71,6 +71,27 @@ _RUN_CONFIG_KEYS = [
     'direction_residual_scale', 'direction_bank_path',
 ]
 
+# How the run's direction bank was built and capped (train_sdflow.py flags), as
+# evaluation/evaluate_sdflow.py's RUN_CONFIG_KEYS / load_models restore them. The
+# editor used to build the bank with none of these: a run trained with
+# --signed_magnitude_input / --magnitude_latent_cond / --use_attr_lora then loaded
+# into a different magnitude network (its extra weights dropped by the non-strict
+# load, the sign of the requested change discarded), and --residual_scale_cap,
+# --bank_dir_layers, --residual_max_norm and --final_delta_max_norm were not
+# applied -- so it edited differently from the model every evaluation scored.
+# (No difference for an annealed run past its schedule: its edit is the flow's.)
+_BANK_CONFIG_KEYS = [
+    'bank_mode', 'bank_mix_start', 'bank_mix_end', 'bank_anneal_start_step', 'bank_anneal_steps',
+    'use_attr_lora', 'attr_lora_rank', 'signed_magnitude_input', 'magnitude_latent_cond',
+    'residual_max_norm', 'direction_guided_delta_max_norm', 'final_delta_max_norm',
+    'residual_scale_cap', 'bank_dir_layers', 'gate_uniform_attrs', 'age_gate_by_strata',
+]
+
+
+def _pos(v):
+    """A cap value from the run config: None unless a positive number."""
+    return float(v) if v is not None and float(v) > 0 else None
+
 
 def _find_run_config(ckpt_dir):
     """config.json lives next to save_models/; accept either dir as ckpt_dir."""
@@ -95,7 +116,16 @@ class SDFlow(object):
                  edit_target='mirror',
                  scale_by_learned=False,
                  clamp_edit_target=False,
-                 use_run_config=True) -> None:
+                 use_run_config=True,
+                 source_from='cond') -> None:
+        # source_from: which reading of the source the edit starts from.
+        # 'cond' (default): the conditioner's own reading of the image, the
+        # value the flow encodes the source under -- what training
+        # (soft_flow_target) and evaluate_sdflow.edit_single_attribute use.
+        # 'sources': the `sources` labels passed to transform(), as this
+        # editor did before: the flow then encodes under one reading and is
+        # asked for a target computed from another (with 0/1 labels, a target
+        # training never produced for that source).
         # edit_target / scale_by_learned / clamp_edit_target: what value an
         # edit of strength `scale` asks the flow for, as evaluate_sdflow.py's
         # flags of the same names. 'mirror' (default): src*(1-s) + (1-src)*s.
@@ -114,9 +144,7 @@ class SDFlow(object):
             if cfg_path is not None:
                 with open(cfg_path) as f:
                     cfg = json.load(f)
-                bank_cfg = {k: cfg[k] for k in ('bank_mode', 'bank_mix_start', 'bank_mix_end',
-                                                'bank_anneal_start_step', 'bank_anneal_steps')
-                            if k in cfg}
+                bank_cfg = {k: cfg[k] for k in _BANK_CONFIG_KEYS if k in cfg}
                 local_vars = {
                     'flow_modules': flow_modules, 'num_blocks': num_blocks,
                     'velocity_field': velocity_field,
@@ -190,6 +218,12 @@ class SDFlow(object):
                              'are strengths of the training rule, not of mirror')
         self.edit_target = edit_target
         self.clamp_edit_target = clamp_edit_target
+        if source_from not in ('cond', 'sources'):
+            raise ValueError(f'source_from must be cond or sources, got {source_from!r}')
+        self.source_from = source_from
+        # training's cap on the whole W+ edit (--final_delta_max_norm), applied
+        # after the bank as in train_sdflow.py / evaluate_sdflow.py
+        self.final_delta_max_norm = _pos(bank_cfg.get('final_delta_max_norm'))
 
         self.class_indices = attr_list
 
@@ -256,7 +290,14 @@ class SDFlow(object):
                 attribute_index=self.class_indices,
                 residual_scale=direction_residual_scale,
                 freeze_directions=direction_freeze,
-                guided_delta_max_norm=self.guided_delta_max_norm,
+                guided_delta_max_norm=(self.guided_delta_max_norm
+                                       if self.guided_delta_max_norm is not None
+                                       else _pos(bank_cfg.get('direction_guided_delta_max_norm'))),
+                residual_max_norm=_pos(bank_cfg.get('residual_max_norm')),
+                use_attr_lora=bool(bank_cfg.get('use_attr_lora', False)),
+                attr_lora_rank=int(bank_cfg.get('attr_lora_rank', 4)),
+                signed_magnitude_input=bool(bank_cfg.get('signed_magnitude_input', False)),
+                magnitude_latent_cond=bool(bank_cfg.get('magnitude_latent_cond', False)),
             ).to(self.device)
             filename = _find_latest_ckpt_optional(ckpt_dir, 'direction_bank', ckpt_step)
             if filename is not None:
@@ -271,6 +312,18 @@ class SDFlow(object):
                 print(f'Loaded direction_bank from {filename}')
             else:
                 print(f'Loaded direction_bank initialization from {direction_bank_path}')
+            # Per-attribute settings training applied to the bank (not in its
+            # state_dict): re-applied from the run config, as load_models does.
+            for _a in (bank_cfg.get('gate_uniform_attrs') or []):
+                self.direction_bank.set_uniform_gate(self.class_indices.index(int(_a)))
+            for _a, _c in parse_attr_spec(bank_cfg.get('residual_scale_cap')).items():
+                self.direction_bank.set_residual_cap(self.class_indices.index(_a), _c)
+            for _a, (_lo, _hi) in parse_attr_spec(bank_cfg.get('bank_dir_layers'), 'range').items():
+                self.direction_bank.set_dir_layers(self.class_indices.index(_a), _lo, _hi)
+            if bank_cfg.get('age_gate_by_strata'):
+                self.direction_bank.enable_strata_routing(
+                    self.class_indices.index(39), self.class_indices.index(20),
+                    self.class_indices.index(15))
             # Combination rule as trained (config.json); pass bank_mode only to
             # run the same weights under another rule. anneal uses the mix the
             # schedule had at the loaded step.
@@ -314,12 +367,22 @@ class SDFlow(object):
         return new_styles
 
     def transform(self, inputs, sources, images=None):
+        """inputs: W+ latents (B, 18, 512); images: the aligned faces, at the
+        resolution the run was trained on (config.json img_size); sources:
+        (B, 40) CelebA attribute readings, only read with source_from='sources'
+        (may be None otherwise)."""
         if images is None:
             raise ValueError('SDFlow.transform requires aligned source images for identity conditioning.')
 
-        targets = sources.clone()
+        src_cond, id_cond, attr_cond = self.conditioner.make_condition(images, inputs, self.id_extractor)
+        attr_local_idx = self.class_indices.index(self.attr_num)
         strength = max(0.0, min(float(self.scale), 4.0))
-        source_attr = sources[:, self.attr_num]
+        if self.source_from == 'sources':
+            if sources is None:
+                raise ValueError("source_from='sources' needs the `sources` attribute readings")
+            source_attr = sources[:, self.attr_num].to(attr_cond)
+        else:
+            source_attr = attr_cond[:, attr_local_idx]
         if self.edit_target == 'train':
             low, high = SOFT_TARGET_TABLE.get(int(self.attr_num), DEFAULT_SOFT_TARGET)
             hard = torch.where(source_attr > 0.5, torch.full_like(source_attr, low),
@@ -330,29 +393,22 @@ class SDFlow(object):
             target = source_attr * (1.0 - strength) + (1.0 - source_attr) * strength
         if self.clamp_edit_target:
             target = target.clamp(0.0, 1.0)
-        targets[:, self.attr_num] = target
 
-        targets = targets[:, self.class_indices]
-
-        src_cond, id_cond, attr_cond = self.conditioner.make_condition(images, inputs, self.id_extractor)
-        attr_local_idx = self.class_indices.index(self.attr_num)
         attr_idx = torch.full((inputs.size(0),), attr_local_idx, device=self.device, dtype=torch.long)
-        z = self.flow(inputs, src_cond, torch.zeros(targets.size(0), inputs.size(1), 1).to(self.device))[0]
+        zero_pad = torch.zeros(inputs.size(0), inputs.size(1), 1).to(self.device)
+        z = self.flow(inputs, src_cond, zero_pad)[0]
 
         new_attr_cond = attr_cond.clone()
-        new_attr_cond[:, attr_local_idx] = targets[:, attr_local_idx]
+        new_attr_cond[:, attr_local_idx] = target
         new_cond = torch.cat([id_cond, new_attr_cond], dim=1)
-        new_styles_raw, _ = self.flow(
-            z,
-            new_cond,
-            torch.zeros(targets.size(0), inputs.size(1), 1).to(self.device),
-            reverse=True,
-        )
-        flow_delta = new_styles_raw - inputs
+        new_styles_raw, _ = self.flow(z, new_cond, zero_pad, reverse=True)
+        delta = new_styles_raw - inputs
         if self.direction_bank is not None:
             attr_delta = new_attr_cond - attr_cond
-            guided_delta = self.direction_bank(flow_delta, attr_delta, attr_idx=attr_idx, latent=inputs)
-            new_styles = inputs + guided_delta
-        else:
-            new_styles = inputs + flow_delta
-        return new_styles
+            # route_scores: read only by --age_gate_by_strata runs
+            delta = self.direction_bank(delta, attr_delta, attr_idx=attr_idx, latent=inputs,
+                                        route_scores=attr_cond)
+        if self.final_delta_max_norm is not None:
+            n = delta.reshape(delta.shape[0], -1).norm(dim=1)
+            delta = delta * (self.final_delta_max_norm / n.clamp(min=1e-8)).clamp(max=1.0).view(-1, 1, 1)
+        return inputs + delta

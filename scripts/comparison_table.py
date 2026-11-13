@@ -161,21 +161,45 @@ def build_inception(use):
 # ── operating point ────────────────────────────────────────────────────────
 
 def strength_at(csv_path, attr_name, target_pct, metric='target_success'):
-    """The strength at which the method's measured curve crosses `target_pct` editing
-    accuracy (linear interpolation between measured strengths, no extrapolation); None
-    when the curve does not reach it."""
+    """The WEAKEST strength at which the method's measured curve reaches `target_pct`
+    editing accuracy: the first crossing going up in strength, linearly interpolated
+    between the two measured strengths around it, no extrapolation. None when the curve
+    does not reach it, or is already above it at its weakest strength (measure smaller
+    strengths then).
+
+    The points used to be sorted by ACCURACY and interpolated in that order. That is the
+    same number on a curve that only rises, but past its peak a too-strong edit breaks
+    the face and the accuracy falls again (InterFaceGAN at large alphas, StyleFlow past
+    its target): sorting interleaved those falling points with the rising ones, so the
+    operating point could land between a weak and a much stronger edit, or on the
+    falling branch itself -- charging the method the identity of an edit stronger than
+    the one that reaches the target. evaluation/plot_strength_curves.py already reads
+    its curves on the rising part only (rising_part)."""
     pts = []
     with open(csv_path, newline='') as f:
         for r in csv.DictReader(f):
             if r['attribute'] == attr_name and r.get(metric) not in (None, '', 'nan'):
-                pts.append((float(r[metric]) * 100.0, float(r['strength'])))
+                pts.append((float(r['strength']), float(r[metric]) * 100.0))
+    return first_crossing(pts, target_pct)
+
+
+def first_crossing(pts, target):
+    """pts: [(strength, accuracy)]. The smallest strength whose interpolated accuracy
+    equals `target` on a segment where the accuracy does not fall; None if there is none."""
+    pts = sorted(pts)
     if not pts:
         return None
-    pts.sort()
-    acc = np.array([p[0] for p in pts])
-    if target_pct < acc.min() - 1e-9 or target_pct > acc.max() + 1e-9:
+    eps = 1e-9
+    if pts[0][1] > target + eps:          # already past the target at the weakest strength
         return None
-    return float(np.interp(target_pct, acc, [p[1] for p in pts]))
+    if abs(pts[0][1] - target) <= eps:
+        return float(pts[0][0])
+    for (s0, a0), (s1, a1) in zip(pts, pts[1:]):
+        if a0 - eps <= target <= a1 + eps and a1 > a0 - eps:
+            if a1 - a0 <= eps:
+                return float(s0)
+            return float(s0 + (min(max(target, a0), a1) - a0) / (a1 - a0) * (s1 - s0))
+    return None
 
 
 # ── table ──────────────────────────────────────────────────────────────────
@@ -320,6 +344,9 @@ def main(argv=None):
     p.add_argument('--sdflow_ckpt_dir', default='./data/ckpt')
     p.add_argument('--sdflow_step', type=int, default=10000)
     p.add_argument('--sdflow_attrs', nargs='+', type=int, default=[15, 20, 39])
+    p.add_argument('--sdflow_img_size', type=int, default=256,
+                   help='Resolution the released SDFlow estimator reads the face at (256, as its own '
+                        'code; 0 = the loader image unchanged). Use the value its curves CSV was made with.')
     p.add_argument('--lt_dir', default='./output/baselines/lt',
                    help='kind lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
@@ -352,7 +379,8 @@ def main(argv=None):
     missing = [a for a in attrs if a not in args.attribute_index]
     if missing:
         raise SystemExit(f'--only_attrs {missing} are not edited attributes of {args.checkpoint_dir}')
-    sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs) if 'sdflow' in kinds else None
+    sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs,
+                         img_size=args.sdflow_img_size) if 'sdflow' in kinds else None
     # the retrained baselines, loaded as scripts/editing_curves.py does
     lt_nets, sflow, sflow_attrs = {}, None, []
     if 'lt' in kinds:

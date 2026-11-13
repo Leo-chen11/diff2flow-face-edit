@@ -241,7 +241,9 @@ def _mechanism_report(args):
         ('counter_attr', args.counter_attr_weight),
         ('preserve_attr (x counter_attr)', args.counter_attr_weight * args.preserve_attr_weight),
         ('coupled_targets', args.coupled_target_weight if args.coupled_targets else 0),
-        ('lag_reg', args.lag_reg_weight),
+        ('lag_reg', args.lag_reg_weight if args.velocity_field != 'original' else 0),
+        ('bank_prior', args.bank_prior_weight
+         if args.direction_bank_path and args.bank_mode in ('prior', 'anneal') else 0),
         ('dir_gate_reg', args.dir_gate_reg_weight),
         ('diffusion_dds', args.diffusion_guidance_weight if dds_on else 0),
         ('age_dds', age_dds_w if dds_on else 0),
@@ -276,6 +278,40 @@ def _mechanism_report(args):
                             else '')), None),
     ]
 
+    # Settings whose known problem has a fix behind a flag this run leaves off.
+    # Nothing here changes the run: it only says so in the first lines of stdout.
+    known = []
+    if args.use_clip_prompt_loss and args.clip_prompt_weight > 0:
+        from models.clip_prompt_loss import _ATTR_PROMPTS
+        _have = set(_ATTR_PROMPTS) | ({5} if args.clip_prompt_bangs else set())
+        _generic = [int(a) for a in args.attribute_index if int(a) not in _have]
+        if _generic:
+            known.append((f'clip_prompt: attrs {_generic} have no prompt pair',
+                          'they get the generic pair ("a face photo" / "a distorted face photo") with '
+                          'the edit\'s sign: a REMOVAL edit of them is pushed toward "a distorted face '
+                          'photo"' + (' (5: --clip_prompt_bangs gives Bangs its own pair)'
+                                      if 5 in _generic else '')))
+    if args.train_edit_direction == 'cond' and not args.target_direction_from_cond:
+        known.append(('target_direction_from_cond off',
+                      'the flow edits the way the conditioner reads the source, the target / CLIP / DDS '
+                      'losses the way the teacher does: opposite pulls on the samples the two read '
+                      'differently (logged as dir_disagree_frac)'))
+    if args.local_region_loss_weight > 0 and not args.local_region_true_dilate:
+        known.append(('local_region_true_dilate off',
+                      'the add-edit mask is the eye region BLURRED (a normalized gaussian lowers a '
+                      'small region to ~0.5 inside) instead of grown: less room for a frame than '
+                      'the removal mask has'))
+    if dds_on and args.diffusion_guidance_scale <= 1.0 and not args.dds_contrast_prompt:
+        known.append((f'DDS at guidance scale {args.diffusion_guidance_scale:g}, neutral source prompt',
+                      'no classifier-free guidance and half the with/without contrast: a weak text '
+                      'signal (the dds arms of scripts/launch_bn_ablation.sh use 7.5 and '
+                      '--dds_contrast_prompt)'))
+    if args.id_cond_dropout > 0:
+        known.append((f'id_cond_dropout {args.id_cond_dropout:g} is not rescaled',
+                      'training zeroes that share of the identity condition without the 1/(1-p) '
+                      'factor, eval feeds all of it: the flow sees a larger identity condition at '
+                      'eval than in training'))
+
     w = 34
     print('\n' + '=' * 62)
     print('ACTIVE MECHANISMS')
@@ -286,6 +322,10 @@ def _mechanism_report(args):
         for label, val, note in rows:
             line = f'   {label:<{w}} {val}'
             print(f'{line}   <- {note}' if note else line)
+    if known:
+        print('-- KNOWN ISSUES LEFT ON (unchanged behaviour; listed so they are a choice)')
+        for label, note in known:
+            print(f'   {label}\n      <- {note}')
     print('-- LOSS WEIGHTS (0 = term contributes nothing)')
     active = [f'{n}={v:g}' for n, v in losses if v and v > 0]
     zeroed = [n for n, v in losses if not v or v <= 0]
