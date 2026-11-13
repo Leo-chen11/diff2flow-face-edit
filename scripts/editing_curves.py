@@ -32,8 +32,9 @@ Methods (--method):
   linear   w + sign * alpha * d with d the mean of the attribute's bank slots
            (the InterFaceGAN-style baseline of scripts/linear_baseline.py);
            --scales are then alphas
-  sdflow   the released SDFlow (github.com/phil329/SDFlow, Li et al., ICCV 2023) with its own
-           checkpoint (--sdflow_ckpt_dir holding labeldist-<step> and prior-<step>, default step 10000):
+  sdflow   SDFlow (github.com/phil329/SDFlow, Li et al.): the released checkpoint, or one trained by
+           training/train_sdflow_original.py on any attributes (--sdflow_ckpt_dir holding labeldist-<step>
+           and prior-<step>, default step 10000; --sdflow_attrs the attributes it was trained on):
            its attribute estimator reads the face, the flow encodes w under that reading, the edited
            attribute is set to -scale (remove) or 1+scale (add) as in its models/editor.py, and the
            flow is run backwards. It only knows Eyeglasses, Male and Young (--sdflow_attrs), so give
@@ -170,6 +171,19 @@ def boundary_directions(path, attribute_index, ds, max_faces=2000):
     return out
 
 
+def infer_estimator_backbone(state):
+    """The AttributeEstimator backbone a labeldist state dict was built with: the width of its
+    final layer (2048: resnet50, 512: resnet18 / resnet34) and, for the 512 ones, whether
+    layer3 has the 6 blocks of resnet34. The released SDFlow checkpoint is resnet34; the
+    released training script (and training/train_sdflow_original.py) builds resnet50."""
+    in_dim = state['backbone.fc.weight'].shape[1]
+    if in_dim == 2048:
+        return 'resnet50'
+    if in_dim == 512:
+        return 'resnet34' if 'backbone.layer3.5.conv1.weight' in state else 'resnet18'
+    raise SystemExit(f'cannot tell the labeldist backbone from a final layer of width {in_dim}')
+
+
 class OfficialSDFlow:
     """models/editor.py of the released SDFlow, with the edit direction given. Its flow has the
     same parameter names and shapes as this repo's cnf(512, '512-512-512-512-512', n_attrs, 1),
@@ -183,21 +197,25 @@ class OfficialSDFlow:
     trained on, and that reading is the condition the flow encodes the source under. 0 / None
     feeds the loader's image unchanged (how the baseline was run before)."""
 
-    def __init__(self, ckpt_dir, step, attrs, device='cuda', img_size=256):
+    def __init__(self, ckpt_dir, step, attrs, device='cuda', img_size=256, backbone='auto'):
         from models.attribute_estimator import AttributeEstimator
         from models.flows.flow import cnf
         self.attrs = list(attrs)
         self.img_size = int(img_size or 0)
-        self.labeldist = AttributeEstimator(backbone='resnet34', attribute_dim=len(self.attrs)).to(device)
-        self.flow = cnf(512, '512-512-512-512-512', len(self.attrs), 1).to(device)
-        for module, stem in ((self.labeldist, 'labeldist'), (self.flow, 'prior')):
-            path = os.path.join(ckpt_dir, f'{stem}-{step:07d}')
+        paths = {stem: os.path.join(ckpt_dir, f'{stem}-{step:07d}') for stem in ('labeldist', 'prior')}
+        for path in paths.values():
             if not os.path.exists(path):
                 raise SystemExit(f'no {path}; the files in {ckpt_dir}: {sorted(os.listdir(ckpt_dir)) if os.path.isdir(ckpt_dir) else "(missing directory)"}'
                                  f' -- pass the right --sdflow_ckpt_dir / --sdflow_step')
-            module.load_state_dict(torch.load(path, map_location='cpu'), strict=True)
+        states = {stem: torch.load(path, map_location='cpu') for stem, path in paths.items()}
+        if backbone == 'auto':
+            backbone = infer_estimator_backbone(states['labeldist'])
+        self.labeldist = AttributeEstimator(backbone=backbone, attribute_dim=len(self.attrs)).to(device)
+        self.flow = cnf(512, '512-512-512-512-512', len(self.attrs), 1).to(device)
+        for module, stem in ((self.labeldist, 'labeldist'), (self.flow, 'prior')):
+            module.load_state_dict(states[stem], strict=True)
             module.eval()
-        print(f'[SDFlow] released checkpoint {ckpt_dir} step {step}, attributes {self.attrs}, '
+        print(f'[SDFlow] checkpoint {ckpt_dir} step {step}, attributes {self.attrs}, estimator {backbone}, '
               f'estimator input ' + (f'{self.img_size} px' if self.img_size else 'as loaded (no resize)'))
 
     @torch.no_grad()
@@ -227,6 +245,10 @@ def main():
     p.add_argument('--sdflow_step', type=int, default=10000)
     p.add_argument('--sdflow_attrs', nargs='+', type=int, default=[15, 20, 39],
                    help='CelebA ids the released SDFlow checkpoint was trained on.')
+    p.add_argument('--sdflow_backbone', default='auto',
+                   choices=['auto', 'resnet18', 'resnet34', 'resnet50', 'resnet101'],
+                   help='--method sdflow: the labeldist backbone; auto reads it off the checkpoint (the '
+                        'released one is resnet34, training/train_sdflow_original.py builds resnet50).')
     p.add_argument('--sdflow_img_size', type=int, default=256,
                    help='--method sdflow: resolution the released attribute estimator reads the face '
                         'at. 256 is what the released SDFlow trains and edits at; 0 feeds the '
@@ -298,7 +320,7 @@ def main():
             raise SystemExit(f'the released SDFlow checkpoint only covers {args.sdflow_attrs}, not {bad}: '
                              f'pass --only_attrs {" ".join(map(str, args.sdflow_attrs))}')
         sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs,
-                             img_size=args.sdflow_img_size)
+                             img_size=args.sdflow_img_size, backbone=args.sdflow_backbone)
     lt_nets, sflow = {}, None
     if args.method == 'lt':
         from models.baselines import LatentTransformer

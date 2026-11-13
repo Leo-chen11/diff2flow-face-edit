@@ -344,6 +344,9 @@ def main(argv=None):
     p.add_argument('--sdflow_ckpt_dir', default='./data/ckpt')
     p.add_argument('--sdflow_step', type=int, default=10000)
     p.add_argument('--sdflow_attrs', nargs='+', type=int, default=[15, 20, 39])
+    p.add_argument('--sdflow_backbone', default='auto',
+                   choices=['auto', 'resnet18', 'resnet34', 'resnet50', 'resnet101'],
+                   help='The SDFlow labeldist backbone; auto reads it off the checkpoint.')
     p.add_argument('--sdflow_img_size', type=int, default=256,
                    help='Resolution the released SDFlow estimator reads the face at (256, as its own '
                         'code; 0 = the loader image unchanged). Use the value its curves CSV was made with.')
@@ -380,7 +383,7 @@ def main(argv=None):
     if missing:
         raise SystemExit(f'--only_attrs {missing} are not edited attributes of {args.checkpoint_dir}')
     sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs,
-                         img_size=args.sdflow_img_size) if 'sdflow' in kinds else None
+                         img_size=args.sdflow_img_size, backbone=args.sdflow_backbone) if 'sdflow' in kinds else None
     # the retrained baselines, loaded as scripts/editing_curves.py does
     lt_nets, sflow, sflow_attrs = {}, None, []
     if 'lt' in kinds:
