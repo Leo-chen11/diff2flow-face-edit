@@ -16,6 +16,14 @@
 #
 #   bash scripts/launch_chain_fix.sh <stage1 run dir> <stage2 run dir> <gpu id>
 #   DRY_RUN=1 ... prints the commands only.
+#
+# The two stages' changes are S1_SETS / S2_SETS (key=value, space-separated; defaults: the fixes above),
+# so the same chain retrains with any other change in BOTH stages, e.g. the velocity-field ablation
+# (the dof checkpoints do not load into the original field, so it cannot resume from stage 1):
+#   TAG=orig S1_SETS="velocity_field=original" S2_SETS="velocity_field=original" \
+#       bash scripts/launch_chain_fix.sh <stage1 run dir> <stage2 run dir> <gpu id>
+# After stage 2 the new run is also scored by scripts/editing_curves.py on the held-out faces
+# (--sample_offset 500), the protocol of the paper's tables.
 set -uo pipefail
 
 S1=${1:?usage: bash scripts/launch_chain_fix.sh <stage1 run dir> <stage2 run dir> <gpu id>}
@@ -49,11 +57,16 @@ build() {   # <config dir> --set ... -> one-line train command
     python -m scripts.rebuild_train_cmd --config "$c/config.json" "$@" 2>>"$LOG/rebuild.log" \
         | tr -d '\\\n' | tr -s ' '
 }
-T1=$(build "$S1" --set "run_name=$N1" --set flow_bn_stats=dataset --set conditioner_bn=freeze \
-    --set conditioner_bn_freeze_after=2000 --set train_resize=area) || exit 1
+# The flags each stage changes (key=value, space-separated). Default: the BatchNorm and resize fixes.
+# Any other change to retrain the chain with (e.g. velocity_field=original in both stages) goes here.
+S1_SETS=${S1_SETS-"flow_bn_stats=dataset conditioner_bn=freeze conditioner_bn_freeze_after=2000 train_resize=area"}
+S2_SETS=${S2_SETS-"flow_bn_stats=freeze conditioner_bn=freeze conditioner_bn_freeze_after=0 train_resize=area"}
+sets() { for kv in $1; do printf -- '--set\n%s\n' "$kv"; done; }
+mapfile -t A1 < <(sets "$S1_SETS")
+mapfile -t A2 < <(sets "$S2_SETS")
+T1=$(build "$S1" --set "run_name=$N1" ${A1[@]+"${A1[@]}"}) || exit 1
 T2=$(build "$S2" --set "run_name=$N2" --set "resume_dir=output/$MODEL/$N1" --set "resume_step=$END1" \
-    --set flow_bn_stats=freeze --set conditioner_bn=freeze --set conditioner_bn_freeze_after=0 \
-    --set train_resize=area) || exit 1
+    ${A2[@]+"${A2[@]}"}) || exit 1
 [ -n "$T1" ] && [ -n "$T2" ] || { echo "rebuild_train_cmd failed, see $LOG/rebuild.log"; exit 1; }
 
 ev() {   # <run dir> <step>
@@ -69,6 +82,7 @@ STEPS=(
     "stage2_train|$T2"
     "stage2_eval_new|$(ev "output/$MODEL/$N2" "$END2")"
     "stage2_eval_orig|$(ev "$S2" "$END2")"
+    "stage2_curves_new|python -m scripts.editing_curves --checkpoint_dir output/$MODEL/$N2 --step $END2 --independent_attr_weights $R50 --independent_attr_backbone r50 --method model --scales 0.2 0.4 0.6 0.8 1.0 1.25 1.5 --sample_offset 500 --num_samples 500"
 )
 Q=""
 for s in "${STEPS[@]}"; do

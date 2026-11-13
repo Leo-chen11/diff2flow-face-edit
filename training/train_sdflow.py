@@ -903,9 +903,13 @@ if __name__ == '__main__':
     # parameters for model structure
     parser.add_argument("--flow_modules", type=str, default='512-512-512-512-512')
     parser.add_argument("--num_blocks", type=int, default=1)
-    parser.add_argument('--velocity_field', default='lag_dof', choices=['lag', 'dof', 'lag_dof'],
-                        help='LAG-DOF decomposed CNF velocity (or its lag / dof half). The original '
-                             'shared velocity with a per-attribute layer mask was removed.')
+    parser.add_argument('--velocity_field', default='lag_dof', choices=['original', 'lag', 'dof', 'lag_dof'],
+                        help='LAG-DOF decomposed CNF velocity (or its lag / dof half). original: the '
+                             'released SDFlow\'s single shared velocity network (models/flows/odefunc.py '
+                             'ODEnet), no attribute / base split and no layer gate -- the control for the '
+                             'dof architecture under the same training recipe; its checkpoints do not load '
+                             'into the other fields, so a comparison retrains from step 0. (The older '
+                             'original-plus-per-attribute-layer-mask variant was removed.)')
     parser.add_argument('--lag_gate_hidden_dim', type=int, default=64)
     parser.add_argument('--lag_gate_init_bias', type=float, default=-0.5)
     parser.add_argument('--flow_bn_stats', default='update', choices=['update', 'freeze', 'dataset'],
