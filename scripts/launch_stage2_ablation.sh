@@ -19,6 +19,10 @@
 #               the flow was given
 #   truedilate  --local_region_true_dilate: the add-eyeglasses mask grown, not blurred
 #   fixes       the three together
+#   custom      any combination: CUSTOM_SETS="key=value key=value" (only via ARMS). The check that
+#               terms which each showed no effect alone can ALL go at once, e.g.
+#               ARMS=custom CUSTOM_SETS="use_diffusion_guidance=false use_clip_prompt_loss=false local_region_head=false"
+#               (give each combination its own TAG: the run is named <run>_abl_custom<TAG>)
 #
 # The term is removed from the resume step on: the first stage's steps still had it. Stage 2 is where
 # the edit moves from the direction bank to the flow, so it is the phase these terms shape the flow in;
@@ -82,6 +86,8 @@ arm_sets() {   # the --set key=value pairs of an arm
         dircond)    echo "target_direction_from_cond=true" ;;
         truedilate) echo "local_region_true_dilate=true" ;;
         fixes)      echo "clip_prompt_bangs=true target_direction_from_cond=true local_region_true_dilate=true" ;;
+        custom)     [ -n "${CUSTOM_SETS:-}" ] || { echo "arm custom needs CUSTOM_SETS=\"key=value ...\"" >&2; exit 1; }
+                    echo "$CUSTOM_SETS" ;;
         *)        echo "unknown arm $1" >&2; exit 1 ;;
     esac
 }
