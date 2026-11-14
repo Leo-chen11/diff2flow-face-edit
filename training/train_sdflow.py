@@ -242,6 +242,8 @@ def _mechanism_report(args):
         ('preserve_attr (x counter_attr)', args.counter_attr_weight * args.preserve_attr_weight),
         ('coupled_targets', args.coupled_target_weight if args.coupled_targets else 0),
         ('lag_reg', args.lag_reg_weight if args.velocity_field != 'original' else 0),
+        ('transport_kinetic', args.transport_kinetic_weight),
+        ('transport_jacobian', args.transport_jacobian_weight),
         ('bank_prior', args.bank_prior_weight
          if args.direction_bank_path and args.bank_mode in ('prior', 'anneal') else 0),
         ('dir_gate_reg', args.dir_gate_reg_weight),
@@ -914,6 +916,37 @@ def freeze_conditioner_bn(conditioner):
             m.eval()
 
 
+def set_transport_reg(flow_model, on):
+    """Turn the transport regularizer states of every CNF block of the flow on or off."""
+    n = 0
+    for m in flow_model.modules():
+        if hasattr(m, 'transport_reg'):
+            m.transport_reg = bool(on)
+            n += 1
+    return n
+
+
+def collect_transport(flow_model):
+    """(kinetic, jacobian) of the flow's LAST solve, summed over its CNF blocks, per W+ dimension
+    (like the NLL's / (18 * 512)) and averaged over the batch; None when nothing was tracked.
+    Read right after the prior(...) call it belongs to: the next call overwrites it."""
+    kin, jac = [], []
+    for m in flow_model.modules():
+        r = getattr(m, '_last_transport', None)
+        if r is not None:
+            kin.append(r[0].flatten(1).sum(1))
+            jac.append(r[1].flatten(1).sum(1))
+    if not kin:
+        return None
+    dims = 18 * 512
+    return torch.stack(kin).sum(0).mean() / dims, torch.stack(jac).sum(0).mean() / dims
+
+
+def flow_nfe(flow_model):
+    """Function evaluations of the flow's last solve (forward and, if run, its adjoint backward)."""
+    return sum(m.num_evals() for m in flow_model.modules() if hasattr(m, 'num_evals'))
+
+
 def collect_lag_dof_losses(flow_model):
     losses = []
     for module in flow_model.modules():
@@ -1456,6 +1489,17 @@ if __name__ == '__main__':
                              '--no-losses_vs_recon to restore the old real-photo references.')
 
     # ── Cross-attribute loss balancing ──────────────────────────────────────
+    parser.add_argument('--transport_kinetic_weight', type=float, default=0.0,
+                        help='Transport regularizer of the conditional CNF (RNODE, Finlay et al. 2020): '
+                             'weight of the kinetic energy  int ||v(w,t,c)||^2 dt  integrated along the '
+                             'encoding (w -> z under the source condition) and decoding (z -> w\' under the '
+                             'target condition) solves, per W+ dimension. Straighter transport is the '
+                             'hypothesis for a smaller edit at the same attribute change (identity) and '
+                             'fewer solver steps (speed). 0 (default): off, training unchanged. Adds no '
+                             'parameter, so a run can resume from a checkpoint trained without it.')
+    parser.add_argument('--transport_jacobian_weight', type=float, default=0.0,
+                        help='Same, for the Jacobian Frobenius norm  int ||dv/dw||_F^2 dt  (Hutchinson '
+                             'estimate with the divergence\'s own probe). 0 (default): off.')
     parser.add_argument('--lag_reg_weight', type=float, default=1.0,
                         help='Overall scale on the LAG-DOF velocity field\'s three internal '
                              'regularizers (orth, gate_smooth, gate_sparse -- only active when '
@@ -2015,6 +2059,10 @@ if __name__ == '__main__':
         attr_context_dim=len(args.attribute_index),
         train_T=False,
     ).cuda()
+    _transport_on = args.transport_kinetic_weight > 0 or args.transport_jacobian_weight > 0
+    if _transport_on:
+        print(f'** transport regularizer on {set_transport_reg(prior, True)} CNF block(s): kinetic '
+              f'{args.transport_kinetic_weight:g}, jacobian {args.transport_jacobian_weight:g}')
     # prior.load_state_dict(torch.load('./pretrained_models/ffhq_prior.pth',map_location='cpu'),strict=True)
     
     img_transform = T.Compose([
@@ -2671,6 +2719,8 @@ if __name__ == '__main__':
             src_cond = torch.cat([id_cond_train, attr_cond], dim=1)
             src_attr_flow = attr_cond[batch_indices, mid_idx].detach()
             approx21, delta_log_p2 = prior(latent, src_cond, zero_pad)
+            transport_enc = collect_transport(prior)
+            nfe_enc = flow_nfe(prior)
 
             # make base distribution standard normal distibution
             approx2 = standard_normal_logprob(approx21).view(args.batch, -1).sum(1, keepdim=True)
@@ -2692,6 +2742,15 @@ if __name__ == '__main__':
             new_cond = torch.cat([id_cond_train.detach(), new_attr_cond], dim=1)
             new_latents_raw, _ = prior(approx21, new_cond, zero_pad, reverse=True)
             lag_dof_losses = collect_lag_dof_losses(prior)
+            transport_dec = collect_transport(prior)
+            nfe_dec = flow_nfe(prior)
+            transport_kin = transport_jac = torch.zeros([], device=latent.device, dtype=latent.dtype)
+            for _tr in (transport_enc, transport_dec):
+                if _tr is not None:
+                    transport_kin = transport_kin + _tr[0]
+                    transport_jac = transport_jac + _tr[1]
+            transport_loss = (args.transport_kinetic_weight * transport_kin
+                              + args.transport_jacobian_weight * transport_jac)
             flow_delta = new_latents_raw - latent
             direction_bank_applied = False
 
@@ -3434,7 +3493,8 @@ if __name__ == '__main__':
                 args.hair_extent_loss_weight * hair_extent_loss +\
                 args.disc_realism_weight * disc_realism_loss +\
                 args.attr_disc_weight * attr_disc_g_loss +\
-                bank_prior_weight * loss_bank_prior
+                bank_prior_weight * loss_bank_prior +\
+                transport_loss
 
             attr_scale_grad_norm = _zero.detach().clone()
             (loss / args.grad_accum_steps).backward()
@@ -3568,6 +3628,10 @@ if __name__ == '__main__':
                 'dir_bank_flow_bank_cos': dir_logs.get('dir_bank_flow_bank_cos', _zero.detach().clone()),
                 'dir_bank_mix': dir_logs.get('dir_bank_mix', _zero.detach().clone()),
                 'loss_bank_prior': loss_bank_prior.detach(),
+                'transport_kinetic': transport_kin.detach(),
+                'transport_jacobian': transport_jac.detach(),
+                'nfe_encode': torch.tensor(float(nfe_enc)),
+                'nfe_decode': torch.tensor(float(nfe_dec)),
                 'bank_prior_weight': torch.tensor(bank_prior_weight),
                 'dir_bank_residual_norm': dir_logs.get('dir_bank_residual_norm', _zero.detach().clone()),
                 'dir_bank_guided_delta_norm_pre_clip': dir_logs.get('dir_bank_guided_delta_norm_pre_clip', _zero.detach().clone()),

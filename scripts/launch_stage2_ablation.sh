@@ -14,6 +14,10 @@
 #   orth      --lag_reg_weight 20: turns on the dof field's orthogonality penalty between its attribute
 #             and base velocities (lag_reg = 0.005 * mean|cos(v_attr, v_base)| for dof, so 0.1 * that);
 #             the final run has it at 0, i.e. the two velocity nets are only summed (only via ARMS)
+#   ot        transport regularizer of the CNF (RNODE): --transport_kinetic_weight 0.01
+#             --transport_jacobian_weight 0.01 -- straighter, smoother conditional transport; logs
+#             transport_kinetic / transport_jacobian / nfe_encode / nfe_decode (only via ARMS)
+#   ot_hi     the same at 0.1 / 0.1                                         (only via ARMS)
 #   noprior   --bank_prior_weight 0: the bank still hands the edit over to the flow (the output
 #             anneal), but the cosine-hinge prior that pulls the flow's edit toward the bank's
 #             directions is gone -- separates the two halves of the annealed linear teacher
@@ -90,6 +94,8 @@ arm_sets() {   # the --set key=value pairs of an arm
         idcont)   echo "id_loss_hinge=false" ;;
         noprior)  echo "bank_prior_weight=0" ;;
         orth)     echo "lag_reg_weight=20" ;;
+        ot)       echo "transport_kinetic_weight=0.01 transport_jacobian_weight=0.01" ;;
+        ot_hi)    echo "transport_kinetic_weight=0.1 transport_jacobian_weight=0.1" ;;
         bangsclip)  echo "clip_prompt_bangs=true" ;;
         dircond)    echo "target_direction_from_cond=true" ;;
         truedilate) echo "local_region_true_dilate=true" ;;

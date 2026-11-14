@@ -27,6 +27,19 @@ def divergence_approx(f, y, e=None):
     return approx_tr_dzdx
 
 
+def divergence_and_vjp(f, y, e):
+    """divergence_approx, also returning e^T df/dy (the vector-Jacobian product it is built
+    from), whose squared norm is the Hutchinson estimate of the Jacobian's Frobenius norm."""
+    e_dzdx = torch.autograd.grad(f, y, e, create_graph=True)[0]
+    cnt = 0
+    while not (e_dzdx * e).requires_grad and cnt < 10:
+        e_dzdx = torch.autograd.grad(f, y, e, create_graph=True)[0]
+        cnt += 1
+    approx_tr_dzdx = (e_dzdx * e).sum(dim=-1)
+    assert approx_tr_dzdx.requires_grad, "(failed to add node to graph)"
+    return approx_tr_dzdx, e_dzdx
+
+
 class Swish(nn.Module):
     def __init__(self):
         super(Swish, self).__init__()
@@ -260,6 +273,19 @@ class ODEfunc(nn.Module):
             self._e = torch.randn_like(y, requires_grad=True).to(y)
 
         with torch.set_grad_enabled(True):
+            if len(states) == 5:  # conditional CNF + the transport regularizer states (CNF.transport_reg)
+                # RNODE (Finlay et al. 2020, "How to train your neural ODE"): integrate, along the
+                # same trajectory, the kinetic energy ||v||^2 and the Hutchinson estimate
+                # ||e^T dv/dy||^2 of the Jacobian's squared Frobenius norm. Penalising them makes
+                # the flow transport along straighter, smoother paths (closer to optimal
+                # transport), which is what lets an adaptive solver take fewer steps.
+                c = states[2]
+                tc = torch.cat([t, c.view(y.size(0), -1)], dim=1)
+                dy = self.diffeq(tc, y)
+                div, vjp = divergence_and_vjp(dy, y, self._e)
+                kinetic = dy.pow(2).sum(dim=-1, keepdim=True)
+                jacobian = vjp.pow(2).sum(dim=-1, keepdim=True)
+                return dy, -div.unsqueeze(-1), torch.zeros_like(c).requires_grad_(True), kinetic, jacobian
             if len(states) == 3:  # conditional CNF
                 c = states[2]
                 tc = torch.cat([t, c.view(y.size(0), -1)], dim=1)

@@ -58,6 +58,13 @@ class CNF(nn.Module):
         self.test_atol = atol
         self.test_rtol = rtol
         self.conditional = conditional
+        # Transport regularizer (train_sdflow.py --transport_kinetic_weight / _jacobian_weight):
+        # when True, a conditional solve also integrates the kinetic energy and the Jacobian
+        # Frobenius estimate along its trajectory (ODEfunc, 5-state branch) and leaves them, per
+        # sample and W+ layer, in self._last_transport. A plain attribute, not state: checkpoints
+        # are unchanged, and a model loaded for evaluation solves exactly as before.
+        self.transport_reg = False
+        self._last_transport = None
 
     def forward(self, x, context=None, logpx=None, integration_times=None, reverse=False):
         
@@ -66,9 +73,12 @@ class CNF(nn.Module):
         else:
             _logpx = logpx
 
+        track = self.conditional and self.transport_reg
         if self.conditional:
             assert context is not None
             states = (x, _logpx, context)
+            if track:
+                states = states + (torch.zeros_like(_logpx), torch.zeros_like(_logpx))
         else:
             states = (x, _logpx)
         atol = [self.atol] * len(states) if _PER_STATE_TOL else self.atol
@@ -117,6 +127,8 @@ class CNF(nn.Module):
             state_t = tuple(s[1] for s in state_t)
 
         z_t, logpz_t = state_t[:2]
+        # integrands are >= 0; a reverse solve runs from T to 0, so its integrals come out negative
+        self._last_transport = (state_t[3].abs(), state_t[4].abs()) if track else None
 
         if logpx is not None:
             return z_t, logpz_t
