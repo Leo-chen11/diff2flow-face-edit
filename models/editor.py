@@ -117,7 +117,13 @@ class SDFlow(object):
                  scale_by_learned=False,
                  clamp_edit_target=False,
                  use_run_config=True,
-                 source_from='cond') -> None:
+                 source_from='cond',
+                 consistent_margin=0.1) -> None:
+        # consistent_margin: with an explicit direction (transform(direction=...)),
+        # a source reading on the wrong side of 0.5 for that direction is moved
+        # to 0.5 -/+ this margin, in the encoding and the target -- the
+        # direction-consistent reading (scripts/editing_curves.py
+        # --consistent_reading). None keeps the reading as it is.
         # source_from: which reading of the source the edit starts from.
         # 'cond' (default): the conditioner's own reading of the image, the
         # value the flow encodes the source under -- what training
@@ -221,6 +227,7 @@ class SDFlow(object):
         if source_from not in ('cond', 'sources'):
             raise ValueError(f'source_from must be cond or sources, got {source_from!r}')
         self.source_from = source_from
+        self.consistent_margin = None if consistent_margin is None else float(consistent_margin)
         # training's cap on the whole W+ edit (--final_delta_max_norm), applied
         # after the bank as in train_sdflow.py / evaluate_sdflow.py
         self.final_delta_max_norm = _pos(bank_cfg.get('final_delta_max_norm'))
@@ -366,11 +373,20 @@ class SDFlow(object):
         )
         return new_styles
 
-    def transform(self, inputs, sources, images=None):
+    def transform(self, inputs, sources, images=None, direction=None):
         """inputs: W+ latents (B, 18, 512); images: the aligned faces, at the
         resolution the run was trained on (config.json img_size); sources:
         (B, 40) CelebA attribute readings, only read with source_from='sources'
-        (may be None otherwise)."""
+        (may be None otherwise).
+
+        direction: None (default, as before) edits the way the source reading
+        points (read as present -> remove) with the edit_target rule. +1 / -1
+        (a number, or a (B,) tensor) asks to ADD / REMOVE the attribute: the
+        target moves `scale` of the way from the source reading to 1 / 0, and
+        with consistent_margin the reading is first made consistent with the
+        request (a face asked to gain the attribute that the conditioner reads
+        as already having it is read as 0.5 - margin) -- in the encoding too,
+        as evaluate_sdflow.edit_single_attribute does with src_value_in_encoding."""
         if images is None:
             raise ValueError('SDFlow.transform requires aligned source images for identity conditioning.')
 
@@ -383,7 +399,17 @@ class SDFlow(object):
             source_attr = sources[:, self.attr_num].to(attr_cond)
         else:
             source_attr = attr_cond[:, attr_local_idx]
-        if self.edit_target == 'train':
+        if direction is not None:
+            d = torch.as_tensor(direction, dtype=attr_cond.dtype, device=attr_cond.device)
+            d = d.expand(inputs.size(0)) if d.dim() == 0 else d.view(-1)
+            if self.consistent_margin is not None:
+                m = self.consistent_margin
+                source_attr = torch.where(d > 0, source_attr.clamp(max=0.5 - m), source_attr.clamp(min=0.5 + m))
+                attr_cond = attr_cond.clone()
+                attr_cond[:, attr_local_idx] = source_attr
+                src_cond = torch.cat([id_cond, attr_cond], dim=1)
+            target = source_attr + strength * ((d > 0).to(source_attr) - source_attr)
+        elif self.edit_target == 'train':
             low, high = SOFT_TARGET_TABLE.get(int(self.attr_num), DEFAULT_SOFT_TARGET)
             hard = torch.where(source_attr > 0.5, torch.full_like(source_attr, low),
                                torch.full_like(source_attr, high))
