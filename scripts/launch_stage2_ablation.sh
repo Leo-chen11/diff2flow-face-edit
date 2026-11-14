@@ -11,6 +11,9 @@
 #   nohead    --no-local_region_head only        (the head locality, added on top of the eyeglasses one)
 #   oneteach  r34 alone: no ConvNeXt second teacher, teacher_combine mean
 #   idcont    continuous ID loss (1 - cos) instead of the hinge
+#   orth      --lag_reg_weight 20: turns on the dof field's orthogonality penalty between its attribute
+#             and base velocities (lag_reg = 0.005 * mean|cos(v_attr, v_base)| for dof, so 0.1 * that);
+#             the final run has it at 0, i.e. the two velocity nets are only summed (only via ARMS)
 #   noprior   --bank_prior_weight 0: the bank still hands the edit over to the flow (the output
 #             anneal), but the cosine-hinge prior that pulls the flow's edit toward the bank's
 #             directions is gone -- separates the two halves of the annealed linear teacher
@@ -86,6 +89,7 @@ arm_sets() {   # the --set key=value pairs of an arm
         oneteach) echo "extra_teacher_weights=none teacher_combine=mean" ;;
         idcont)   echo "id_loss_hinge=false" ;;
         noprior)  echo "bank_prior_weight=0" ;;
+        orth)     echo "lag_reg_weight=20" ;;
         bangsclip)  echo "clip_prompt_bangs=true" ;;
         dircond)    echo "target_direction_from_cond=true" ;;
         truedilate) echo "local_region_true_dilate=true" ;;
