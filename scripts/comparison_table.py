@@ -354,6 +354,11 @@ def main(argv=None):
                    help='kind lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
                    help='kind styleflow: scripts/train_baselines.py styleflow output.')
+    p.add_argument('--consistent_reading', type=float, default=None, metavar='MARGIN',
+                   help='kind model only: the direction-consistent source reading of '
+                        'scripts/editing_curves.py --consistent_reading (a conditioner reading on the '
+                        'wrong side of 0.5 for the requested direction is moved to 0.5 -/+ MARGIN, in '
+                        'the encoding and the target). Give the value the model\'s curves CSV was made with.')
     p.add_argument('--no_fid', action='store_true', help='Skip FID / KID (needs torchmetrics + torch-fidelity).')
     p.add_argument('--out_dir', default='./output/comparison')
     p.set_defaults(eval_resize='area', num_samples=1000)
@@ -446,10 +451,16 @@ def main(argv=None):
             dirs = lin if kind == 'linear' else bnd
             new_lat = latent + (d * sc).view(-1, 1, 1) * dirs[g].to(latent)
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+        # --consistent_reading: as scripts/editing_curves.py (the curves CSV that picked `sc`
+        # must have been made with the same value)
+        sv = None
+        if args.consistent_reading is not None:
+            sv = torch.where(d > 0, attr_cond[:, li].clamp(max=0.5 - args.consistent_reading),
+                             attr_cond[:, li].clamp(min=0.5 + args.consistent_reading))
         return edit_single_attribute(
             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond, li, sc, direction_bank,
             attr_global_idx=g, bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
-            composite=False, direction=d)
+            composite=False, direction=d, src_value=sv, src_value_in_encoding=sv is not None)
 
     rec = {}                                    # (t, method, g) -> {metric: (N,) array, NaN where not measured}
     feats = defaultdict(list)                   # (t, method, g) -> [(k, 2048)] edited features of the kept faces
@@ -559,6 +570,7 @@ def main(argv=None):
     with open(os.path.join(args.out_dir, 'comparison.json'), 'w') as f:
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'num_faces': seen,
                               'sample_offset': args.sample_offset,
+                              'consistent_reading': args.consistent_reading,
                               'target_acc': args.target_acc, 'match_metric': args.match_metric,
                               'attributes': [name(a) for a in attrs], 'eval_resize': args.eval_resize,
                               'id_model': 'ArcFace IR-SE50' if arc is not None else 'facenet casia-webface',
