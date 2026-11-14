@@ -49,6 +49,10 @@ Methods (--method):
   lt       Latent Transformer (Yao et al., ICCV 2021) retrained on these latents
            (scripts/train_baselines.py lt): w + sign * alpha * F(w); --scales are alphas,
            its training step being alpha ~ 0.5-1, e.g. 0.25 0.5 0.75 1 1.5 2
+  adatrans AdaTrans (Huang et al., ICCV 2023; models/adatrans.py): retrained on these latents by
+           training/train_adatrans.py, or the official released checkpoints (--adatrans_dir); one
+           model per attribute, condition +1 / -1 from the R50 direction; --scales are numbers of
+           steps (trained with 10), e.g. 1 2 3 4 5 6 8 10 12 14 16
   styleflow StyleFlow (Abdal et al., TOG 2021) retrained on these latents
            (scripts/train_baselines.py styleflow): encode under the r34 readings, move the
            attribute toward its target end by --scales (1 = reach it), decode;
@@ -184,6 +188,26 @@ def infer_estimator_backbone(state):
     raise SystemExit(f'cannot tell the labeldist backbone from a final layer of width {in_dim}')
 
 
+def load_adatrans(adatrans_dir, attrs, device='cuda'):
+    """{attr: AdaTrans} from <dir>/<attr>/model.pth (training/train_adatrans.py) or the official
+    release layout <dir>/<attr>/save_models/model-latest; strict loads."""
+    from models.adatrans import AdaTrans
+    nets = {}
+    for a in attrs:
+        cands = [os.path.join(adatrans_dir, str(a), 'model.pth'),
+                 os.path.join(adatrans_dir, str(a), 'save_models', 'model-latest')]
+        path = next((c for c in cands if os.path.exists(c)), None)
+        if path is None:
+            raise SystemExit(f'no AdaTrans checkpoint for attribute {a}: looked for {cands} '
+                             f'(train it: python training/train_adatrans.py edit --attr {a} --out {adatrans_dir})')
+        net = AdaTrans(c_dim=1, max_steps=10, n_layers=10, hid_dim=512, n_styles=18, style_dim=512)
+        state = torch.load(path, map_location='cpu')
+        net.load_state_dict({k.replace('module.', ''): v for k, v in state.items()}, strict=True)
+        nets[a] = net.to(device).eval()
+        print(f'[AdaTrans] attribute {a}: {path}')
+    return nets
+
+
 class OfficialSDFlow:
     """models/editor.py of the released SDFlow, with the edit direction given. Its flow has the
     same parameter names and shapes as this repo's cnf(512, '512-512-512-512-512', n_attrs, 1),
@@ -235,7 +259,11 @@ class OfficialSDFlow:
 def main():
     p = build_parser()
     p.add_argument('--method', default='model',
-                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow'])
+                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans'])
+    p.add_argument('--adatrans_dir', default='./output/baselines/adatrans',
+                   help='--method adatrans: <dir>/<attr>/model.pth (training/train_adatrans.py) or the official '
+                        'release layout <dir>/<attr>/save_models/model-latest. --scales are numbers of steps '
+                        '(trained with 10), e.g. 1 2 3 4 5 6 8 10 12 14 16.')
     p.add_argument('--lt_dir', default='./output/baselines/lt',
                    help='--method lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
@@ -321,7 +349,9 @@ def main():
                              f'pass --only_attrs {" ".join(map(str, args.sdflow_attrs))}')
         sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs,
                              img_size=args.sdflow_img_size, backbone=args.sdflow_backbone)
-    lt_nets, sflow = {}, None
+    lt_nets, sflow, ada = {}, None, None
+    if args.method == 'adatrans':
+        ada = load_adatrans(args.adatrans_dir, attrs)
     if args.method == 'lt':
         from models.baselines import LatentTransformer
         for a in attrs:
@@ -392,6 +422,10 @@ def main():
                 for sc in args.scales:
                     if sdf is not None:
                         face = sdf.edit(G, img, latent, g, d, sc)
+                    elif ada is not None:
+                        from models.adatrans import adatrans_edit
+                        new_lat = adatrans_edit(ada[g], latent, d, sc)
+                        face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif lt_nets:
                         new_lat = lt_nets[g].edit(latent, d * sc)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
@@ -503,7 +537,8 @@ def main():
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None,
-                              'sdflow_img_size': args.sdflow_img_size if args.method == 'sdflow' else None},
+                              'sdflow_img_size': args.sdflow_img_size if args.method == 'sdflow' else None,
+                              'adatrans_dir': args.adatrans_dir if args.method == 'adatrans' else None},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
           f'[--run OTHER=...] --attributes All --output_dir ./output/curves')
