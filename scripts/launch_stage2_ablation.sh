@@ -11,6 +11,9 @@
 #   nohead    --no-local_region_head only        (the head locality, added on top of the eyeglasses one)
 #   oneteach  r34 alone: no ConvNeXt second teacher, teacher_combine mean
 #   idcont    continuous ID loss (1 - cos) instead of the hinge
+#   noprior   --bank_prior_weight 0: the bank still hands the edit over to the flow (the output
+#             anneal), but the cosine-hinge prior that pulls the flow's edit toward the bank's
+#             directions is gone -- separates the two halves of the annealed linear teacher
 # and, not removals but the fixes the final run left off (train_sdflow.py prints them at startup
 # under KNOWN ISSUES LEFT ON; only via ARMS):
 #   bangsclip   --clip_prompt_bangs: Bangs gets its own CLIP prompt pair instead of the generic one,
@@ -71,7 +74,7 @@ SCALES=${SCALES:-0.2 0.4 0.6 0.8 1.0 1.25 1.5}
 OFFSET=${OFFSET:-500}
 NUM=${NUM:-500}
 
-if [ -n "${ARMS:-}" ]; then read -r -a ARMS <<< "$ARMS"; else ARMS=(nodds noclip noloc nohead oneteach idcont); fi
+if [ -n "${ARMS:-}" ]; then read -r -a ARMS <<< "$ARMS"; else ARMS=(nodds noclip noloc nohead oneteach idcont noprior); fi
 
 arm_sets() {   # the --set key=value pairs of an arm
     case $1 in
@@ -82,6 +85,7 @@ arm_sets() {   # the --set key=value pairs of an arm
         nohead)   echo "local_region_head=false" ;;
         oneteach) echo "extra_teacher_weights=none teacher_combine=mean" ;;
         idcont)   echo "id_loss_hinge=false" ;;
+        noprior)  echo "bank_prior_weight=0" ;;
         bangsclip)  echo "clip_prompt_bangs=true" ;;
         dircond)    echo "target_direction_from_cond=true" ;;
         truedilate) echo "local_region_true_dilate=true" ;;
