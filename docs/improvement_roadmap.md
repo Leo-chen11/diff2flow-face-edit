@@ -192,9 +192,11 @@
 | 2022 | GradCtrl | 已移植並訓練，等驗證和曲線 |
 | 2023 | AdaTrans | 已重寫並訓練，等曲線 |
 | 2024 | SDFlow | 已重訓並驗證 |
-| 2024 | PluGeN4Faces | 還沒接，license 和權重沒確認 |
+| 2024 | PluGeN4Faces | **不比**（見下） |
 
-- 🟠 AdaTrans 還沒有跟官方權重對過（SDFlow 和 GradCtrl 都有這一步）。解方：下載官方的 Eyeglasses/Male/Smiling 權重，在同一批臉上各跑一次。
+- **PluGeN4Faces 不能比**（已讀官方 repo）：沒有釋出權重；訓練需要影片資料集（Celeb-DF 的同一人多個畫面）和一個沒有公開的 9 屬性偵測器；屬性裡也沒有 Bangs。論文在相關研究裡引用，並寫明這個原因。
+- **DyStyle 不能比**（已讀官方 repo）：repo 裡只有 README 和圖片，沒有程式碼。
+- 🟠 AdaTrans 還沒有跟官方的編輯器權重對過（SDFlow 和 GradCtrl 都有這一步）。官方 README 給的下載連結列出的內容是分類器、RealNVP、e4e、StyleGAN 和 latent，沒有明列編輯器權重。拿得到就在同一批臉上各跑一次；拿不到就在論文寫明「依官方超參數重新實作並訓練，官方編輯器權重未公開」，並列出和官方不同的地方。
 - 🟡 2025、2026 沒有找到設定相同又有程式碼的方法。論文用一句話交代範圍即可。
 
 ---
