@@ -41,7 +41,7 @@ fidelity metrics give for doing nothing.
 Kinds: model (the checkpoint), boundary (InterFaceGAN), linear (the bank's mean direction),
 sdflow (the released checkpoint), lt and styleflow (the baselines retrained by
 scripts/train_baselines.py; --lt_dir / --styleflow_ckpt), adatrans (training/train_adatrans.py or
-the official release; --adatrans_dir), gradctrl (training/train_gradctrl.py; --gradctrl_dir), noedit.
+the official release; --adatrans_dir), gradctrl (training/train_gradctrl.py; --gradctrl_dir), plugen (training/train_plugen.py; --plugen_dir), noedit.
 
 --sample_offset N skips the first N test faces (the first 500 are the development set); give
 the same value to scripts/editing_curves.py so the strengths are picked on the same faces.
@@ -90,7 +90,7 @@ METRICS = [
 ]
 PAPER_COLUMNS = ['acc', 'id', 'ssim', 'lpips', 'fid', 'clip_d']
 PER_FACE = ('acc', 'acc_celeb', 'id', 'ssim', 'lpips', 'pres', 'clip', 'clip_d')
-KINDS = ('model', 'boundary', 'linear', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'noedit')
+KINDS = ('model', 'boundary', 'linear', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen', 'noedit')
 
 
 def name(g):
@@ -332,7 +332,7 @@ def parse_specs(raw):
 def main(argv=None):
     p = build_parser()
     p.add_argument('--method_spec', action='append', required=True, metavar='NAME:KIND[:CSV]',
-                   help='A method: its name in the table, its kind (model, boundary, linear, sdflow, lt, styleflow, adatrans, gradctrl, noedit) '
+                   help='A method: its name in the table, its kind (model, boundary, linear, sdflow, lt, styleflow, adatrans, gradctrl, plugen, noedit) '
                         'and the curves CSV from scripts/editing_curves.py whose accuracy-vs-strength '
                         'curve picks its strength. Repeatable; order = row order.')
     p.add_argument('--target_acc', nargs='+', type=float, default=[80.0],
@@ -355,6 +355,10 @@ def main(argv=None):
                    help='kind lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
     p.add_argument('--adatrans_dir', default='./output/baselines/adatrans',
                    help='kind adatrans: <dir>/<attr>/model.pth or <dir>/<attr>/save_models/model-latest.')
+    p.add_argument('--plugen_dir', default='./output/baselines/plugen',
+                   help='kind plugen: <dir>/model.pth + config.json (training/train_plugen.py).')
+    p.add_argument('--plugen_others', default='labels', choices=['labels', 'encoded'],
+                   help='kind plugen: as scripts/editing_curves.py (use what its curve was made with).')
     p.add_argument('--gradctrl_dir', default='./output/baselines/gradctrl',
                    help='kind gradctrl: <dir>/model.pth + config.json (training/train_gradctrl.py).')
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
@@ -400,6 +404,10 @@ def main(argv=None):
     if 'adatrans' in kinds:
         from scripts.editing_curves import load_adatrans
         ada = load_adatrans(args.adatrans_dir, attrs)
+    pg, pg_attrs = None, []
+    if 'plugen' in kinds:
+        from scripts.editing_curves import load_plugen
+        pg, pg_attrs = load_plugen(args.plugen_dir, attrs)
     gc = None
     if 'gradctrl' in kinds:
         from scripts.editing_curves import load_gradctrl
@@ -449,7 +457,7 @@ def main(argv=None):
                 f'{name(g)} ' + ('--' if strength[(t, s["name"], g)] is None else f'{strength[(t, s["name"], g)]:.3f}')
                 for g in attrs))
 
-    def edit(kind, img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond=None):
+    def edit(kind, img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond=None, pg_labels=None):
         if kind == 'noedit':
             return src
         if kind == 'sdflow':
@@ -457,6 +465,10 @@ def main(argv=None):
         if kind == 'adatrans':
             from models.adatrans import adatrans_edit
             new_lat = adatrans_edit(ada[g], latent, d, sc)       # fractional steps: a partial last step
+            return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+        if kind == 'plugen':
+            from models.plugen import plugen_edit
+            new_lat = plugen_edit(pg, latent, pg_attrs.index(g), d, sc, pg_labels)
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         if kind == 'gradctrl':
             from models.gradctrl import gradctrl_edit
@@ -493,12 +505,13 @@ def main(argv=None):
                 break
             take = min(img.size(0), N - seen)
             img, latent = img[:take].cuda(), latent[:take].cuda()
-            sf_cond = None
-            if sflow is not None:      # StyleFlow's condition: the r34 readings it was trained on
+            sf_cond, pg_labels = None, None
+            if sflow is not None or pg is not None:   # the r34 readings these baselines were trained on
                 pred = pred[:take].float().reshape(take, -1)[:, :40].cuda()
                 if pred.min() < 0 or pred.max() > 1:
                     pred = torch.sigmoid(pred)
-                sf_cond = pred[:, sflow_attrs]
+                sf_cond = pred[:, sflow_attrs] if sflow is not None else None
+                pg_labels = 2.0 * pred[:, pg_attrs] - 1.0 if pg is not None and args.plugen_others == 'labels' else None
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             src_256 = resize_for_judge(src, (256, 256))
@@ -525,7 +538,7 @@ def main(argv=None):
                         sc = strength[(t, s['name'], g)]
                         if sc is None:
                             continue
-                        face = edit(s['kind'], img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond)
+                        face = edit(s['kind'], img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond, pg_labels)
                         f256 = resize_for_judge(face, (256, 256))
                         ep = torch.sigmoid(indep_teacher(f256)[0])[:, :40]
                         vals = {

@@ -58,6 +58,10 @@ Methods (--method):
            it (--gradctrl_dir); the edit walks the masked classifier gradient on the attribute's
            W+ layers; --scales are numbers of steps of 4/9 (the official demo: 9), e.g.
            1 2 3 4 5 6 7 8 9 11 13 15 18
+  plugen   PluGeN (Wolczyk et al., AAAI 2022; models/plugen.py) retrained on these latents by
+           training/train_plugen.py (--plugen_dir): encode with its NICE flow, write the attribute
+           coordinate, decode; --scales are the value written (1 = the end of the label range),
+           e.g. 0.25 0.5 0.75 1 1.5 2 3
   styleflow StyleFlow (Abdal et al., TOG 2021) retrained on these latents
            (scripts/train_baselines.py styleflow): encode under the r34 readings, move the
            attribute toward its target end by --scales (1 = reach it), decode;
@@ -213,6 +217,24 @@ def load_adatrans(adatrans_dir, attrs, device='cuda'):
     return nets
 
 
+def load_plugen(plugen_dir, attrs, device='cuda'):
+    """(flow, its attribute list) from <dir>/model.pth + config.json (training/train_plugen.py)."""
+    from models.plugen import PluGeNFlow
+    cfg_path = os.path.join(plugen_dir, 'config.json')
+    if not os.path.exists(cfg_path):
+        raise SystemExit(f'no {cfg_path}: run python training/train_plugen.py --out {plugen_dir}')
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    pattrs = [int(a) for a in cfg['attrs']]
+    bad = [a for a in attrs if a not in pattrs]
+    if bad:
+        raise SystemExit(f'the PluGeN flow in {plugen_dir} was trained on {pattrs}, not {bad}')
+    model = PluGeNFlow(512, cfg.get('n_layers', 4), cfg.get('n_couplings', 4), cfg.get('hidden', 512))
+    model.load_state_dict(torch.load(os.path.join(plugen_dir, 'model.pth'), map_location='cpu'), strict=True)
+    print(f'[PluGeN] {plugen_dir}: attributes {pattrs}, {cfg.get("epochs_done", "?")} epochs')
+    return model.to(device).eval(), pattrs
+
+
 def load_gradctrl(gradctrl_dir, attrs, device='cuda'):
     """{attr: edit settings} for GradCtrl from <dir>/model.pth + config.json (training/train_gradctrl.py);
     each value is a dict of the gradctrl_edit keyword arguments with the shared classifier."""
@@ -296,7 +318,13 @@ class OfficialSDFlow:
 def main():
     p = build_parser()
     p.add_argument('--method', default='model',
-                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl'])
+                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen'])
+    p.add_argument('--plugen_dir', default='./output/baselines/plugen',
+                   help='--method plugen: <dir>/model.pth + config.json (training/train_plugen.py). '
+                        '--scales are the value written to the attribute coordinate, e.g. 0.25 0.5 0.75 1 1.5 2 3.')
+    p.add_argument('--plugen_others', default='labels', choices=['labels', 'encoded'],
+                   help='--method plugen: the other attribute coordinates are written with the r34 readings of '
+                        'the source (labels, the official evaluation) or left as the flow encoded them (encoded).')
     p.add_argument('--gradctrl_dir', default='./output/baselines/gradctrl',
                    help='--method gradctrl: <dir>/model.pth + config.json (training/train_gradctrl.py). '
                         '--scales are numbers of steps of 4/9, e.g. 1 2 3 4 5 6 7 8 9 11 13 15 18.')
@@ -393,6 +421,7 @@ def main():
     if args.method == 'adatrans':
         ada = load_adatrans(args.adatrans_dir, attrs)
     gc = load_gradctrl(args.gradctrl_dir, attrs) if args.method == 'gradctrl' else None
+    pg, pg_attrs = load_plugen(args.plugen_dir, attrs) if args.method == 'plugen' else (None, [])
     if args.method == 'lt':
         from models.baselines import LatentTransformer
         for a in attrs:
@@ -440,11 +469,12 @@ def main():
             if seen >= args.num_samples:
                 break
             img, latent = img.cuda(), latent.cuda()
-            if sflow is not None:      # StyleFlow's condition: the r34 readings it was trained on
+            if sflow is not None or pg is not None:   # the r34 readings these baselines were trained on
                 pred = pred.float().reshape(pred.size(0), -1)[:, :40].cuda()
                 if pred.min() < 0 or pred.max() > 1:
                     pred = torch.sigmoid(pred)
-                sf_cond = pred[:, sflow_attrs]
+                sf_cond = pred[:, sflow_attrs] if sflow is not None else None
+                pg_labels = 2.0 * pred[:, pg_attrs] - 1.0 if args.plugen_others == 'labels' else None
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             src_256 = resize_for_judge(src, (256, 256))
@@ -466,6 +496,10 @@ def main():
                     elif ada is not None:
                         from models.adatrans import adatrans_edit
                         new_lat = adatrans_edit(ada[g], latent, d, sc)
+                        face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                    elif pg is not None:
+                        from models.plugen import plugen_edit
+                        new_lat = plugen_edit(pg, latent, pg_attrs.index(g), d, sc, pg_labels)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif gc is not None:
                         from models.gradctrl import gradctrl_edit
@@ -584,7 +618,9 @@ def main():
                               'boundaries': args.boundaries if args.method == 'boundary' else None,
                               'sdflow_img_size': args.sdflow_img_size if args.method == 'sdflow' else None,
                               'adatrans_dir': args.adatrans_dir if args.method == 'adatrans' else None,
-                              'gradctrl_dir': args.gradctrl_dir if args.method == 'gradctrl' else None},
+                              'gradctrl_dir': args.gradctrl_dir if args.method == 'gradctrl' else None,
+                              'plugen_dir': args.plugen_dir if args.method == 'plugen' else None,
+                              'plugen_others': args.plugen_others if args.method == 'plugen' else None},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
           f'[--run OTHER=...] --attributes All --output_dir ./output/curves')
