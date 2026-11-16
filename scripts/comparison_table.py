@@ -41,7 +41,7 @@ fidelity metrics give for doing nothing.
 Kinds: model (the checkpoint), boundary (InterFaceGAN), linear (the bank's mean direction),
 sdflow (the released checkpoint), lt and styleflow (the baselines retrained by
 scripts/train_baselines.py; --lt_dir / --styleflow_ckpt), adatrans (training/train_adatrans.py or
-the official release; --adatrans_dir), noedit.
+the official release; --adatrans_dir), gradctrl (training/train_gradctrl.py; --gradctrl_dir), noedit.
 
 --sample_offset N skips the first N test faces (the first 500 are the development set); give
 the same value to scripts/editing_curves.py so the strengths are picked on the same faces.
@@ -90,7 +90,7 @@ METRICS = [
 ]
 PAPER_COLUMNS = ['acc', 'id', 'ssim', 'lpips', 'fid', 'clip_d']
 PER_FACE = ('acc', 'acc_celeb', 'id', 'ssim', 'lpips', 'pres', 'clip', 'clip_d')
-KINDS = ('model', 'boundary', 'linear', 'sdflow', 'lt', 'styleflow', 'adatrans', 'noedit')
+KINDS = ('model', 'boundary', 'linear', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'noedit')
 
 
 def name(g):
@@ -332,7 +332,7 @@ def parse_specs(raw):
 def main(argv=None):
     p = build_parser()
     p.add_argument('--method_spec', action='append', required=True, metavar='NAME:KIND[:CSV]',
-                   help='A method: its name in the table, its kind (model, boundary, linear, sdflow, lt, styleflow, adatrans, noedit) '
+                   help='A method: its name in the table, its kind (model, boundary, linear, sdflow, lt, styleflow, adatrans, gradctrl, noedit) '
                         'and the curves CSV from scripts/editing_curves.py whose accuracy-vs-strength '
                         'curve picks its strength. Repeatable; order = row order.')
     p.add_argument('--target_acc', nargs='+', type=float, default=[80.0],
@@ -355,6 +355,8 @@ def main(argv=None):
                    help='kind lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
     p.add_argument('--adatrans_dir', default='./output/baselines/adatrans',
                    help='kind adatrans: <dir>/<attr>/model.pth or <dir>/<attr>/save_models/model-latest.')
+    p.add_argument('--gradctrl_dir', default='./output/baselines/gradctrl',
+                   help='kind gradctrl: <dir>/model.pth + config.json (training/train_gradctrl.py).')
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
                    help='kind styleflow: scripts/train_baselines.py styleflow output.')
     p.add_argument('--consistent_reading', type=float, default=None, metavar='MARGIN',
@@ -398,6 +400,10 @@ def main(argv=None):
     if 'adatrans' in kinds:
         from scripts.editing_curves import load_adatrans
         ada = load_adatrans(args.adatrans_dir, attrs)
+    gc = None
+    if 'gradctrl' in kinds:
+        from scripts.editing_curves import load_gradctrl
+        gc = load_gradctrl(args.gradctrl_dir, attrs)
     if 'lt' in kinds:
         from models.baselines import LatentTransformer
         for a in attrs:
@@ -451,6 +457,10 @@ def main(argv=None):
         if kind == 'adatrans':
             from models.adatrans import adatrans_edit
             new_lat = adatrans_edit(ada[g], latent, d, sc)       # fractional steps: a partial last step
+            return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+        if kind == 'gradctrl':
+            from models.gradctrl import gradctrl_edit
+            new_lat = gradctrl_edit(latent=latent, direction=d, steps=sc, **gc[g])
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         if kind == 'lt':
             new_lat = lt_nets[g].edit(latent, d * sc)

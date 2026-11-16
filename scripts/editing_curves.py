@@ -53,6 +53,11 @@ Methods (--method):
            training/train_adatrans.py, or the official released checkpoints (--adatrans_dir); one
            model per attribute, condition +1 / -1 from the R50 direction; --scales are numbers of
            steps (trained with 10), e.g. 1 2 3 4 5 6 8 10 12 14 16
+  gradctrl GradCtrl (Chen et al., ECCV 2022; models/gradctrl.py): the latent classifier retrained
+           on these latents by training/train_gradctrl.py, or the official FFHQ release imported by
+           it (--gradctrl_dir); the edit walks the masked classifier gradient on the attribute's
+           W+ layers; --scales are numbers of steps of 4/9 (the official demo: 9), e.g.
+           1 2 3 4 5 6 7 8 9 11 13 15 18
   styleflow StyleFlow (Abdal et al., TOG 2021) retrained on these latents
            (scripts/train_baselines.py styleflow): encode under the r34 readings, move the
            attribute toward its target end by --scales (1 = reach it), decode;
@@ -208,6 +213,38 @@ def load_adatrans(adatrans_dir, attrs, device='cuda'):
     return nets
 
 
+def load_gradctrl(gradctrl_dir, attrs, device='cuda'):
+    """{attr: edit settings} for GradCtrl from <dir>/model.pth + config.json (training/train_gradctrl.py);
+    each value is a dict of the gradctrl_edit keyword arguments with the shared classifier."""
+    from models.gradctrl import MultiLabelClassifier, edit_settings
+    cfg_path = os.path.join(gradctrl_dir, 'config.json')
+    if not os.path.exists(cfg_path):
+        raise SystemExit(f'no {cfg_path}: run python training/train_gradctrl.py train --out {gradctrl_dir}')
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    cattrs = [int(a) for a in cfg['attrs']]
+    bad = [a for a in attrs if a not in cattrs]
+    if bad:
+        raise SystemExit(f'the GradCtrl classifier in {gradctrl_dir} covers {[a for a in cattrs if a >= 0]}, '
+                         f'not {bad}: pass --only_attrs with its attributes')
+    model = MultiLabelClassifier(len(cattrs), n_shared_layers=cfg.get('n_shared_layers', 0),
+                                 hidden_size=cfg.get('hidden_size', 16))
+    model.load_state_dict(torch.load(os.path.join(gradctrl_dir, 'model.pth'), map_location='cpu'), strict=True)
+    model = model.to(device).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    out = {}
+    for a in attrs:
+        st = cfg.get('settings', {}).get(str(a))
+        over = {a: (st['keep'], st['top_channels'], tuple(st['layers']))} if st else None
+        exclude, top, layers = edit_settings(a, cattrs, over)
+        out[a] = dict(model=model, branch=cattrs.index(a), exclude=exclude, top=top, layers=layers,
+                      step_size=cfg.get('step_size', 4.0 / 9.0), sign=float(cfg.get('signs', {}).get(str(a), 1.0)))
+        print(f'[GradCtrl] attribute {a}: branch {out[a]["branch"]}, keeps {[cattrs[i] for i in exclude]} '
+              f'(top {top}), layers {layers}, sign {out[a]["sign"]:+.0f}')
+    return out
+
+
 class OfficialSDFlow:
     """models/editor.py of the released SDFlow, with the edit direction given. Its flow has the
     same parameter names and shapes as this repo's cnf(512, '512-512-512-512-512', n_attrs, 1),
@@ -259,7 +296,10 @@ class OfficialSDFlow:
 def main():
     p = build_parser()
     p.add_argument('--method', default='model',
-                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans'])
+                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl'])
+    p.add_argument('--gradctrl_dir', default='./output/baselines/gradctrl',
+                   help='--method gradctrl: <dir>/model.pth + config.json (training/train_gradctrl.py). '
+                        '--scales are numbers of steps of 4/9, e.g. 1 2 3 4 5 6 7 8 9 11 13 15 18.')
     p.add_argument('--adatrans_dir', default='./output/baselines/adatrans',
                    help='--method adatrans: <dir>/<attr>/model.pth (training/train_adatrans.py) or the official '
                         'release layout <dir>/<attr>/save_models/model-latest. --scales are numbers of steps '
@@ -352,6 +392,7 @@ def main():
     lt_nets, sflow, ada = {}, None, None
     if args.method == 'adatrans':
         ada = load_adatrans(args.adatrans_dir, attrs)
+    gc = load_gradctrl(args.gradctrl_dir, attrs) if args.method == 'gradctrl' else None
     if args.method == 'lt':
         from models.baselines import LatentTransformer
         for a in attrs:
@@ -425,6 +466,10 @@ def main():
                     elif ada is not None:
                         from models.adatrans import adatrans_edit
                         new_lat = adatrans_edit(ada[g], latent, d, sc)
+                        face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                    elif gc is not None:
+                        from models.gradctrl import gradctrl_edit
+                        new_lat = gradctrl_edit(latent=latent, direction=d, steps=sc, **gc[g])
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif lt_nets:
                         new_lat = lt_nets[g].edit(latent, d * sc)
@@ -538,7 +583,8 @@ def main():
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None,
                               'sdflow_img_size': args.sdflow_img_size if args.method == 'sdflow' else None,
-                              'adatrans_dir': args.adatrans_dir if args.method == 'adatrans' else None},
+                              'adatrans_dir': args.adatrans_dir if args.method == 'adatrans' else None,
+                              'gradctrl_dir': args.gradctrl_dir if args.method == 'gradctrl' else None},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
           f'[--run OTHER=...] --attributes All --output_dir ./output/curves')

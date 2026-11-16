@@ -10,7 +10,7 @@
 #   STEP     default 130000
 #   SDF      retrained 5-attribute SDFlow ckpt dir (default output/sdflow_original_5attr/save_models,
 #            where scripts/pack_eval_bundle.sh puts it)      SDF_STEP default 17549
-#   METHODS  any of: ours adatrans sdflow5 lt styleflow interfacegan (default all)
+#   METHODS  any of: ours adatrans gradctrl sdflow5 lt styleflow interfacegan (default all)
 #   OUT      default output/curves
 # CSVs: $OUT/<method>_off500.csv, logs beside them.
 set -u
@@ -20,7 +20,7 @@ STEP=${STEP:-130000}
 SDF=${SDF:-output/sdflow_original_5attr/save_models}
 SDF_STEP=${SDF_STEP:-17549}
 OUT=${OUT:-output/curves}
-METHODS=${METHODS:-ours adatrans sdflow5 lt styleflow interfacegan}
+METHODS=${METHODS:-ours adatrans gradctrl sdflow5 lt styleflow interfacegan}
 J="--independent_attr_weights ./data/r50_celebahq_eval.pth --independent_attr_backbone r50"
 H="--sample_offset 500 --num_samples 500"
 mkdir -p "$OUT"
@@ -40,6 +40,8 @@ for m in $METHODS; do
                           --scales 0.2 0.4 0.6 0.8 1.0 1.25 1.5 ;;
         adatrans)     run adatrans --method adatrans --adatrans_dir ./output/baselines/adatrans \
                           --scales 1 2 3 4 5 6 8 10 12 14 16 ;;
+        gradctrl)     run gradctrl --method gradctrl --gradctrl_dir ./output/baselines/gradctrl \
+                          --scales 1 2 3 4 5 6 7 8 9 11 13 15 18 ;;
         sdflow5)      run sdflow5 --method sdflow --sdflow_ckpt_dir "$SDF" --sdflow_step "$SDF_STEP" \
                           --sdflow_attrs 15 20 39 31 5 --sdflow_img_size 256 \
                           --scales -1 -0.75 -0.5 -0.25 0 0.25 0.5 1 1.5 2 ;;
