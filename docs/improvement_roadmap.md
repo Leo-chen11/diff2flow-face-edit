@@ -192,6 +192,7 @@
 | 2022 | GradCtrl | 已移植並訓練，等驗證和曲線 |
 | 2022 | PluGeN | 已實作（`training/train_plugen.py`），等訓練和曲線 |
 | 2023 | AdaTrans | 已重寫並訓練，等曲線 |
+| 2023 | DeltaEdit | 已實作，用官方釋出的權重（不用訓練），等曲線 |
 | 2024 | SDFlow | 已重訓並驗證 |
 | 2024 | PluGeN4Faces | **不比**（見下） |
 

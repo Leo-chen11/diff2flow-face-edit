@@ -62,6 +62,11 @@ Methods (--method):
            training/train_plugen.py (--plugen_dir): encode with its NICE flow, write the attribute
            coordinate, decode; --scales are the value written (1 = the end of the label range),
            e.g. 0.25 0.5 0.75 1 1.5 2 3
+  deltaedit DeltaEdit (Lyu et al., CVPR 2023; models/deltaedit.py) with the OFFICIAL released face
+           model (--deltaedit_dir with net_face.pth and fs3.npy): text-driven, a StyleSpace change
+           predicted from the source's CLIP feature and a prompt direction ("face with eyeglasses"
+           against "face", ...); --scales multiply that change (1 = the official edit), e.g.
+           0.25 0.5 0.75 1 1.5 2 3 4
   styleflow StyleFlow (Abdal et al., TOG 2021) retrained on these latents
            (scripts/train_baselines.py styleflow): encode under the r34 readings, move the
            attribute toward its target end by --scales (1 = reach it), decode;
@@ -318,7 +323,16 @@ class OfficialSDFlow:
 def main():
     p = build_parser()
     p.add_argument('--method', default='model',
-                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen'])
+                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen', 'deltaedit'])
+    p.add_argument('--deltaedit_dir', default='./data/deltaedit',
+                   help='--method deltaedit: folder with the official net_face.pth and fs3.npy. --scales multiply '
+                        'the predicted StyleSpace change, e.g. 0.25 0.5 0.75 1 1.5 2 3 4.')
+    p.add_argument('--deltaedit_threshold', type=float, default=0.03,
+                   help='--method deltaedit: relevance threshold of the channels edited (the official 0.03).')
+    p.add_argument('--deltaedit_removal', default='auto', choices=['auto', 'negate'],
+                   help='--method deltaedit: a removal uses the opposite prompt where models/deltaedit.py PROMPTS '
+                        'has one (Male, Young) and the negated add direction otherwise (auto), or always the '
+                        'negated add direction (negate).')
     p.add_argument('--plugen_dir', default='./output/baselines/plugen',
                    help='--method plugen: <dir>/model.pth + config.json (training/train_plugen.py). '
                         '--scales are the value written to the attribute coordinate, e.g. 0.25 0.5 0.75 1 1.5 2 3.')
@@ -422,6 +436,10 @@ def main():
         ada = load_adatrans(args.adatrans_dir, attrs)
     gc = load_gradctrl(args.gradctrl_dir, attrs) if args.method == 'gradctrl' else None
     pg, pg_attrs = load_plugen(args.plugen_dir, attrs) if args.method == 'plugen' else (None, [])
+    de = None
+    if args.method == 'deltaedit':
+        from models.deltaedit import DeltaEdit
+        de = DeltaEdit(args.deltaedit_dir, attrs, threshold=args.deltaedit_threshold, removal=args.deltaedit_removal)
     if args.method == 'lt':
         from models.baselines import LatentTransformer
         for a in attrs:
@@ -475,6 +493,7 @@ def main():
                     pred = torch.sigmoid(pred)
                 sf_cond = pred[:, sflow_attrs] if sflow is not None else None
                 pg_labels = 2.0 * pred[:, pg_attrs] - 1.0 if args.plugen_others == 'labels' else None
+            de_feat = de.image_feature(img) if de is not None else None
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
             src_256 = resize_for_judge(src, (256, 256))
@@ -497,6 +516,8 @@ def main():
                         from models.adatrans import adatrans_edit
                         new_lat = adatrans_edit(ada[g], latent, d, sc)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                    elif de is not None:
+                        face = de.edit(G, latent, de_feat, g, d, sc)
                     elif pg is not None:
                         from models.plugen import plugen_edit
                         new_lat = plugen_edit(pg, latent, pg_attrs.index(g), d, sc, pg_labels)
@@ -619,6 +640,9 @@ def main():
                               'sdflow_img_size': args.sdflow_img_size if args.method == 'sdflow' else None,
                               'adatrans_dir': args.adatrans_dir if args.method == 'adatrans' else None,
                               'gradctrl_dir': args.gradctrl_dir if args.method == 'gradctrl' else None,
+                              'deltaedit': ({'dir': args.deltaedit_dir, 'threshold': args.deltaedit_threshold,
+                                             'removal': args.deltaedit_removal}
+                                            if args.method == 'deltaedit' else None),
                               'plugen_dir': args.plugen_dir if args.method == 'plugen' else None,
                               'plugen_others': args.plugen_others if args.method == 'plugen' else None},
                    'rows': rows}, f, indent=2)
