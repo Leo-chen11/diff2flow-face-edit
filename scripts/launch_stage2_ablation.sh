@@ -58,6 +58,10 @@
 #   R50=<path>           the R50 judge (default ./data/r50_celebahq_eval.pth)
 #   SCALES="..."         edit strengths of the curves (default 0.2 0.4 0.6 0.8 1.0 1.25 1.5)
 #   OFFSET / NUM         held-out faces: skip the first OFFSET (default 500), score NUM (default 500)
+#   CR=<margin>          --consistent_reading of the curves (default 0.1, the final inference rule; CR= for
+#                        none). The CSV name ends in _cr<margin> (_crnone without), so curves made with and
+#                        without it never overwrite each other -- compare an arm only with a control scored
+#                        the same way
 #   DRY_RUN=1            print the commands only
 set -uo pipefail
 
@@ -84,6 +88,8 @@ R50=${R50:-./data/r50_celebahq_eval.pth}
 SCALES=${SCALES:-0.2 0.4 0.6 0.8 1.0 1.25 1.5}
 OFFSET=${OFFSET:-500}
 NUM=${NUM:-500}
+CR=${CR-0.1}
+CRTAG=_cr${CR:-none}
 
 if [ -n "${ARMS:-}" ]; then read -r -a ARMS <<< "$ARMS"; else ARMS=(nodds noclip noloc nohead oneteach idcont noprior); fi
 
@@ -127,6 +133,8 @@ for i in "${!ARMS[@]}"; do
     curves="python -m scripts.editing_curves --checkpoint_dir output/$MODEL/$name --step $END"
     curves+=" --independent_attr_weights $R50 --independent_attr_backbone r50 --method model"
     curves+=" --scales $SCALES --sample_offset $OFFSET --num_samples $NUM"
+    [ -n "$CR" ] && curves+=" --consistent_reading $CR"
+    curves+=" --out_csv output/$MODEL/$name/curves_model_s${END}_off${OFFSET}${CRTAG}.csv"
     echo "== $arm on GPU $gpu =="
     echo "   $train"
     echo "   $curves"
@@ -138,4 +146,4 @@ for gpu in "${!QUEUE[@]}"; do
     nohup bash -c "${QUEUE[$gpu]} echo 'GPU $gpu queue done' >> $LOG/status.txt" > /dev/null 2>&1 &
 done
 echo "launched. progress: tail -f $LOG/*_train.log   finished arms: cat $LOG/status.txt"
-echo "curves: output/$MODEL/<run>_abl_<arm>/curves_model_s${END}_off${OFFSET}.csv"
+echo "curves: output/$MODEL/<run>_abl_<arm>$TAG/curves_model_s${END}_off${OFFSET}${CRTAG}.csv"
