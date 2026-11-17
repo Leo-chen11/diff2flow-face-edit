@@ -40,7 +40,11 @@ Methods (--method):
            flow is run backwards. It only knows Eyeglasses, Male and Young (--sdflow_attrs), so give
            every method --only_attrs 15 20 39: "All" then averages the same attributes for all of them.
            --scales are the editor's `scale`, e.g. 0 0.25 0.5 1 1.5 2
-  boundary InterFaceGAN: w + sign * alpha * sd * n with n the attribute's unit
+  interfacegan InterFaceGAN as its official code (scripts/fit_interfacegan.py: linear SVM on the
+           top / bottom 2% of the latents by the attribute score, unit normal n in W): every W+
+           layer moves by sign * distance * n (--interfacegan_boundaries); --scales are distances,
+           e.g. 0.5 1 1.5 2 2.5 3 4 5 6 (the official demo: up to 3)
+  boundary an InterFaceGAN-STYLE baseline (not the official fit): w + sign * alpha * sd * n with n the attribute's unit
            normal of a linear W+ boundary (scripts/fit_attr_boundaries.py,
            --boundaries) and sd the spread of the test faces' latents along n,
            so alpha = 2 moves a face two standard deviations across the
@@ -189,6 +193,25 @@ def boundary_directions(path, attribute_index, ds, max_faces=2000):
     return out
 
 
+def interfacegan_directions(path, attrs):
+    """{attr: (18, 512)} the official-style InterFaceGAN unit normal (scripts/fit_interfacegan.py) on every
+    W+ layer, so that sign * distance * it is the official W+ edit."""
+    if not os.path.exists(path):
+        raise SystemExit(f'no {path}: run python -m scripts.fit_interfacegan --out {path}')
+    d = torch.load(path, map_location='cpu')
+    bad = [a for a in attrs if a not in d['attrs']]
+    if bad:
+        raise SystemExit(f'{path} has boundaries for {d["attrs"]}, not {bad}')
+    out = {}
+    for a in attrs:
+        n = d['normals'][d['attrs'].index(a)].float()
+        st = d.get('stats', {}).get(a, {})
+        print(f'[InterFaceGAN] {name(a)}: held-out accuracy {st.get("val_acc", float("nan")) * 100:.1f}%, '
+              f'latent std along the normal {st.get("spread", float("nan")):.3f}')
+        out[a] = n.view(1, 512).expand(18, 512).clone()
+    return out
+
+
 def infer_estimator_backbone(state):
     """The AttributeEstimator backbone a labeldist state dict was built with: the width of its
     final layer (2048: resnet50, 512: resnet18 / resnet34) and, for the 512 ones, whether
@@ -323,7 +346,9 @@ class OfficialSDFlow:
 def main():
     p = build_parser()
     p.add_argument('--method', default='model',
-                   choices=['model', 'linear', 'boundary', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen', 'deltaedit'])
+                   choices=['model', 'linear', 'boundary', 'interfacegan', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen', 'deltaedit'])
+    p.add_argument('--interfacegan_boundaries', default='./data/interfacegan_boundaries.pth',
+                   help='--method interfacegan: scripts/fit_interfacegan.py output. --scales are distances.')
     p.add_argument('--deltaedit_dir', default='./data/deltaedit',
                    help='--method deltaedit: folder with the official net_face.pth and fs3.npy. --scales multiply '
                         'the predicted StyleSpace change, e.g. 0.25 0.5 0.75 1 1.5 2 3 4.')
@@ -350,7 +375,8 @@ def main():
                         'release layout <dir>/<attr>/save_models/model-latest. --scales are numbers of steps '
                         '(trained with 10), e.g. 1 2 3 4 5 6 8 10 12 14 16.')
     p.add_argument('--lt_dir', default='./output/baselines/lt',
-                   help='--method lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
+                   help='--method lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt), or the official '
+                        'release\'s tnet_<attr>.pth.tar (same parameter names).')
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
                    help='--method styleflow: scripts/train_baselines.py styleflow output.')
     p.add_argument('--sdflow_ckpt_dir', default='./data/ckpt',
@@ -448,6 +474,8 @@ def main():
         from models.baselines import LatentTransformer
         for a in attrs:
             path = os.path.join(args.lt_dir, f'tnet_{a}.pth')
+            if not os.path.exists(path) and os.path.exists(path + '.tar'):
+                path += '.tar'          # the official release's name (same parameter names)
             if not os.path.exists(path):
                 raise SystemExit(f'no {path}: run python -m scripts.train_baselines lt --out {args.lt_dir}')
             lt_nets[a] = LatentTransformer().cuda().eval()
@@ -467,7 +495,8 @@ def main():
                        latents_file=args.latent_file, preds_file=args.preds_file,
                        train=False, transform=tf)
     lin = linear_directions(args.direction_bank_path, attrs) if args.method == 'linear' \
-        else boundary_directions(args.boundaries, attrs, ds) if args.method == 'boundary' else None
+        else boundary_directions(args.boundaries, attrs, ds) if args.method == 'boundary' \
+        else interfacegan_directions(args.interfacegan_boundaries, attrs) if args.method == 'interfacegan' else None
     # --sample_offset (evaluate_sdflow.py's flag, same test order): skip the development faces.
     # boundary_directions above reads ds itself, so only the loader is offset.
     eval_ds = data.Subset(ds, range(args.sample_offset, len(ds))) if args.sample_offset else ds
@@ -641,6 +670,8 @@ def main():
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None,
+                              'interfacegan_boundaries': (args.interfacegan_boundaries
+                                                          if args.method == 'interfacegan' else None),
                               'sdflow_img_size': args.sdflow_img_size if args.method == 'sdflow' else None,
                               'adatrans_dir': args.adatrans_dir if args.method == 'adatrans' else None,
                               'gradctrl_dir': args.gradctrl_dir if args.method == 'gradctrl' else None,

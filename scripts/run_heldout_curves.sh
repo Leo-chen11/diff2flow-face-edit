@@ -10,7 +10,9 @@
 #   STEP     default 130000
 #   SDF      retrained 5-attribute SDFlow ckpt dir (default output/sdflow_original_5attr/save_models,
 #            where scripts/pack_eval_bundle.sh puts it)      SDF_STEP default 17549
-#   METHODS  any of: ours adatrans gradctrl plugen deltaedit sdflow5 lt styleflow interfacegan (default all)
+#   METHODS  any of: ours adatrans gradctrl plugen deltaedit sdflow5 lt styleflow interfacegan (default all);
+#            interfacegan_lr = the older
+#            InterFaceGAN-style logistic-regression boundaries (not the official fit)
 #   OUT      default output/curves
 # CSVs: $OUT/<method>_off500.csv, logs beside them.
 set -u
@@ -51,7 +53,10 @@ for m in $METHODS; do
                           --scales -1 -0.75 -0.5 -0.25 0 0.25 0.5 1 1.5 2 ;;
         lt)           run lt --method lt --scales 0.25 0.5 0.75 1 1.5 2 ;;
         styleflow)    run styleflow --method styleflow --scales 0.25 0.5 0.75 1 1.5 2 3 ;;
-        interfacegan) run interfacegan --method boundary --scales 1 2 3 4 5 6 ;;
+        interfacegan) run interfacegan --method interfacegan \
+                          --interfacegan_boundaries ./data/interfacegan_boundaries.pth \
+                          --scales 0.5 1 1.5 2 2.5 3 4 5 6 ;;
+        interfacegan_lr) run interfacegan_lr --method boundary --scales 1 2 3 4 5 6 ;;
         *)            echo "unknown method $m" ;;
     esac
 done

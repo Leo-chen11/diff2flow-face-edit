@@ -90,7 +90,7 @@ METRICS = [
 ]
 PAPER_COLUMNS = ['acc', 'id', 'ssim', 'lpips', 'fid', 'clip_d']
 PER_FACE = ('acc', 'acc_celeb', 'id', 'ssim', 'lpips', 'pres', 'clip', 'clip_d')
-KINDS = ('model', 'boundary', 'linear', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen', 'deltaedit', 'noedit')
+KINDS = ('model', 'boundary', 'interfacegan', 'linear', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen', 'deltaedit', 'noedit')
 
 
 def name(g):
@@ -332,7 +332,7 @@ def parse_specs(raw):
 def main(argv=None):
     p = build_parser()
     p.add_argument('--method_spec', action='append', required=True, metavar='NAME:KIND[:CSV]',
-                   help='A method: its name in the table, its kind (model, boundary, linear, sdflow, lt, styleflow, adatrans, gradctrl, plugen, deltaedit, noedit) '
+                   help='A method: its name in the table, its kind (model, boundary, interfacegan, linear, sdflow, lt, styleflow, adatrans, gradctrl, plugen, deltaedit, noedit) '
                         'and the curves CSV from scripts/editing_curves.py whose accuracy-vs-strength '
                         'curve picks its strength. Repeatable; order = row order.')
     p.add_argument('--target_acc', nargs='+', type=float, default=[80.0],
@@ -352,9 +352,12 @@ def main(argv=None):
                    help='Resolution the released SDFlow estimator reads the face at (256, as its own '
                         'code; 0 = the loader image unchanged). Use the value its curves CSV was made with.')
     p.add_argument('--lt_dir', default='./output/baselines/lt',
-                   help='kind lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt).')
+                   help='kind lt: folder with tnet_<attr>.pth (scripts/train_baselines.py lt), or the official '
+                        'release\'s tnet_<attr>.pth.tar (same parameter names).')
     p.add_argument('--adatrans_dir', default='./output/baselines/adatrans',
                    help='kind adatrans: <dir>/<attr>/model.pth or <dir>/<attr>/save_models/model-latest.')
+    p.add_argument('--interfacegan_boundaries', default='./data/interfacegan_boundaries.pth',
+                   help='kind interfacegan: scripts/fit_interfacegan.py output.')
     p.add_argument('--deltaedit_dir', default='./data/deltaedit',
                    help='kind deltaedit: folder with the official net_face.pth and fs3.npy.')
     p.add_argument('--deltaedit_threshold', type=float, default=0.03)
@@ -429,6 +432,8 @@ def main(argv=None):
         from models.baselines import LatentTransformer
         for a in attrs:
             path = os.path.join(args.lt_dir, f'tnet_{a}.pth')
+            if not os.path.exists(path) and os.path.exists(path + '.tar'):
+                path += '.tar'          # the official release's name (same parameter names)
             if not os.path.exists(path):
                 raise SystemExit(f'no {path}: run python -m scripts.train_baselines lt --out {args.lt_dir}')
             lt_nets[a] = LatentTransformer().cuda().eval()
@@ -449,6 +454,11 @@ def main(argv=None):
                        preds_file=args.preds_file, train=False, transform=tf)
     lin = linear_directions(args.direction_bank_path, attrs) if 'linear' in kinds else None
     bnd = boundary_directions(args.boundaries, attrs, ds) if 'boundary' in kinds else None
+    if 'interfacegan' in kinds:
+        from scripts.editing_curves import interfacegan_directions
+        ifg = interfacegan_directions(args.interfacegan_boundaries, attrs)
+    else:
+        ifg = None
     # --sample_offset (evaluate_sdflow.py's flag): skip the development faces. The curves CSVs
     # that pick the strengths should come from the same faces (editing_curves.py --sample_offset).
     eval_ds = data.Subset(ds, range(args.sample_offset, len(ds))) if args.sample_offset else ds
@@ -495,8 +505,8 @@ def main(argv=None):
         if kind == 'styleflow':
             new_lat = styleflow_edit(sflow, latent, sf_cond, sflow_attrs.index(g), d, sc, attr=g)
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
-        if kind in ('linear', 'boundary'):
-            dirs = lin if kind == 'linear' else bnd
+        if kind in ('linear', 'boundary', 'interfacegan'):
+            dirs = {'linear': lin, 'boundary': bnd, 'interfacegan': ifg}[kind]
             new_lat = latent + (d * sc).view(-1, 1, 1) * dirs[g].to(latent)
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         # --consistent_reading: as scripts/editing_curves.py (the curves CSV that picked `sc`
