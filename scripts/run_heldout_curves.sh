@@ -30,7 +30,7 @@ run() {   # <csv name> <editing_curves args...>
     out=$OUT/${name}_off500.csv
     [ -f "$out" ] && { echo "skip $name ($out exists)"; return; }
     echo "== $name  $(date '+%F %T')"
-    python -m scripts.editing_curves --checkpoint_dir "$RUN" --step "$STEP" $J $H --out_csv "$out" "$@" \
+    python -u -m scripts.editing_curves --checkpoint_dir "$RUN" --step "$STEP" $J $H --out_csv "$out" "$@" \
         > "$OUT/${name}_off500.log" 2>&1 || echo "!! $name failed, see $OUT/${name}_off500.log"
 }
 
