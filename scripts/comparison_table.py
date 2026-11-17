@@ -358,6 +358,9 @@ def main(argv=None):
     p.add_argument('--deltaedit_dir', default='./data/deltaedit',
                    help='kind deltaedit: folder with the official net_face.pth and fs3.npy.')
     p.add_argument('--deltaedit_threshold', type=float, default=0.03)
+    p.add_argument('--deltaedit_prompt', action='append', default=None, metavar='ATTR=ADD[|REMOVE]',
+                   help='--method deltaedit: replace an attribute\'s prompts, e.g. "39=young face|elderly face" '
+                        '(no REMOVE: the negated add direction); repeat for several attributes.')
     p.add_argument('--deltaedit_removal', default='auto', choices=['auto', 'negate'],
                    help='kind deltaedit: as scripts/editing_curves.py (use what its curve was made with).')
     p.add_argument('--plugen_dir', default='./output/baselines/plugen',
@@ -411,8 +414,9 @@ def main(argv=None):
         ada = load_adatrans(args.adatrans_dir, attrs)
     de = None
     if 'deltaedit' in kinds:
-        from models.deltaedit import DeltaEdit
-        de = DeltaEdit(args.deltaedit_dir, attrs, threshold=args.deltaedit_threshold, removal=args.deltaedit_removal)
+        from models.deltaedit import DeltaEdit, parse_prompt_overrides
+        de = DeltaEdit(args.deltaedit_dir, attrs, threshold=args.deltaedit_threshold, removal=args.deltaedit_removal,
+                       prompts=parse_prompt_overrides(args.deltaedit_prompt))
     pg, pg_attrs = None, []
     if 'plugen' in kinds:
         from scripts.editing_curves import load_plugen

@@ -45,7 +45,7 @@ for m in $METHODS; do
         plugen)       run plugen --method plugen --plugen_dir ./output/baselines/plugen --plugen_others encoded \
                           --scales 0 0.1 0.25 0.5 0.75 1 1.5 2 3 4 5 ;;
         deltaedit)    run deltaedit --method deltaedit --deltaedit_dir ./data/deltaedit \
-                          --scales 0.25 0.5 0.75 1 1.5 2 3 4 ;;
+                          --scales 0.1 0.25 0.5 0.75 1 1.5 2 3 4 6 8 ;;
         sdflow5)      run sdflow5 --method sdflow --sdflow_ckpt_dir "$SDF" --sdflow_step "$SDF_STEP" \
                           --sdflow_attrs 15 20 39 31 5 --sdflow_img_size 256 \
                           --scales -1 -0.75 -0.5 -0.25 0 0.25 0.5 1 1.5 2 ;;

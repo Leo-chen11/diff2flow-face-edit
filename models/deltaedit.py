@@ -17,8 +17,11 @@ Used here:
     (resized to 256, then its x7 upsample + 8x8 average pool to 224, fed in [-1, 1] without CLIP's
     own normalisation -- how the released model was trained)
   * prompts (PROMPTS): the official style "face with ..." against the neutral "face". A removal has
-    no official recipe: Male / Young use the opposite prompt ("female face", "old face"); the others
-    use the negated direction of their "add" prompt (removal='negate' negates for all five)
+    no official recipe: Male uses the opposite prompt ("female face"), the others the negated direction
+    of their "add" prompt -- the better of the two for each attribute on the development faces
+    (opposite prompts: Male 92.8% at ArcFace 0.510 against 92.1% at 0.438 negated; Young "old face"
+    15% at strength 4 against 53% negated). removal='negate' negates for all five; --deltaedit_prompt
+    (scripts/editing_curves.py) replaces any attribute's prompts
   * strength: the predicted change is multiplied by --scales (1 = the official edit)
 The released model was trained on 58,000 FFHQ photos chosen at random by its authors (plus sampled
 faces), so some of this repo's test faces were probably among its training inputs.
@@ -41,7 +44,7 @@ NEUTRAL = 'face'
 PROMPTS = {
     15: ('face with eyeglasses', None),
     20: ('male face', 'female face'),
-    39: ('young face', 'old face'),
+    39: ('young face', None),
     31: ('face with smile', None),
     5: ('face with bangs', None),
 }
@@ -170,8 +173,23 @@ def text_feature(clip_model, prompt, device):
     return e / e.norm()
 
 
+def parse_prompt_overrides(items):
+    """['39=young face|elderly face', '5=face with bangs'] -> {39: ('young face', 'elderly face'),
+    5: ('face with bangs', None)}: ATTR=ADD[|REMOVE]; no REMOVE (or '-') = the negated add direction."""
+    out = {}
+    for item in items or []:
+        attr, _, spec = item.partition('=')
+        add, _, rm = spec.partition('|')
+        if not attr.strip().isdigit() or not add.strip():
+            raise SystemExit(f'--deltaedit_prompt {item!r}: expected ATTR=ADD[|REMOVE], e.g. 39=young face|old face')
+        rm = rm.strip()
+        out[int(attr)] = (add.strip(), None if rm in ('', '-') else rm)
+    return out
+
+
 class DeltaEdit:
-    def __init__(self, deltaedit_dir, attrs, device='cuda', threshold=0.03, removal='auto', clip_model=None):
+    def __init__(self, deltaedit_dir, attrs, device='cuda', threshold=0.03, removal='auto', clip_model=None,
+                 prompts=None):
         ckpt, fs3 = os.path.join(deltaedit_dir, 'net_face.pth'), os.path.join(deltaedit_dir, 'fs3.npy')
         for path, where in ((ckpt, 'the pretrained DeltaMapper link of the official README'),
                             (fs3, 'models/stylegan2/npy_ffhq/fs3.npy of the official repository')):
@@ -187,13 +205,16 @@ class DeltaEdit:
         self.clip = clip_model.eval()
         relevance = torch.from_numpy(np.load(fs3).astype(np.float32)).to(device)        # (6048, 512)
         assert relevance.shape == (S_DIM, 512), relevance.shape
-        bad = [a for a in attrs if a not in PROMPTS]
+        table = dict(PROMPTS)
+        table.update(prompts or {})
+        self.prompts = {a: table[a] for a in attrs if a in table}
+        bad = [a for a in attrs if a not in table]
         if bad:
             raise SystemExit(f'no DeltaEdit prompt for attributes {bad} (models/deltaedit.py PROMPTS)')
         neutral = text_feature(self.clip, NEUTRAL, device)
         self.dt, self.keep = {}, {}                 # (attr, +1 / -1) -> unit direction, channels kept
         for a in attrs:
-            add, rm = PROMPTS[a]
+            add, rm = table[a]
             d_add = text_feature(self.clip, add, device) - neutral
             d_rm = -d_add if (rm is None or removal == 'negate') else text_feature(self.clip, rm, device) - neutral
             for sign, d in ((1, d_add), (-1, d_rm)):
@@ -206,7 +227,9 @@ class DeltaEdit:
     @torch.no_grad()
     def image_feature(self, img):
         """CLIP feature of the real photos (B, 3, H, W) in [-1, 1], the official preprocessing."""
-        x = F.interpolate(img.float(), size=(256, 256), mode='bilinear', align_corners=False, antialias=True)             if img.shape[-1] != 256 else img.float()
+        x = img.float()
+        if x.shape[-1] != 256:
+            x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
         x = F.avg_pool2d(F.interpolate(x, scale_factor=7, mode='nearest'), kernel_size=8)
         c = self.clip.encode_image(x.to(self.clip.visual.conv1.weight.dtype)).float()
         return c / c.norm(dim=-1, keepdim=True)

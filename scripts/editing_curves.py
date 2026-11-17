@@ -329,6 +329,9 @@ def main():
                         'the predicted StyleSpace change, e.g. 0.25 0.5 0.75 1 1.5 2 3 4.')
     p.add_argument('--deltaedit_threshold', type=float, default=0.03,
                    help='--method deltaedit: relevance threshold of the channels edited (the official 0.03).')
+    p.add_argument('--deltaedit_prompt', action='append', default=None, metavar='ATTR=ADD[|REMOVE]',
+                   help='--method deltaedit: replace an attribute\'s prompts, e.g. "39=young face|elderly face" '
+                        '(no REMOVE: the negated add direction); repeat for several attributes.')
     p.add_argument('--deltaedit_removal', default='auto', choices=['auto', 'negate'],
                    help='--method deltaedit: a removal uses the opposite prompt where models/deltaedit.py PROMPTS '
                         'has one (Male, Young) and the negated add direction otherwise (auto), or always the '
@@ -438,8 +441,9 @@ def main():
     pg, pg_attrs = load_plugen(args.plugen_dir, attrs) if args.method == 'plugen' else (None, [])
     de = None
     if args.method == 'deltaedit':
-        from models.deltaedit import DeltaEdit
-        de = DeltaEdit(args.deltaedit_dir, attrs, threshold=args.deltaedit_threshold, removal=args.deltaedit_removal)
+        from models.deltaedit import DeltaEdit, parse_prompt_overrides
+        de = DeltaEdit(args.deltaedit_dir, attrs, threshold=args.deltaedit_threshold, removal=args.deltaedit_removal,
+                       prompts=parse_prompt_overrides(args.deltaedit_prompt))
     if args.method == 'lt':
         from models.baselines import LatentTransformer
         for a in attrs:
@@ -641,7 +645,8 @@ def main():
                               'adatrans_dir': args.adatrans_dir if args.method == 'adatrans' else None,
                               'gradctrl_dir': args.gradctrl_dir if args.method == 'gradctrl' else None,
                               'deltaedit': ({'dir': args.deltaedit_dir, 'threshold': args.deltaedit_threshold,
-                                             'removal': args.deltaedit_removal}
+                                             'removal': args.deltaedit_removal,
+                                             'prompts': de.prompts if de is not None else None}
                                             if args.method == 'deltaedit' else None),
                               'plugen_dir': args.plugen_dir if args.method == 'plugen' else None,
                               'plugen_others': args.plugen_others if args.method == 'plugen' else None},
