@@ -42,8 +42,8 @@ for m in $METHODS; do
                           --scales 1 2 3 4 5 6 8 10 12 14 16 ;;
         gradctrl)     run gradctrl --method gradctrl --gradctrl_dir ./output/baselines/gradctrl \
                           --scales 1 2 3 4 5 6 7 8 9 11 13 15 18 22 26 ;;
-        plugen)       run plugen --method plugen --plugen_dir ./output/baselines/plugen \
-                          --scales 0.25 0.5 0.75 1 1.5 2 3 ;;
+        plugen)       run plugen --method plugen --plugen_dir ./output/baselines/plugen --plugen_others encoded \
+                          --scales 0 0.1 0.25 0.5 0.75 1 1.5 2 3 4 5 ;;
         deltaedit)    run deltaedit --method deltaedit --deltaedit_dir ./data/deltaedit \
                           --scales 0.25 0.5 0.75 1 1.5 2 3 4 ;;
         sdflow5)      run sdflow5 --method sdflow --sdflow_ckpt_dir "$SDF" --sdflow_step "$SDF_STEP" \
