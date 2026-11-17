@@ -24,3 +24,6 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# launcher logs (scripts/launch_*.sh)
+logs/
