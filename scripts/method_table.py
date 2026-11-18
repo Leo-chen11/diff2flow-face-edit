@@ -10,6 +10,13 @@ matched quantity, interpolated linearly between the two measured strengths aroun
                 target itself; read the id and the r18 accuracy. Best id per row in bold.
   --match id    the ArcFace similarity falls to --target (e.g. 0.85). The id cell is then the target;
                 read the two accuracies. Best R50 accuracy per row in bold.
+  --match strength  every method at one FIXED strength (--target, e.g. 0.95), as the table comparing runs
+                of one model (ctrl / wsd / long ...). Only meaningful for methods whose strength means
+                the same thing -- your own model and its ablations, all with the editor's `scale`. For
+                other methods give each its own operating point with NAME=curves.csv@STRENGTH
+                (e.g. AdaTrans=...@10 for its 10 trained steps) and say so in the caption. A strength the
+                curve did not measure is interpolated between its neighbours and marked ~ (measure it
+                exactly with scripts/editing_curves.py --scales 0.95); outside the measured range: --.
 
 The curve is read at its FIRST crossing. A method whose curve never reaches the target for an attribute
 shows "--" (match acc) or its strongest measured point marked * (match id: it never loses that much
@@ -21,6 +28,8 @@ it is not all of them.
     python -m scripts.method_table --match id --target 0.85
     python -m scripts.method_table --target 95 --run Ours=output/curves/ours_cr0.1_off500.csv \\
         --run SDFlow=output/curves/sdflow5_off500.csv
+    python -m scripts.method_table --match strength --target 0.95 \\
+        --run ctrl=<run>/curves_model_s130000_off500_cr0.1.csv --run nomakeup=<run2>/curves_....csv
 
 Writes output/tables/method_table_<match>_<target>.{md,csv}. The curves must be the held-out ones
 (scripts/run_heldout_curves.sh: *_off500.csv), one CSV per method with the columns of
@@ -78,12 +87,23 @@ def read_at(rows, match, target):
     return None
 
 
-def fmt(cell, match, bold_idx, best):
+def read_strength(rows, s):
+    """The curve at strength s: the measured row, or the linear interpolation (flag ~), or None outside."""
+    for row in rows:
+        if abs(row[0] - s) < 1e-9:
+            return row + ('',)
+    for prev, row in zip(rows, rows[1:]):
+        if prev[0] < s < row[0]:
+            return lerp(prev, row, (s - prev[0]) / (row[0] - prev[0])) + ('~',)
+    return None
+
+
+def fmt(cell, bold):
     if cell is None:
         return '--'
     _, r50, r18, ident, flag = cell
     s = f'{ident:.3f} / {r50 * 100:.1f} / {r18 * 100:.1f}{flag}'
-    return f'**{s}**' if bold_idx and best else s
+    return f'**{s}**' if bold else s
 
 
 def main():
@@ -91,26 +111,29 @@ def main():
     p.add_argument('--run', action='append', default=None, metavar='NAME=curves.csv',
                    help='a method (repeat); default: every method of scripts/run_heldout_curves.sh found in --curves')
     p.add_argument('--curves', default='output/curves')
-    p.add_argument('--match', default='acc', choices=['acc', 'id'])
-    p.add_argument('--target', type=float, default=None, help='percent for --match acc (default 90), ArcFace for --match id (default 0.85)')
+    p.add_argument('--match', default='acc', choices=['acc', 'id', 'strength'])
+    p.add_argument('--target', type=float, default=None, help='percent for --match acc (default 90), ArcFace for --match id (default 0.85), '
+                                                      'the strength for --match strength (default 0.95)')
     p.add_argument('--attrs', nargs='+', default=ATTRS)
     p.add_argument('--out_dir', default='output/tables')
     args = p.parse_args()
 
     if args.target is None:
-        args.target = 90.0 if args.match == 'acc' else 0.85
+        args.target = {'acc': 90.0, 'id': 0.85, 'strength': 0.95}[args.match]
     target = args.target / 100.0 if args.match == 'acc' else args.target
     runs = []
     if args.run:
         for item in args.run:
             name, _, path = item.partition('=')
-            runs.append((name.strip(), path.strip()))
+            path, _, at = path.partition('@')                    # NAME=curves.csv[@strength]
+            runs.append((name.strip(), path.strip(), float(at) if at else None))
     else:
-        runs = [(n, os.path.join(args.curves, f)) for n, f in DEFAULT_RUNS]
-    have = []
-    for name, path in runs:
+        runs = [(n, os.path.join(args.curves, f), None) for n, f in DEFAULT_RUNS]
+    have, at_of = [], {}
+    for name, path, at in runs:
         if os.path.exists(path):
             have.append((name, read_curves(path)))
+            at_of[name] = at
         else:
             print(f'  - {name}: no {path} (skipped)')
     if not have:
@@ -119,7 +142,12 @@ def main():
     cells = {}                     # (method, attr) -> cell
     for name, curves in have:
         for a in args.attrs:
-            cells[(name, a)] = read_at(curves[a], args.match, target) if a in curves else None
+            if a not in curves:
+                cells[(name, a)] = None
+            elif args.match == 'strength':
+                cells[(name, a)] = read_strength(curves[a], at_of[name] if at_of[name] is not None else target)
+            else:
+                cells[(name, a)] = read_at(curves[a], args.match, target)
     names = [n for n, _ in have]
 
     # Average over the attributes a method has a value for
@@ -129,7 +157,7 @@ def main():
         if vals:
             m = tuple(sum(v[i] for v in vals) / len(vals) for i in range(4))
             flag = '' if len(vals) == len(args.attrs) else f' ({len(vals)}/{len(args.attrs)})'
-            avg[n] = m + (flag + ('*' if any(v[4] for v in vals) else ''),)
+            avg[n] = m + (flag + ''.join(sorted({v[4] for v in vals if v[4]})),)
         else:
             avg[n] = None
 
@@ -144,17 +172,26 @@ def main():
     for label, getter in [(a, lambda n, a=a: cells[(n, a)]) for a in args.attrs] + [('Average', lambda n: avg[n])]:
         vals = {n: getter(n) for n in names}
         top = max((v[best_idx] for v in vals.values() if v is not None), default=None)
-        cs = [fmt(vals[n], args.match, True, vals[n] is not None and abs(vals[n][best_idx] - top) < 5e-4) for n in names]
+        if args.match == 'strength':                       # as the run-comparison table: only Average in bold
+            cs = [fmt(vals[n], label == 'Average') for n in names]
+        else:
+            cs = [fmt(vals[n], vals[n] is not None and abs(vals[n][best_idx] - top) < 5e-4) for n in names]
         md.append('| ' + ' | '.join([f'**{label}**' if label == 'Average' else label] + cs) + ' |')
         rows_out.append([label] + [('' if vals[n] is None else f'{vals[n][3]:.4f}/{vals[n][1] * 100:.2f}/{vals[n][2] * 100:.2f}') for n in names])
 
-    unit = f'R50 editing accuracy {args.target:g}%' if args.match == 'acc' else f'ArcFace {args.target:g}'
-    note = (f'Each method read at the strength where its curve reaches {unit} (interpolated, first crossing); '
-            'cell = ArcFace id / R50 accuracy % / CelebA-r18 accuracy %. Best ' +
-            ('id' if args.match == 'acc' else 'R50 accuracy') + ' per row in bold. -- : the curve never reaches the target; '
-            '* : ' + ('the weakest measured strength is already above the target' if args.match == 'acc'
-                      else 'the curve never loses that much identity (its strongest point)') +
-            '; (k/n): k of n attributes available.')
+    if args.match == 'strength':
+        custom = ', '.join(f'{n} at {a:g}' for n, a in at_of.items() if a is not None)
+        note = (f'Every method at strength {args.target:g}' + (f' except {custom}' if custom else '') +
+                '; cell = ArcFace id / R50 accuracy % / CelebA-r18 accuracy %. ~ : interpolated between the two '
+                'measured strengths around it; -- : outside the measured range; (k/n): k of n attributes available.')
+    else:
+        unit = f'R50 editing accuracy {args.target:g}%' if args.match == 'acc' else f'ArcFace {args.target:g}'
+        note = (f'Each method read at the strength where its curve reaches {unit} (interpolated, first crossing); '
+                'cell = ArcFace id / R50 accuracy % / CelebA-r18 accuracy %. Best ' +
+                ('id' if args.match == 'acc' else 'R50 accuracy') + ' per row in bold. -- : the curve never reaches the target; '
+                '* : ' + ('the weakest measured strength is already above the target' if args.match == 'acc'
+                          else 'the curve never loses that much identity (its strongest point)') +
+                '; (k/n): k of n attributes available.')
     text = '\n'.join(md) + '\n\n' + note + '\n'
     print('\n' + text)
     os.makedirs(args.out_dir, exist_ok=True)
