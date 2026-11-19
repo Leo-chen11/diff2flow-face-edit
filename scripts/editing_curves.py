@@ -404,6 +404,14 @@ def main():
     p.add_argument('--scales', nargs='+', type=float, default=[0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
                    help='Edit strengths (alphas for --method linear).')
     p.add_argument('--preserve_set', default='edited', choices=['edited', 'all40'])
+    p.add_argument('--direction_judge', default='r50', choices=['r50', 'r18'],
+                   help='Whose reading of the source stands in for the user\'s request: the edit direction '
+                        'and which faces are clear enough to score (default r50, every curve so far). r18 '
+                        '(the CelebA judge, needs its weights) is the swap test of --consistent_reading, '
+                        'which follows the request: R50 is then the judge that did not choose it. Either '
+                        'way the CSV also has R50 accuracy on the consensus faces (cons_r50_success: both '
+                        'judges read the source clearly and the same way, so the request is the same '
+                        'whichever judge makes it) and on the rest (dis_r50_success, n_disagree).')
     p.add_argument('--consistent_reading', type=float, default=None, metavar='MARGIN',
                    help='--method model only. Direction-consistent source reading: when the '
                         'conditioner reads the source on the wrong side of 0.5 for the requested '
@@ -437,6 +445,9 @@ def main():
 
     prior, conditioner, G, id_criterion, _, _, direction_bank = load_models(args)
     _, indep_id, _, indep_teacher, _, celeb_judge = build_optional_judges(args, args.attribute_index, id_criterion)
+    if args.direction_judge == 'r18' and celeb_judge is None:
+        raise SystemExit('--direction_judge r18 needs the CelebA r18 judge (--celeba_attr_judge_weights, '
+                         'default ./data/celeba_attr_resnet18.pth)')
     if indep_id is None:
         raise SystemExit('the independent face-ID model (facenet-pytorch) is required')
     arc = None
@@ -535,10 +546,14 @@ def main():
             src_id = indep_id.extract(src_256)
             src_arc = arc.extract(src_256) if arc is not None else None
             seg_src = parse_seg(bg_parser, src_256) if bg_parser is not None else None
+            # --direction_judge: whose reading of the source stands in for the user's request (the
+            # direction, and which faces are clear enough to score). R50 by default; r18 for the swap
+            # test of an inference rule that follows the request (--consistent_reading).
+            dsrc = sc_src if args.direction_judge == 'r18' else sp
             for g in attrs:
                 li = args.attribute_index.index(g)
-                d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
-                keep = (sp[:, g] > CLEAR_HI) | (sp[:, g] < CLEAR_LO)
+                d = torch.where(dsrc[:, g] > 0.5, -1.0, 1.0)
+                keep = (dsrc[:, g] > CLEAR_HI) | (dsrc[:, g] < CLEAR_LO)
                 if not keep.any():
                     continue
                 others = [j for j in (attrs if args.preserve_set == 'edited' else range(40)) if j != g]
@@ -580,14 +595,22 @@ def main():
                             src_value_in_encoding=args.consistent_reading is not None)
                     f256 = resize_for_judge(face, (256, 256))
                     ep = torch.sigmoid(indep_teacher(f256)[0])[:, :40]
-                    ok = torch.where(sp[:, g] > 0.5, ep[:, g] < 0.5 - args.success_margin,
+                    # success = the R50 reading of the edit crossed 0.5 the REQUESTED way (with the
+                    # default --direction_judge r50 this is exactly the old rule)
+                    ok = torch.where(d < 0, ep[:, g] < 0.5 - args.success_margin,
                                      ep[:, g] > 0.5 + args.success_margin)
                     if sc_src is not None:
                         ce = celeb_judge.scores(f256)[:, g]
                         cs = sc_src[:, g]
-                        both = keep & ((cs > CLEAR_HI) | (cs < CLEAR_LO)) & ((cs > 0.5) == (sp[:, g] > 0.5))
+                        # consensus faces: both judges read the source clearly and the same way, so the
+                        # requested direction is the same whichever judge stands in for the user
+                        both = (((cs > CLEAR_HI) | (cs < CLEAR_LO)) & ((sp[:, g] > CLEAR_HI) | (sp[:, g] < CLEAR_LO))
+                                & ((cs > 0.5) == (sp[:, g] > 0.5)))
                         c_ok = torch.where(cs > 0.5, ce < 0.5 - args.success_margin,
                                            ce > 0.5 + args.success_margin)
+                        # faces scored for R50 accuracy where the two judges read the source differently
+                        # (one unclear or the other side): there the direction is the direction judge's call
+                        disagree = keep & ~both
                     idv = (src_id * indep_id.extract(f256)).sum(1)
                     so, eo = sp[:, others], ep[:, others]
                     clear_o = (so > CLEAR_HI) | (so < CLEAR_LO)
@@ -620,6 +643,8 @@ def main():
                         r['id_arc'] += (src_arc * arc.extract(f256)).sum(1)[keep].tolist()
                     if sc_src is not None:
                         r['celeb'] += c_ok[both].float().tolist()
+                        r['cons_r50'] += ok[both].float().tolist()
+                        r['dis_r50'] += ok[disagree].float().tolist()
             seen += img.size(0)
 
     rows = []
@@ -633,6 +658,9 @@ def main():
                          'preserve_acc': float(np.mean(r['pres'])), 'n': len(r['acc']),
                          'id_arc': float(np.mean(r['id_arc'])) if r['id_arc'] else float('nan'),
                          'celeb_success': float(np.mean(r['celeb'])) if r['celeb'] else float('nan'),
+                         'cons_r50_success': float(np.mean(r['cons_r50'])) if r['cons_r50'] else float('nan'),
+                         'n_disagree': len(r['dis_r50']),
+                         'dis_r50_success': float(np.mean(r['dis_r50'])) if r['dis_r50'] else float('nan'),
                          'n_celeb': len(r['celeb']),
                          'region_preserve': float(np.mean(r['region'])) if r['region'] else float('nan'),
                          'bg_psnr': float(np.mean(r['bg_psnr'])) if r['bg_psnr'] else float('nan'),
@@ -644,16 +672,21 @@ def main():
                          **{k: float(np.mean([x[k] for x in per]))
                             for k in ('target_success', 'effective_success', 'id_sim_real', 'preserve_acc',
                                       'celeb_success', 'id_arc', 'region_preserve', 'bg_psnr', 'bg_mse')},
+                         **{k: float(np.nanmean([x[k] for x in per])) if not all(np.isnan(x[k]) for x in per)
+                            else float('nan') for k in ('cons_r50_success', 'dis_r50_success')},
+                         'n_disagree': sum(x['n_disagree'] for x in per),
                          'n': sum(x['n'] for x in per), 'n_celeb': sum(x['n_celeb'] for x in per)})
 
     label = f'{args.method}'
     print(f'\n{label}, {seen} faces, preserve_set={args.preserve_set}')
     print(f'  {"attribute":<11} {"scale":>6} {"EditAcc":>8} {"r18Acc":>7} {"ArcFace":>8} {"facenet":>8} '
-          f'{"AttrPres":>9} {"Region":>7} {"n":>5}')
+          f'{"AttrPres":>9} {"Region":>7} {"n":>5}   {"R50cons":>7} {"R50dis":>7} {"n_dis":>5}')
     for x in rows:
         print(f'  {x["attribute"]:<11} {x["strength"]:6.2f} {x["target_success"] * 100:7.1f}% '
               f'{x["celeb_success"] * 100:6.1f}% {x["id_arc"]:8.3f} {x["id_sim_real"]:8.3f} '
-              f'{x["preserve_acc"] * 100:8.1f}% {x["region_preserve"] * 100:6.1f}% {x["n"]:5d}')
+              f'{x["preserve_acc"] * 100:8.1f}% {x["region_preserve"] * 100:6.1f}% {x["n"]:5d}   '
+              f'{x.get("cons_r50_success", float("nan")) * 100:6.1f}% {x.get("dis_r50_success", float("nan")) * 100:6.1f}% '
+              f'{x.get("n_disagree", 0):5d}')
 
     path = args.out_csv or os.path.join(
         args.checkpoint_dir,
@@ -667,6 +700,7 @@ def main():
                               'scales': args.scales, 'num_samples': seen, 'sample_offset': args.sample_offset,
                               'preserve_set': args.preserve_set,
                               'consistent_reading': args.consistent_reading,
+                              'direction_judge': args.direction_judge,
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None,

@@ -6,8 +6,10 @@ Strengths mean different things for different methods (steps, a coefficient, a S
 a fixed strength cannot be shared; each method is read at the strength where ITS OWN curve reaches the
 matched quantity, interpolated linearly between the two measured strengths around it:
 
-  --match acc   (default) the R50 editing accuracy reaches --target (percent). The R50 cell is then the
-                target itself; read the id and the r18 accuracy. Best id per row in bold.
+  --match acc   (default) the editing accuracy of --judge (r50, or r18: the CelebA judge on the consensus
+                faces) reaches --target (percent). That judge's cell is then the target itself; read the
+                rest. Best id per row in bold. Report both judges: the curves take the edit direction from
+                R50 (scripts/editing_curves.py --direction_judge), so R50 accuracy is not independent of it.
   --match id    the ArcFace similarity falls to --target (e.g. 0.85). The id cell is then the target;
                 read the two accuracies. Best R50 accuracy per row in bold.
   --match strength  every method at one FIXED strength (--target, e.g. 0.95), as the table comparing runs
@@ -70,8 +72,8 @@ def lerp(p, q, t):
 def read_at(rows, match, target):
     """(strength, r50, r18, id, flag) at the first crossing of `target`, or None.
     acc is in 0-1 and id in 0-1 inside; target for match acc is given in 0-1 too."""
-    key = 1 if match == 'acc' else 3
-    rising = match == 'acc'
+    key = {'acc': 1, 'acc_r18': 2}.get(match, 3)
+    rising = match in ('acc', 'acc_r18')
     for i, row in enumerate(rows):
         hit = row[key] >= target if rising else row[key] <= target
         if not hit:
@@ -114,6 +116,8 @@ def main():
     p.add_argument('--match', default='acc', choices=['acc', 'id', 'strength'])
     p.add_argument('--target', type=float, default=None, help='percent for --match acc (default 90), ArcFace for --match id (default 0.85), '
                                                       'the strength for --match strength (default 0.95)')
+    p.add_argument('--judge', default='r50', choices=['r50', 'r18'],
+                   help='--match acc: whose accuracy reaches the target (default r50).')
     p.add_argument('--attrs', nargs='+', default=ATTRS)
     p.add_argument('--out_dir', default='output/tables')
     args = p.parse_args()
@@ -147,7 +151,8 @@ def main():
             elif args.match == 'strength':
                 cells[(name, a)] = read_strength(curves[a], at_of[name] if at_of[name] is not None else target)
             else:
-                cells[(name, a)] = read_at(curves[a], args.match, target)
+                m = 'acc_r18' if (args.match == 'acc' and args.judge == 'r18') else args.match
+                cells[(name, a)] = read_at(curves[a], m, target)
     names = [n for n, _ in have]
 
     # Average over the attributes a method has a value for
@@ -185,7 +190,8 @@ def main():
                 '; cell = ArcFace id / R50 accuracy % / CelebA-r18 accuracy %. ~ : interpolated between the two '
                 'measured strengths around it; -- : outside the measured range; (k/n): k of n attributes available.')
     else:
-        unit = f'R50 editing accuracy {args.target:g}%' if args.match == 'acc' else f'ArcFace {args.target:g}'
+        unit = (f'{args.judge.upper()} editing accuracy {args.target:g}%' if args.match == 'acc'
+                else f'ArcFace {args.target:g}')
         note = (f'Each method read at the strength where its curve reaches {unit} (interpolated, first crossing); '
                 'cell = ArcFace id / R50 accuracy % / CelebA-r18 accuracy %. Best ' +
                 ('id' if args.match == 'acc' else 'R50 accuracy') + ' per row in bold. -- : the curve never reaches the target; '
@@ -195,7 +201,8 @@ def main():
     text = '\n'.join(md) + '\n\n' + note + '\n'
     print('\n' + text)
     os.makedirs(args.out_dir, exist_ok=True)
-    stem = os.path.join(args.out_dir, f'method_table_{args.match}_{args.target:g}')
+    stem = os.path.join(args.out_dir, f'method_table_{args.match}_{args.target:g}'
+                        + (f'_{args.judge}' if args.match == 'acc' and args.judge != 'r50' else ''))
     with open(stem + '.md', 'w') as f:
         f.write(text)
     with open(stem + '.csv', 'w', newline='') as f:
