@@ -60,6 +60,9 @@
 # Environment:
 #   ARMS="<arm> ..."     pick the arms (default: all but ctrl)
 #   TAG=<suffix>         appended to every run name and the log directory
+#   EXTRA_SETS="k=v ..." set these keys in EVERY arm, e.g. EXTRA_SETS="batch=16" (also in the control: a
+#                        run with another batch size is not comparable with one trained with the
+#                        config's; give it its own TAG)
 #   SEED=<n>             overrides the run's --seed
 #   RESUME_DIR=<dir>     the stage-1 run dir to resume from, when the config.json's own resume_dir
 #                        (an absolute path of the machine it was trained on) does not exist here
@@ -140,7 +143,7 @@ for i in "${!ARMS[@]}"; do
     sets=(--set "run_name=$name")
     if [ -n "$aseed" ]; then sets+=(--set "seed=$aseed"); elif [ -n "${SEED:-}" ]; then sets+=(--set "seed=$SEED"); fi
     [ -n "${RESUME_DIR:-}" ] && sets+=(--set "resume_dir=$RESUME_DIR")
-    for kv in $(arm_sets "$aname"); do sets+=(--set "$kv"); done
+    for kv in $(arm_sets "$aname") ${EXTRA_SETS:-}; do sets+=(--set "$kv"); done
     train=$(python -m scripts.rebuild_train_cmd --config "$CFG" "${sets[@]}" 2>>"$LOG/rebuild.log") \
         || { echo "rebuild_train_cmd failed for $arm, see $LOG/rebuild.log"; exit 1; }
     train=$(echo "$train" | tr -d '\\\n' | tr -s ' ')
