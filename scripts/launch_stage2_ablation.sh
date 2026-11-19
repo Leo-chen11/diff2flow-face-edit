@@ -33,6 +33,10 @@
 #               the flow was given
 #   truedilate  --local_region_true_dilate: the add-eyeglasses mask grown, not blurred
 #   fixes       the three together
+#   nodds_noclip / nodds_noloc / nodds_noprior   the frozen-Stable-Diffusion term removed AND one more
+#               (CLIP prompt / both locality losses / the bank prior): for a machine where the control
+#               does not fit, the pruning goes one term at a time on top of nodds
+#   nodds_none  all four candidate terms removed at once (nodds + noclip + noloc + noprior)
 #   custom      any combination: CUSTOM_SETS="key=value key=value" (only via ARMS). The check that
 #               terms which each showed no effect alone can ALL go at once, e.g.
 #               ARMS=custom CUSTOM_SETS="use_diffusion_guidance=false use_clip_prompt_loss=false local_region_head=false"
@@ -47,7 +51,11 @@
 #   bash scripts/launch_stage2_ablation.sh <final stage-2 run dir> "<gpu ids>"
 #   bash scripts/launch_stage2_ablation.sh output/SDFlow/multi_v1_min_2teach_seed1_bn_ctrl_wsd_from50k_long "0 1"
 #
-# Arms are dealt round-robin to the GPUs; arms sharing a GPU run one after the other. Everything runs
+# ARM@SEED runs that arm with its own seed (nodds@2: run nodds_s2), so one call can queue the same arm
+# under two seeds; plain ARM keeps the run's seed (or SEED=).
+#
+# Arms are dealt round-robin to the GPUs; arms sharing a GPU run one after the other (the next one
+# starts when the previous finished, or failed). Everything runs
 # in the background; logs in logs/stage2_ablation<TAG>/, runs named <run>_abl_<arm><TAG>.
 # Environment:
 #   ARMS="<arm> ..."     pick the arms (default: all but ctrl)
@@ -94,7 +102,7 @@ CRTAG=_cr${CR:-none}
 if [ -n "${ARMS:-}" ]; then read -r -a ARMS <<< "$ARMS"; else ARMS=(nodds noclip noloc nohead oneteach idcont noprior); fi
 
 arm_sets() {   # the --set key=value pairs of an arm
-    case $1 in
+    case ${1%@*} in
         ctrl)     ;;
         nodds)    echo "use_diffusion_guidance=false" ;;
         noclip)   echo "use_clip_prompt_loss=false" ;;
@@ -103,6 +111,10 @@ arm_sets() {   # the --set key=value pairs of an arm
         oneteach) echo "extra_teacher_weights=none teacher_combine=mean" ;;
         idcont)   echo "id_loss_hinge=false" ;;
         noprior)  echo "bank_prior_weight=0" ;;
+        nodds_noclip)  echo "use_diffusion_guidance=false use_clip_prompt_loss=false" ;;
+        nodds_noloc)   echo "use_diffusion_guidance=false local_region_loss_weight=0 local_region_head=false" ;;
+        nodds_noprior) echo "use_diffusion_guidance=false bank_prior_weight=0" ;;
+        nodds_none)    echo "use_diffusion_guidance=false use_clip_prompt_loss=false local_region_loss_weight=0 local_region_head=false bank_prior_weight=0" ;;
         orth)     echo "lag_reg_weight=20" ;;
         nomakeup) echo "coupled_targets=20-:36-,18-,34- coupled_target_weight=0.6" ;;
         ot)       echo "transport_kinetic_weight=0.01 transport_jacobian_weight=0.01" ;;
@@ -116,17 +128,19 @@ arm_sets() {   # the --set key=value pairs of an arm
         *)        echo "unknown arm $1" >&2; exit 1 ;;
     esac
 }
-for arm in "${ARMS[@]}"; do arm_sets "$arm" > /dev/null; done   # an unknown arm stops here
+for arm in "${ARMS[@]}"; do arm_sets "${arm%@*}" > /dev/null; done   # an unknown arm stops here
 
 declare -A QUEUE
 for i in "${!ARMS[@]}"; do
-    arm=${ARMS[$i]}
+    arm=${ARMS[$i]}                                   # ARM or ARM@SEED
+    aname=${arm%@*}; aseed=""; [[ $arm == *@* ]] && aseed=${arm#*@}
+    tagseed=${aseed:+_s$aseed}
     gpu=${GPUS[$((i % ${#GPUS[@]}))]}
-    name="${BASE}_abl_${arm}$TAG"
+    name="${BASE}_abl_${aname}${tagseed}$TAG"
     sets=(--set "run_name=$name")
-    [ -n "${SEED:-}" ] && sets+=(--set "seed=$SEED")
+    if [ -n "$aseed" ]; then sets+=(--set "seed=$aseed"); elif [ -n "${SEED:-}" ]; then sets+=(--set "seed=$SEED"); fi
     [ -n "${RESUME_DIR:-}" ] && sets+=(--set "resume_dir=$RESUME_DIR")
-    for kv in $(arm_sets "$arm"); do sets+=(--set "$kv"); done
+    for kv in $(arm_sets "$aname"); do sets+=(--set "$kv"); done
     train=$(python -m scripts.rebuild_train_cmd --config "$CFG" "${sets[@]}" 2>>"$LOG/rebuild.log") \
         || { echo "rebuild_train_cmd failed for $arm, see $LOG/rebuild.log"; exit 1; }
     train=$(echo "$train" | tr -d '\\\n' | tr -s ' ')
@@ -135,10 +149,11 @@ for i in "${!ARMS[@]}"; do
     curves+=" --scales $SCALES --sample_offset $OFFSET --num_samples $NUM"
     [ -n "$CR" ] && curves+=" --consistent_reading $CR"
     curves+=" --out_csv output/$MODEL/$name/curves_model_s${END}_off${OFFSET}${CRTAG}.csv"
-    echo "== $arm on GPU $gpu =="
+    echo "== $aname${tagseed} on GPU $gpu =="
     echo "   $train"
     echo "   $curves"
-    QUEUE[$gpu]+="CUDA_VISIBLE_DEVICES=$gpu $train > $LOG/${arm}_train.log 2>&1 && CUDA_VISIBLE_DEVICES=$gpu $curves > $LOG/${arm}_curves.log 2>&1 || echo '!! $arm failed, see $LOG/${arm}_*.log' >> $LOG/status.txt; "
+    lname=${aname}${tagseed}
+    QUEUE[$gpu]+="CUDA_VISIBLE_DEVICES=$gpu $train > $LOG/${lname}_train.log 2>&1 && CUDA_VISIBLE_DEVICES=$gpu $curves > $LOG/${lname}_curves.log 2>&1 && echo 'done $lname' >> $LOG/status.txt || echo '!! $lname failed, see $LOG/${lname}_*.log' >> $LOG/status.txt; "
 done
 
 [ "${DRY_RUN:-0}" = 1 ] && { echo "(DRY_RUN: nothing launched)"; exit 0; }
