@@ -12,19 +12,31 @@
 #            where scripts/pack_eval_bundle.sh puts it)      SDF_STEP default 17549
 #   METHODS  any of: ours adatrans gradctrl plugen deltaedit sdflow5 lt styleflow interfacegan (default all);
 #            interfacegan_lr = the older
-#            InterFaceGAN-style logistic-regression boundaries (not the official fit)
-#   OUT      default output/curves
+#            InterFaceGAN-style logistic-regression boundaries (not the official fit);
+#            ours_nocr = ours without the reading rule; sdflow5_cr / styleflow_cr = the two conditional
+#            baselines WITH the same reading rule (CR margin) -- the three methods that edit from a
+#            reading of the source, so the only ones the rule acts on
+#   CR       the reading rule's margin for ours / sdflow5_cr / styleflow_cr (default 0.1)
+#   FACE_SET direction (default: the faces R50 reads clearly, every curve so far) or consensus (the faces
+#            R50 AND the CelebA r18 read clearly and the same way: the request does not depend on which
+#            judge makes it; the protocol for any table with the reading rule in it)
+#   OUT      default output/curves (FACE_SET=consensus: output/curves_consensus)
 # CSVs: $OUT/<method>_off500.csv, logs beside them.
+#
+#   FACE_SET=consensus METHODS="ours ours_nocr sdflow5 sdflow5_cr styleflow styleflow_cr adatrans gradctrl \
+#       plugen deltaedit lt interfacegan" bash scripts/run_heldout_curves.sh
 set -u
 cd "$(dirname "$0")/.."
 RUN=${RUN:-output/multi_v1_min_2teach_seed1_bn_ctrl_wsd_from50k_long}
 STEP=${STEP:-130000}
 SDF=${SDF:-output/sdflow_original_5attr/save_models}
 SDF_STEP=${SDF_STEP:-17549}
-OUT=${OUT:-output/curves}
+FACE_SET=${FACE_SET:-direction}
+CR=${CR:-0.1}
+if [ "$FACE_SET" = consensus ]; then OUT=${OUT:-output/curves_consensus}; else OUT=${OUT:-output/curves}; fi
 METHODS=${METHODS:-ours adatrans gradctrl plugen deltaedit sdflow5 lt styleflow interfacegan}
 J="--independent_attr_weights ./data/r50_celebahq_eval.pth --independent_attr_backbone r50"
-H="--sample_offset 500 --num_samples 500"
+H="--sample_offset 500 --num_samples 500 --face_set $FACE_SET"
 mkdir -p "$OUT"
 
 run() {   # <csv name> <editing_curves args...>
@@ -38,8 +50,9 @@ run() {   # <csv name> <editing_curves args...>
 
 for m in $METHODS; do
     case $m in
-        ours)         run ours_cr0.1 --method model --consistent_reading 0.1 \
-                          --scales 0.2 0.4 0.6 0.8 1.0 1.25 1.5 ;;
+        ours)         run ours_cr$CR --method model --consistent_reading "$CR" \
+                          --scales 0.2 0.4 0.6 0.8 0.95 1.0 1.25 1.5 ;;
+        ours_nocr)    run ours_nocr --method model --scales 0.2 0.4 0.6 0.8 0.95 1.0 1.25 1.5 ;;
         adatrans)     run adatrans --method adatrans --adatrans_dir ./output/baselines/adatrans \
                           --scales 1 2 3 4 5 6 8 10 12 14 16 ;;
         gradctrl)     run gradctrl --method gradctrl --gradctrl_dir ./output/baselines/gradctrl \
@@ -51,8 +64,13 @@ for m in $METHODS; do
         sdflow5)      run sdflow5 --method sdflow --sdflow_ckpt_dir "$SDF" --sdflow_step "$SDF_STEP" \
                           --sdflow_attrs 15 20 39 31 5 --sdflow_img_size 256 \
                           --scales -1 -0.75 -0.5 -0.25 0 0.25 0.5 1 1.5 2 ;;
+        sdflow5_cr)   run sdflow5_cr$CR --method sdflow --sdflow_ckpt_dir "$SDF" --sdflow_step "$SDF_STEP" \
+                          --sdflow_attrs 15 20 39 31 5 --sdflow_img_size 256 --consistent_reading "$CR" \
+                          --scales -1 -0.75 -0.5 -0.25 0 0.25 0.5 1 1.5 2 ;;
         lt)           run lt --method lt --scales 0.25 0.5 0.75 1 1.5 2 ;;
         styleflow)    run styleflow --method styleflow --scales 0.25 0.5 0.75 1 1.5 2 3 ;;
+        styleflow_cr) run styleflow_cr$CR --method styleflow --consistent_reading "$CR" \
+                          --scales 0.25 0.5 0.75 1 1.5 2 3 ;;
         interfacegan) run interfacegan --method interfacegan \
                           --interfacegan_boundaries ./data/interfacegan_boundaries.pth \
                           --scales 0.5 1 1.5 2 2.5 3 4 5 6 ;;

@@ -33,12 +33,22 @@ it is not all of them.
     python -m scripts.method_table --match strength --target 0.95 \\
         --run ctrl=<run>/curves_model_s130000_off500_cr0.1.csv --run nomakeup=<run2>/curves_....csv
 
-Writes output/tables/method_table_<match>_<target>.{md,csv}. The curves must be the held-out ones
-(scripts/run_heldout_curves.sh: *_off500.csv), one CSV per method with the columns of
-scripts/editing_curves.py.
+Writes output/tables/method_table_<match>_<target>.{md,csv} (curves from output/curves_consensus:
+output/tables_consensus/...). The curves must be the held-out ones (scripts/run_heldout_curves.sh:
+*_off500.csv), one CSV per method with the columns of scripts/editing_curves.py.
+
+Protocol check: every CSV's .json (written beside it by scripts/editing_curves.py) must give the same
+faces -- sample_offset, num_samples and face_set -- or the table is refused (--allow_mixed to override,
+e.g. for a CSV older than the face_set option, which was always the direction face set). The caption
+states the face set, the faces per attribute, and which methods ran with the reading rule (CR) at what
+margin, so a table never mixes protocols silently.
+
+    FACE_SET=consensus ... bash scripts/run_heldout_curves.sh         # then
+    python -m scripts.method_table --curves output/curves_consensus --target 90
 """
 import argparse
 import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -47,7 +57,9 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 ATTRS = ['Eyeglasses', 'Male', 'Young', 'Smiling', 'Bangs']
 DEFAULT_RUNS = [
-    ('Ours', 'ours_cr0.1_off500.csv'), ('SDFlow', 'sdflow5_off500.csv'), ('AdaTrans', 'adatrans_off500.csv'),
+    ('Ours', 'ours_cr0.1_off500.csv'), ('Ours (no CR)', 'ours_nocr_off500.csv'),
+    ('SDFlow', 'sdflow5_off500.csv'), ('SDFlow+CR', 'sdflow5_cr0.1_off500.csv'),
+    ('StyleFlow+CR', 'styleflow_cr0.1_off500.csv'), ('AdaTrans', 'adatrans_off500.csv'),
     ('DeltaEdit', 'deltaedit_off500.csv'), ('GradCtrl', 'gradctrl_off500.csv'), ('PluGeN', 'plugen_off500.csv'),
     ('StyleFlow', 'styleflow_off500.csv'), ('LT', 'lt_off500.csv'), ('InterFaceGAN', 'interfacegan_off500.csv'),
 ]
@@ -63,6 +75,24 @@ def read_curves(path):
             row = (float(r['strength']), float(r['target_success']), float(r['celeb_success']), float(r['id_arc']))
             out.setdefault(r['attribute'], []).append(row)
     return {a: sorted(rows) for a, rows in out.items()}
+
+
+def read_meta(path):
+    """The config scripts/editing_curves.py saved beside the CSV ({} when there is none)."""
+    try:
+        with open(os.path.splitext(path)[0] + '.json') as f:
+            return json.load(f).get('config', {})
+    except (OSError, ValueError):
+        return {}
+
+
+def faces_per_attr(path):
+    out = {}
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            if r['attribute'] != 'All' and 'n' in r:
+                out.setdefault(r['attribute'], int(float(r['n'])))
+    return out
 
 
 def lerp(p, q, t):
@@ -119,8 +149,14 @@ def main():
     p.add_argument('--judge', default='r50', choices=['r50', 'r18'],
                    help='--match acc: whose accuracy reaches the target (default r50).')
     p.add_argument('--attrs', nargs='+', default=ATTRS)
-    p.add_argument('--out_dir', default='output/tables')
+    p.add_argument('--out_dir', default=None,
+                   help='default output/tables (output/tables_consensus for --curves output/curves_consensus)')
+    p.add_argument('--allow_mixed', action='store_true',
+                   help='build the table even when the CSVs were not all made on the same faces')
     args = p.parse_args()
+    if args.out_dir is None:
+        tail = os.path.basename(os.path.normpath(args.curves))
+        args.out_dir = os.path.join('output', 'tables' + (tail[len('curves'):] if tail.startswith('curves') else ''))
 
     if args.target is None:
         args.target = {'acc': 90.0, 'id': 0.85, 'strength': 0.95}[args.match]
@@ -133,15 +169,29 @@ def main():
             runs.append((name.strip(), path.strip(), float(at) if at else None))
     else:
         runs = [(n, os.path.join(args.curves, f), None) for n, f in DEFAULT_RUNS]
-    have, at_of = [], {}
+    have, at_of, meta, n_of = [], {}, {}, {}
     for name, path, at in runs:
         if os.path.exists(path):
             have.append((name, read_curves(path)))
             at_of[name] = at
+            meta[name] = read_meta(path)
+            n_of[name] = faces_per_attr(path)
         else:
             print(f'  - {name}: no {path} (skipped)')
     if not have:
         raise SystemExit('no curve CSV found')
+
+    # the same faces for every method, or the comparison is not one
+    proto = {n: (m.get('sample_offset'), m.get('num_samples'), m.get('face_set', 'direction'))
+             for n, m in meta.items()}
+    if len(set(proto.values())) > 1:
+        lines = '\n'.join(f'    {n:<14} offset {o}  faces {k}  face_set {fs}' for n, (o, k, fs) in proto.items())
+        msg = f'the curves were not made on the same faces:\n{lines}'
+        if not args.allow_mixed:
+            raise SystemExit(msg + '\n(--allow_mixed to build the table anyway)')
+        print('[WARN] ' + msg)
+    face_set = next(iter(proto.values()))[2]
+    cr_of = {n: m.get('consistent_reading') for n, m in meta.items()}
 
     cells = {}                     # (method, attr) -> cell
     for name, curves in have:
@@ -198,6 +248,12 @@ def main():
                 '* : ' + ('the weakest measured strength is already above the target' if args.match == 'acc'
                           else 'the curve never loses that much identity (its strongest point)') +
                 '; (k/n): k of n attributes available.')
+    first = n_of[names[0]]
+    note += (' Faces: ' + ('those R50 AND the CelebA r18 both read clearly and the same way (consensus)'
+                           if face_set == 'consensus' else 'those the R50 judge reads clearly')
+             + ', per attribute ' + ', '.join(f'{a} {first[a]}' for a in args.attrs if a in first) + '.')
+    with_cr = [f'{n} ({cr_of[n]:g})' for n in names if cr_of.get(n) is not None]
+    note += (' Reading rule (CR, margin): ' + ', '.join(with_cr) + '; every other method without it.' if with_cr else ' No method used the reading rule (CR).')
     text = '\n'.join(md) + '\n\n' + note + '\n'
     print('\n' + text)
     os.makedirs(args.out_dir, exist_ok=True)

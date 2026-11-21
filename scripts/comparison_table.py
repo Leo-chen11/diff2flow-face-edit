@@ -25,7 +25,9 @@ per attribute, and everything else is measured there on the same faces:
 
 Every number is measured against the unedited reconstruction G(e4e latent), not the real
 photo, so the inversion error does not enter. Faces are the ones the R50 judge reads
-clearly on the source (the same for all methods). Marks: bold = best (or tied with the best:
+clearly on the source (the same for all methods); --face_set consensus: only those R50 and the
+CelebA r18 both read clearly and the same way (docs/cr_two_judge_protocol.md). KIND+cr (model,
+sdflow, styleflow) runs a method with the direction-consistent reading rule. Marks: bold = best (or tied with the best:
 paired difference within 1.96 standard errors), underline = best of the rest; Acc is the
 matched quantity and is not ranked. A "No-edit" row (kind noedit) shows what the
 fidelity metrics give for doing nothing.
@@ -91,6 +93,10 @@ METRICS = [
 PAPER_COLUMNS = ['acc', 'id', 'ssim', 'lpips', 'fid', 'clip_d']
 PER_FACE = ('acc', 'acc_celeb', 'id', 'ssim', 'lpips', 'pres', 'clip', 'clip_d')
 KINDS = ('model', 'boundary', 'interfacegan', 'linear', 'sdflow', 'lt', 'styleflow', 'adatrans', 'gradctrl', 'plugen', 'deltaedit', 'noedit')
+# the methods that edit FROM a reading of the source (ours: the conditioner, SDFlow: its label estimator,
+# StyleFlow: the r34 labels it is conditioned on) take the reading rule as KIND+cr; the others move along
+# the request whatever the source looks like, so the rule has nothing to act on
+CR_KINDS = ('model', 'sdflow', 'styleflow')
 
 
 def name(g):
@@ -321,11 +327,16 @@ def parse_specs(raw):
     specs = []
     for item in raw:
         parts = item.split(':', 2)
+        cr = len(parts) >= 2 and parts[1].endswith('+cr')
+        if cr:
+            parts[1] = parts[1][:-3]
+            if parts[1] not in CR_KINDS:
+                raise SystemExit(f'--method_spec {item!r}: +cr only for {CR_KINDS}')
         if len(parts) < 2 or parts[1] not in KINDS:
-            raise SystemExit(f'--method_spec {item!r}: expected NAME:KIND[:curves.csv] with KIND in {KINDS}')
+            raise SystemExit(f'--method_spec {item!r}: expected NAME:KIND[+cr][:curves.csv] with KIND in {KINDS}')
         if parts[1] != 'noedit' and (len(parts) < 3 or not os.path.exists(parts[2])):
             raise SystemExit(f'--method_spec {item!r}: needs the existing curves CSV of scripts/editing_curves.py')
-        specs.append({'name': parts[0], 'kind': parts[1], 'csv': parts[2] if len(parts) > 2 else None})
+        specs.append({'name': parts[0], 'kind': parts[1], 'cr': cr, 'csv': parts[2] if len(parts) > 2 else None})
     return specs
 
 
@@ -375,10 +386,16 @@ def main(argv=None):
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
                    help='kind styleflow: scripts/train_baselines.py styleflow output.')
     p.add_argument('--consistent_reading', type=float, default=None, metavar='MARGIN',
-                   help='kind model only: the direction-consistent source reading of '
-                        'scripts/editing_curves.py --consistent_reading (a conditioner reading on the '
-                        'wrong side of 0.5 for the requested direction is moved to 0.5 -/+ MARGIN, in '
-                        'the encoding and the target). Give the value the model\'s curves CSV was made with.')
+                   help='The direction-consistent source reading of scripts/editing_curves.py '
+                        '--consistent_reading (a method\'s own reading on the wrong side of 0.5 for the '
+                        'requested direction is moved to 0.5 -/+ MARGIN, in the encoding and the target). '
+                        'Applies to kind model (as before) and to every KIND+cr spec (model+cr, sdflow+cr, '
+                        'styleflow+cr; margin 0.1 when this is not given). Give the value each curves CSV '
+                        'was made with.')
+    p.add_argument('--face_set', default='direction', choices=['direction', 'consensus'],
+                   help='As scripts/editing_curves.py --face_set: direction (default) = the faces R50 reads '
+                        'clearly; consensus = those both R50 and the CelebA r18 read clearly and the same '
+                        'way (needs the r18 weights). Use the one the curves CSVs were made with.')
     p.add_argument('--no_fid', action='store_true', help='Skip FID / KID (needs torchmetrics + torch-fidelity).')
     p.add_argument('--out_dir', default='./output/comparison')
     p.set_defaults(eval_resize='area', num_samples=1000)
@@ -397,6 +414,8 @@ def main(argv=None):
         args, args.attribute_index, id_criterion)
     if indep_id is None or lpips_fn is None:
         raise SystemExit('facenet-pytorch and lpips are required')
+    if args.face_set == 'consensus' and celeb_judge is None:
+        raise SystemExit('--face_set consensus needs the CelebA r18 judge (--celeba_attr_judge_weights)')
     arc = ArcFaceJudge(args.arcface_weights) if os.path.exists(args.arcface_weights) else None
     if arc is None:
         print(f'[WARN] no ArcFace weights at {args.arcface_weights}: the ID column is facenet instead')
@@ -480,11 +499,17 @@ def main(argv=None):
                 f'{name(g)} ' + ('--' if strength[(t, s["name"], g)] is None else f'{strength[(t, s["name"], g)]:.3f}')
                 for g in attrs))
 
-    def edit(kind, img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond=None, pg_labels=None, de_feat=None):
+    def cr_margin(spec):
+        if spec['cr']:
+            return args.consistent_reading if args.consistent_reading is not None else 0.1
+        return args.consistent_reading if spec['kind'] == 'model' else None
+
+    def edit(kind, img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond=None, pg_labels=None, de_feat=None,
+             cr=None):
         if kind == 'noedit':
             return src
         if kind == 'sdflow':
-            return sdf.edit(G, img, latent, g, d, sc)
+            return sdf.edit(G, img, latent, g, d, sc, margin=cr)
         if kind == 'adatrans':
             from models.adatrans import adatrans_edit
             new_lat = adatrans_edit(ada[g], latent, d, sc)       # fractional steps: a partial last step
@@ -503,6 +528,9 @@ def main(argv=None):
             new_lat = lt_nets[g].edit(latent, d * sc)
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         if kind == 'styleflow':
+            if cr is not None:
+                from evaluation.evaluate_sdflow import consistent_source
+                sf_cond = consistent_source(sf_cond, sflow_attrs.index(g), d, cr)
             new_lat = styleflow_edit(sflow, latent, sf_cond, sflow_attrs.index(g), d, sc, attr=g)
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         if kind in ('linear', 'boundary', 'interfacegan'):
@@ -512,9 +540,8 @@ def main(argv=None):
         # --consistent_reading: as scripts/editing_curves.py (the curves CSV that picked `sc`
         # must have been made with the same value)
         sv = None
-        if args.consistent_reading is not None:
-            sv = torch.where(d > 0, attr_cond[:, li].clamp(max=0.5 - args.consistent_reading),
-                             attr_cond[:, li].clamp(min=0.5 + args.consistent_reading))
+        if cr is not None:
+            sv = torch.where(d > 0, attr_cond[:, li].clamp(max=0.5 - cr), attr_cond[:, li].clamp(min=0.5 + cr))
         return edit_single_attribute(
             prior, conditioner, G, id_criterion, img, latent, attr_cond, id_cond, li, sc, direction_bank,
             attr_global_idx=g, bypass_glasses_direction_bank=args.bypass_glasses_direction_bank,
@@ -550,6 +577,9 @@ def main(argv=None):
                 li = args.attribute_index.index(g)
                 d = torch.where(sp[:, g] > 0.5, -1.0, 1.0)
                 keep = (sp[:, g] > CLEAR_HI) | (sp[:, g] < CLEAR_LO)
+                if args.face_set == 'consensus':       # as scripts/editing_curves.py --face_set consensus
+                    _cs = sc_src[:, g]
+                    keep = keep & ((_cs > CLEAR_HI) | (_cs < CLEAR_LO)) & ((_cs > 0.5) == (sp[:, g] > 0.5))
                 if not keep.any():
                     continue
                 kidx = keep.nonzero().view(-1).cpu().numpy()
@@ -564,7 +594,8 @@ def main(argv=None):
                         sc = strength[(t, s['name'], g)]
                         if sc is None:
                             continue
-                        face = edit(s['kind'], img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond, pg_labels, de_feat)
+                        face = edit(s['kind'], img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond, pg_labels,
+                                    de_feat, cr=cr_margin(s))
                         f256 = resize_for_judge(face, (256, 256))
                         ep = torch.sigmoid(indep_teacher(f256)[0])[:, :40]
                         vals = {
@@ -631,6 +662,8 @@ def main(argv=None):
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'num_faces': seen,
                               'sample_offset': args.sample_offset,
                               'consistent_reading': args.consistent_reading,
+                              'reading_rule': {s['name']: cr_margin(s) for s in specs},
+                              'face_set': args.face_set,
                               'target_acc': args.target_acc, 'match_metric': args.match_metric,
                               'attributes': [name(a) for a in attrs], 'eval_resize': args.eval_resize,
                               'id_model': 'ArcFace IR-SE50' if arc is not None else 'facenet casia-webface',

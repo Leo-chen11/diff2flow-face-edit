@@ -836,8 +836,10 @@ def consistent_source(attr_cond, local_idx, direction, margin):
     """attr_cond with the edited attribute's SOURCE value moved to the far side
     of 0.5 from the requested direction: add -> min(src, 0.5 - m), rm ->
     max(src, 0.5 + m). Off (attr_cond unchanged) without a margin or a
-    direction. Not part of any edit path: only scripts/diagnose_attr_edit.py's
-    E<m> condition uses it.
+    direction. Used by scripts/editing_curves.py --consistent_reading for the
+    SDFlow and StyleFlow baselines (the same rule as our model's, which
+    edit_single_attribute applies through src_value) and by
+    scripts/diagnose_attr_edit.py's E<m> condition.
 
     Why: with a given direction the flow is asked for src + s*(end - src). When
     the conditioner already reads the source on the target side (Young: a face

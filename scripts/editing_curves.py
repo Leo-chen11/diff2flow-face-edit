@@ -118,7 +118,7 @@ import evaluation.evaluate_sdflow as E
 from common.attr_tables import bank_num_k
 from evaluation.evaluate_sdflow import (
     ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges,
-    build_parser, edit_single_attribute, load_models, resize_for_judge,
+    build_parser, consistent_source, edit_single_attribute, load_models, resize_for_judge,
 )
 from models.arcface import ArcFaceJudge
 from models.dataset import SDFlowDataset
@@ -330,12 +330,17 @@ class OfficialSDFlow:
               f'estimator input ' + (f'{self.img_size} px' if self.img_size else 'as loaded (no resize)'))
 
     @torch.no_grad()
-    def edit(self, G, img, latent, g, direction, scale):
+    def edit(self, G, img, latent, g, direction, scale, margin=None):
+        """margin: the direction-consistent reading rule (--consistent_reading) on this method's OWN
+        attribute estimator: a reading on the wrong side of 0.5 for the requested direction is moved to
+        0.5 -/+ margin before the flow encodes under it."""
         if self.img_size and img.shape[-1] != self.img_size:
             # bilinear, as the released loader's T.Resize; at exactly half size it is a 2x2 average
             img = torch.nn.functional.interpolate(img, (self.img_size, self.img_size), mode='bilinear',
                                                   align_corners=False)
         reading = self.labeldist(img, latent)
+        if margin is not None:
+            reading = consistent_source(reading, self.attrs.index(g), direction, margin)
         z = self.flow(latent, reading, torch.zeros(latent.size(0), latent.size(1), 1).to(latent))[0]
         new = reading.clone()
         new[:, self.attrs.index(g)] = torch.where(direction > 0, 1.0 + scale, -scale)
@@ -404,6 +409,13 @@ def main():
     p.add_argument('--scales', nargs='+', type=float, default=[0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
                    help='Edit strengths (alphas for --method linear).')
     p.add_argument('--preserve_set', default='edited', choices=['edited', 'all40'])
+    p.add_argument('--face_set', default='direction', choices=['direction', 'consensus'],
+                   help='Which faces are scored. direction (default, every curve so far): those the direction '
+                        'judge reads clearly. consensus: those BOTH judges (R50 and the CelebA r18) read clearly '
+                        'and the same way -- the request is then the same whichever judge stands in for the '
+                        'user and never rests on one judge\'s misreading; every metric (both accuracies, '
+                        'ArcFace, preservation) is on these faces. Same faces for every method: they depend on '
+                        'the source and the two judges only.')
     p.add_argument('--direction_judge', default='r50', choices=['r50', 'r18'],
                    help='Whose reading of the source stands in for the user\'s request: the edit direction '
                         'and which faces are clear enough to score (default r50, every curve so far). r18 '
@@ -413,8 +425,12 @@ def main():
                         'judges read the source clearly and the same way, so the request is the same '
                         'whichever judge makes it) and on the rest (dis_r50_success, n_disagree).')
     p.add_argument('--consistent_reading', type=float, default=None, metavar='MARGIN',
-                   help='--method model only. Direction-consistent source reading: when the '
-                        'conditioner reads the source on the wrong side of 0.5 for the requested '
+                   help='--method model, sdflow, styleflow (the three methods that edit FROM a reading of '
+                        'the source; the others move along the request unconditionally and ignore it). '
+                        'Direction-consistent source reading: when the '
+                        'method\'s own attribute reading (ours: the conditioner; SDFlow: its label '
+                        'estimator; StyleFlow: the r34 labels it is conditioned on) puts the source on the '
+                        'wrong side of 0.5 for the requested '
                         'direction (asked to add an attribute it already reads as present, or the '
                         'reverse), the flow encodes and targets with that reading moved to '
                         '0.5 - MARGIN (add) / 0.5 + MARGIN (remove); sources read on the right side '
@@ -445,6 +461,8 @@ def main():
 
     prior, conditioner, G, id_criterion, _, _, direction_bank = load_models(args)
     _, indep_id, _, indep_teacher, _, celeb_judge = build_optional_judges(args, args.attribute_index, id_criterion)
+    if args.face_set == 'consensus' and celeb_judge is None:
+        raise SystemExit('--face_set consensus needs the CelebA r18 judge (--celeba_attr_judge_weights)')
     if args.direction_judge == 'r18' and celeb_judge is None:
         raise SystemExit('--direction_judge r18 needs the CelebA r18 judge (--celeba_attr_judge_weights, '
                          'default ./data/celeba_attr_resnet18.pth)')
@@ -554,12 +572,18 @@ def main():
                 li = args.attribute_index.index(g)
                 d = torch.where(dsrc[:, g] > 0.5, -1.0, 1.0)
                 keep = (dsrc[:, g] > CLEAR_HI) | (dsrc[:, g] < CLEAR_LO)
+                if args.face_set == 'consensus':
+                    # both judges read the source clearly and the same way: the request does not depend
+                    # on which judge stands in for the user, and no judge's misreading defines it
+                    _cs = sc_src[:, g]
+                    keep = (keep & ((sp[:, g] > CLEAR_HI) | (sp[:, g] < CLEAR_LO))
+                            & ((_cs > CLEAR_HI) | (_cs < CLEAR_LO)) & ((_cs > 0.5) == (sp[:, g] > 0.5)))
                 if not keep.any():
                     continue
                 others = [j for j in (attrs if args.preserve_set == 'edited' else range(40)) if j != g]
                 for sc in args.scales:
                     if sdf is not None:
-                        face = sdf.edit(G, img, latent, g, d, sc)
+                        face = sdf.edit(G, img, latent, g, d, sc, margin=args.consistent_reading)
                     elif ada is not None:
                         from models.adatrans import adatrans_edit
                         new_lat = adatrans_edit(ada[g], latent, d, sc)
@@ -578,7 +602,9 @@ def main():
                         new_lat = lt_nets[g].edit(latent, d * sc)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif sflow is not None:
-                        new_lat = styleflow_edit(sflow, latent, sf_cond, sflow_attrs.index(g), d, sc, attr=g)
+                        _sfc = sf_cond if args.consistent_reading is None else consistent_source(
+                            sf_cond, sflow_attrs.index(g), d, args.consistent_reading)
+                        new_lat = styleflow_edit(sflow, latent, _sfc, sflow_attrs.index(g), d, sc, attr=g)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif lin is not None:
                         new_lat = latent + (d * sc).view(-1, 1, 1) * lin[g].to(latent)
@@ -701,6 +727,7 @@ def main():
                               'preserve_set': args.preserve_set,
                               'consistent_reading': args.consistent_reading,
                               'direction_judge': args.direction_judge,
+                              'face_set': args.face_set,
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None,

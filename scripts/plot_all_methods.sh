@@ -5,8 +5,9 @@
 #
 #   bash scripts/plot_all_methods.sh
 # Environment:
-#   CURVES   folder of the <method>_off500.csv files (default output/curves)
-#   OUT      output folder (default output/figures/all_methods)
+#   CURVES   folder of the <method>_off500.csv files (default output/curves; the consensus-face curves of
+#            FACE_SET=consensus bash scripts/run_heldout_curves.sh: CURVES=output/curves_consensus)
+#   OUT      output folder (default output/figures/all_methods, or .../all_methods_consensus)
 #   OURS     your model's CSV (default: $CURVES/ours_cr0.1_off500.csv, else $CURVES/final_cr0.1_off500.csv)
 # Writes, each as .png and .pdf plus a table (.csv) of every curve read at 40 60 80 90 95%:
 #   $OUT/r50/        accuracy by the R50 judge,         right panel: other attributes preserved
@@ -15,7 +16,10 @@
 set -u
 cd "$(dirname "$0")/.."
 CURVES=${CURVES:-output/curves}
-OUT=${OUT:-output/figures/all_methods}
+case $(basename "$CURVES") in
+    curves_consensus) OUT=${OUT:-output/figures/all_methods_consensus} ;;
+    *)                OUT=${OUT:-output/figures/all_methods} ;;
+esac
 if [ -z "${OURS:-}" ]; then
     OURS=$CURVES/ours_cr0.1_off500.csv
     [ -f "$OURS" ] || OURS=$CURVES/final_cr0.1_off500.csv
@@ -24,7 +28,10 @@ fi
 # name in the legend = CSV
 METHODS=(
     "Ours=$OURS"
+    "Ours (no CR)=$CURVES/ours_nocr_off500.csv"
     "SDFlow=$CURVES/sdflow5_off500.csv"
+    "SDFlow+CR=$CURVES/sdflow5_cr0.1_off500.csv"
+    "StyleFlow+CR=$CURVES/styleflow_cr0.1_off500.csv"
     "AdaTrans=$CURVES/adatrans_off500.csv"
     "DeltaEdit=$CURVES/deltaedit_off500.csv"
     "GradCtrl=$CURVES/gradctrl_off500.csv"
