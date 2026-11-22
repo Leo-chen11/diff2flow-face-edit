@@ -92,6 +92,6 @@ def cnf(input_dim, dims, zdim, num_blocks, velocity_field='original',
 def state_has_layer_embed(state_dict):
     """Whether a saved flow was trained with --velocity_layer_embed (its per-W+-row biases are in it):
     the eval and the editor build the flow to match the checkpoint, so they cannot silently drop them."""
-    return any('.layer_bias.' in k for k in state_dict)
+    return any('.row_bias.' in k for k in state_dict)
 
 

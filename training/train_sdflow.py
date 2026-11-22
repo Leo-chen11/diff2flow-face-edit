@@ -943,6 +943,19 @@ def collect_transport(flow_model):
     return torch.stack(kin).sum(0).mean() / dims, torch.stack(jac).sum(0).mean() / dims
 
 
+def row_offset_stats(flow_model):
+    """--velocity_layer_embed: mean |offset| of the per-W+-row gate logits and biases, and how much the
+    rows differ (the mean over units of the std across the 18 rows). 0 = the old, row-blind field."""
+    g, b, spread = [], [], []
+    for n, p in flow_model.named_parameters():
+        if '.row_gate.' in n or '.row_bias.' in n:
+            (g if '.row_gate.' in n else b).append(p.detach().abs().mean())
+            spread.append(p.detach().std(0).mean())
+    if not g:
+        return None
+    return torch.stack(g).mean(), torch.stack(b).mean(), torch.stack(spread).mean()
+
+
 def flow_nfe(flow_model):
     """Function evaluations of the flow's last solve (forward and, if run, its adjoint backward)."""
     return sum(m.num_evals() for m in flow_model.modules() if hasattr(m, 'num_evals'))
@@ -3707,6 +3720,7 @@ if __name__ == '__main__':
                         + (1.0 - args.best_metric_ema) * _m)
                     celeb_acc_log['judge_celeb_acc_ema'] = torch.tensor(best_metric_ema)
 
+            _row_stats = row_offset_stats(prior) if args.velocity_layer_embed else None
             _log_dict = {
                 'loss_total': loss,
                 'loss_kd': kd_loss,
@@ -3761,6 +3775,8 @@ if __name__ == '__main__':
                 'loss_disc_realism':  disc_realism_loss,
                 'dir_disagree_frac':  dir_disagree.mean(),
                 'train_cr_frac':      train_cr_frac,
+                **({} if _row_stats is None else {'row_gate_abs': _row_stats[0], 'row_bias_abs': _row_stats[1],
+                                                  'row_spread': _row_stats[2]}),
                 'train_verified_frac': train_verified_frac,
                 'train_abstain_frac': train_abstain_frac,
                 'target_out_of_range_frac': target_out_of_range,

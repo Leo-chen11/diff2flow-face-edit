@@ -77,6 +77,8 @@ class ODEnet(nn.Module):
     def __init__(self, hidden_dims, input_shape, context_dim, layer_type="concat", nonlinearity="softplus",
                  layer_embed_layers=0):
         super(ODEnet, self).__init__()
+        if layer_embed_layers and layer_type != "concatsquash":
+            raise ValueError('layer_embed_layers needs layer_type concatsquash')
         base_layer = {
             "reslinear":diffeq_layers.ResLinear,
             "ignore": diffeq_layers.IgnoreLinear,
@@ -106,23 +108,37 @@ class ODEnet(nn.Module):
 
         self.layers = nn.ModuleList(layers)
         self.activation_fns = nn.ModuleList(activation_fns[:-1])
-        # Layer-aware velocity (--velocity_layer_embed): the net is applied to every W+ row with the same
-        # weights and the same per-sample context, so it cannot tell row 3 (pose / face shape) from row 12
-        # (colour) except from the row's own values. A learned per-row bias on every hidden layer tells it.
-        # Zero at init: a model resumed from a checkpoint without it starts out computing exactly what it did.
-        self.layer_bias = None
+        # Layer-aware velocity (--velocity_layer_embed). Without it the net applies the same weights and
+        # the same per-sample hyper-network output (gate, bias of every ConcatSquash layer, functions of
+        # (t, condition)) to all 18 W+ rows, so it tells row 3 (pose, face shape) from row 12 (colour)
+        # only by the row's own values -- and e4e rows are close to each other. Here the W+ row index
+        # enters the hyper-network exactly like t does: every layer's gate logit and bias get a learned
+        # per-row offset,
+        #     h_l = W x_l * sigmoid(G [t, c] + g_row) + (B [t, c] + b_row),
+        # i.e. a one-hot row index concatenated to the hyper-network's input. Because the offset sits
+        # inside the sigmoid, a unit can open only where the condition AND the row call for it (an
+        # attribute x layer interaction), and on the output layer it scales / shifts the velocity of each
+        # row directly. No gate that can collapse, no extra loss: g_row = b_row = 0 at init, so a model
+        # resumed from a checkpoint without them computes exactly what it did (bit-identical), and if
+        # the rows do not help, the offsets stay near 0 and the model stays the old one.
+        self.row_gate = self.row_bias = None
         if layer_embed_layers:
-            self.layer_bias = nn.ParameterList(
-                [nn.Parameter(torch.zeros(layer_embed_layers, d)) for d in hidden_dims])
+            dims = list(hidden_dims) + [input_shape[0]]
+            self.row_gate = nn.ParameterList([nn.Parameter(torch.zeros(layer_embed_layers, d)) for d in dims])
+            self.row_bias = nn.ParameterList([nn.Parameter(torch.zeros(layer_embed_layers, d)) for d in dims])
 
     def forward(self, context, y):
         dx = y
+        rows = (self.row_bias is not None and dx.dim() == 3 and dx.size(1) == self.row_bias[0].size(0))
         for l, layer in enumerate(self.layers):
-            dx = layer(context, dx)
+            if rows:
+                gate = torch.sigmoid(layer._hyper_gate(context).unsqueeze(1) + self.row_gate[l].to(dx.dtype))
+                bias = layer._hyper_bias(context).unsqueeze(1) + self.row_bias[l].to(dx.dtype)
+                dx = layer._layer(dx) * gate + bias
+            else:
+                dx = layer(context, dx)
             # if not last layer, use nonlinearity
             if l < len(self.layers) - 1:
-                if self.layer_bias is not None and dx.dim() == 3 and dx.size(1) == self.layer_bias[l].size(0):
-                    dx = dx + self.layer_bias[l].to(dx.dtype).unsqueeze(0)
                 dx = self.activation_fns[l](dx)
         return dx
 
@@ -207,7 +223,8 @@ class LAGDOFODEnet(nn.Module):
         else:
             base_context = context
         v_base = self.base_velocity(base_context, y)
-        gate = self.layer_gate(context, y)
+        # dof sums the two velocities and never uses the gate: skip computing it (same output)
+        gate = None if self.mode == 'dof' else self.layer_gate(context, y)
         self._last_v_attr = v_attr
         self._last_v_base = v_base
         self._last_gate = gate
@@ -233,7 +250,7 @@ class LAGDOFODEnet(nn.Module):
 
         attr_flat = v_attr.reshape(v_attr.size(0), -1)
         base_flat = v_base.reshape(v_base.size(0), -1)
-        zero = gate.new_tensor(0.0)
+        zero = v_attr.new_tensor(0.0)
         if self.mode in {'dof', 'lag_dof'}:
             orth = torch.abs(nn.functional.cosine_similarity(attr_flat, base_flat, dim=1, eps=eps)).mean()
             orth_layer = torch.abs(nn.functional.cosine_similarity(v_attr, v_base, dim=-1, eps=eps)).mean()

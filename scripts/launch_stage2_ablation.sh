@@ -44,8 +44,10 @@
 #               clearly on one side, the precomputed r34 agrees, the conditioner is on the other side) the
 #               edit takes the teachers' direction and the reading rule. Its control is dircond (the
 #               losses follow the edit's direction, nothing corrected)
-#   layeremb    --velocity_layer_embed: a zero-initialised learned bias per W+ row in the velocity nets
-#               (layer-aware velocity; the resumed model starts out identical)
+#   layeremb    --velocity_layer_embed: the W+ row index enters the velocity nets' hyper-network like t
+#               does (a learned per-row offset on every layer's gate logit and bias, zero at init, so the
+#               resumed model is bit-identical at its first step). Check first that the edits really are
+#               row-blind: scripts/layer_profile.py
 #   nodds_noclip / nodds_noloc / nodds_noprior   the frozen-Stable-Diffusion term removed AND one more
 #               (CLIP prompt / both locality losses / the bank prior): for a machine where the control
 #               does not fit, the pruning goes one term at a time on top of nodds
