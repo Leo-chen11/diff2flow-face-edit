@@ -45,34 +45,64 @@
 
 ### 2b. 只在「證實讀錯」時才修正（`vercr`）——取代 trcr 當主要版本
 
-trcr 的問題：只要 conditioner 和 r34 讀法不同，就一律以 r34 為準。但 r34 也會讀錯，這樣等於把 conditioner 的判斷整個換掉。
+規則寫在 `common/verified_direction.py`，訓練和抽查工具共用同一個函式。
 
-`vercr`（`--train_edit_direction verified --train_consistent_reading 0.1`）：**方向照舊由 conditioner 決定**，只有同時滿足下面四個條件，才判定 conditioner 讀錯並修正：
+**沒有標準答案，所以不能證明規則永遠對。能做的是三件事：讓誤修正很難發生、讓誤修正的傷害很小、把誤修正率實際量出來。**
 
-1. r34 老師看原圖，讀得很清楚（大於 0.65 或小於 0.35）。
-2. ConvNeXt 老師也讀得很清楚，而且跟 r34 同一邊。
-3. 事先算好的 r34 讀值也同一邊。
-4. conditioner 在另一邊（或離 0.5 不到 0.1）。
+#### (1) 讓誤修正很難發生：證據要來自會「以不同方式出錯」的來源
 
-修正的內容跟推論時的 CR 一樣（方向改成老師的、讀值移到 0.4 / 0.6）。其他所有臉**完全不動**。老師讀得不清楚、或兩個老師意見不同時，代表沒有證據說 conditioner 錯，就不修正。
+| 證據 | 擋掉的錯誤 |
+|---|---|
+| 兩個架構不同的老師（r34、ConvNeXt） | 單一網路的偏差 |
+| 每個老師看三種版本：原圖、左右翻轉、e4e 重建圖 | 姿勢、反光、構圖造成的誤判；**反演把屬性弄丟**（照片有眼鏡、重建圖沒有，flow 編輯的是重建圖） |
+| 事先算好的 r34 讀值 | 多一票（跟 r34 是同一個網路，不算獨立） |
+| 這些讀值至少要跟模型一樣確定（`--verify_beat`） | 模型非常確定、證據只是勉強清楚的情況 |
 
-| conditioner | r34 / ConvNeXt / 預先 r34 | 結果 |
+**全部 7 個讀值都清楚地站在同一邊**、模型在另一邊，才修正。評估用的 R50、r18 **永遠不當證據**。
+
+#### (2) 有矛盾但證據不夠時：不修正，也不訓練方向（abstain）
+
+| 情況 | 做法 |
+|---|---|
+| 沒有任何讀值清楚地反對模型 | **照模型**（絕大部分的臉） |
+| 全部清楚反對、而且夠確定 | **修正** |
+| 有讀值清楚反對模型，但不是全部、或不夠確定 | **跳過**：這張臉這一步不給方向的監督（target、CLIP、DDS 都不算），ID、屬性保持、flow 的 likelihood 照常 |
+
+跳過是關鍵：誰對誰錯分不出來時，與其猜一邊，不如不教。目前的訓練在這些臉上反而是「flow 跟模型、loss 跟老師」，兩邊互相拉扯。
+
+實際判斷（用訓練程式的同一個函式算出來）：
+
+| 模型讀值 | 7 個讀值 | 結果 |
 |---|---|---|
-| 0.70 | 0.10 / 0.20 / 0.15 | 證實讀錯 → 方向「加」，讀值 0.70 → 0.40 |
-| 0.20 | 0.10 / 0.20 / 0.15 | 一致 → 不動 |
-| 0.70 | 0.10 / **0.55** / 0.15 | ConvNeXt 不確定 → 不動 |
-| 0.70 | 0.10 / 0.20 / **0.60** | 預先 r34 不同意 → 不動 |
-| 0.70 | 0.40 / 0.45 / 0.42 | 老師都不確定 → 不動 |
+| 0.70 | 全部 0.10 到 0.22 | 修正：方向「加」，0.70 → 0.40 |
+| 0.20 | 全部 0.10 到 0.22 | 照模型 |
+| 0.70 | 原圖都說不是，**重建圖**是 0.55、0.60 | 跳過（可能是反演改變了臉） |
+| 0.70 | **翻轉後**變 0.40、0.45 | 跳過 |
+| 0.70 | ConvNeXt 0.55 | 跳過 |
+| 0.98 | 全部 0.30 到 0.33 | 跳過（模型比證據確定得多） |
+| 0.70 | 全部 0.45 到 0.55 | 照模型（沒有人確定，也沒有人清楚反對） |
+| 0.30 | 全部 0.80 到 0.92 | 修正：方向「移除」，0.30 → 0.60 |
 
-（這張表是用訓練程式裡的同一段規則實際算出來的。）
+#### (3) 誤修正的傷害很小
 
-另外，所有臉的 target、CLIP、DDS loss 都跟著「這次編輯的方向」走，所以沒被修正的臉也不會再有矛盾的梯度。這一半就是既有的 `dircond` arm，所以 **`dircond` 是 vercr 的對照組**：
+就算 7 個讀值全錯、模型是對的（例如臉其實很年輕，卻全部讀成老），修正後的訓練題目是「讓這張臉更年輕」。這本身仍是合理的要求，也正是推論時使用者會給的那種要求。真正的代價只有兩點：
+- 編碼時用 0.4 而不是 0.7，等於一點點標籤雜訊。
+- 那一步本來要練「變老」，改成練「變年輕」。
 
-- dircond：只消除矛盾，不修正任何讀值。
-- vercr：消除矛盾，**再加上**修正證實讀錯的臉。
-- 兩者的差距 = 「修正讀錯」這件事本身的貢獻。
+而且目前的訓練在同一張臉上，loss 本來就已經跟著老師走了。
 
-log：`train_verified_frac`（老師清楚且一致的比例）、`train_cr_frac`（實際被修正的比例）。
+#### (4) 把誤修正率量出來（訓練前先做）
+
+`scripts/audit_verified_direction.py` 用**同一個函式**和起點 checkpoint 的 conditioner 掃訓練資料，輸出：
+- 每個屬性「照模型、修正、跳過」各佔多少。
+- 被修正和被跳過的臉的圖（左原圖、右重建圖，標上模型和證據的讀值）。
+- 一份 `labels.csv` 讓你標：M = 模型對、V = 證據對、? = 看不出來。
+
+標完再跑 `--score`，就得到每個屬性的**誤修正率和 95% 信賴區間**。這個數字要放在消融表旁邊：誤修正率夠低，規則才可信。如果某個屬性的誤修正率高（例如 Young 定義本來就模糊），就把那個屬性的修正關掉，或把 `--verify_clear` 調嚴。
+
+log：`train_verified_frac`、`train_cr_frac`（修正）、`train_abstain_frac`（跳過）。
+
+**對照組 `dircond`**：只讓 loss 跟著 flow 的方向（消除矛盾），不修正、不跳過。vercr 跟 dircond 的差距，就是「修正加跳過」的貢獻。
 
 ### 3. 速度網路知道自己在哪一層（`layeremb`）
 
@@ -124,6 +154,24 @@ nohup python -u -m scripts.editing_curves --checkpoint_dir "$RUN" --step 130000 
 
 ```bash
 python -m scripts.method_table --target 90 --run "live=output/curves/ours_cr0.1_off500.csv" --run "EMA=output/curves/ours_ema_cr0.1_off500.csv"
+```
+
+### 2a. 先抽查 vercr 的規則（cchen，不用訓練，約數十分鐘）
+
+用 stage 2 起點（stage 1 的 50k）的 conditioner，跟 vercr 訓練一開始的狀態相同：
+
+```bash
+cd ~/d2f && git pull && O="/home/cchen/桌面/SDFlow-main (副本)/output/SDFlow"; S1=$(python -c "import json;print(json.load(open('$O/multi_v1_min_2teach_seed1_bn_ctrl_wsd_from50k/config.json'))['resume_dir'])"); echo "$S1"
+```
+
+```bash
+python -m scripts.audit_verified_direction --checkpoint_dir "$S1" --step 50000 --independent_attr_weights ./data/r50_celebahq_eval.pth --independent_attr_backbone r50 --num_faces 3000 --out_dir output/audit_verified
+```
+
+看 `output/audit_verified/summary.md` 和 `sheets/` 的圖，在 `labels.csv` 的 human 欄填 M / V / ?，然後：
+
+```bash
+python -m scripts.audit_verified_direction --score output/audit_verified/labels.csv
 ```
 
 ### 2. 三個訓練 arm（cchen，跟 nodds_b8 同樣的設定才能比）

@@ -32,6 +32,7 @@ from models.flows.flow import cnf
 from models.flows.normalization import MovingBatchNormNd
 from models.flows.utils import modify_one_attribute, standard_normal_logprob
 from models.attribute_estimator import make_attr_classifier
+from common.verified_direction import verified_direction
 from models.conditioner import IdentityAttributeConditioner
 from models.direction_bank import AttributeDirectionBank, _inverse_softplus, bank_mix_at, parse_attr_spec
 from models.stylegan2.model import Generator, Discriminator
@@ -1724,9 +1725,21 @@ if __name__ == '__main__':
                              "opposite to the edit the flow was told to make. Identical whenever "
                              "they agree. Default off (old behaviour).")
     parser.add_argument('--verify_clear', type=float, default=0.65,
-                        help="--train_edit_direction verified: a teacher reading counts as clear above "
+                        help="--train_edit_direction verified: a view's reading counts as clear above "
                              "this or below 1 - this (default 0.65 / 0.35, the evaluation's clear-face "
                              "thresholds).")
+    parser.add_argument('--verify_views', nargs='+', default=['photo', 'flip', 'recon'],
+                        choices=['photo', 'flip', 'recon'],
+                        help="--train_edit_direction verified: what every teacher reads (all must "
+                             "agree to overrule the conditioner): the photo, its mirror image, the e4e "
+                             "reconstruction G(latent) -- the face the flow actually edits. The "
+                             "precomputed r34 reading is always one more view. "
+                             "common/verified_direction.py.")
+    parser.add_argument('--verify_beat', type=float, default=0.0,
+                        help="--train_edit_direction verified: when the conditioner is clearly on the "
+                             "other side, the least confident view must be at least this much MORE "
+                             "confident (|p - 0.5|) than the conditioner to overrule it; otherwise the "
+                             "edit abstains.")
     parser.add_argument('--train_edit_direction', default='cond', choices=['cond', 'teacher', 'verified'],
                         help="Which way each training edit goes (add vs rm). 'cond' (old "
                              "behaviour): the conditioner's own reading of the source, so the flow "
@@ -1736,15 +1749,18 @@ if __name__ == '__main__':
                              "edit faces the conditioner misreads -- as at eval, where the "
                              "direction is given (evaluate_sdflow.py --edit_direction indep). "
                              "'verified': the conditioner decides, as in 'cond', EXCEPT where it is "
-                             "shown to be wrong: every training teacher (r34 and the extra one) reads "
-                             "the source photo clearly (--verify_clear) on the same side, the "
-                             "precomputed r34 reading agrees, and the conditioner is on the other side "
-                             "of 0.5 or within --train_consistent_reading of it. Only those edits take "
-                             "the teachers' direction and the reading rule (needs "
-                             "--train_consistent_reading); every other edit is untouched. The target / "
-                             "CLIP / DDS losses follow the edit's direction everywhere (as "
+                             "shown to be wrong (common/verified_direction.py): every training teacher "
+                             "reads every view (--verify_views) clearly on one side, the precomputed r34 "
+                             "reading agrees, the conditioner is on the other side of 0.5 (or within "
+                             "--train_consistent_reading of it), and the views are at least as sure as "
+                             "the conditioner (--verify_beat). Those edits take that direction and the "
+                             "reading rule (needs --train_consistent_reading). Edits the evidence "
+                             "contradicts without proving the conditioner wrong ABSTAIN: no target / "
+                             "CLIP / DDS supervision. Every other edit is untouched. The target / CLIP / "
+                             "DDS losses follow the edit's direction everywhere (as "
                              "--target_direction_from_cond). Logged: train_cr_frac (corrected), "
-                             "train_verified_frac (teachers clear and agreeing).")
+                             "train_abstain_frac, train_verified_frac. Check the rule on the data first: "
+                             "scripts/audit_verified_direction.py.")
     parser.add_argument('--train_consistent_reading', type=float, default=None, metavar='MARGIN',
                         help="The direction-consistent reading rule of the evaluation "
                              "(editing_curves.py --consistent_reading) applied in TRAINING: when the "
@@ -2749,7 +2765,10 @@ if __name__ == '__main__':
             # flow edits from the conditioner's own reading of the source.
             _cond_src = attr_cond[batch_indices, mid_idx].detach()
             _cr_mask = None                      # which edits the reading rule may touch (None = all)
+            _abstain = None                      # verified mode: edits with no direction supervision
+            _early_recon = None                  # verified mode: G(latent), reused below
             train_verified_frac = torch.zeros([], device=latent.device)
+            train_abstain_frac = torch.zeros([], device=latent.device)
             if args.train_edit_direction == 'teacher':
                 edit_is_rm = attributes[batch_indices, mid_idx] > 0.5
             elif args.train_edit_direction == 'verified':
@@ -2759,18 +2778,31 @@ if __name__ == '__main__':
                 if args.train_consistent_reading is None:
                     raise SystemExit('--train_edit_direction verified needs --train_consistent_reading')
                 with torch.no_grad():
-                    _t = teacher_probs_each(F.interpolate(img, (256, 256), mode='bilinear',
-                                                          align_corners=False))
-                    _t = _t[:, batch_indices, attribute_index.to(mid_idx.device)[mid_idx]]   # (K, B)
-                    _hi = (_t > args.verify_clear).all(0)
-                    _lo = (_t < 1.0 - args.verify_clear).all(0)
-                    _pre = attributes[batch_indices, mid_idx]
-                    _verified = (_hi & (_pre > 0.5)) | (_lo & (_pre <= 0.5))
-                    _m = args.train_consistent_reading
-                    _cond_wrong = torch.where(_hi, _cond_src < 0.5 + _m, _cond_src > 0.5 - _m)
-                    _cr_mask = _verified & _cond_wrong
-                    edit_is_rm = torch.where(_cr_mask, _hi, _cond_src > 0.5)
-                    train_verified_frac = _verified.float().mean()
+                    _gabs = attribute_index.to(mid_idx.device)[mid_idx]
+                    _views = []
+                    if 'photo' in args.verify_views or 'flip' in args.verify_views:
+                        _ph = F.interpolate(img, (256, 256), mode='bilinear', align_corners=False)
+                        if 'photo' in args.verify_views:
+                            _views.append(_ph)
+                        if 'flip' in args.verify_views:
+                            _views.append(torch.flip(_ph, dims=[3]))
+                    if 'recon' in args.verify_views:
+                        _early_recon = resize_generated(
+                            G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1),
+                            (args.img_size, args.img_size), args.train_resize)
+                        _views.append(F.interpolate(_early_recon, (256, 256), mode='bilinear',
+                                                    align_corners=False))
+                    _reads = [attributes[batch_indices, mid_idx].float()]
+                    for _v in _views:
+                        _reads += list(teacher_probs_each(_v)[:, batch_indices, _gabs].float())
+                    _vd = verified_direction(_cond_src.float(), torch.stack(_reads),
+                                             margin=args.train_consistent_reading,
+                                             clear=args.verify_clear, beat=args.verify_beat)
+                    _cr_mask = _vd['correct']
+                    _abstain = _vd['abstain']
+                    edit_is_rm = _vd['rm']
+                    train_verified_frac = _vd['verified'].float().mean()
+                    train_abstain_frac = _abstain.float().mean()
             else:
                 edit_is_rm = _cond_src > 0.5
             src_cond = torch.cat([id_cond_train, attr_cond], dim=1)
@@ -2855,8 +2887,8 @@ if __name__ == '__main__':
             # ── Source RECONSTRUCTION, G(latent) ────────────────────────────
             # Computed at most once per step and reused by every consumer
             # (--losses_vs_recon, the face-parser losses).
-            src_recon = None
-            if args.losses_vs_recon or face_parser is not None:
+            src_recon = _early_recon
+            if src_recon is None and (args.losses_vs_recon or face_parser is not None):
                 with torch.no_grad():
                     src_recon = G([latent], input_is_latent=True,
                                   randomize_noise=False)[0].clamp(-1, 1)
@@ -3190,6 +3222,8 @@ if __name__ == '__main__':
             # squared error to the soft target (a hinge variant had no effect at
             # matched identity and was removed)
             changed_mse_per_sample = (edited_probs - soft_target_for_loss).pow(2)
+            if _abstain is not None:            # verified mode: no direction supervision there
+                changed_mse_per_sample = changed_mse_per_sample * (~_abstain).to(changed_mse_per_sample.dtype)
             changed_loss = changed_mse_per_sample.mean()
 
             _zero = torch.zeros([], device=latent.device, dtype=latent.dtype)
@@ -3268,6 +3302,8 @@ if __name__ == '__main__':
                 if args.clip_prompt_bangs:
                     clip_sample_weight[_clip_abs_idx == 5] = args.clip_prompt_bangs_weight
 
+                if _abstain is not None:
+                    clip_sample_weight = clip_sample_weight * (~_abstain).to(clip_sample_weight.dtype)
                 clip_semantic_loss = (clip_sample_weight * clip_loss_each).mean()
 
             if lag_dof_losses is None:
@@ -3336,6 +3372,9 @@ if __name__ == '__main__':
                 dds_skip = torch.zeros_like(is_age)
                 for _a in args.dds_skip_attrs:
                     dds_skip |= mid_abs_idx == _a
+                if _abstain is not None:        # verified mode: abstained edits get no DDS either
+                    dds_skip |= _abstain
+                    is_age = is_age & ~_abstain
 
                 non_age_fires = (
                     (~is_age & ~dds_skip).any()
@@ -3723,6 +3762,7 @@ if __name__ == '__main__':
                 'dir_disagree_frac':  dir_disagree.mean(),
                 'train_cr_frac':      train_cr_frac,
                 'train_verified_frac': train_verified_frac,
+                'train_abstain_frac': train_abstain_frac,
                 'target_out_of_range_frac': target_out_of_range,
                 'clip_prompt_weight':  torch.tensor(args.clip_prompt_weight),
             }
