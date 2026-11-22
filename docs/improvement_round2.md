@@ -205,3 +205,29 @@ for r in nodds_b8 nodds_s2_b8 vercr_nodds_b8 dircond_nodds_b8 layeremb_nodds_b8;
 | layeremb | nodds_b8 s1、s2 | 同準確率下 ArcFace、preserve、region 至少一項大於雜訊，其他不變差 |
 
 通過的才進下一步：完整訓練 × 3 個 seed（論文的消融表）。
+
+---
+
+## 四、暫緩：loss 消融（記著，之後再訓練）
+
+2026-11-22 決定先不訓練，保留到 vercr / layeremb 有結果之後。
+
+| arm | 拿掉什麼（都在 nodds 之上，batch 8） | 狀態 |
+|---|---|---|
+| nodds_noloc | Stable Diffusion + 兩個區域保持 loss | **暫緩，未訓練** |
+| nodds_noprior | Stable Diffusion + 方向庫的 prior | **暫緩，未訓練** |
+| nodds_none | Stable Diffusion + CLIP 提示 + 區域保持 + prior（四項一起拿掉） | **暫緩，未訓練** |
+
+已有的對照組：nodds_b8 seed 1、seed 2（held-out、CR 0.1：同準確率 ArcFace 整體差 ≤ 0.003，單一屬性 ≤ 0.009，這就是判斷有沒有差的雜訊尺度）。
+
+之後要跑時（cchen，設定和 nodds_b8 完全一樣）：
+
+```bash
+cd ~/d2f && git pull && O="/home/cchen/桌面/SDFlow-main (副本)/output/SDFlow"; P=multi_v1_min_2teach_seed1_bn_ctrl_wsd_from50k
+```
+
+```bash
+EXTRA_SETS="batch=8" TAG=b8 ARMS="nodds_noloc nodds_noprior nodds_none" bash scripts/launch_stage2_ablation.sh "$O/$P" "0"
+```
+
+注意：如果之後 vercr 或 layeremb 被併進最終版，這三個消融要改成疊在新版本上重跑，否則消融的對象不是論文的最終模型。
