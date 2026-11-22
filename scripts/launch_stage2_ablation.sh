@@ -39,6 +39,11 @@
 #   trcr        teachdir + --train_consistent_reading 0.1: the inference reading rule in training, so
 #               the flow learns the edits whose source its conditioner misreads instead of only being
 #               corrected at inference; score it with and without CR (CR= for none)
+#   vercr       --train_edit_direction verified --train_consistent_reading 0.1: the conditioner keeps
+#               deciding each edit's direction; only where it is SHOWN wrong (both teachers read the photo
+#               clearly on one side, the precomputed r34 agrees, the conditioner is on the other side) the
+#               edit takes the teachers' direction and the reading rule. Its control is dircond (the
+#               losses follow the edit's direction, nothing corrected)
 #   layeremb    --velocity_layer_embed: a zero-initialised learned bias per W+ row in the velocity nets
 #               (layer-aware velocity; the resumed model starts out identical)
 #   nodds_noclip / nodds_noloc / nodds_noprior   the frozen-Stable-Diffusion term removed AND one more
@@ -137,6 +142,7 @@ arm_sets() {   # the --set key=value pairs of an arm
         teachdir)   echo "train_edit_direction=teacher" ;;
         trcr)       echo "train_edit_direction=teacher train_consistent_reading=0.1" ;;
         layeremb)   echo "velocity_layer_embed=true" ;;
+        vercr)      echo "train_edit_direction=verified train_consistent_reading=0.1" ;;
         custom)     [ -n "${CUSTOM_SETS:-}" ] || { echo "arm custom needs CUSTOM_SETS=\"key=value ...\"" >&2; exit 1; }
                     echo "$CUSTOM_SETS" ;;
         *)        echo "unknown arm $1" >&2; exit 1 ;;

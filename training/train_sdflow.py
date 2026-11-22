@@ -1723,14 +1723,28 @@ if __name__ == '__main__':
                              "0.5, logged as dir_disagree_frac) the default asks the output to move "
                              "opposite to the edit the flow was told to make. Identical whenever "
                              "they agree. Default off (old behaviour).")
-    parser.add_argument('--train_edit_direction', default='cond', choices=['cond', 'teacher'],
+    parser.add_argument('--verify_clear', type=float, default=0.65,
+                        help="--train_edit_direction verified: a teacher reading counts as clear above "
+                             "this or below 1 - this (default 0.65 / 0.35, the evaluation's clear-face "
+                             "thresholds).")
+    parser.add_argument('--train_edit_direction', default='cond', choices=['cond', 'teacher', 'verified'],
                         help="Which way each training edit goes (add vs rm). 'cond' (old "
                              "behaviour): the conditioner's own reading of the source, so the flow "
                              "never sees a source condition on the target side of 0.5. 'teacher': "
                              "the frozen r34 teacher's precomputed reading (--preds_file), the "
                              "direction the target loss already uses, so the flow is also asked to "
                              "edit faces the conditioner misreads -- as at eval, where the "
-                             "direction is given (evaluate_sdflow.py --edit_direction indep).")
+                             "direction is given (evaluate_sdflow.py --edit_direction indep). "
+                             "'verified': the conditioner decides, as in 'cond', EXCEPT where it is "
+                             "shown to be wrong: every training teacher (r34 and the extra one) reads "
+                             "the source photo clearly (--verify_clear) on the same side, the "
+                             "precomputed r34 reading agrees, and the conditioner is on the other side "
+                             "of 0.5 or within --train_consistent_reading of it. Only those edits take "
+                             "the teachers' direction and the reading rule (needs "
+                             "--train_consistent_reading); every other edit is untouched. The target / "
+                             "CLIP / DDS losses follow the edit's direction everywhere (as "
+                             "--target_direction_from_cond). Logged: train_cr_frac (corrected), "
+                             "train_verified_frac (teachers clear and agreeing).")
     parser.add_argument('--train_consistent_reading', type=float, default=None, metavar='MARGIN',
                         help="The direction-consistent reading rule of the evaluation "
                              "(editing_curves.py --consistent_reading) applied in TRAINING: when the "
@@ -2734,8 +2748,29 @@ if __name__ == '__main__':
             # Edit direction (True = remove): see --train_edit_direction. The
             # flow edits from the conditioner's own reading of the source.
             _cond_src = attr_cond[batch_indices, mid_idx].detach()
+            _cr_mask = None                      # which edits the reading rule may touch (None = all)
+            train_verified_frac = torch.zeros([], device=latent.device)
             if args.train_edit_direction == 'teacher':
                 edit_is_rm = attributes[batch_indices, mid_idx] > 0.5
+            elif args.train_edit_direction == 'verified':
+                # correct the conditioner only where it is shown wrong: all teachers clear and on one
+                # side, the precomputed r34 reading agreeing, the conditioner on the other side (or
+                # within the margin of 0.5)
+                if args.train_consistent_reading is None:
+                    raise SystemExit('--train_edit_direction verified needs --train_consistent_reading')
+                with torch.no_grad():
+                    _t = teacher_probs_each(F.interpolate(img, (256, 256), mode='bilinear',
+                                                          align_corners=False))
+                    _t = _t[:, batch_indices, attribute_index.to(mid_idx.device)[mid_idx]]   # (K, B)
+                    _hi = (_t > args.verify_clear).all(0)
+                    _lo = (_t < 1.0 - args.verify_clear).all(0)
+                    _pre = attributes[batch_indices, mid_idx]
+                    _verified = (_hi & (_pre > 0.5)) | (_lo & (_pre <= 0.5))
+                    _m = args.train_consistent_reading
+                    _cond_wrong = torch.where(_hi, _cond_src < 0.5 + _m, _cond_src > 0.5 - _m)
+                    _cr_mask = _verified & _cond_wrong
+                    edit_is_rm = torch.where(_cr_mask, _hi, _cond_src > 0.5)
+                    train_verified_frac = _verified.float().mean()
             else:
                 edit_is_rm = _cond_src > 0.5
             src_cond = torch.cat([id_cond_train, attr_cond], dim=1)
@@ -2746,6 +2781,8 @@ if __name__ == '__main__':
                 _m = args.train_consistent_reading
                 _col = attr_cond[batch_indices, mid_idx]
                 _crv = torch.where(edit_is_rm, _col.clamp(min=0.5 + _m), _col.clamp(max=0.5 - _m))
+                if _cr_mask is not None:
+                    _crv = torch.where(_cr_mask, _crv, _col)
                 _attr_cond_flow = attr_cond.clone()
                 _attr_cond_flow[batch_indices, mid_idx] = _crv
                 src_cond = torch.cat([id_cond_train, _attr_cond_flow], dim=1)
@@ -3133,7 +3170,7 @@ if __name__ == '__main__':
             # --target_direction_from_cond (or --train_edit_direction teacher)
             # makes the loss follow the flow's direction.
             dir_disagree = ((src_attr > 0.5) != edit_is_rm).float()
-            if args.target_direction_from_cond or args.train_edit_direction == 'teacher':
+            if args.target_direction_from_cond or args.train_edit_direction in ('teacher', 'verified'):
                 hard_teacher_target = compute_soft_targets(src_attr, mid_idx, args.attribute_index,
                                                            is_rm=edit_is_rm)
             else:
@@ -3685,6 +3722,7 @@ if __name__ == '__main__':
                 'loss_disc_realism':  disc_realism_loss,
                 'dir_disagree_frac':  dir_disagree.mean(),
                 'train_cr_frac':      train_cr_frac,
+                'train_verified_frac': train_verified_frac,
                 'target_out_of_range_frac': target_out_of_range,
                 'clip_prompt_weight':  torch.tensor(args.clip_prompt_weight),
             }

@@ -43,6 +43,37 @@
 - 不加任何 loss。
 - 要附一個對照組 `teachdir`（只改方向來源、不加 CR 規則），才能分清楚是哪一半有用。
 
+### 2b. 只在「證實讀錯」時才修正（`vercr`）——取代 trcr 當主要版本
+
+trcr 的問題：只要 conditioner 和 r34 讀法不同，就一律以 r34 為準。但 r34 也會讀錯，這樣等於把 conditioner 的判斷整個換掉。
+
+`vercr`（`--train_edit_direction verified --train_consistent_reading 0.1`）：**方向照舊由 conditioner 決定**，只有同時滿足下面四個條件，才判定 conditioner 讀錯並修正：
+
+1. r34 老師看原圖，讀得很清楚（大於 0.65 或小於 0.35）。
+2. ConvNeXt 老師也讀得很清楚，而且跟 r34 同一邊。
+3. 事先算好的 r34 讀值也同一邊。
+4. conditioner 在另一邊（或離 0.5 不到 0.1）。
+
+修正的內容跟推論時的 CR 一樣（方向改成老師的、讀值移到 0.4 / 0.6）。其他所有臉**完全不動**。老師讀得不清楚、或兩個老師意見不同時，代表沒有證據說 conditioner 錯，就不修正。
+
+| conditioner | r34 / ConvNeXt / 預先 r34 | 結果 |
+|---|---|---|
+| 0.70 | 0.10 / 0.20 / 0.15 | 證實讀錯 → 方向「加」，讀值 0.70 → 0.40 |
+| 0.20 | 0.10 / 0.20 / 0.15 | 一致 → 不動 |
+| 0.70 | 0.10 / **0.55** / 0.15 | ConvNeXt 不確定 → 不動 |
+| 0.70 | 0.10 / 0.20 / **0.60** | 預先 r34 不同意 → 不動 |
+| 0.70 | 0.40 / 0.45 / 0.42 | 老師都不確定 → 不動 |
+
+（這張表是用訓練程式裡的同一段規則實際算出來的。）
+
+另外，所有臉的 target、CLIP、DDS loss 都跟著「這次編輯的方向」走，所以沒被修正的臉也不會再有矛盾的梯度。這一半就是既有的 `dircond` arm，所以 **`dircond` 是 vercr 的對照組**：
+
+- dircond：只消除矛盾，不修正任何讀值。
+- vercr：消除矛盾，**再加上**修正證實讀錯的臉。
+- 兩者的差距 = 「修正讀錯」這件事本身的貢獻。
+
+log：`train_verified_frac`（老師清楚且一致的比例）、`train_cr_frac`（實際被修正的比例）。
+
 ### 3. 速度網路知道自己在哪一層（`layeremb`）
 
 **問題（已用程式碼確認）：**速度網路對 W+ 的 18 層用**同一組權重、同一個條件**。它分不出第 3 層（姿勢、臉型）和第 12 層（顏色），只能從那一層本身的數值去猜。但 StyleGAN 不同層管的東西完全不同，眼鏡、笑容、年齡用到的層也不同。
@@ -104,15 +135,15 @@ cd ~/d2f && git pull && O="/home/cchen/桌面/SDFlow-main (副本)/output/SDFlow
 ```
 
 ```bash
-EXTRA_SETS="batch=8 use_diffusion_guidance=false" TAG=nodds_b8 ARMS="trcr teachdir layeremb" bash scripts/launch_stage2_ablation.sh "$O/$P" "0"
+EXTRA_SETS="batch=8 use_diffusion_guidance=false" TAG=nodds_b8 ARMS="vercr dircond layeremb" bash scripts/launch_stage2_ablation.sh "$O/$P" "0"
 ```
 
-三個會依序跑，每個和 nodds_b8 一樣久。順序是 trcr → teachdir → layeremb（trcr 最重要，先跑）。
+三個會依序跑，每個和 nodds_b8 一樣久。vercr 最重要，先跑。trcr 和 teachdir 留著當備案（`ARMS="trcr teachdir"`），不用先跑。
 
 **每個 arm 都要有「不加 CR」的曲線**（launcher 只會跑加 CR 0.1 的版本）。nodds_b8 的兩個 seed 也要補：
 
 ```bash
-for r in nodds_b8 nodds_s2_b8 trcr_nodds_b8 teachdir_nodds_b8 layeremb_nodds_b8; do d="$O/${P}_abl_$r"; [ -d "$d/save_models" ] || continue; f="$d/curves_model_s100000_off500_crnone.csv"; [ -f "$f" ] || python -u -m scripts.editing_curves --checkpoint_dir "$d" --step 100000 --independent_attr_weights ./data/r50_celebahq_eval.pth --independent_attr_backbone r50 --method model --scales 0.2 0.4 0.6 0.8 1.0 1.25 1.5 --sample_offset 500 --num_samples 500 --out_csv "$f" > "${f%.csv}.log" 2>&1; done
+for r in nodds_b8 nodds_s2_b8 vercr_nodds_b8 dircond_nodds_b8 layeremb_nodds_b8; do d="$O/${P}_abl_$r"; [ -d "$d/save_models" ] || continue; f="$d/curves_model_s100000_off500_crnone.csv"; [ -f "$f" ] || python -u -m scripts.editing_curves --checkpoint_dir "$d" --step 100000 --independent_attr_weights ./data/r50_celebahq_eval.pth --independent_attr_backbone r50 --method model --scales 0.2 0.4 0.6 0.8 1.0 1.25 1.5 --sample_offset 500 --num_samples 500 --out_csv "$f" > "${f%.csv}.log" 2>&1; done
 ```
 
 ### 3. 判斷
@@ -121,8 +152,8 @@ for r in nodds_b8 nodds_s2_b8 trcr_nodds_b8 teachdir_nodds_b8 layeremb_nodds_b8;
 
 | arm | 跟誰比 | 算成功的條件 |
 |---|---|---|
-| trcr | nodds_b8 s1、s2 | 不加 CR 時：同準確率 ArcFace 或準確率明顯高於兩個 seed（大於雜訊）；加 CR 時不變差 |
-| teachdir | nodds_b8 s1、s2 | 用來拆解 trcr：若 teachdir 已經一樣好，功勞在「方向來源」；若只有 trcr 好，功勞在「CR 規則」 |
+| vercr | nodds_b8 s1、s2，以及 dircond | 不加 CR 時：明顯高於兩個 seed（大於雜訊）；加 CR 時不變差；而且要贏 dircond，才能說「修正讀錯」有貢獻 |
+| dircond | nodds_b8 s1、s2 | 只消除矛盾梯度有沒有用 |
 | layeremb | nodds_b8 s1、s2 | 同準確率下 ArcFace、preserve、region 至少一項大於雜訊，其他不變差 |
 
 通過的才進下一步：完整訓練 × 3 個 seed（論文的消融表）。
