@@ -33,6 +33,14 @@
 #               the flow was given
 #   truedilate  --local_region_true_dilate: the add-eyeglasses mask grown, not blurred
 #   fixes       the three together
+# and the improvement candidates that add no loss term (only via ARMS):
+#   teachdir    --train_edit_direction teacher: each training edit goes the way the r34 teacher reads
+#               the photo, not the way the flow's own conditioner reads it (the control of trcr)
+#   trcr        teachdir + --train_consistent_reading 0.1: the inference reading rule in training, so
+#               the flow learns the edits whose source its conditioner misreads instead of only being
+#               corrected at inference; score it with and without CR (CR= for none)
+#   layeremb    --velocity_layer_embed: a zero-initialised learned bias per W+ row in the velocity nets
+#               (layer-aware velocity; the resumed model starts out identical)
 #   nodds_noclip / nodds_noloc / nodds_noprior   the frozen-Stable-Diffusion term removed AND one more
 #               (CLIP prompt / both locality losses / the bank prior): for a machine where the control
 #               does not fit, the pruning goes one term at a time on top of nodds
@@ -126,6 +134,9 @@ arm_sets() {   # the --set key=value pairs of an arm
         dircond)    echo "target_direction_from_cond=true" ;;
         truedilate) echo "local_region_true_dilate=true" ;;
         fixes)      echo "clip_prompt_bangs=true target_direction_from_cond=true local_region_true_dilate=true" ;;
+        teachdir)   echo "train_edit_direction=teacher" ;;
+        trcr)       echo "train_edit_direction=teacher train_consistent_reading=0.1" ;;
+        layeremb)   echo "velocity_layer_embed=true" ;;
         custom)     [ -n "${CUSTOM_SETS:-}" ] || { echo "arm custom needs CUSTOM_SETS=\"key=value ...\"" >&2; exit 1; }
                     echo "$CUSTOM_SETS" ;;
         *)        echo "unknown arm $1" >&2; exit 1 ;;

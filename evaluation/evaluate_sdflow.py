@@ -61,7 +61,7 @@ from common.id_loss import IDLoss
 from common.ops import load_network
 from common.version import code_version
 from models.dataset import SDFlowDataset
-from models.flows.flow import cnf
+from models.flows.flow import cnf, state_has_layer_embed
 from models.attribute_estimator import AttributeClassifier
 from models.conditioner import IdentityAttributeConditioner
 from models.stylegan2.model import Generator
@@ -517,6 +517,10 @@ def apply_run_config(args):
     """If the run saved a config.json (train_sdflow.py writes one), use it as
     the source of truth for model-structure flags. CLI flags you pass
     explicitly still win; --ignore_run_config disables the whole mechanism."""
+    global CKPT_SUBDIR
+    CKPT_SUBDIR = 'save_models_ema' if getattr(args, 'ema_weights', False) else 'save_models'
+    if CKPT_SUBDIR != 'save_models':
+        print(f'[RunConfig] loading the EMA weights: {os.path.join(args.checkpoint_dir, CKPT_SUBDIR)}')
     cfg_path = os.path.join(args.checkpoint_dir, 'config.json')
     if getattr(args, 'ignore_run_config', False):
         return args
@@ -589,9 +593,12 @@ def _check_load(result, name):
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
+CKPT_SUBDIR = 'save_models'      # --ema_weights: 'save_models_ema' (training's EMA shadow weights)
+
+
 def _ckpt_path(checkpoint_dir, module_name, step):
     """Return path like save_models/prior-0017000 (no .pth extension)."""
-    return os.path.join(checkpoint_dir, 'save_models',
+    return os.path.join(checkpoint_dir, CKPT_SUBDIR,
                         f'{module_name}-{str(step).zfill(7)}')
 
 
@@ -648,6 +655,8 @@ def load_models(args):
     condition_dim = args.id_cond_dim + num_attrs
 
     # ── Flow ──────────────────────────────────────────────────────────────
+    prior_ckpt = _ckpt_path(args.checkpoint_dir, 'prior', args.step)
+    _prior_state = load_network(prior_ckpt)
     prior = cnf(
         512, args.flow_modules, condition_dim, args.num_blocks,
         velocity_field=args.velocity_field, num_layers=18,
@@ -655,11 +664,11 @@ def load_models(args):
         gate_init_bias=args.lag_gate_init_bias,
         attr_context_dim=num_attrs,
         train_T=False,
+        layer_embed=state_has_layer_embed(_prior_state),     # --velocity_layer_embed runs
     ).to(device).eval()
 
-    prior_ckpt = _ckpt_path(args.checkpoint_dir, 'prior', args.step)
     print(f'Loading prior  ← {prior_ckpt}')
-    _check_load(prior.load_state_dict(load_network(prior_ckpt), strict=False), 'prior')
+    _check_load(prior.load_state_dict(_prior_state, strict=False), 'prior')
 
     # ── Conditioner ───────────────────────────────────────────────────────
     conditioner = IdentityAttributeConditioner(
@@ -2518,6 +2527,10 @@ def build_parser():
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
+    parser.add_argument('--ema_weights', action='store_true',
+                        help='Load the EMA shadow weights training saves under <run>/save_models_ema/ '
+                             '(--ema_decay 0.999, about the last 1000 steps averaged) instead of the live '
+                             'weights in save_models/. Same file names, so nothing else changes.')
     parser.add_argument('--celeba_attr_judge_weights',
                         default='./data/celeba_attr_resnet18.pth',
                         help='Path to a CelebAAttrClassifierJudge checkpoint (ResNet18, '

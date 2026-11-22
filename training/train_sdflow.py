@@ -1731,6 +1731,27 @@ if __name__ == '__main__':
                              "direction the target loss already uses, so the flow is also asked to "
                              "edit faces the conditioner misreads -- as at eval, where the "
                              "direction is given (evaluate_sdflow.py --edit_direction indep).")
+    parser.add_argument('--train_consistent_reading', type=float, default=None, metavar='MARGIN',
+                        help="The direction-consistent reading rule of the evaluation "
+                             "(editing_curves.py --consistent_reading) applied in TRAINING: when the "
+                             "conditioner reads the edited attribute on the wrong side of 0.5 for the "
+                             "edit's direction (or within MARGIN of it), the flow encodes and targets "
+                             "with the reading moved to 0.5 - MARGIN (add) / 0.5 + MARGIN (remove). "
+                             "With --train_edit_direction cond the direction comes from that same "
+                             "reading, so it only touches readings within MARGIN of 0.5; pair it with "
+                             "--train_edit_direction teacher, where the direction is the r34 teacher's "
+                             "and the conditioner disagrees on some faces -- the situation of every "
+                             "evaluation, where the direction is the user's request. Training then sees "
+                             "exactly the inputs the rule gives at inference, and the target, CLIP and "
+                             "DDS losses follow the same direction (no contradictory gradient on those "
+                             "faces). Logged: train_cr_frac, the share of edits it changed. Default off.")
+    parser.add_argument('--velocity_layer_embed', action=argparse.BooleanOptionalAction, default=False,
+                        help='Layer-aware velocity: a learned bias per W+ row (18) on every hidden layer '
+                             'of the velocity net(s). Without it the net applies the same function to '
+                             'every row, telling coarse (pose, shape) from fine (colour) rows only by '
+                             'their values. Zero-initialised, so a run resumed from a checkpoint without '
+                             'it starts from exactly that model (stage-2 ablation arm layeremb). The '
+                             'evaluation and the editor detect it from the checkpoint.')
     parser.add_argument('--celeba_attr_judge_weights', default=None,
                         help='Optional independent CelebA attribute classifier (the same weights '
                              'evaluate_sdflow.py scores AccCeleb with). Used for LOGGING ONLY -- it '
@@ -2058,6 +2079,7 @@ if __name__ == '__main__':
         gate_init_bias=args.lag_gate_init_bias,
         attr_context_dim=len(args.attribute_index),
         train_T=False,
+        layer_embed=args.velocity_layer_embed,
     ).cuda()
     _transport_on = args.transport_kinetic_weight > 0 or args.transport_jacobian_weight > 0
     if _transport_on:
@@ -2718,6 +2740,17 @@ if __name__ == '__main__':
                 edit_is_rm = _cond_src > 0.5
             src_cond = torch.cat([id_cond_train, attr_cond], dim=1)
             src_attr_flow = attr_cond[batch_indices, mid_idx].detach()
+            train_cr_frac = torch.zeros([], device=latent.device)
+            if args.train_consistent_reading is not None:
+                # --train_consistent_reading: the inference rule, in the encoding and the target
+                _m = args.train_consistent_reading
+                _col = attr_cond[batch_indices, mid_idx]
+                _crv = torch.where(edit_is_rm, _col.clamp(min=0.5 + _m), _col.clamp(max=0.5 - _m))
+                _attr_cond_flow = attr_cond.clone()
+                _attr_cond_flow[batch_indices, mid_idx] = _crv
+                src_cond = torch.cat([id_cond_train, _attr_cond_flow], dim=1)
+                src_attr_flow = _crv.detach()
+                train_cr_frac = (_crv.detach() != _col.detach()).float().mean()
             approx21, delta_log_p2 = prior(latent, src_cond, zero_pad)
             transport_enc = collect_transport(prior)
             nfe_enc = flow_nfe(prior)
@@ -3651,6 +3684,7 @@ if __name__ == '__main__':
                 'loss_hair_extent':   hair_extent_loss,
                 'loss_disc_realism':  disc_realism_loss,
                 'dir_disagree_frac':  dir_disagree.mean(),
+                'train_cr_frac':      train_cr_frac,
                 'target_out_of_range_frac': target_out_of_range,
                 'clip_prompt_weight':  torch.tensor(args.clip_prompt_weight),
             }

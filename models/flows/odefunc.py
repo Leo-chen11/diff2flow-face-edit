@@ -74,7 +74,8 @@ class ODEnet(nn.Module):
     Helper class to make neural nets for use in continuous normalizing flows
     """
 
-    def __init__(self, hidden_dims, input_shape, context_dim, layer_type="concat", nonlinearity="softplus"):
+    def __init__(self, hidden_dims, input_shape, context_dim, layer_type="concat", nonlinearity="softplus",
+                 layer_embed_layers=0):
         super(ODEnet, self).__init__()
         base_layer = {
             "reslinear":diffeq_layers.ResLinear,
@@ -105,6 +106,14 @@ class ODEnet(nn.Module):
 
         self.layers = nn.ModuleList(layers)
         self.activation_fns = nn.ModuleList(activation_fns[:-1])
+        # Layer-aware velocity (--velocity_layer_embed): the net is applied to every W+ row with the same
+        # weights and the same per-sample context, so it cannot tell row 3 (pose / face shape) from row 12
+        # (colour) except from the row's own values. A learned per-row bias on every hidden layer tells it.
+        # Zero at init: a model resumed from a checkpoint without it starts out computing exactly what it did.
+        self.layer_bias = None
+        if layer_embed_layers:
+            self.layer_bias = nn.ParameterList(
+                [nn.Parameter(torch.zeros(layer_embed_layers, d)) for d in hidden_dims])
 
     def forward(self, context, y):
         dx = y
@@ -112,6 +121,8 @@ class ODEnet(nn.Module):
             dx = layer(context, dx)
             # if not last layer, use nonlinearity
             if l < len(self.layers) - 1:
+                if self.layer_bias is not None and dx.dim() == 3 and dx.size(1) == self.layer_bias[l].size(0):
+                    dx = dx + self.layer_bias[l].to(dx.dtype).unsqueeze(0)
                 dx = self.activation_fns[l](dx)
         return dx
 
@@ -155,7 +166,7 @@ class LAGDOFODEnet(nn.Module):
 
     def __init__(self, hidden_dims, input_shape, context_dim, layer_type="concat",
                  nonlinearity="softplus", num_layers=18, gate_hidden_dim=64,
-                 gate_init_bias=-1.5, mode='lag_dof', attr_context_dim=0):
+                 gate_init_bias=-1.5, mode='lag_dof', attr_context_dim=0, layer_embed=False):
         super(LAGDOFODEnet, self).__init__()
         if mode not in {'lag', 'dof', 'lag_dof'}:
             raise ValueError(f'Unknown LAG-DOF mode: {mode}')
@@ -167,6 +178,7 @@ class LAGDOFODEnet(nn.Module):
             context_dim=context_dim,
             layer_type=layer_type,
             nonlinearity=nonlinearity,
+            layer_embed_layers=num_layers if layer_embed else 0,
         )
         self.base_velocity = ODEnet(
             hidden_dims=hidden_dims,
@@ -174,6 +186,7 @@ class LAGDOFODEnet(nn.Module):
             context_dim=context_dim,
             layer_type=layer_type,
             nonlinearity=nonlinearity,
+            layer_embed_layers=num_layers if layer_embed else 0,
         )
         self.layer_gate = LayerGate(
             context_dim=context_dim,

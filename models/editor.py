@@ -8,7 +8,7 @@ from common.attr_tables import DEFAULT_SOFT_TARGET, SOFT_TARGET_TABLE, bank_num_
 from common.id_loss import IDLoss
 from models.conditioner import IdentityAttributeConditioner
 from models.direction_bank import AttributeDirectionBank, bank_mix_at, parse_attr_spec
-from models.flows.flow import cnf
+from models.flows.flow import cnf, state_has_layer_embed
 
 
 def _format_ckpt_step(step):
@@ -264,6 +264,7 @@ class SDFlow(object):
         print(f'Loaded conditioner from {filename}')
 
         flow_condition_dim = self.conditioner.condition_dim
+        _prior_file = _find_latest_ckpt(ckpt_dir, 'prior', ckpt_step)
         self.flow = cnf(
             512,
             flow_modules,
@@ -275,8 +276,9 @@ class SDFlow(object):
             gate_init_bias=lag_gate_init_bias,
             attr_context_dim=len(self.class_indices),
             train_T=False,
+            layer_embed=state_has_layer_embed(torch.load(_prior_file, map_location='cpu')),
         ).to(self.device)
-        filename = _find_latest_ckpt(ckpt_dir, 'prior', ckpt_step)
+        filename = _prior_file
         _load_state_allow_old_pos(self.flow, filename)
         self.flow.eval()
         print(f'Loaded flow from {filename}')

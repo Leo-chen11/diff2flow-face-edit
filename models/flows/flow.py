@@ -8,7 +8,7 @@ def build_model(input_dim, hidden_dims, context_dim, num_blocks, conditional,
                 velocity_field='original', num_layers=18, gate_hidden_dim=64,
                 gate_init_bias=-1.5, use_adjoint=True, train_T=True,
                 solver='dopri5', atol=1e-5, rtol=1e-5,
-                attr_context_dim=0):
+                attr_context_dim=0, layer_embed=False):
     def build_cnf():
         # assert layer_type in {'ignore','squash','scale','concat','concat_v2','concatsquash','concatscale'}
         if velocity_field in {'lag', 'dof', 'lag_dof'}:
@@ -23,6 +23,7 @@ def build_model(input_dim, hidden_dims, context_dim, num_blocks, conditional,
                 gate_init_bias=gate_init_bias,
                 mode=velocity_field,
                 attr_context_dim=attr_context_dim,
+                layer_embed=layer_embed,
             )
         elif velocity_field == 'original':
             diffeq = ODEnet(
@@ -31,6 +32,7 @@ def build_model(input_dim, hidden_dims, context_dim, num_blocks, conditional,
                 context_dim=context_dim,
                 layer_type=layer_type,
                 nonlinearity=nonlinearity,
+                layer_embed_layers=num_layers if layer_embed else 0,
             )
         else:
             raise ValueError(f'Unknown velocity_field: {velocity_field}')
@@ -68,7 +70,7 @@ def build_model(input_dim, hidden_dims, context_dim, num_blocks, conditional,
 def cnf(input_dim, dims, zdim, num_blocks, velocity_field='original',
         num_layers=18, gate_hidden_dim=64, gate_init_bias=-1.5,
         use_adjoint=True, train_T=True, solver='dopri5',
-        atol=1e-5, rtol=1e-5, attr_context_dim=0):
+        atol=1e-5, rtol=1e-5, attr_context_dim=0, layer_embed=False):
     dims = tuple(map(int, dims.split("-")))
     # input_dim, hidden_dims, context_dim, num_blocks, conditional,layer_type='concatsquash'
     model = build_model(input_dim=input_dim, hidden_dims=dims,
@@ -82,7 +84,14 @@ def cnf(input_dim, dims, zdim, num_blocks, velocity_field='original',
                         solver=solver,
                         atol=atol,
                         rtol=rtol,
-                        attr_context_dim=attr_context_dim)
+                        attr_context_dim=attr_context_dim,
+                        layer_embed=layer_embed)
     return model
+
+
+def state_has_layer_embed(state_dict):
+    """Whether a saved flow was trained with --velocity_layer_embed (its per-W+-row biases are in it):
+    the eval and the editor build the flow to match the checkpoint, so they cannot silently drop them."""
+    return any('.layer_bias.' in k for k in state_dict)
 
 

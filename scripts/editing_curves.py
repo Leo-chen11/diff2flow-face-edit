@@ -723,6 +723,7 @@ def main():
         w.writerows(rows)
     with open(os.path.splitext(path)[0] + '.json', 'w') as f:
         json.dump({'config': {'checkpoint_dir': args.checkpoint_dir, 'step': args.step, 'method': args.method,
+                              'ema_weights': bool(getattr(args, 'ema_weights', False)),
                               'scales': args.scales, 'num_samples': seen, 'sample_offset': args.sample_offset,
                               'preserve_set': args.preserve_set,
                               'consistent_reading': args.consistent_reading,
