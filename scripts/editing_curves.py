@@ -118,7 +118,7 @@ from tqdm import tqdm
 import evaluation.evaluate_sdflow as E
 from common.attr_tables import bank_num_k
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges,
+    ATTR_NAMES, _latest_step, apply_ode_args, apply_run_config, build_optional_judges,
     build_parser, consistent_source, edit_single_attribute, load_models, resize_for_judge,
 )
 from models.arcface import ArcFaceJudge
@@ -490,6 +490,7 @@ def main():
                              f'pass --only_attrs {" ".join(map(str, args.sdflow_attrs))}')
         sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs,
                              img_size=args.sdflow_img_size, backbone=args.sdflow_backbone)
+        apply_ode_args(sdf.flow, args, 'SDFlow')         # the same solver settings as our flow gets
     lt_nets, sflow, ada = {}, None, None
     if args.method == 'adatrans':
         ada = load_adatrans(args.adatrans_dir, attrs)
@@ -518,6 +519,7 @@ def main():
             raise SystemExit(f'{args.styleflow_ckpt} was trained on {ck["attrs"]}, not {bad}')
         sflow = styleflow_cnf(len(ck['attrs'])).cuda().eval()
         sflow.load_state_dict(ck['state_dict'])
+        apply_ode_args(sflow, args, 'StyleFlow')
         sflow_attrs = list(ck['attrs'])
         print(f'[StyleFlow] {args.styleflow_ckpt} step {ck["step"]}, attributes {sflow_attrs}')
     tf = T.Compose([T.ToTensor(), T.Resize((args.img_size, args.img_size)), T.Normalize(mean=0.5, std=0.5)])
@@ -731,6 +733,8 @@ def main():
                               'direction_judge': args.direction_judge,
                               'face_set': args.face_set,
                               'conditioner_input': args.conditioner_input or 'photo',
+                              'ode': {'solver': args.ode_solver, 'tol': args.ode_tol, 'steps': args.ode_steps,
+                                      'fast_edit': bool(args.fast_edit)},
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None,

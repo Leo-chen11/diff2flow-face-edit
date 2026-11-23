@@ -57,6 +57,7 @@ class CNF(nn.Module):
         self.test_solver = solver
         self.test_atol = atol
         self.test_rtol = rtol
+        self.test_options = None          # e.g. {'step_size': 0.25} for a fixed-step solver (flow.configure_inference)
         self.conditional = conditional
         # Transport regularizer (train_sdflow.py --transport_kinetic_weight / _jacobian_weight):
         # when True, a conditional solve also integrates the kinetic energy and the Jacobian
@@ -121,6 +122,7 @@ class CNF(nn.Module):
                 atol=self.test_atol,
                 rtol=self.test_rtol,
                 method=self.test_solver,
+                **({'options': self.test_options} if self.test_options else {}),
             )
 
         if len(integration_times) == 2:

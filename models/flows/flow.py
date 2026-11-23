@@ -95,3 +95,46 @@ def state_has_layer_embed(state_dict):
     return any('.row_bias.' in k for k in state_dict)
 
 
+
+
+FIXED_STEP_SOLVERS = ('euler', 'midpoint', 'rk4', 'heun2', 'heun3', 'explicit_adams', 'implicit_adams', 'fixed_adams')
+
+
+def cnf_blocks(flow):
+    return [m for m in flow.modules() if isinstance(m, CNF)]
+
+
+def configure_inference(flow, solver=None, tol=None, steps=None, skip_divergence=None):
+    """How a flow solves its ODE when it is NOT training (the evaluation and the editor; training
+    always uses its own solver, tolerances and the divergence). Returns a short description.
+
+    solver: a torchdiffeq method name (None keeps the trained one, dopri5). Adaptive solvers
+        (dopri5, bosh3, adaptive_heun, ...) take tol as both atol and rtol; fixed-step solvers
+        (euler, midpoint, rk4, ...) take `steps` steps over each block's integration interval [0, T].
+    skip_divergence: integrate the latent only, not log p (models/flows/odefunc.py ODEfunc).
+    The function counts it calls in each block's odefunc._num_evals (flow_nfe)."""
+    blocks = cnf_blocks(flow)
+    for b in blocks:
+        if solver is not None:
+            b.test_solver = solver
+        if tol is not None:
+            b.test_atol = b.test_rtol = float(tol)
+        if b.test_solver in FIXED_STEP_SOLVERS:
+            if not steps:
+                raise ValueError(f'solver {b.test_solver} is fixed-step: give the number of steps')
+            b.test_options = {'step_size': float(b.T) / int(steps)}
+        else:
+            b.test_options = None
+        if skip_divergence is not None:
+            b.odefunc.skip_divergence = bool(skip_divergence)
+    b = blocks[0] if blocks else None
+    if b is None:
+        return 'no CNF block'
+    how = (f'{b.test_solver}, {steps} steps' if b.test_solver in FIXED_STEP_SOLVERS
+           else f'{b.test_solver}, tol {b.test_atol:g}')
+    return how + (', latent only (no log-det)' if b.odefunc.skip_divergence else ', with log-det')
+
+
+def flow_nfe(flow):
+    """Velocity evaluations of the last solve, summed over the flow's CNF blocks."""
+    return int(sum(b.num_evals() for b in cnf_blocks(flow)))

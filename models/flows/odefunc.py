@@ -286,6 +286,15 @@ class ODEfunc(nn.Module):
         self.diffeq = diffeq
         self.divergence_fn = divergence_approx
         self.register_buffer("_num_evals", torch.tensor(0.))
+        # Inference fast path (flow.configure_inference(skip_divergence=True)): an edit only needs the
+        # trajectory of the latent, never log p. The divergence term costs a Hutchinson vector-Jacobian
+        # product -- a backward pass through the velocity net with create_graph -- at EVERY evaluation,
+        # and its random estimate also enters the adaptive solver's error control. With this flag the
+        # log-p state gets derivative 0 (it stays where it started), the velocity runs without autograd,
+        # and the solver controls the step on the latent alone. The latent's ODE is the same, so the
+        # edit agrees with the full solve up to the solver tolerance. Never set during training (the
+        # NLL needs the divergence); a plain attribute, not saved in checkpoints.
+        self.skip_divergence = False
 
     def before_odeint(self, e=None):
         self._e = e
@@ -293,6 +302,13 @@ class ODEfunc(nn.Module):
 
     def forward(self, t, states):
         y = states[0]
+        if self.skip_divergence and len(states) == 3:
+            self._num_evals += 1
+            with torch.no_grad():
+                tt = torch.ones(y.size(0), 1).to(y) * t.detach().type_as(y)
+                c = states[2]
+                dy = self.diffeq(torch.cat([tt, c.view(y.size(0), -1)], dim=1), y)
+            return dy, torch.zeros_like(states[1]), torch.zeros_like(c)
         t = torch.ones(y.size(0), 1).to(y) * t.clone().detach().requires_grad_(True).type_as(y)
         self._num_evals += 1
         for state in states:

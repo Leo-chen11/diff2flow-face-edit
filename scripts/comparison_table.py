@@ -68,7 +68,7 @@ from tqdm import tqdm
 
 import evaluation.evaluate_sdflow as E
 from evaluation.evaluate_sdflow import (
-    ATTR_NAMES, _latest_step, apply_run_config, build_optional_judges, build_parser,
+    ATTR_NAMES, _latest_step, apply_ode_args, apply_run_config, build_optional_judges, build_parser,
     edit_single_attribute, load_models, resize_for_judge,
 )
 from models.arcface import ArcFaceJudge
@@ -428,6 +428,8 @@ def main(argv=None):
         raise SystemExit(f'--only_attrs {missing} are not edited attributes of {args.checkpoint_dir}')
     sdf = OfficialSDFlow(args.sdflow_ckpt_dir, args.sdflow_step, args.sdflow_attrs,
                          img_size=args.sdflow_img_size, backbone=args.sdflow_backbone) if 'sdflow' in kinds else None
+    if sdf is not None:
+        apply_ode_args(sdf.flow, args, 'SDFlow')
     # the retrained baselines, loaded as scripts/editing_curves.py does
     lt_nets, sflow, sflow_attrs = {}, None, []
     ada = None
@@ -465,6 +467,7 @@ def main(argv=None):
             raise SystemExit(f'{args.styleflow_ckpt} was trained on {ck["attrs"]}, not {bad}')
         sflow = styleflow_cnf(len(ck['attrs'])).cuda().eval()
         sflow.load_state_dict(ck['state_dict'])
+        apply_ode_args(sflow, args, 'StyleFlow')
         sflow_attrs = list(ck['attrs'])
         print(f'[StyleFlow] {args.styleflow_ckpt} step {ck["step"]}, attributes {sflow_attrs}')
 

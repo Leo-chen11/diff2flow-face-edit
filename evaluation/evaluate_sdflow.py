@@ -598,6 +598,17 @@ def _check_load(result, name):
 CKPT_SUBDIR = 'save_models'      # --ema_weights: 'save_models_ema' (training's EMA shadow weights)
 
 
+def apply_ode_args(flow, args, name='flow'):
+    """--ode_solver / --ode_tol / --ode_steps / --fast_edit on a loaded flow (models.flows.flow.
+    configure_inference). Without any of them the flow solves as trained."""
+    solver, tol, steps = getattr(args, 'ode_solver', None), getattr(args, 'ode_tol', None), getattr(args, 'ode_steps', None)
+    fast = bool(getattr(args, 'fast_edit', False))
+    if solver is None and tol is None and steps is None and not fast:
+        return
+    from models.flows.flow import configure_inference
+    print(f'[ODE] {name}: ' + configure_inference(flow, solver=solver, tol=tol, steps=steps, skip_divergence=fast))
+
+
 def _ckpt_path(checkpoint_dir, module_name, step):
     """Return path like save_models/prior-0017000 (no .pth extension)."""
     return os.path.join(checkpoint_dir, CKPT_SUBDIR,
@@ -671,6 +682,7 @@ def load_models(args):
 
     print(f'Loading prior  ← {prior_ckpt}')
     _check_load(prior.load_state_dict(_prior_state, strict=False), 'prior')
+    apply_ode_args(prior, args, 'prior')
 
     # ── Conditioner ───────────────────────────────────────────────────────
     conditioner = IdentityAttributeConditioner(
@@ -2538,6 +2550,21 @@ def build_parser():
                              'reconstruction G(latent) (the face the flow edits and the judges read). '
                              'Default: what the run was trained with (config.json), photo for older runs. '
                              'Give it to override, e.g. recon on a photo-trained run as a training-free test.')
+    parser.add_argument('--ode_solver', default=None,
+                        help='How the flow solves its ODE at evaluation (training is unaffected): a torchdiffeq '
+                             'method. Default: as trained (dopri5). Adaptive: dopri5, bosh3, adaptive_heun; '
+                             'fixed-step (needs --ode_steps): rk4, midpoint, euler. scripts/run_speed_study.sh '
+                             'sweeps these against quality.')
+    parser.add_argument('--ode_tol', type=float, default=None,
+                        help='Adaptive solvers: atol = rtol = this (default: as trained, 1e-5).')
+    parser.add_argument('--ode_steps', type=int, default=None,
+                        help='Fixed-step solvers: steps over each flow block\'s interval.')
+    parser.add_argument('--fast_edit', action='store_true',
+                        help='Integrate the latent only, not log p: an edit never uses the log-density, whose '
+                             'divergence term costs a backward pass through the velocity net at every '
+                             'evaluation (models/flows/odefunc.py). Same ODE for the latent, so the edit agrees '
+                             'with the full solve up to the solver tolerance; off by default so the numbers '
+                             'reproduce the ones reported so far.')
     parser.add_argument('--ema_weights', action='store_true',
                         help='Load the EMA shadow weights training saves under <run>/save_models_ema/ '
                              '(--ema_decay 0.999, about the last 1000 steps averaged) instead of the live '
