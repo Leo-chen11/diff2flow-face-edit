@@ -110,6 +110,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.utils import data
 from tqdm import tqdm
@@ -416,6 +417,14 @@ def main():
                         'user and never rests on one judge\'s misreading; every metric (both accuracies, '
                         'ArcFace, preservation) is on these faces. Same faces for every method: they depend on '
                         'the source and the two judges only.')
+    p.add_argument('--conditioner_input', default='photo', choices=['photo', 'recon'],
+                   help='What the model\'s conditioner reads the source attributes from. photo (default, as '
+                        'trained): the real photo. recon: the e4e reconstruction G(latent) -- the face the flow '
+                        'actually edits and the judges read. The audit (scripts/audit_verified_direction.py) '
+                        'found 4-8%% of faces read on the other side of 0.5 between photo and reconstruction '
+                        '(Male, Young, Smiling, Bangs). A training-free test of whether reading the edited face '
+                        'removes part of what --consistent_reading fixes (the conditioner was trained on photos; '
+                        'the identity condition still comes from the photo).')
     p.add_argument('--direction_judge', default='r50', choices=['r50', 'r18'],
                    help='Whose reading of the source stands in for the user\'s request: the edit direction '
                         'and which faces are clear enough to score (default r50, every curve so far). r18 '
@@ -558,6 +567,10 @@ def main():
             de_feat = de.image_feature(img) if de is not None else None
             _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
             src = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+            if args.conditioner_input == 'recon':
+                # read the attributes off the face the flow edits (and the judges read), not the photo
+                _ac = conditioner.attr_estimator(F.interpolate(src, (img.shape[-2], img.shape[-1]), mode='area'))
+                attr_cond = _ac[0] if isinstance(_ac, tuple) else _ac
             src_256 = resize_for_judge(src, (256, 256))
             sp = torch.sigmoid(indep_teacher(src_256)[0])[:, :40]
             sc_src = celeb_judge.scores(src_256)[:, :40] if celeb_judge is not None else None
@@ -729,6 +742,7 @@ def main():
                               'consistent_reading': args.consistent_reading,
                               'direction_judge': args.direction_judge,
                               'face_set': args.face_set,
+                              'conditioner_input': args.conditioner_input,
                               'eval_resize': args.eval_resize,
                               'arcface_weights': args.arcface_weights if arc is not None else None,
                               'boundaries': args.boundaries if args.method == 'boundary' else None,
