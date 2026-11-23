@@ -261,6 +261,7 @@ for r in nodds_b8 nodds_s2_b8 vercr_nodds_b8 dircond_nodds_b8 layeremb_nodds_b8;
 
 | arm | 拿掉什麼（都在 nodds 之上，batch 8） | 狀態 |
 |---|---|---|
+| nodds_noclip | Stable Diffusion + CLIP 提示 | **已完成（seed 1）**：整體沒有可測的差別（同 R50 90% ArcFace 0.844 對 0.845/0.845，r18 一樣），屬性保持 +0.3、區域保持 +0.7；Bangs 區域保持 +1.7 到 +2.4（三種對齊都一致），Eyeglasses ArcFace −0.004 到 −0.006、Male −0.005 到 −0.008（都在單屬性雜訊 0.009 內，但方向一致）。結論：CLIP 提示可以拿掉的候選，要第二個 seed 確認 |
 | nodds_noloc | Stable Diffusion + 兩個區域保持 loss | **暫緩，未訓練** |
 | nodds_noprior | Stable Diffusion + 方向庫的 prior | **暫緩，未訓練** |
 | nodds_none | Stable Diffusion + CLIP 提示 + 區域保持 + prior（四項一起拿掉） | **暫緩，未訓練** |
