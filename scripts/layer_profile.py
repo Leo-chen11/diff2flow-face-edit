@@ -78,14 +78,20 @@ def main():
                 n[g] += int(ok.sum())
             seen += img.size(0)
 
-    # the bank's own per-layer directions (what stage 2 handed the edit over from)
+    # the bank's own per-layer profile (what stage 2 handed the edit over from). Its direction_units are
+    # unit vectors PER ROW (so their norms say nothing); the per-row magnitude is the bank's layer-norm
+    # prior (_prior_norms, from the bank file's layer_norms), masked by --bank_dir_layers.
     bank_share = {}
-    if bank is not None and hasattr(bank, 'direction_units'):
-        U = bank.direction_units.detach().float().cpu()                     # (A, K, 18, 512)
+    prior = getattr(bank, '_prior_norms', None) if bank is not None else None
+    if prior is not None:
+        P = prior.detach().float().cpu()                                     # (A, 18)
+        masks = getattr(bank, '_dir_layer_mask', {}) or {}
         for li, g in enumerate(attrs):
-            e = U[li].pow(2).sum(-1)                                         # (K, 18)
-            e = e / e.sum(1, keepdim=True).clamp(min=1e-12)
-            bank_share[g] = e.mean(0)
+            m = P[li].clone()
+            if li in masks:
+                m = m * masks[li].float().cpu()
+            e = m.pow(2)
+            bank_share[g] = e / e.sum().clamp(min=1e-12)
 
     rows = []
     for g in attrs:
