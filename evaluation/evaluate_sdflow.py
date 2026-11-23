@@ -506,6 +506,8 @@ RUN_CONFIG_KEYS = [
     'residual_max_norm', 'direction_guided_delta_max_norm', 'final_delta_max_norm',
     # how the bank combines with the flow (--bank_mode) and anneal's schedule
     'bank_mode', 'bank_mix_start', 'bank_mix_end', 'bank_anneal_start_step', 'bank_anneal_steps',
+    # what the conditioner reads the attributes off (train --conditioner_input)
+    'conditioner_input',
 ]
 
 # Old eval flag names -> the training name they now share (apply_run_config
@@ -811,6 +813,10 @@ def load_models(args):
     G = Generator(size=1024, style_dim=512, n_mlp=8)
     G.load_state_dict(ckpt['g_ema'])
     G.to(device).eval()
+    if (getattr(args, 'conditioner_input', None) or 'photo') == 'recon':
+        from models.conditioner import make_recon_fn
+        conditioner.recon_fn = make_recon_fn(G)
+        print('[Conditioner] attributes read off the reconstruction G(latent) (--conditioner_input recon)')
     for p in G.parameters():
         p.requires_grad_(False)
 
@@ -2527,6 +2533,11 @@ def build_parser():
                              'training. Strongest form of independent attribute judging.')
     parser.add_argument('--independent_attr_backbone', default='r34',
                         help='Backbone for --independent_attr_weights.')
+    parser.add_argument('--conditioner_input', default=None, choices=['photo', 'recon'],
+                        help='What the conditioner reads the source attributes off: the photo, or the e4e '
+                             'reconstruction G(latent) (the face the flow edits and the judges read). '
+                             'Default: what the run was trained with (config.json), photo for older runs. '
+                             'Give it to override, e.g. recon on a photo-trained run as a training-free test.')
     parser.add_argument('--ema_weights', action='store_true',
                         help='Load the EMA shadow weights training saves under <run>/save_models_ema/ '
                              '(--ema_decay 0.999, about the last 1000 steps averaged) instead of the live '

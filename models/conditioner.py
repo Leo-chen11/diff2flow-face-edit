@@ -123,8 +123,25 @@ class FrozenFeatureAttributeConditioner(nn.Module):
         return torch.sigmoid(self.projector(feat))
 
 
+def make_recon_fn(G):
+    """--conditioner_input recon: the e4e reconstruction G(latent), area-resized to the conditioner's
+    input size -- the face the flow transforms, which an inversion can change from the photo (the
+    audit found 4-8% of faces read on the other side of 0.5 for Male / Young / Smiling / Bangs).
+    No gradient: the reconstruction is an input, like the photo."""
+    def recon(latents, hw):
+        with torch.no_grad():
+            x = G([latents], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+            return F.interpolate(x, tuple(hw), mode='area')
+    return recon
+
+
 class IdentityAttributeConditioner(nn.Module):
-    """Build the SDFlow condition c = [identity condition, attribute condition]."""
+    """Build the SDFlow condition c = [identity condition, attribute condition].
+
+    recon_fn (set with make_recon_fn for --conditioner_input recon runs): the ATTRIBUTE condition is
+    then read off the reconstruction G(latent) instead of the photo, so c describes the W+ code the
+    flow models (p(w | c)) and edits; the identity condition still comes from the photo. Every caller
+    of make_condition gets it without changes."""
 
     def __init__(self, attr_dim, id_dim=32, attr_backbone='resnet50', id_scale=0.25,
                  id_feature_dim=512, conditioner_backbone='resnet',
@@ -135,6 +152,7 @@ class IdentityAttributeConditioner(nn.Module):
         self.id_scale = float(id_scale)
         self.conditioner_backbone = conditioner_backbone
         self.condition_dim = self.id_dim + self.attr_dim
+        self.recon_fn = None              # a plain function, not a submodule: not in the state dict
 
         if conditioner_backbone == 'resnet':
             self.attr_estimator = AttributeEstimator(
@@ -160,8 +178,13 @@ class IdentityAttributeConditioner(nn.Module):
             nn.Linear(256, self.id_dim),
         )
 
-    def make_condition(self, images, latents=None, id_extractor=None):
-        attr_cond = self.attr_estimator(images)
+    def make_condition(self, images, latents=None, id_extractor=None, attr_images=None):
+        """attr_images: what to read the attributes off (default: the reconstruction with recon_fn
+        set and latents given, else the photo)."""
+        if attr_images is None:
+            attr_images = self.recon_fn(latents, images.shape[-2:]) \
+                if (self.recon_fn is not None and latents is not None) else images
+        attr_cond = self.attr_estimator(attr_images)
         if isinstance(attr_cond, tuple):
             attr_cond = attr_cond[0]
 

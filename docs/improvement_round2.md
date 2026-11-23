@@ -153,6 +153,40 @@ flow 的速度網路對 W+ 的 18 層用**同一組權重**，每一層的「超
 2. **分數有改變**：跟 nodds_b8 兩個 seed 比，同準確率下 ArcFace、preserve 或 region 至少一項的提升大於雜訊（整體 0.003、單一屬性 0.009），而且其他指標沒有變差。
 3. **兩個都要有**。只有分數變好、機制沒變，就不能說是「因為知道層」。
 
+### 4. 讀「被編輯的那張臉」（`recon`）——由抽查發現的新貢獻
+
+#### 證據（抽查，2026-11-23）
+
+- conditioner **只看原圖**（`models/conditioner.py`），但 flow 編輯的是 e4e latent，也就是重建圖；評估時 judge 也是看重建圖。
+- r34 看原圖和看重建圖，讀在 0.5 不同邊的比例：Male 3.9 到 4.6%、Young 7.1 到 7.7%、Smiling 6.3 到 6.5%、Bangs 3.8 到 4.6%、Eyeglasses 0.2 到 0.5%。
+- 訓練臉上，conditioner 跟 r34(重建圖) 不一致的比例是跟 r34(原圖) 的約 2 倍。
+
+#### 理論理由
+
+flow 學的是 p(w | c)：在條件 c 下 W+ 編碼 w 的分布。c 應該描述 w 本身。用原圖讀 c，當反演改掉了屬性時，c 描述的是一張 flow 沒有在編輯的臉，等於標籤雜訊；編輯時，flow 也會從錯的起點出發。
+
+#### 改法（`--conditioner_input recon`，arm `recon`），三個地方一起改，彼此才不矛盾
+
+| 環節 | 原本 | 改成 |
+|---|---|---|
+| conditioner 讀屬性 | 原圖 | 重建圖 G(latent)（area 縮放到同樣大小） |
+| conditioner 的 kd 目標 | 事先算好的 r34(原圖) | 即時算 r34(重建圖)：**條件和它的目標描述同一張臉** |
+| target loss 的起點 | 老師讀原圖 | 老師讀重建圖（既有的 `--target_src_from_recon`） |
+| ID 條件 | 原圖 | 不變（只改屬性） |
+
+- 所有呼叫 conditioner 的地方（BN 校正、預覽、EMA、評估腳本）都自動跟著讀重建圖，不用逐一改。
+- 評估和推論編輯器會從 `config.json` 自動判斷；推論編輯器要先呼叫 `set_generator(G)`，忘了會直接報錯，不會默默用錯。
+- 訓練時重建圖本來就要算（`losses_vs_recon`），所以只多一次 r34 前向，幾乎不增加時間。
+- 已用替身生成器驗證：讀原圖、讀重建圖、指定輸入、EMA 複製四種情況的行為都正確。
+
+#### 怎麼證明它是貢獻（三個都要）
+
+1. **機制**：訓練後用 `audit_verified_direction.py` 再量。conditioner 跟 r34(重建圖) 的不一致應該降到原本跟 r34(原圖) 的水準。
+2. **不加 CR 的分數**：跟 nodds_b8 兩個 seed 比，不加 CR 的準確率或同準確率 ID 要高於雜訊。因為模型從對的起點出發，應該比較少「編不動」。
+3. **CR 的作用變小**：加 CR 和不加 CR 的差距應該縮小。這同時回答教授的疑問：一部分 CR 修的是「讀錯臉」，從根本修好就不需要它了。
+
+訓練前可以先做不訓練的測試（第三節 2c）：現有模型推論時改讀重建圖。不過現有的 conditioner 只在原圖上訓練過，所以那個測試結果不好，也不代表訓練後會失敗。
+
 ## 二、下一批（要再寫程式，先等上面三項的結果）
 
 | 編號 | 想法 | 改的是哪個既有東西 | 為什麼可能有用 | 會不會加 loss |
@@ -188,6 +222,10 @@ nohup python -u -m scripts.editing_curves --checkpoint_dir "$RUN" --step 130000 
 ```bash
 python -m scripts.method_table --target 90 --run "live=output/curves/ours_cr0.1_off500.csv" --run "EMA=output/curves/ours_ema_cr0.1_off500.csv"
 ```
+
+### 2c. recon 的不訓練測試（cchen，開發臉）
+
+現有模型推論時改讀重建圖（`--conditioner_input recon`，所有評估腳本都有這個選項），跟讀原圖比，有無 CR 各一條，共 4 條，都在開發臉（offset 0）上跑，不碰 held-out。
 
 ### 2b. 先量 layeremb 要解決的問題存不存在（cchen，不用訓練）
 

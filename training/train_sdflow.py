@@ -1788,6 +1788,18 @@ if __name__ == '__main__':
                              "exactly the inputs the rule gives at inference, and the target, CLIP and "
                              "DDS losses follow the same direction (no contradictory gradient on those "
                              "faces). Logged: train_cr_frac, the share of edits it changed. Default off.")
+    parser.add_argument('--conditioner_input', default='photo', choices=['photo', 'recon'],
+                        help="What the conditioner reads the ATTRIBUTE condition off. photo (old behaviour): "
+                             "the real photo. recon: the e4e reconstruction G(latent) -- the face whose W+ "
+                             "code the flow models and edits, and the one the judges read. An inversion can "
+                             "change an attribute (the audit found 4-8%% of faces on the other side of 0.5 "
+                             "between photo and reconstruction for Male / Young / Smiling / Bangs); with "
+                             "photo the condition then describes a face the flow is not editing. With recon "
+                             "the distillation target (kd) is the r34 teacher's reading of the same "
+                             "reconstruction, not the precomputed reading of the photo. Pair with "
+                             "--target_src_from_recon so the target loss also starts from the "
+                             "reconstruction. The identity condition still comes from the photo. The "
+                             "evaluation and the editor follow config.json.")
     parser.add_argument('--velocity_layer_embed', action=argparse.BooleanOptionalAction, default=False,
                         help='Layer-aware velocity: a learned bias per W+ row (18) on every hidden layer '
                              'of the velocity net(s). Without it the net applies the same function to '
@@ -2506,6 +2518,14 @@ if __name__ == '__main__':
     for p in G.parameters():
         p.requires_grad_(False)
     print('** StyleGAN2 model initialization success !')
+    if args.conditioner_input == 'recon':
+        # every make_condition call (BN calibration, previews, the EMA copy) reads the reconstruction;
+        # the training step passes it in directly to reuse the one it renders anyway
+        from models.conditioner import make_recon_fn
+        conditioner.recon_fn = make_recon_fn(G)
+        if args.use_ema:
+            conditioner_ema.recon_fn = conditioner.recon_fn
+        print('** conditioner reads the attributes off the reconstruction G(latent) (--conditioner_input recon)')
 
     discriminator = None
     if args.disc_realism_weight > 0:
@@ -2757,9 +2777,22 @@ if __name__ == '__main__':
             attributes = pred[:,attribute_index]
             zero_pad = torch.zeros(args.batch, 18, 1, device=latent.device, dtype=latent.dtype)
             
-            _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
+            _early_recon = None                  # G(latent) at img_size, rendered once and reused below
+            if args.conditioner_input == 'recon':
+                with torch.no_grad():
+                    _recon_full = G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
+                    _early_recon = resize_generated(_recon_full, (args.img_size, args.img_size), args.train_resize)
+                    _cond_in = F.interpolate(_recon_full, (img.shape[-2], img.shape[-1]), mode='area')
+                    # the condition describes the reconstruction, so does its distillation target
+                    _kd_target = torch.sigmoid(attr_teacher(F.interpolate(
+                        _recon_full, (256, 256), mode='area'))[0])[:, attribute_index.to(latent.device)]
+                    del _recon_full
+                _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion, attr_images=_cond_in)
+                kd_loss = F.mse_loss(attr_cond, _kd_target)
+            else:
+                _, id_cond, attr_cond = conditioner.make_condition(img, latent, id_criterion)
+                kd_loss = F.mse_loss(attr_cond, attributes)
             id_cond_train = apply_id_condition_dropout(id_cond, args.id_cond_dropout)
-            kd_loss = F.mse_loss(attr_cond, attributes)
 
             if args.attribute_sampling == 'cycle':
                 modify_idx = torch.full(
@@ -2779,7 +2812,6 @@ if __name__ == '__main__':
             _cond_src = attr_cond[batch_indices, mid_idx].detach()
             _cr_mask = None                      # which edits the reading rule may touch (None = all)
             _abstain = None                      # verified mode: edits with no direction supervision
-            _early_recon = None                  # verified mode: G(latent), reused below
             train_verified_frac = torch.zeros([], device=latent.device)
             train_abstain_frac = torch.zeros([], device=latent.device)
             if args.train_edit_direction == 'teacher':
@@ -2800,7 +2832,7 @@ if __name__ == '__main__':
                         if 'flip' in args.verify_views:
                             _views.append(torch.flip(_ph, dims=[3]))
                     if 'recon' in args.verify_views:
-                        _early_recon = resize_generated(
+                        _early_recon = _early_recon if _early_recon is not None else resize_generated(
                             G([latent], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1),
                             (args.img_size, args.img_size), args.train_resize)
                         _views.append(F.interpolate(_early_recon, (256, 256), mode='bilinear',

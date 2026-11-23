@@ -44,6 +44,9 @@
 #               clearly on one side, the precomputed r34 agrees, the conditioner is on the other side) the
 #               edit takes the teachers' direction and the reading rule. Its control is dircond (the
 #               losses follow the edit's direction, nothing corrected)
+#   recon       --conditioner_input recon --target_src_from_recon: the conditioner reads the attributes off
+#               the reconstruction G(latent) (the face the flow edits), distilled from the r34 teacher's
+#               reading of that reconstruction; the target loss also starts from the reconstruction
 #   layeremb    --velocity_layer_embed: the W+ row index enters the velocity nets' hyper-network like t
 #               does (a learned per-row offset on every layer's gate logit and bias, zero at init, so the
 #               resumed model is bit-identical at its first step). Check first that the edits really are
@@ -144,6 +147,7 @@ arm_sets() {   # the --set key=value pairs of an arm
         teachdir)   echo "train_edit_direction=teacher" ;;
         trcr)       echo "train_edit_direction=teacher train_consistent_reading=0.1" ;;
         layeremb)   echo "velocity_layer_embed=true" ;;
+        recon)      echo "conditioner_input=recon target_src_from_recon=true" ;;
         vercr)      echo "train_edit_direction=verified train_consistent_reading=0.1" ;;
         custom)     [ -n "${CUSTOM_SETS:-}" ] || { echo "arm custom needs CUSTOM_SETS=\"key=value ...\"" >&2; exit 1; }
                     echo "$CUSTOM_SETS" ;;

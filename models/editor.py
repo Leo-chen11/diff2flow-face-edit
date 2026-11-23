@@ -182,6 +182,7 @@ class SDFlow(object):
                 id_cond_scale = cfg.get('id_cond_scale', id_cond_scale)
                 attr_backbone = cfg.get('attr_backbone', attr_backbone)
                 conditioner_backbone = cfg.get('conditioner_backbone', conditioner_backbone)
+                self.conditioner_input = cfg.get('conditioner_input', 'photo') or 'photo'
                 clip_model = cfg.get('clip_model', clip_model)
                 fused_hidden_dim = cfg.get('fused_hidden_dim', fused_hidden_dim)
                 direction_residual_scale = cfg.get('direction_residual_scale',
@@ -375,6 +376,12 @@ class SDFlow(object):
         )
         return new_styles
 
+    def set_generator(self, G):
+        """For --conditioner_input recon runs: the generator that renders the reconstruction the
+        conditioner reads (models.conditioner.make_recon_fn)."""
+        from models.conditioner import make_recon_fn
+        self.conditioner.recon_fn = make_recon_fn(G)
+
     def transform(self, inputs, sources, images=None, direction=None):
         """inputs: W+ latents (B, 18, 512); images: the aligned faces, at the
         resolution the run was trained on (config.json img_size); sources:
@@ -392,6 +399,9 @@ class SDFlow(object):
         if images is None:
             raise ValueError('SDFlow.transform requires aligned source images for identity conditioning.')
 
+        if getattr(self, 'conditioner_input', 'photo') == 'recon' and self.conditioner.recon_fn is None:
+            raise ValueError('this run reads the attributes off the reconstruction (--conditioner_input recon): '
+                             'call set_generator(G) with the StyleGAN2 generator first')
         src_cond, id_cond, attr_cond = self.conditioner.make_condition(images, inputs, self.id_extractor)
         attr_local_idx = self.class_indices.index(self.attr_num)
         strength = max(0.0, min(float(self.scale), 4.0))
