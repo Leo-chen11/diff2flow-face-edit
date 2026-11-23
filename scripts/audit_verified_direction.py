@@ -65,10 +65,45 @@ def score(path):
           'abstain rows: who was right where the rule refused to decide (no target is right there).')
 
 
+def analyze(path, clear=0.65):
+    """Why edits abstain or are corrected: per attribute, how often the conditioner and the precomputed r34
+    disagree on the side of 0.5, how many of the views clearly contradict the conditioner, and which."""
+    rows = list(csv.DictReader(open(path)))
+    vcols = ['precomputed_r34'] + [k for k in rows[0] if k.startswith('t') and '_' in k]
+    by = defaultdict(list)
+    for r in rows:
+        by[r['attribute']].append(r)
+    print(f'views: {vcols}\n')
+    for a, rs in by.items():
+        n = len(rs)
+        side = sum((float(r['conditioner']) > 0.5) != (float(r['precomputed_r34']) > 0.5) for r in rs)
+        k_hist = defaultdict(int)
+        per_view = defaultdict(int)
+        for r in rs:
+            c = float(r['conditioner'])
+            against = [v for v in vcols if (float(r[v]) < 1 - clear) if c > 0.5] if c > 0.5 else \
+                      [v for v in vcols if float(r[v]) > clear]
+            k_hist[len(against)] += 1
+            if r['decision'] == 'abstain':
+                for v in against:
+                    per_view[v] += 1
+        n_ab = sum(r['decision'] == 'abstain' for r in rs)
+        print(f'{a}: conditioner vs precomputed r34 on opposite sides of 0.5: {side}/{n} ({side / n * 100:.1f}%)')
+        print('   views clearly against the conditioner (count: faces): '
+              + ', '.join(f'{k}: {k_hist[k]}' for k in sorted(k_hist)))
+        if n_ab:
+            print(f'   among the {n_ab} abstained, how often each view was one of those against: '
+                  + ', '.join(f'{v} {per_view[v] / n_ab * 100:.0f}%' for v in vcols))
+        print()
+
+
 def main():
     if '--score' in sys.argv:
         i = sys.argv.index('--score')
         return score(sys.argv[i + 1])
+    if '--analyze' in sys.argv:
+        i = sys.argv.index('--analyze')
+        return analyze(sys.argv[i + 1])
 
     import torch
     import torch.nn.functional as F
@@ -92,6 +127,11 @@ def main():
     p.add_argument('--sheet_faces', type=int, default=40, help='faces per attribute and decision on the sheets')
     p.add_argument('--out_dir', default='./output/audit_verified')
     p.add_argument('--score', default=None)
+    p.add_argument('--analyze', default=None, help='a decisions.csv: why edits abstain (no model needed)')
+    p.add_argument('--split', default='train', choices=['train', 'test'],
+                   help='train (what training sees) or test (the first --num_faces test faces, i.e. the '
+                        'development faces for --num_faces <= 500): the conditioner was fitted to the '
+                        'training faces, so its misread rate there can understate the one at evaluation')
     args = apply_run_config(p.parse_args())
     cfg = json.load(open(os.path.join(args.checkpoint_dir, 'config.json')))
     os.makedirs(os.path.join(args.out_dir, 'sheets'), exist_ok=True)
@@ -111,7 +151,8 @@ def main():
     tf = T.Compose([T.ToTensor(), T.Resize((img_size, img_size)), T.Normalize(mean=0.5, std=0.5)])
     ds = SDFlowDataset(index_file=cfg.get('index_file', './data/ffhq.txt'), image_root=cfg.get('image_root', 'data/FFHQ'),
                        latents_file=cfg.get('latent_file', './data/ffhq_e4e_latents.pth'),
-                       preds_file=cfg.get('preds_file', './data/ffhq_e4e_preds.pth'), train=True, transform=tf)
+                       preds_file=cfg.get('preds_file', './data/ffhq_e4e_preds.pth'), train=args.split == 'train',
+                       transform=tf)
     loader = DataLoader(ds, batch_size=8, shuffle=False, num_workers=2)
     attrs = list(args.attribute_index)
     resize = cfg.get('train_resize', 'nearest')
@@ -159,7 +200,7 @@ def main():
     cnt = defaultdict(lambda: defaultdict(int))
     for r in rows:
         cnt[r['attribute']][r['decision']] += 1
-    lines = [f'# Verified-correction audit: {args.checkpoint_dir} step {args.step}, {seen} training faces',
+    lines = [f'# Verified-correction audit: {args.checkpoint_dir} step {args.step}, {seen} {args.split} faces',
              f'margin {args.margin}, clear {args.clear}, beat {args.beat}, views precomputed r34 + '
              f'{len(teachers)} teacher(s) x {args.views}', '',
              '| attribute | follow | correct | abstain |', '|---|---|---|---|']
