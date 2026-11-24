@@ -11,8 +11,9 @@ strengths around it. Three outcomes per cell:
               target. Not a property of the method -- add a smaller strength to its --scales.
   not reached the STRONGEST measured strength edits less than that. The note says how far it got, at
               what strength and identity, and whether the curve was still rising there (then a larger
-              strength may reach it: add one to --scales) or had flattened (the method saturates below
-              the target: a real limit -- e.g. DeltaEdit's Young, which its paper does not cover)
+              strength may reach it: add one to --scales), had flattened (the method saturates below
+              the target: a real limit -- e.g. DeltaEdit's Young, which its paper does not cover), or
+              had already destroyed the identity (ArcFace < 0.35: not chased further)
 
 100% means every scored face succeeded; a pooled curve rarely gets there exactly, so its cell is
 usually "not reached" with the highest accuracy shown.
@@ -48,6 +49,8 @@ DEFAULT_RUNS = [
     ('LT', 'lt_off500.csv'), ('InterFaceGAN', 'interfacegan_off500.csv'),
 ]
 FLAT = 0.005          # accuracy gain (0-1) between the last two strengths below which a curve has flattened
+ID_FLOOR = 0.35       # ArcFace below which the face is no longer the same person: a target not reached by
+                      # then is not chased with larger strengths
 
 
 def load(path):
@@ -111,6 +114,9 @@ def ladder(pts, target, key):
     if target >= 1.0 - 1e-9 and p[key] >= 0.99:
         why = ('100% means every scored face succeeds; the last few faces resist any strength, so a pooled '
                'curve stops just short of it')
+    elif rising and pts[-1][3] < ID_FLOOR:
+        why = (f'identity already lost at the strongest measured strength (ArcFace {pts[-1][3]:.3f} < {ID_FLOOR}): '
+               'not chased further')
     elif rising:
         why = 'still rising at the strongest measured strength: a larger strength may reach it'
     else:
