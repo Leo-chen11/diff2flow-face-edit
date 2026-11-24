@@ -389,8 +389,9 @@ def main(argv=None):
                    help='The direction-consistent source reading of scripts/editing_curves.py '
                         '--consistent_reading (a method\'s own reading on the wrong side of 0.5 for the '
                         'requested direction is moved to 0.5 -/+ MARGIN, in the encoding and the target). '
-                        'Applies to kind model (as before) and to every KIND+cr spec (model+cr, sdflow+cr, '
-                        'styleflow+cr; margin 0.1 when this is not given). Give the value each curves CSV '
+                        'Applies to every KIND+cr spec (model+cr, sdflow+cr, styleflow+cr; margin 0.1 when '
+                        'this is not given), and to a plain kind model only when no spec says +cr (then '
+                        'model+cr and model are the with / without columns). Give the value each curves CSV '
                         'was made with.')
     p.add_argument('--face_set', default='direction', choices=['direction', 'consensus'],
                    help='As scripts/editing_curves.py --face_set: direction (default) = the faces R50 reads '
@@ -502,10 +503,17 @@ def main(argv=None):
                 f'{name(g)} ' + ('--' if strength[(t, s["name"], g)] is None else f'{strength[(t, s["name"], g)]:.3f}')
                 for g in attrs))
 
+    # once any spec says +cr, the rule is per spec: a plain `model` then runs WITHOUT it (so
+    # "Ours:model+cr" and "Ours (no CR):model" can share one table); otherwise a plain `model` takes
+    # --consistent_reading, as before
+    _explicit_cr = any(s['cr'] for s in specs)
+
     def cr_margin(spec):
         if spec['cr']:
             return args.consistent_reading if args.consistent_reading is not None else 0.1
-        return args.consistent_reading if spec['kind'] == 'model' else None
+        if spec['kind'] == 'model' and not _explicit_cr:
+            return args.consistent_reading
+        return None
 
     def edit(kind, img, latent, src, attr_cond, id_cond, g, li, d, sc, sf_cond=None, pg_labels=None, de_feat=None,
              cr=None):
