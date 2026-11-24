@@ -213,6 +213,11 @@ class LAGDOFODEnet(nn.Module):
         )
         self._last_v_attr = None
         self._last_v_base = None
+        # the part of the velocity that sees the attributes, as it enters the sum: v_attr (dof) or
+        # gate * v_attr (lag, lag_dof). The base velocity is computed with the attributes zeroed, so it is
+        # the same under the source and the target condition; with this part at 0 an edit returns the
+        # source unchanged. ODEfunc's transport_target 'attr' regularises this part only.
+        self._last_v_edit = None
         self._last_gate = None
 
     def forward(self, context, y):
@@ -228,6 +233,7 @@ class LAGDOFODEnet(nn.Module):
         self._last_v_attr = v_attr
         self._last_v_base = v_base
         self._last_gate = gate
+        self._last_v_edit = v_attr if self.mode == 'dof' else gate * v_attr
         if self.mode == 'lag':
             return gate * v_attr
         if self.mode == 'dof':
@@ -295,6 +301,10 @@ class ODEfunc(nn.Module):
         # edit agrees with the full solve up to the solver tolerance. Never set during training (the
         # NLL needs the divergence); a plain attribute, not saved in checkpoints.
         self.skip_divergence = False
+        # Which velocity the transport regulariser (CNF.transport_reg) measures: 'full' = the whole
+        # field (RNODE as published), 'attr' = only the attribute part of a decomposed field
+        # (LAGDOFODEnet._last_v_edit). The log-density always uses the whole field's divergence.
+        self.transport_target = 'full'
 
     def before_odeint(self, e=None):
         self._e = e
@@ -325,11 +335,23 @@ class ODEfunc(nn.Module):
                 # ||e^T dv/dy||^2 of the Jacobian's squared Frobenius norm. Penalising them makes
                 # the flow transport along straighter, smoother paths (closer to optimal
                 # transport), which is what lets an adaptive solver take fewer steps.
+                # transport_target 'attr': the same two integrals of the ATTRIBUTE part of a decomposed
+                # field only -- the part an edit comes from -- while the base part, which models the
+                # density of W+ codes, is left free. The divergence for log p stays the whole field's.
                 c = states[2]
                 tc = torch.cat([t, c.view(y.size(0), -1)], dim=1)
                 dy = self.diffeq(tc, y)
-                div, vjp = divergence_and_vjp(dy, y, self._e)
-                kinetic = dy.pow(2).sum(dim=-1, keepdim=True)
+                if self.transport_target == 'attr':
+                    v = getattr(self.diffeq, '_last_v_edit', None)
+                    if v is None:
+                        raise RuntimeError("transport_target 'attr' needs a decomposed velocity field "
+                                           "(velocity_field dof, lag or lag_dof)")
+                    div = self.divergence_fn(dy, y, e=self._e)
+                    vjp = torch.autograd.grad(v, y, self._e, create_graph=True)[0]
+                else:
+                    v = dy
+                    div, vjp = divergence_and_vjp(dy, y, self._e)
+                kinetic = v.pow(2).sum(dim=-1, keepdim=True)
                 jacobian = vjp.pow(2).sum(dim=-1, keepdim=True)
                 return dy, -div.unsqueeze(-1), torch.zeros_like(c).requires_grad_(True), kinetic, jacobian
             if len(states) == 3:  # conditional CNF

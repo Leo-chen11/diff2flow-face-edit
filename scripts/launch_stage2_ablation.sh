@@ -22,6 +22,10 @@
 #             --transport_jacobian_weight 0.01 -- straighter, smoother conditional transport; logs
 #             transport_kinetic / transport_jacobian / nfe_encode / nfe_decode (only via ARMS)
 #   ot_hi     the same at 0.1 / 0.1                                         (only via ARMS)
+#   ot_attr   the transport regularizer on the ATTRIBUTE part of the dof field only
+#             (--transport_target attr, 0.01 / 0.01): the part an edit comes from, with the base part
+#             (the density model) left free -- against ot, the same terms on the whole field (only via ARMS)
+#   ot_attr_hi  the same at 0.1 / 0.1                                       (only via ARMS)
 #   noprior   --bank_prior_weight 0: the bank still hands the edit over to the flow (the output
 #             anneal), but the cosine-hinge prior that pulls the flow's edit toward the bank's
 #             directions is gone -- separates the two halves of the annealed linear teacher
@@ -140,6 +144,8 @@ arm_sets() {   # the --set key=value pairs of an arm
         nomakeup) echo "coupled_targets=20-:36-,18-,34- coupled_target_weight=0.6" ;;
         ot)       echo "transport_kinetic_weight=0.01 transport_jacobian_weight=0.01" ;;
         ot_hi)    echo "transport_kinetic_weight=0.1 transport_jacobian_weight=0.1" ;;
+        ot_attr)  echo "transport_kinetic_weight=0.01 transport_jacobian_weight=0.01 transport_target=attr" ;;
+        ot_attr_hi) echo "transport_kinetic_weight=0.1 transport_jacobian_weight=0.1 transport_target=attr" ;;
         bangsclip)  echo "clip_prompt_bangs=true" ;;
         dircond)    echo "target_direction_from_cond=true" ;;
         truedilate) echo "local_region_true_dilate=true" ;;

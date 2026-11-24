@@ -243,8 +243,8 @@ def _mechanism_report(args):
         ('preserve_attr (x counter_attr)', args.counter_attr_weight * args.preserve_attr_weight),
         ('coupled_targets', args.coupled_target_weight if args.coupled_targets else 0),
         ('lag_reg', args.lag_reg_weight if args.velocity_field != 'original' else 0),
-        ('transport_kinetic', args.transport_kinetic_weight),
-        ('transport_jacobian', args.transport_jacobian_weight),
+        (f'transport_kinetic ({args.transport_target} velocity)', args.transport_kinetic_weight),
+        (f'transport_jacobian ({args.transport_target} velocity)', args.transport_jacobian_weight),
         ('bank_prior', args.bank_prior_weight
          if args.direction_bank_path and args.bank_mode in ('prior', 'anneal') else 0),
         ('dir_gate_reg', args.dir_gate_reg_weight),
@@ -917,13 +917,21 @@ def freeze_conditioner_bn(conditioner):
             m.eval()
 
 
-def set_transport_reg(flow_model, on):
-    """Turn the transport regularizer states of every CNF block of the flow on or off."""
+def set_transport_reg(flow_model, on, target='full'):
+    """Turn the transport regularizer states of every CNF block of the flow on or off, measuring
+    target 'full' (the whole velocity, RNODE) or 'attr' (only the attribute part of a decomposed field,
+    --transport_target). Returns the number of CNF blocks."""
+    from models.flows.odefunc import LAGDOFODEnet, ODEfunc
+    if target == 'attr' and on and not any(isinstance(m, LAGDOFODEnet) for m in flow_model.modules()):
+        raise SystemExit("--transport_target attr needs a decomposed velocity field "
+                         "(--velocity_field dof, lag or lag_dof); 'original' has no attribute part")
     n = 0
     for m in flow_model.modules():
         if hasattr(m, 'transport_reg'):
             m.transport_reg = bool(on)
             n += 1
+        if isinstance(m, ODEfunc):
+            m.transport_target = target
     return n
 
 
@@ -1514,6 +1522,17 @@ if __name__ == '__main__':
     parser.add_argument('--transport_jacobian_weight', type=float, default=0.0,
                         help='Same, for the Jacobian Frobenius norm  int ||dv/dw||_F^2 dt  (Hutchinson '
                              'estimate with the divergence\'s own probe). 0 (default): off.')
+    parser.add_argument('--transport_target', default='full', choices=['full', 'attr'],
+                        help="Which velocity the two transport terms measure. full (default): the whole "
+                             "field v, RNODE as published. attr: only the ATTRIBUTE part of a decomposed "
+                             "field (--velocity_field dof: v_attr; lag / lag_dof: gate * v_attr). The base "
+                             "velocity is computed with the attributes zeroed, so it is the same under the "
+                             "source and the target condition and an edit comes from the attribute part "
+                             "alone (it returns the source unchanged when that part is 0); penalising only "
+                             "that part asks for the least-action attribute transport -- a small, straight "
+                             "edit -- while the base part, which models the density of W+ codes (the NLL), "
+                             "stays free. The log-density's divergence is always the whole field's. The "
+                             "logged transport_kinetic / transport_jacobian are then of the attribute part."),
     parser.add_argument('--lag_reg_weight', type=float, default=1.0,
                         help='Overall scale on the LAG-DOF velocity field\'s three internal '
                              'regularizers (orth, gate_smooth, gate_sparse -- only active when '
@@ -2138,8 +2157,9 @@ if __name__ == '__main__':
     ).cuda()
     _transport_on = args.transport_kinetic_weight > 0 or args.transport_jacobian_weight > 0
     if _transport_on:
-        print(f'** transport regularizer on {set_transport_reg(prior, True)} CNF block(s): kinetic '
-              f'{args.transport_kinetic_weight:g}, jacobian {args.transport_jacobian_weight:g}')
+        print(f'** transport regularizer on {set_transport_reg(prior, True, args.transport_target)} CNF block(s) '
+              f'({args.transport_target} velocity): kinetic {args.transport_kinetic_weight:g}, '
+              f'jacobian {args.transport_jacobian_weight:g}')
     # prior.load_state_dict(torch.load('./pretrained_models/ffhq_prior.pth',map_location='cpu'),strict=True)
     
     img_transform = T.Compose([
