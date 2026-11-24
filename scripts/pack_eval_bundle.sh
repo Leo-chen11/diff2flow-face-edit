@@ -8,15 +8,20 @@
 #   data/FFHQ/<file>                           only the first N_TEST test-split images
 #   output/<run name>/config.json + save_models/*-<STEP>
 #   output/sdflow_original_5attr/save_models/{prior,labeldist}-<SDF_STEP>
-#   output/baselines/{adatrans,lt,styleflow}/...
+#   output/baselines/{adatrans,lt,styleflow,gradctrl,plugen}/...
+#   data/deltaedit/                            DeltaEdit's official net_face.pth + fs3.npy
 # Symlinks are followed (a run linked from the Desktop is packed as its files).
 #
 #   RUN=output/<run> STEP=130000 SDF=<dir with prior-0017549> bash scripts/pack_eval_bundle.sh
 # Environment:
 #   RUN        the run dir (required)            STEP      its step (default 130000)
 #   SDF        retrained SDFlow ckpt dir         SDF_STEP  default 17549   (skipped when unset)
-#   ADA LT STYLEFLOW   baseline dirs (default output/baselines/{adatrans,lt,styleflow})
+#   ADA LT STYLEFLOW GRADCTRL PLUGEN   baseline dirs (default output/baselines/<name>)
+#   DELTAEDIT  default data/deltaedit
 #   N_TEST     test images to pack (default 1000: covers --sample_offset 500 --num_samples 500)
+#   DATA=0     leave out data/ (judges, generator, latents, images): for a machine that has them
+#              already; the baselines' files under data/ (deltaedit, interfacegan boundaries) are
+#              still packed
 #   OUT        output tar (default eval_bundle.tar)
 # Anything missing is reported and skipped; the tar holds the rest.
 set -uo pipefail
@@ -29,6 +34,10 @@ SDF_STEP=${SDF_STEP:-17549}
 ADA=${ADA:-output/baselines/adatrans}
 LT=${LT:-output/baselines/lt}
 STYLEFLOW=${STYLEFLOW:-output/baselines/styleflow}
+GRADCTRL=${GRADCTRL:-output/baselines/gradctrl}
+PLUGEN=${PLUGEN:-output/baselines/plugen}
+DELTAEDIT=${DELTAEDIT:-data/deltaedit}
+DATA=${DATA:-1}
 N_TEST=${N_TEST:-1000}
 OUT=${OUT:-eval_bundle.tar}
 S=$(printf '%07d' "$STEP")
@@ -45,11 +54,14 @@ add() {   # add <source> <path inside the tar>
     fi
 }
 
-for f in ffhq.txt ffhq_e4e_latents.pth ffhq_e4e_preds.pth stylegan2-ffhq-config-f.pt \
-         r34_a40_age_256_classifier.pth r50_celebahq_eval.pth celeba_attr_resnet18.pth \
-         model_ir_se50.pth parsing_bisenet.pth direction_bank_multi.pth attr_boundaries_wplus.pth; do
-    add "data/$f" "data/$f"
-done
+if [ "$DATA" = 1 ]; then
+    for f in ffhq.txt ffhq_e4e_latents.pth ffhq_e4e_preds.pth stylegan2-ffhq-config-f.pt \
+             r34_a40_age_256_classifier.pth r50_celebahq_eval.pth celeba_attr_resnet18.pth \
+             model_ir_se50.pth parsing_bisenet.pth direction_bank_multi.pth attr_boundaries_wplus.pth; do
+        add "data/$f" "data/$f"
+    done
+fi
+add data/interfacegan_boundaries.pth data/interfacegan_boundaries.pth
 
 NAME=$(basename "$(cd "$RUN" && pwd)")
 add "$RUN/config.json" "output/$NAME/config.json"
@@ -69,8 +81,11 @@ fi
 add "$ADA" output/baselines/adatrans
 add "$LT" output/baselines/lt
 add "$STYLEFLOW" output/baselines/styleflow
+add "$GRADCTRL" output/baselines/gradctrl
+add "$PLUGEN" output/baselines/plugen
+add "$DELTAEDIT" data/deltaedit
 
-if [ -f data/ffhq.txt ]; then
+if [ "$DATA" = 1 ] && [ -f data/ffhq.txt ]; then
     python - "$N_TEST" > "$STAGE/test_files.txt" << 'EOF'
 import sys
 import pandas as pd
