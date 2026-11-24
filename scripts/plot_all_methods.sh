@@ -58,3 +58,10 @@ python evaluation/plot_strength_curves.py "${RUNS[@]}" $READ --output_dir "$OUT/
     && python evaluation/plot_strength_curves.py "${RUNS[@]}" $READ --right_panel region --ylim_bg 0 100 \
            --output_dir "$OUT/r50_region" \
     && echo "figures: $OUT/{r50,r18,r50_region}/curves_<attribute>.png (.pdf beside each)"
+# every method read at R50 / r18 40 50 ... 100%, with the reason for each missing point
+for j in r50 r18; do
+    for pool in all common; do
+        python -m scripts.accuracy_ladder --curves "$CURVES" --judge $j --pool $pool --out_dir "$OUT/ladder" > /dev/null \
+            && echo "ladder: $OUT/ladder/ladder_${j}_${pool}.{md,png}"
+    done
+done
