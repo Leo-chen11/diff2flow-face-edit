@@ -37,7 +37,7 @@ SDF_STEP=${SDF_STEP:-17549}
 FACE_SET=${FACE_SET:-direction}
 CR=${CR:-0.1}
 if [ "$FACE_SET" = consensus ]; then OUT=${OUT:-output/curves_consensus}; else OUT=${OUT:-output/curves}; fi
-METHODS=${METHODS:-ours adatrans gradctrl plugen deltaedit sdflow5 lt styleflow interfacegan}
+METHODS=${METHODS:-ours_nocr sdflow5 styleflow adatrans gradctrl plugen deltaedit lt}
 J="--independent_attr_weights ./data/r50_celebahq_eval.pth --independent_attr_backbone r50"
 H="--sample_offset 500 --num_samples 500 --face_set $FACE_SET"
 mkdir -p "$OUT"

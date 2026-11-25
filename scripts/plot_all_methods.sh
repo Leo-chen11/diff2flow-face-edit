@@ -34,7 +34,6 @@ METHODS=(
     "GradCtrl=$CURVES/gradctrl_off500.csv"
     "PluGeN=$CURVES/plugen_off500.csv"
     "LT=$CURVES/lt_off500.csv"
-    "InterFaceGAN=$CURVES/interfacegan_off500.csv"
 )
 if [ "${WITH_CR:-0}" = 1 ]; then
     METHODS+=("Ours+CR=$CURVES/ours_cr0.1_off500.csv" "SDFlow+CR=$CURVES/sdflow5_cr0.1_off500.csv"

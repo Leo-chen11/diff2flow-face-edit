@@ -60,7 +60,7 @@ DEFAULT_RUNS = [                 # no method gets the reading rule (CR); add CR 
     ('Ours', 'ours_nocr_off500.csv'), ('SDFlow', 'sdflow5_off500.csv'), ('StyleFlow', 'styleflow_off500.csv'),
     ('AdaTrans', 'adatrans_off500.csv'), ('DeltaEdit', 'deltaedit_off500.csv'),
     ('GradCtrl', 'gradctrl_off500.csv'), ('PluGeN', 'plugen_off500.csv'),
-    ('LT', 'lt_off500.csv'), ('InterFaceGAN', 'interfacegan_off500.csv'),
+    ('LT', 'lt_off500.csv'),         # InterFaceGAN is not part of the comparison (add it with --run)
 ]
 
 

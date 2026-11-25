@@ -46,8 +46,8 @@ ATTRS = ['Eyeglasses', 'Male', 'Young', 'Smiling', 'Bangs']
 BASE_RUNS = [                       # methods that move along the request whatever the source looks like
     ('AdaTrans', 'adatrans_off500.csv'), ('DeltaEdit', 'deltaedit_off500.csv'),
     ('GradCtrl', 'gradctrl_off500.csv'), ('PluGeN', 'plugen_off500.csv'),
-    ('LT', 'lt_off500.csv'), ('InterFaceGAN', 'interfacegan_off500.csv'),
-]
+    ('LT', 'lt_off500.csv'),
+]                                   # InterFaceGAN is not part of the comparison (add it with --run)
 NOCR_RUNS = [('Ours', 'ours_nocr_off500.csv'), ('SDFlow', 'sdflow5_off500.csv'),
              ('StyleFlow', 'styleflow_off500.csv')]
 CR_RUNS = [('Ours+CR', 'ours_cr0.1_off500.csv'), ('SDFlow+CR', 'sdflow5_cr0.1_off500.csv'),

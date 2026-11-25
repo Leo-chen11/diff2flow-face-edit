@@ -23,7 +23,7 @@ WITH_CR=${WITH_CR:-0}
 # No method gets the reading rule (CR): ours, SDFlow and StyleFlow edit from their own reading of the source
 # and are run as they are. WITH_CR=1 adds the three CR variants (an analysis of the rule, not the comparison).
 if [ "$WITH_CR" = 1 ]; then export CR=${CR:-0.1}; fi
-export METHODS=${METHODS:-ours_nocr sdflow5 styleflow adatrans gradctrl plugen deltaedit lt interfacegan}
+export METHODS=${METHODS:-ours_nocr sdflow5 styleflow adatrans gradctrl plugen deltaedit lt}
 [ "$WITH_CR" = 1 ] && export METHODS="$METHODS ours sdflow5_cr styleflow_cr"
 TARGETS=${TARGETS:-70 85 95}
 CMP_OUT=${CMP_OUT:-output/comparison_consensus}
@@ -46,7 +46,6 @@ add "GradCtrl"      gradctrl      "$C/gradctrl_off500.csv"
 add "PluGeN"        plugen        "$C/plugen_off500.csv"
 add "DeltaEdit"     deltaedit     "$C/deltaedit_off500.csv"
 add "LT"            lt            "$C/lt_off500.csv"
-add "InterFaceGAN"  interfacegan  "$C/interfacegan_off500.csv"
 if [ "$WITH_CR" = 1 ]; then
     add "Ours+CR"      model+cr     "$C/ours_cr${CR}_off500.csv"
     add "SDFlow+CR"    sdflow+cr    "$C/sdflow5_cr${CR}_off500.csv"
