@@ -227,25 +227,31 @@ def main():
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(8, 5.5))
-        cmap = plt.get_cmap('tab20')
+        fig, ax = plt.subplots(figsize=(8, 5.8))
+        cmap = plt.get_cmap('tab10')
         for k, (n, pts) in enumerate(curves.items()):
             if not pts:
                 continue
-            col = cmap(k % 20)
-            ax.plot([q[key] * 100 for q in pts], [q[3] for q in pts], '-', color=col, alpha=0.35, lw=1)
+            col = cmap(k % 10)
+            # the method's measured curve as ONE solid line, up to its highest accuracy (a curve that turns
+            # back -- e.g. LT, whose accuracy falls again after its peak -- is cut at the peak); the dots
+            # are the matched accuracies, read on that same line
+            top = max(range(len(pts)), key=lambda i: pts[i][key])
+            xs, ys = [q[key] * 100 for q in pts[:top + 1]], [q[3] for q in pts[:top + 1]]
+            ax.plot(xs, ys, '-', color=col, lw=1.9)
             got = [(t, c) for t, c in zip(args.targets, cells[n]) if c[0] == 'ok']
             miss = [f'{t:g}' for t, c in zip(args.targets, cells[n]) if c[0] != 'ok']
-            lab = n + (f'  (no {", ".join(miss)}%)' if miss else '')
-            ax.plot([t for t, _ in got], [c[4] for _, c in got], 'o-', color=col, lw=1.8, ms=5, label=lab)
+            lab = n + (f'  (not reached: {", ".join(miss)}%)' if miss else '')
+            ax.plot([t for t, _ in got], [c[4] for _, c in got], 'o', color=col, ms=6, mec='white', mew=0.8, label=lab)
         for t in args.targets:
-            ax.axvline(t, color='0.85', lw=0.6, zorder=0)
+            ax.axvline(t, color='0.88', lw=0.6, zorder=0)
         ax.set_xlabel(f'{args.judge.upper()} editing accuracy (%)')
         ax.set_ylabel('ArcFace identity (higher = better)')
-        ax.set_title(f'Identity at matched accuracy ({scope})', fontsize=9)
+        short = scope.split(' (')[0]
+        ax.set_title(f'Identity at matched {args.judge.upper()} accuracy\n{short}', fontsize=10)
         ax.set_xlim(min(args.targets) - 5, max(args.targets) + 2)
         ax.grid(alpha=0.25)
-        ax.legend(fontsize=7, loc='lower left')
+        ax.legend(fontsize=8, loc='lower left')
         fig.tight_layout()
         fig.savefig(stem + '.png', dpi=200)
         fig.savefig(stem + '.pdf')
