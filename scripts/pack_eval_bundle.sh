@@ -19,6 +19,9 @@
 #   ADA LT STYLEFLOW GRADCTRL PLUGEN   baseline dirs (default output/baselines/<name>)
 #   DELTAEDIT  default data/deltaedit
 #   N_TEST     test images to pack (default 1000: covers --sample_offset 500 --num_samples 500)
+#   BASELINES_ONLY=1   only the files the methods other than our model need that a first bundle may
+#              have left out: the retrained SDFlow (SDF=), GradCtrl, PluGeN, DeltaEdit and the InterFaceGAN
+#              boundaries; RUN is not needed. For topping up a machine that already has the rest
 #   DATA=0     leave out data/ (judges, generator, latents, images): for a machine that has them
 #              already; the baselines' files under data/ (deltaedit, interfacegan boundaries) are
 #              still packed
@@ -27,7 +30,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-RUN=${RUN:?set RUN=<run dir>}
+BASELINES_ONLY=${BASELINES_ONLY:-0}
+if [ "$BASELINES_ONLY" = 1 ]; then
+    RUN=${RUN:-}
+else
+    RUN=${RUN:?set RUN=<run dir> (or BASELINES_ONLY=1)}
+fi
 STEP=${STEP:-130000}
 SDF=${SDF:-}
 SDF_STEP=${SDF_STEP:-17549}
@@ -54,7 +62,7 @@ add() {   # add <source> <path inside the tar>
     fi
 }
 
-if [ "$DATA" = 1 ]; then
+if [ "$DATA" = 1 ] && [ "$BASELINES_ONLY" != 1 ]; then
     for f in ffhq.txt ffhq_e4e_latents.pth ffhq_e4e_preds.pth stylegan2-ffhq-config-f.pt \
              r34_a40_age_256_classifier.pth r50_celebahq_eval.pth celeba_attr_resnet18.pth \
              model_ir_se50.pth parsing_bisenet.pth direction_bank_multi.pth attr_boundaries_wplus.pth; do
@@ -63,14 +71,17 @@ if [ "$DATA" = 1 ]; then
 fi
 add data/interfacegan_boundaries.pth data/interfacegan_boundaries.pth
 
-NAME=$(basename "$(cd "$RUN" && pwd)")
-add "$RUN/config.json" "output/$NAME/config.json"
-found=0
-for f in "$RUN"/save_models/*-"$S"; do
-    [ -e "$f" ] || continue
-    add "$f" "output/$NAME/save_models/$(basename "$f")"; found=1
-done
-[ $found = 1 ] || MISSING+=("$RUN/save_models/*-$S")
+NAME=baselines-only
+if [ "$BASELINES_ONLY" != 1 ]; then
+    NAME=$(basename "$(cd "$RUN" && pwd)")
+    add "$RUN/config.json" "output/$NAME/config.json"
+    found=0
+    for f in "$RUN"/save_models/*-"$S"; do
+        [ -e "$f" ] || continue
+        add "$f" "output/$NAME/save_models/$(basename "$f")"; found=1
+    done
+    [ $found = 1 ] || MISSING+=("$RUN/save_models/*-$S")
+fi
 
 if [ -n "$SDF" ]; then
     T=$(printf '%07d' "$SDF_STEP")
@@ -78,14 +89,16 @@ if [ -n "$SDF" ]; then
         add "$SDF/$m-$T" "output/sdflow_original_5attr/save_models/$m-$T"
     done
 fi
-add "$ADA" output/baselines/adatrans
-add "$LT" output/baselines/lt
-add "$STYLEFLOW" output/baselines/styleflow
+if [ "$BASELINES_ONLY" != 1 ]; then
+    add "$ADA" output/baselines/adatrans
+    add "$LT" output/baselines/lt
+    add "$STYLEFLOW" output/baselines/styleflow
+fi
 add "$GRADCTRL" output/baselines/gradctrl
 add "$PLUGEN" output/baselines/plugen
 add "$DELTAEDIT" data/deltaedit
 
-if [ "$DATA" = 1 ] && [ -f data/ffhq.txt ]; then
+if [ "$DATA" = 1 ] && [ "$BASELINES_ONLY" != 1 ] && [ -f data/ffhq.txt ]; then
     python - "$N_TEST" > "$STAGE/test_files.txt" << 'EOF'
 import sys
 import pandas as pd
