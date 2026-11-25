@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from scripts.accuracy_ladder import ATTRS, DEFAULT_RUNS, all_row, ladder, load, pooled
+from scripts.accuracy_ladder import ATTRS, all_row, ladder, load, pooled, runs_for
 
 TARGETS = [40, 50, 60, 70, 80, 90, 100]
 # the smallest strength each method can take (run_heldout_curves.sh passes the same to `suggest`):
@@ -114,8 +114,8 @@ def classify(cell, min_strength=0.0):
     return 'fixable', 'no curve'
 
 
-def report(curves_dir, targets, runs=None):
-    runs = runs or [(n, os.path.join(curves_dir, f)) for n, f in DEFAULT_RUNS]
+def report(curves_dir, targets, runs=None, variants='nocr'):
+    runs = runs or [(n, os.path.join(curves_dir, f)) for n, f in runs_for(variants)]
     data = {n: load(p) for n, p in runs if os.path.exists(p)}
     missing = [n for n, p in runs if not os.path.exists(p)]
     covered = {n: [a for a in ATTRS if a in d] for n, d in data.items()}
@@ -165,13 +165,14 @@ def main():
     r = sub.add_parser('report')
     r.add_argument('--curves', required=True)
     r.add_argument('--targets', nargs='+', type=float, default=TARGETS)
+    r.add_argument('--variants', default='nocr', choices=['nocr', 'cr', 'both'])
     args = p.parse_args()
     if args.cmd == 'suggest':
         print(' '.join(suggest(args.csv, args.targets, args.min_strength)))
     elif args.cmd == 'merge':
         merge(args.a, args.b, args.out)
     else:
-        sys.exit(0 if report(args.curves, args.targets) else 1)
+        sys.exit(0 if report(args.curves, args.targets, variants=args.variants) else 1)
 
 
 if __name__ == '__main__':

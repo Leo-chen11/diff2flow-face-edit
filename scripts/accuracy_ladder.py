@@ -40,14 +40,26 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 ATTRS = ['Eyeglasses', 'Male', 'Young', 'Smiling', 'Bangs']
-DEFAULT_RUNS = [
-    ('Ours', 'ours_cr0.1_off500.csv'), ('Ours (no CR)', 'ours_nocr_off500.csv'),
-    ('SDFlow', 'sdflow5_off500.csv'), ('SDFlow+CR', 'sdflow5_cr0.1_off500.csv'),
-    ('StyleFlow', 'styleflow_off500.csv'), ('StyleFlow+CR', 'styleflow_cr0.1_off500.csv'),
+# No method is given the reading rule (CR) by default: the flow methods (ours, SDFlow, StyleFlow) edit
+# from their own reading of the source, and every one of them is run as it is. The CR variants are an
+# option (--variants cr / both) for the analysis of the rule, not part of the comparison.
+BASE_RUNS = [                       # methods that move along the request whatever the source looks like
     ('AdaTrans', 'adatrans_off500.csv'), ('DeltaEdit', 'deltaedit_off500.csv'),
     ('GradCtrl', 'gradctrl_off500.csv'), ('PluGeN', 'plugen_off500.csv'),
     ('LT', 'lt_off500.csv'), ('InterFaceGAN', 'interfacegan_off500.csv'),
 ]
+NOCR_RUNS = [('Ours', 'ours_nocr_off500.csv'), ('SDFlow', 'sdflow5_off500.csv'),
+             ('StyleFlow', 'styleflow_off500.csv')]
+CR_RUNS = [('Ours+CR', 'ours_cr0.1_off500.csv'), ('SDFlow+CR', 'sdflow5_cr0.1_off500.csv'),
+           ('StyleFlow+CR', 'styleflow_cr0.1_off500.csv')]
+DEFAULT_RUNS = NOCR_RUNS + BASE_RUNS
+
+
+def runs_for(variants='nocr'):
+    """The default (name, csv) list: nocr (default, no CR anywhere), cr (the flow methods with the
+    reading rule), both."""
+    flows = {'nocr': NOCR_RUNS, 'cr': CR_RUNS, 'both': NOCR_RUNS + CR_RUNS}[variants]
+    return flows + BASE_RUNS
 FLAT = 0.005          # accuracy gain (0-1) between the last two strengths below which a curve has flattened
 ID_FLOOR = 0.35       # ArcFace below which the face is no longer the same person: a target not reached by
                       # then is not chased with larger strengths
@@ -128,6 +140,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--run', action='append', default=None, metavar='NAME=curves.csv')
     p.add_argument('--curves', default='output/curves')
+    p.add_argument('--variants', default='nocr', choices=['nocr', 'cr', 'both'],
+                   help='which flow-method curves: nocr (default: no method gets the reading rule), cr, both')
     p.add_argument('--targets', nargs='+', type=float, default=[40, 50, 60, 70, 80, 90, 100])
     p.add_argument('--judge', default='r50', choices=['r50', 'r18'], help='whose accuracy is matched')
     p.add_argument('--pool', default='all', choices=['all', 'common'],
@@ -142,7 +156,7 @@ def main():
             name, _, path = item.partition('=')
             runs.append((name.strip(), path.strip()))
     else:
-        runs = [(n, os.path.join(args.curves, f)) for n, f in DEFAULT_RUNS]
+        runs = [(n, os.path.join(args.curves, f)) for n, f in runs_for(args.variants)]
     data = {}
     for name, path in runs:
         if os.path.exists(path):

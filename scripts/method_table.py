@@ -56,12 +56,11 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 ATTRS = ['Eyeglasses', 'Male', 'Young', 'Smiling', 'Bangs']
-DEFAULT_RUNS = [
-    ('Ours', 'ours_cr0.1_off500.csv'), ('Ours (no CR)', 'ours_nocr_off500.csv'),
-    ('SDFlow', 'sdflow5_off500.csv'), ('SDFlow+CR', 'sdflow5_cr0.1_off500.csv'),
-    ('StyleFlow+CR', 'styleflow_cr0.1_off500.csv'), ('AdaTrans', 'adatrans_off500.csv'),
-    ('DeltaEdit', 'deltaedit_off500.csv'), ('GradCtrl', 'gradctrl_off500.csv'), ('PluGeN', 'plugen_off500.csv'),
-    ('StyleFlow', 'styleflow_off500.csv'), ('LT', 'lt_off500.csv'), ('InterFaceGAN', 'interfacegan_off500.csv'),
+DEFAULT_RUNS = [                 # no method gets the reading rule (CR); add CR curves with --run
+    ('Ours', 'ours_nocr_off500.csv'), ('SDFlow', 'sdflow5_off500.csv'), ('StyleFlow', 'styleflow_off500.csv'),
+    ('AdaTrans', 'adatrans_off500.csv'), ('DeltaEdit', 'deltaedit_off500.csv'),
+    ('GradCtrl', 'gradctrl_off500.csv'), ('PluGeN', 'plugen_off500.csv'),
+    ('LT', 'lt_off500.csv'), ('InterFaceGAN', 'interfacegan_off500.csv'),
 ]
 
 

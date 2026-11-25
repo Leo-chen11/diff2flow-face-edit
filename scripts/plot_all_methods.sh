@@ -8,7 +8,8 @@
 #   CURVES   folder of the <method>_off500.csv files (default output/curves; the consensus-face curves of
 #            FACE_SET=consensus bash scripts/run_heldout_curves.sh: CURVES=output/curves_consensus)
 #   OUT      output folder (default output/figures/all_methods, or .../all_methods_consensus)
-#   OURS     your model's CSV (default: $CURVES/ours_cr0.1_off500.csv, else $CURVES/final_cr0.1_off500.csv)
+#   OURS     your model's CSV (default: $CURVES/ours_nocr_off500.csv: no method gets the reading rule)
+#   WITH_CR  1 = also draw the CR curves of ours, SDFlow and StyleFlow
 # Writes, each as .png and .pdf plus a table (.csv) of every curve read at 40 60 80 90 95%:
 #   $OUT/r50/        accuracy by the R50 judge,         right panel: other attributes preserved
 #   $OUT/r18/        accuracy by the CelebA r18 judge,  right panel: other attributes preserved
@@ -20,26 +21,27 @@ case $(basename "$CURVES") in
     curves_consensus) OUT=${OUT:-output/figures/all_methods_consensus} ;;
     *)                OUT=${OUT:-output/figures/all_methods} ;;
 esac
-if [ -z "${OURS:-}" ]; then
-    OURS=$CURVES/ours_cr0.1_off500.csv
-    [ -f "$OURS" ] || OURS=$CURVES/final_cr0.1_off500.csv
-fi
+# No method gets the reading rule (CR) by default; WITH_CR=1 adds the CR curves of the three flow methods.
+OURS=${OURS:-$CURVES/ours_nocr_off500.csv}
 
 # name in the legend = CSV
 METHODS=(
     "Ours=$OURS"
-    "Ours (no CR)=$CURVES/ours_nocr_off500.csv"
     "SDFlow=$CURVES/sdflow5_off500.csv"
-    "SDFlow+CR=$CURVES/sdflow5_cr0.1_off500.csv"
-    "StyleFlow+CR=$CURVES/styleflow_cr0.1_off500.csv"
+    "StyleFlow=$CURVES/styleflow_off500.csv"
     "AdaTrans=$CURVES/adatrans_off500.csv"
     "DeltaEdit=$CURVES/deltaedit_off500.csv"
     "GradCtrl=$CURVES/gradctrl_off500.csv"
     "PluGeN=$CURVES/plugen_off500.csv"
-    "StyleFlow=$CURVES/styleflow_off500.csv"
     "LT=$CURVES/lt_off500.csv"
     "InterFaceGAN=$CURVES/interfacegan_off500.csv"
 )
+if [ "${WITH_CR:-0}" = 1 ]; then
+    METHODS+=("Ours+CR=$CURVES/ours_cr0.1_off500.csv" "SDFlow+CR=$CURVES/sdflow5_cr0.1_off500.csv"
+              "StyleFlow+CR=$CURVES/styleflow_cr0.1_off500.csv")
+fi
+
+VARIANTS=nocr; [ "${WITH_CR:-0}" = 1 ] && VARIANTS=both
 
 RUNS=()
 for m in "${METHODS[@]}"; do
@@ -61,7 +63,7 @@ python evaluation/plot_strength_curves.py "${RUNS[@]}" $READ --output_dir "$OUT/
 # every method read at R50 / r18 40 50 ... 100%, with the reason for each missing point
 for j in r50 r18; do
     for pool in all common; do
-        python -m scripts.accuracy_ladder --curves "$CURVES" --judge $j --pool $pool --out_dir "$OUT/ladder" > /dev/null \
+        python -m scripts.accuracy_ladder --curves "$CURVES" --judge $j --pool $pool --variants "$VARIANTS" --out_dir "$OUT/ladder" > /dev/null \
             && echo "ladder: $OUT/ladder/ladder_${j}_${pool}.{md,png}"
     done
 done
