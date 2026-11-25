@@ -373,6 +373,12 @@ def main():
     p.add_argument('--plugen_others', default='labels', choices=['labels', 'encoded'],
                    help='--method plugen: the other attribute coordinates are written with the r34 readings of '
                         'the source (labels, the official evaluation) or left as the flow encoded them (encoded).')
+    p.add_argument('--plugen_mode', default='set', choices=['set', 'interp'],
+                   help='--method plugen: set = the attribute coordinate is set to direction*strength (official; '
+                        'strength 0 moves every face to the decision boundary, it is not "no edit"); interp = it '
+                        'moves from the source value towards direction: z + strength*(direction - z) (strength 0 = '
+                        'the source; a check that the matched-accuracy numbers do not depend on how strength is '
+                        'counted).')
     p.add_argument('--gradctrl_dir', default='./output/baselines/gradctrl',
                    help='--method gradctrl: <dir>/model.pth + config.json (training/train_gradctrl.py). '
                         '--scales are numbers of steps of 4/9, e.g. 1 2 3 4 5 6 7 8 9 11 13 15 18.')
@@ -595,7 +601,7 @@ def main():
                         face = de.edit(G, latent, de_feat, g, d, sc)
                     elif pg is not None:
                         from models.plugen import plugen_edit
-                        new_lat = plugen_edit(pg, latent, pg_attrs.index(g), d, sc, pg_labels)
+                        new_lat = plugen_edit(pg, latent, pg_attrs.index(g), d, sc, pg_labels, args.plugen_mode)
                         face = G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
                     elif gc is not None:
                         from models.gradctrl import gradctrl_edit
@@ -748,7 +754,8 @@ def main():
                                              'prompts': de.prompts if de is not None else None}
                                             if args.method == 'deltaedit' else None),
                               'plugen_dir': args.plugen_dir if args.method == 'plugen' else None,
-                              'plugen_others': args.plugen_others if args.method == 'plugen' else None},
+                              'plugen_others': args.plugen_others if args.method == 'plugen' else None,
+                              'plugen_mode': args.plugen_mode if args.method == 'plugen' else None},
                    'rows': rows}, f, indent=2)
     print(f'saved {path}\nplot: python evaluation/plot_strength_curves.py --run NAME={path} '
           f'[--run OTHER=...] --attributes All --output_dir ./output/curves')

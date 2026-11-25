@@ -65,10 +65,16 @@ def to_code(p):
 
 
 @torch.no_grad()
-def plugen_edit(model, latent, k, direction, strength, labels=None):
-    """Edit W+ latents (B, 18, 512): attribute coordinate k of the code is set to
-    direction * strength (+1 / -1 are the two ends of the label range the flow was trained on;
-    strength > 1 goes past them).
+def plugen_edit(model, latent, k, direction, strength, labels=None, mode='set'):
+    """Edit W+ latents (B, 18, 512) by changing attribute coordinate k of the code.
+
+    mode 'set' (the official edit): z_k is set to direction * strength (+1 / -1 are the two ends of
+    the label range the flow was trained on; strength > 1 goes past them). Strength 0 is NOT "no
+    edit": it moves every face to the decision boundary z_k = 0.
+    mode 'interp': z_k moves from where the source is towards the target end, z_k + strength *
+    (direction - z_k): strength 0 is the source itself (exactly, the flow is invertible), 1 the label
+    end, > 1 past it. Each face moves along the same line as in 'set'; only how far the faces are at
+    one strength differs.
 
     labels: (B, K) source attribute values on the [-1, 1] scale. Given (the official evaluation):
     ALL K attribute coordinates are written -- the other attributes with their labels, the edited
@@ -78,5 +84,11 @@ def plugen_edit(model, latent, k, direction, strength, labels=None):
     z = model(v)
     if labels is not None:
         z[:, :labels.size(1)] = labels.to(z)
-    z[:, k] = direction.to(z).view(-1) * float(strength)
+    d = direction.to(z).view(-1)
+    if mode == 'set':
+        z[:, k] = d * float(strength)
+    elif mode == 'interp':
+        z[:, k] = z[:, k] + float(strength) * (d - z[:, k])
+    else:
+        raise ValueError(f'unknown PluGeN mode {mode}')
     return latent + (model.inverse(z) - v)[:, None, :]

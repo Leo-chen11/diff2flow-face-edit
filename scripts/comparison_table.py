@@ -381,6 +381,8 @@ def main(argv=None):
                    help='kind plugen: <dir>/model.pth + config.json (training/train_plugen.py).')
     p.add_argument('--plugen_others', default='labels', choices=['labels', 'encoded'],
                    help='kind plugen: as scripts/editing_curves.py (use what its curve was made with).')
+    p.add_argument('--plugen_mode', default='set', choices=['set', 'interp'],
+                   help='kind plugen: as scripts/editing_curves.py (use what its curve was made with).')
     p.add_argument('--gradctrl_dir', default='./output/baselines/gradctrl',
                    help='kind gradctrl: <dir>/model.pth + config.json (training/train_gradctrl.py).')
     p.add_argument('--styleflow_ckpt', default='./output/baselines/styleflow/styleflow.pth',
@@ -529,7 +531,7 @@ def main(argv=None):
             return de.edit(G, latent, de_feat, g, d, sc)
         if kind == 'plugen':
             from models.plugen import plugen_edit
-            new_lat = plugen_edit(pg, latent, pg_attrs.index(g), d, sc, pg_labels)
+            new_lat = plugen_edit(pg, latent, pg_attrs.index(g), d, sc, pg_labels, args.plugen_mode)
             return G([new_lat], input_is_latent=True, randomize_noise=False)[0].clamp(-1, 1)
         if kind == 'gradctrl':
             from models.gradctrl import gradctrl_edit
