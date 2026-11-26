@@ -89,6 +89,11 @@ def analyze(path, clear=0.65):
                     per_view[v] += 1
         n_ab = sum(r['decision'] == 'abstain' for r in rs)
         print(f'{a}: conditioner vs precomputed r34 on opposite sides of 0.5: {side}/{n} ({side / n * 100:.1f}%)')
+        # per view: a conditioner that reads the reconstruction (--conditioner_input recon) should agree
+        # with t*_recon about as well as a photo-reading one agrees with t*_photo
+        print('   opposite sides of 0.5, conditioner vs each view: ' + ', '.join(
+            f'{v} {sum((float(r["conditioner"]) > 0.5) != (float(r[v]) > 0.5) for r in rs) / n * 100:.1f}%'
+            for v in vcols))
         print('   views clearly against the conditioner (count: faces): '
               + ', '.join(f'{k}: {k_hist[k]}' for k in sorted(k_hist)))
         if n_ab:
