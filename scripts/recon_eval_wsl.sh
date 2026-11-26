@@ -48,7 +48,7 @@ copy() {
     if [ ! -f "$CNX" ]; then
         c=$(find "$WIN" -name "$(basename "$CNX")" 2>/dev/null | head -n 1)
         if [ -n "$c" ] && cpn "$c" data; then echo "copied the ConvNeXt teacher from $c"
-        else echo "ERROR: $CNX not found here or in $WIN (the audit needs it)"; ok=0; fi
+        else echo "note: no $CNX here or in $WIN -- the audit reads with r34 only (enough for the mechanism check)"; fi
     fi
     echo; echo "paths in the recon config (they should be relative, ./data/...):"
     grep -o '"[a-z_]*\(weights\|file\|root\)": *"[^"]*"' "$A/${P}_abl_recon_nodds_b8/config.json" 2>/dev/null
@@ -70,8 +70,9 @@ run() {
         o=output/audit_mech/${r}_test
         if [ -f "$o/decisions.csv" ]; then echo "== audit $r exists"; continue; fi
         echo "== audit $r (development faces)  $(date '+%F %T')"
+        extra=(); [ -f "$CNX" ] || extra=(--main_teacher_only)
         python -u -m scripts.audit_verified_direction --checkpoint_dir "$A/${P}_abl_$r" --step "$STEP" \
-            --split test --num_faces 500 --out_dir "$o" > "output/audit_mech_${r}_test.log" 2>&1 \
+            ${extra[@]+"${extra[@]}"} --split test --num_faces 500 --out_dir "$o" > "output/audit_mech_${r}_test.log" 2>&1 \
             || echo "ERROR audit $r, see output/audit_mech_${r}_test.log"
     done
     echo; echo "########## paste everything below"

@@ -125,6 +125,10 @@ def main():
 
     p = build_parser()
     p.add_argument('--num_faces', type=int, default=3000, help='training faces to scan')
+    p.add_argument('--main_teacher_only', action='store_true',
+                   help='read the views with the run\'s main teacher (r34) only, not its extra teacher: the '
+                        'mechanism check (conditioner vs t0_photo / t0_recon) needs only that one; the '
+                        'decisions then use fewer views than training did')
     p.add_argument('--margin', type=float, default=0.1, help='--train_consistent_reading')
     p.add_argument('--clear', type=float, default=0.65, help='--verify_clear')
     p.add_argument('--beat', type=float, default=0.0, help='--verify_beat')
@@ -144,7 +148,7 @@ def main():
     _, conditioner, G, id_criterion, _, _, _ = load_models(args)
     teachers = []
     for bb, w in [(cfg.get('attribute_backbone', 'r34'), cfg.get('attribute_weights')),
-                  (cfg.get('extra_teacher_backbone'), cfg.get('extra_teacher_weights'))]:
+                  (cfg.get('extra_teacher_backbone'), None if args.main_teacher_only else cfg.get('extra_teacher_weights'))]:
         if not w or w == 'none':
             continue
         t = make_attr_classifier(bb)
