@@ -22,7 +22,7 @@
 #            judge makes it; the protocol for any table with the reading rule in it)
 #   OUT      default output/curves (FACE_SET=consensus: output/curves_consensus)
 # CSVs: $OUT/<method>_off500.csv, logs beside them. After each method, up to ROUNDS (default 3)
-# coverage rounds add strengths until its curve spans R50 40-100% (scripts/ladder_check.py); a CSV that
+# coverage rounds add strengths until its curve spans R50 40-95% (scripts/ladder_check.py); a CSV that
 # already exists is not re-run, only topped up. At the end: $OUT/coverage_check.md (PASS / FAIL per
 # method) and the 7-point tables and figures in $OUT/ladder/.
 #
@@ -55,7 +55,7 @@ run() {   # <csv name> <smallest valid strength> <editing_curves args...>
         python -u -m scripts.editing_curves --checkpoint_dir "$RUN" --step "$STEP" $J $H --out_csv "$out" "$@" \
             > "$log" 2>&1 || { echo "!! $name failed, see $log"; return; }
     fi
-    # make the curve span R50 40-100%: smaller strengths where its weakest already edits past 40%,
+    # make the curve span R50 40-95%: smaller strengths where its weakest already edits past 40%,
     # larger ones where it is still rising at its strongest (scripts/ladder_check.py); the later
     # --scales replaces the method's grid for that extra run only
     for r in $(seq 1 "$ROUNDS"); do
@@ -103,7 +103,7 @@ for m in $METHODS; do
     esac
 done
 echo "all done $(date '+%F %T')"
-# the standard: every method read at R50 40 50 60 70 80 90 100%, or the missing points explained
+# the standard: every method read at R50 40 50 60 70 80 90 95%, or the missing points explained
 python -m scripts.ladder_check report --curves "$OUT" || echo "(coverage check: FAIL -- run this script again to top up, see $OUT/coverage_check.md)"
 for pool in all common; do python -m scripts.accuracy_ladder --curves "$OUT" --pool $pool > /dev/null; done
 echo "tables and figures: $OUT/ladder/ladder_r50_{all,common}.{md,png}"
