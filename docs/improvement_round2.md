@@ -402,16 +402,30 @@ S1=$(python -c "import json;print(json.load(open('$O/$P/config.json'))['resume_d
 | 實驗組 | 拿掉什麼（都疊在「拿掉 SD」上，批次大小 8） | 狀態 |
 |---|---|---|
 | nodds_noclip | Stable Diffusion + CLIP 提示 | **已完成（隨機種子 1）**：整體沒有可測的差別（同 R50 90% 時 ArcFace 0.844，對照組 0.845 / 0.845；r18 也一樣），屬性保持 +0.3、區域保持 +0.7。Bangs 區域保持 +1.7 到 +2.4（三種對齊方式都一致）；Eyeglasses ArcFace −0.004 到 −0.006、Male −0.005 到 −0.008（都在單一屬性雜訊 0.009 以內，但方向一致）。結論：CLIP 提示是可以拿掉的候選，需要第二個隨機種子確認 |
-| nodds_noloc | Stable Diffusion + 兩個區域保持損失 | **暫緩，未訓練** |
-| nodds_noprior | Stable Diffusion + 方向庫的先驗 | **暫緩，未訓練** |
-| nodds_none | Stable Diffusion + CLIP 提示 + 區域保持 + 先驗（四項一起拿掉） | **暫緩，未訓練** |
+| nodds_noloc | Stable Diffusion + 兩個區域保持損失 | 改疊在 recon 上（見下） |
+| nodds_noprior | Stable Diffusion + 方向庫的先驗 | 改疊在 recon 上（見下） |
+| nodds_none | Stable Diffusion + CLIP 提示 + 區域保持 + 先驗（四項一起拿掉） | 改疊在 recon 上（見下） |
 
 現有的對照組：nodds_b8 隨機種子 1、2（保留測試臉、CR 0.1；同準確率下 ArcFace 整體差 ≤ 0.003，單一屬性 ≤ 0.009，這就是判斷有沒有差的雜訊尺度）。
 
-之後要跑時（設定跟 nodds_b8 完全一樣）：
+### 2026-11-27 更新：recon 通過，消融改疊在 recon 上
+
+recon 併進最終版，所以消融的對照組換成 `recon_nodds_b8`，每個實驗組都是「recon + 拿掉 SD + 再拿掉一項」。nodds_noclip 的結果（舊基底）只當參考，要在新基底上重跑。
+
+| 實驗組（名稱尾巴 `_recon_b8`） | 跟對照組 recon_nodds_b8 差在哪 | 回答的問題 |
+|---|---|---|
+| `nodds_s2` | 只換隨機種子（2） | 新基底的雜訊尺度；同時是 recon 的第二個種子 |
+| `nodds_noclip` | 再拿掉 CLIP 提示 | CLIP 能不能刪 |
+| `nodds_noloc` | 再拿掉兩個區域保持損失 | 區域保持損失有沒有用 |
+| `nodds_noprior` | 再拿掉方向庫先驗 | 先驗有沒有用 |
+| `nodds_none` | 四項一起拿掉 | 一起刪會不會出事 |
+
+評估一律不加 CR，一般臉集和共識臉集各一條（`curves_model_s100000_off500_crnone{,_consensus}.csv`）。對照組 recon_nodds_b8 已有一般臉集的曲線，共識臉集那條用第 4 項的指令補。
 
 ```bash
-EXTRA_SETS="batch=8" TAG=b8 ARMS="nodds_noloc nodds_noprior nodds_none" bash scripts/launch_stage2_ablation.sh "$O/$P" "0"
+EXTRA_SETS="batch=8 conditioner_input=recon target_src_from_recon=true" TAG=recon_b8 ARMS="nodds@2 nodds_noclip nodds_noloc nodds_noprior nodds_none" bash scripts/launch_stage2_ablation.sh "$O/$P" "0"
 ```
 
-**注意：** 如果之後 recon 或 layeremb 被併進最終版，這幾個消融要改成疊在新版本上重跑，否則消融的對象就不是論文的最終模型。
+判斷：跟對照組在同 R50 準確率下比 ArcFace、屬性保持、區域保持。差距在雜訊內（整體 ≤0.003、單一屬性 ≤0.009，以 nodds_s2 那組重新確認）就刪掉；變差超過雜訊就留下，那就是它有用的證據。
+
+限制：這些都只在第二階段（50k 之後）拿掉。結論要寫成「第二階段不需要」；最終配方決定後，用完整訓練 × 3 個種子確認。
